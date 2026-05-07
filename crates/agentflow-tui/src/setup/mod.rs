@@ -279,7 +279,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     instances: 1,
                     model_backend: Some("openai/gpt-4o-mini".to_string()),
                     routing_key: Some("lore-key".to_string()),
-                    github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
+                    github_token_env: None, // No token needed for inactive agents
                 },
             ]
         } else {
