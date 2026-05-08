@@ -1,7 +1,12 @@
 [package]
-name = "agentflow-tui"
-version = "0.1.0"
-edition = "2021"
+name        = "agentflow-tui"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Terminal UI for OpenFlows setup and configuration"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["tui", "terminal", "setup", "wizard"]
+categories  = ["command-line-interface", "command-line-utilities"]
 
 [dependencies]
 ratatui = "0.29"

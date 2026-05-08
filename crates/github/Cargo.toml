@@ -1,8 +1,12 @@
 [package]
-name    = "github"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "github"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "GitHub API client for OpenFlows orchestration"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["github", "api", "git"]
+categories  = ["api-bindings", "web-programming"]
 
 [dependencies]
 anyhow        = { workspace = true }

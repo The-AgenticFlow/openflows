@@ -1,8 +1,12 @@
 [package]
-name    = "config"
-version = "0.2.0"
-edition = "2021"
-license = "MIT"
+name        = "config"
+version     = "0.2.0"
+edition     = "2021"
+license     = "MIT"
+description = "Configuration management for OpenFlows agent orchestration"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["config", "agent", "orchestration"]
+categories  = ["config"]
 
 [dependencies]
 anyhow      = { workspace = true }

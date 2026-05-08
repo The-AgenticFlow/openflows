@@ -1,8 +1,12 @@
 [package]
-name = "agent-lore"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-lore"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Lore documentation agent for OpenFlows - maintains project documentation"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agent", "lore", "documentation", "changelog"]
+categories  = ["development-tools"]
 
 [dependencies]
 anyhow = { workspace = true }

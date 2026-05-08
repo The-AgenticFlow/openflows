@@ -1,8 +1,12 @@
 [package]
-name    = "agent-client"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-client"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "LLM client library with multi-provider support (Anthropic, OpenAI, Gemini, Fireworks)"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["llm", "ai", "anthropic", "openai", "gemini", "fireworks"]
+categories  = ["api-bindings", "ai"]
 
 [dependencies]
 anyhow          = { workspace = true }

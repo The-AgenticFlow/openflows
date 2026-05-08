@@ -1,9 +1,12 @@
 [package]
-name = "pair-harness"
-version = "0.2.0"
-edition = "2021"
-license = "MIT"
+name        = "pair-harness"
+version     = "0.2.0"
+edition     = "2021"
+license     = "MIT"
 description = "Event-driven harness for FORGE-SENTINEL pair lifecycle management"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agents", "forge", "sentinel", "orchestration"]
+categories  = ["asynchronous", "development-tools"]
 
 [dependencies]
 anyhow = { workspace = true }

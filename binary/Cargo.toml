@@ -1,8 +1,12 @@
 [package]
-name    = "openflows"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "openflows"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "OpenFlows - Autonomous AI Dev Team orchestration framework"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agents", "orchestration", "automation", "development"]
+categories  = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "agentflow"

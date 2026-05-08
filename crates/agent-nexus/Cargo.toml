@@ -1,8 +1,12 @@
 [package]
-name = "agent-nexus"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-nexus"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Nexus orchestration agent for OpenFlows - assigns work to workers"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agent", "nexus", "orchestration", "scheduler"]
+categories  = ["development-tools"]
 
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }
