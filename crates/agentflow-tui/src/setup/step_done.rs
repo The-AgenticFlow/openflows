@@ -74,7 +74,7 @@ impl DoneStep {
                     .constraints([
                         Constraint::Length(3),
                         Constraint::Length(6),
-                        Constraint::Length(6),
+                        Constraint::Length(7),
                         Constraint::Min(1),
                     ])
                     .split(area);
@@ -110,7 +110,7 @@ impl DoneStep {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(1),
-                        Constraint::Length(4),
+                        Constraint::Length(5),
                     ])
                     .split(chunks[2]);
 
@@ -126,7 +126,8 @@ impl DoneStep {
                 let steps = vec![
                     Line::styled("  1. Review your .env and registry.json files", theme.text_style()),
                     Line::styled("  2. Run 'openflows-setup' to reconfigure", theme.text_style()),
-                    Line::styled("  3. Run 'openflows' to start", theme.text_style()),
+                    Line::styled("  3. Run 'openflows-doctor' to validate setup", theme.text_style()),
+                    Line::styled("  4. Run 'openflows' to start", theme.text_style()),
                 ];
                 let steps_para = Paragraph::new(steps);
                 steps_para.render(next_chunks[1], f.buffer_mut());
