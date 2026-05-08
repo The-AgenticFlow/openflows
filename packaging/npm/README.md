@@ -113,18 +113,26 @@ openflows
 
 ## Troubleshooting
 
-### `mcp-proxy not found`
+### `mcp-proxy` Installation Issues
 
-The post-install script tries to install `mcp-proxy` globally. If it fails:
+The post-install script attempts to install `mcp-proxy` (Python tool from PyPI) automatically. If you see errors:
 
-```bash
-npm install -g mcp-proxy
-```
+1. **Install manually:**
+   ```bash
+   # Recommended (fastest)
+   uv tool install mcp-proxy
+   
+   # Alternative
+   pipx install mcp-proxy
+   ```
 
-Or use Docker mode:
-```bash
-export GITHUB_MCP_TYPE=docker
-```
+2. **Use Docker mode instead:**
+   ```bash
+   export GITHUB_MCP_TYPE=docker
+   openflows
+   ```
+
+The `mcp-proxy` tool bridges stdio to HTTP MCP servers like GitHub Copilot's MCP endpoint.
 
 ### Permission Denied
 

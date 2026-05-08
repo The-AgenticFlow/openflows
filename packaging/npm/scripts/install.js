@@ -99,36 +99,78 @@ function extractTarGz(tarPath, destDir) {
 }
 
 /**
- * Install mcp-proxy globally - required for GitHub MCP connectivity
+ * Install mcp-proxy - required for GitHub MCP connectivity
+ * 
+ * mcp-proxy is a Python tool from PyPI (sparfenyuk/mcp-proxy)
+ * It bridges stdio to HTTP MCP servers like GitHub Copilot's MCP endpoint.
+ * 
+ * Strategy:
+ * 1. Check if mcp-proxy is already available
+ * 2. Install via uv (fast) or pipx (alternative)
+ * 3. Fall back to Docker mode instructions if Python tools unavailable
  */
 async function ensureMcpProxy() {
     console.log(`[openflows] Checking mcp-proxy installation...`);
     
+    // Check if already installed
     try {
-        // Check if mcp-proxy is already installed
-        execSync('which mcp-proxy || where mcp-proxy 2>/dev/null', { stdio: 'pipe' });
+        execSync('which mcp-proxy', { stdio: 'pipe' });
         console.log(`[openflows] ✓ mcp-proxy already installed`);
         return true;
     } catch {
         // Not installed, proceed with installation
     }
     
-    console.log(`[openflows] Installing mcp-proxy (required for GitHub connectivity)...`);
+    console.log(`[openflows] Installing mcp-proxy (required for GitHub MCP)...`);
     
+    // Try uv first (fastest)
     try {
-        // Try to install globally
-        execSync('npm install -g mcp-proxy', { 
+        execSync('which uv', { stdio: 'pipe' });
+        console.log(`[openflows] Installing via uv...`);
+        execSync('uv tool install mcp-proxy', {
             stdio: 'inherit',
-            timeout: 60000 
+            timeout: 120000 
         });
-        console.log(`[openflows] ✓ mcp-proxy installed successfully`);
+        console.log(`[openflows] ✓ mcp-proxy installed via uv`);
         return true;
     } catch (err) {
-        console.warn(`[openflows] ⚠ Could not install mcp-proxy globally: ${err.message}`);
-        console.warn(`[openflows]   You may need to run: npm install -g mcp-proxy`);
-        console.warn(`[openflows]   Or use GITHUB_MCP_TYPE=docker in your environment`);
-        return false;
+        // uv failed or not available
     }
+    
+    // Try pipx as alternative
+    try {
+        execSync('which pipx', { stdio: 'pipe' });
+        console.log(`[openflows] Installing via pipx...`);
+        execSync('pipx install mcp-proxy', {
+            stdio: 'inherit',
+            timeout: 120000 
+        });
+        console.log(`[openflows] ✓ mcp-proxy installed via pipx`);
+        return true;
+    } catch (err) {
+        // pipx failed or not available
+    }
+    
+    // Try pip3 as last resort
+    try {
+        execSync('which pip3', { stdio: 'pipe' });
+        console.log(`[openflows] Installing via pip3...`);
+        execSync('pip3 install --user mcp-proxy', {
+            stdio: 'inherit',
+            timeout: 120000 
+        });
+        console.log(`[openflows] ✓ mcp-proxy installed via pip3`);
+        return true;
+    } catch (err) {
+        // pip3 failed or not available
+    }
+    
+    console.warn(`[openflows] ⚠ Could not install mcp-proxy automatically.`);
+    console.warn(`[openflows]   Please install manually:`);
+    console.warn(`[openflows]     uv tool install mcp-proxy`);
+    console.warn(`[openflows]   Or use Docker mode:`);
+    console.warn(`[openflows]     export GITHUB_MCP_TYPE=docker`);
+    return false;
 }
 
 /**

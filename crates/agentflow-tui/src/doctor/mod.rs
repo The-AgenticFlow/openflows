@@ -152,12 +152,12 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         ));
     }
 
-    // Check for mcp-proxy installation
+    // Check for mcp-proxy installation (Python tool from PyPI)
     if env_check::check_command("mcp-proxy").is_some() {
         checks.push(("mcp-proxy installed".to_string(), CheckState::Pass));
     } else {
         checks.push((
-            "mcp-proxy not found (install: npm i -g mcp-proxy)".to_string(),
+            "mcp-proxy not found (install: uv tool install mcp-proxy)".to_string(),
             CheckState::Fail,
         ));
     }
