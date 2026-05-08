@@ -229,7 +229,7 @@ If VESSEL crashes after merging but before emitting `ticket_merged`, the system 
 
 1. **Unit Tests** — Mock GitHub API responses
 2. **Integration Tests** — In-memory SharedStore, mock HTTP
-3. **E2E Tests** — Full flow with `agentflow.rs`
+3. **E2E Tests** — Full flow with `real_test.rs`
 
 ## Future Enhancements
 

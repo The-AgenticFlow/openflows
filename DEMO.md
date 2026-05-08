@@ -68,7 +68,7 @@ GATEWAY_API_KEY=your-gateway-api-key
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run the orchestration
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 ### 3. Prepare Target Repository
@@ -98,7 +98,7 @@ gh issue create --title "Add UI styling" --body "Style the calculator with a mod
 
 ```bash
 # From AgentFlow directory
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 **If your gateway only supports OpenAI format** (needs the local Anthropic-to-OpenAI proxy):
@@ -108,7 +108,7 @@ cargo run --bin agentflow
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run the orchestration
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 ### What Happens During Execution
@@ -202,7 +202,7 @@ AgentFlow/
 |   |-- pocketflow-core/      # Flow engine, shared store, routing
 |
 |-- binary/src/bin/
-|   |-- agentflow.rs          # Live orchestration entry point
+|   |-- real_test.rs          # Live orchestration entry point
 |   |-- demo.rs               # Mocked demo
 |
 |-- .env                      # Your API keys (not in git)
@@ -304,7 +304,7 @@ GITHUB_REPOSITORY=your-username/my-calculator
 
 ```bash
 cd AgentFlow
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 ### 5. Watch the Magic

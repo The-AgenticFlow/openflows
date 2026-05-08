@@ -253,7 +253,7 @@ async fn test_sync_issues_populates_store() {
 
 ### Integration Testing
 
-Run `cargo run --bin agentflow` and verify:
+Run `cargo run --bin real_test` and verify:
 1. NEXUS assigns work on the **first** loop iteration (step 0)
 2. No repeated `no_work` loops before ticket assignment
 3. Flow stops after 3 consecutive `no_work` if no issues exist

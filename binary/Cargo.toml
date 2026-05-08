@@ -5,16 +5,8 @@ edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "agentflow"
-path = "src/bin/agentflow.rs"
-
-[[bin]]
-name = "agentflow-demo"
+name = "agent-team"
 path = "src/main.rs"
-
-[[bin]]
-name = "demo"
-path = "src/bin/demo.rs"
 
 [dependencies]
 pocketflow-core = { path = "../crates/pocketflow-core" }

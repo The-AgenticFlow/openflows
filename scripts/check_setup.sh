@@ -176,7 +176,7 @@ if [ -f "Cargo.toml" ]; then
     success "Cargo.toml found"
     
     # Try to check cargo build (without actually building)
-    if cargo check --bin agentflow &> /dev/null; then
+    if cargo check --bin real_test &> /dev/null; then
         success "Project compiles successfully"
     else
         warning "Project has compilation issues. Run 'cargo build' to see details."
@@ -241,7 +241,7 @@ if [ "$ALL_CHECKS_PASSED" = true ]; then
     echo -e "${GREEN}✓ All checks passed!${NC}"
     echo ""
     echo "You're ready to run AgentFlow:"
-    echo "  cargo run --bin agentflow"
+    echo "  cargo run --bin real_test"
     exit 0
 else
     echo -e "${RED}✗ Some checks failed${NC}"
