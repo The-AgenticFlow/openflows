@@ -27,7 +27,11 @@ rustc --version
 node --version
 # If not installed: https://nodejs.org/
 
-# Install Claude Code CLI (REQUIRED - all agents use it)
+# Install GitHub CLI (optional but helpful)
+gh --version
+# If not installed: https://cli.github.com/
+
+# Install Claude Code CLI (REQUIRED for FORGE agent)
 claude --version
 # If not installed: https://www.anthropic.com/claude-code
 ```
@@ -38,22 +42,15 @@ You'll need:
 
 | Key | Purpose | Where to Get |
 |-----|---------|--------------|
-| `ANTHROPIC_API_KEY` | Powers Claude Code (all agents) | https://console.anthropic.com/ |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub operations (issues, PRs, CI) | https://github.com/settings/tokens |
-
-Optional provider keys (used when `PROXY_URL` is not set, or as fallback):
-
-| Key | Purpose |
-|-----|---------|
-| `OPENAI_API_KEY` | OpenAI models via proxy or direct |
-| `GEMINI_API_KEY` | Gemini models via proxy or direct |
-| `FIREWORKS_API_KEY` | Fireworks AI models (default gateway) |
-| `GROQ_API_KEY` | Groq models via proxy |
+| `ANTHROPIC_API_KEY` | Powers Claude Code (FORGE agent) | https://console.anthropic.com/ |
+| `OPENAI_API_KEY` | Powers NEXUS orchestrator | https://platform.openai.com/api-keys |
+| `GEMINI_API_KEY` | Powers NEXUS orchestrator when using Gemini | https://aistudio.google.com/app/apikey |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub operations (issues, PRs) | https://github.com/settings/tokens |
 
 For the GitHub token, ensure these scopes:
-- `repo` (full control of private repositories)
-- `workflow` (update GitHub Action workflows)
-- `write:packages` (upload packages to GitHub Package Registry)
+- ✅ `repo` (full control of private repositories)
+- ✅ `workflow` (update GitHub Action workflows)
+- ✅ `write:packages` (upload packages to GitHub Package Registry)
 
 ---
 
@@ -75,57 +72,65 @@ nano .env  # or use your preferred editor
 
 ### 3. Configure Your `.env`
 
-#### Proxy Mode (Recommended)
+```env
+# LLM Provider for NEXUS orchestrator
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxx
+OPENAI_MODEL=gpt-4o-mini
+
+# Alternative: Use Gemini for NEXUS
+# LLM_PROVIDER=gemini
+# GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxx
+# GEMINI_MODEL=gemini-2.5-flash
+
+# Alternative: Use Anthropic for NEXUS as well
+# LLM_PROVIDER=anthropic
+# ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
+
+# Claude Code (FORGE agent) - REQUIRED
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
+
+# GitHub Personal Access Token
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxxxxxxxxxxx
+
+# Target repository (format: owner/repo)
+GITHUB_REPOSITORY=your-username/test-calculator
+```
+
+**⚠️ Important**: NEXUS can use `openai`, `gemini`, or `anthropic`. FORGE still requires `ANTHROPIC_API_KEY` for Claude Code.
+
+#### If your gateway only supports OpenAI format
+
+If you're using a third-party gateway that doesn't support the Anthropic Messages API, you need the local protocol proxy:
 
 ```env
-# Proxy URL (enables proxy-first routing)
+# Claude CLI and Nexus send Anthropic requests to the LOCAL proxy
 PROXY_URL=http://localhost:8080/v1
-PROXY_API_KEY=your-proxy-key
+PROXY_API_KEY=your-gateway-api-key
 
-# Upstream gateway (for local Anthropic-to-OpenAI proxy)
-GATEWAY_URL=https://api.fireworks.ai/inference/v1/
+# The LOCAL proxy forwards OpenAI-format requests to the REMOTE gateway
+GATEWAY_URL=https://api.ai.camer.digital/v1/
 GATEWAY_API_KEY=your-gateway-api-key
 
-# Model provider mapping
+# Route non-Anthropic models through OpenAI client format
 MODEL_PROVIDER_MAP=glm=openai,deepseek=openai,gpt=openai
-
-# Claude CLI path
-CLAUDE_PATH=claude
-
-# GitHub
-GITHUB_REPOSITORY=your-username/enterprise-inventory
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxxxxxxxxxxx
-
-# Fallback API keys (used when proxy has transient errors)
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
-
-# Logging
-RUST_LOG=info,agent_team=debug,pocketflow_core=debug
 ```
 
-#### Direct Mode (No Proxy)
+Then start the proxy before running the orchestration:
 
-```env
-# Fallback order (tried in order when PROXY_URL is not set)
-LLM_FALLBACK=anthropic,gemini
+```bash
+# Terminal 1: Start proxy (reads .env automatically)
+./scripts/start_proxy.sh
 
-# Model-to-provider mapping
-MODEL_PROVIDER_MAP=glm=openai,deepseek=openai,gpt=openai
-
-# Provider API keys
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxx
-OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxx
-GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxx
-FIREWORKS_API_KEY=your_fireworks_api_key
-
-# GitHub
-GITHUB_REPOSITORY=your-username/enterprise-inventory
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxxxxxxxxxxx
+# Terminal 2: Run orchestration
+cargo run --bin real_test
 ```
+
+When your provider adds native Anthropic support, just change `PROXY_URL` to point directly to the gateway and remove `GATEWAY_*`.
 
 ### 4. Verify Your Setup
 
-Run the setup checker:
+Run the setup checker to ensure everything is configured correctly:
 
 ```bash
 ./scripts/check_setup.sh
@@ -134,21 +139,25 @@ Run the setup checker:
 **Expected output:**
 
 ```
-AgentFlow Setup Checker
+🔍 AgentFlow Setup Checker
 =============================
 
 1. Checking System Requirements...
 -----------------------------------
 ✓ Rust 1.75.0 is installed
 ✓ Node.js v20.11.0 is installed
-✓ Claude Code CLI is installed
+✓ Claude Code CLI is installed (v1.0.0)
 ✓ Git 2.43.0 is installed
+✓ GitHub CLI 2.42.0 is installed (optional)
 
 2. Checking Environment Configuration...
 ----------------------------------------
 ✓ .env file exists
+✓ ANTHROPIC_API_KEY is set
+✓ LLM_PROVIDER is set to: openai
+✓ OPENAI_API_KEY is set
 ✓ GITHUB_PERSONAL_ACCESS_TOKEN is set
-✓ GITHUB_REPOSITORY is set to: your-username/enterprise-inventory
+✓ GITHUB_REPOSITORY is set to: your-username/test-calculator
 
 3. Checking Project Build...
 ----------------------------
@@ -159,16 +168,18 @@ AgentFlow Setup Checker
 --------------------------------------
 ✓ NEXUS persona found
 ✓ FORGE persona found
-✓ SENTINEL persona found
-✓ VESSEL persona found
-✓ LORE persona found
-✓ Registry has 5 agents configured
+✓ Worker registry found
+✓ Registry has 3 worker slots configured
+
+5. Checking Workspace Directory...
+-----------------------------------
+⚠ Workspace directory will be created at: /home/christian/.agentflow/workspaces
 
 =============================
 ✓ All checks passed!
 
 You're ready to run AgentFlow:
-  cargo run --bin agentflow
+  cargo run --bin real_test
 ```
 
 If any checks fail, follow the error messages to fix the issues.
@@ -177,33 +188,44 @@ If any checks fail, follow the error messages to fix the issues.
 
 ## Creating a Target Project
 
-AgentFlow needs a GitHub repository with issues to work on. Let's create a fullstack enterprise inventory management system with REST API, database models, authentication, and a React frontend.
+AgentFlow needs a GitHub repository with issues to work on. Let's create a simple calculator project.
 
 ### Option A: Using GitHub CLI
 
 ```bash
 # Create a new public repository
-gh repo create enterprise-inventory --public --clone
+gh repo create test-calculator --public --clone
 
-cd enterprise-inventory
+cd test-calculator
 
-# Initialize project structure (see docs/example-issues.md for full details)
-bash /path/to/AgentFlow/scripts/init-target-project.sh
+# Initialize with README
+echo "# Calculator App" > README.md
+echo "An autonomous AI-built calculator" >> README.md
+git add README.md
+git commit -m "Initial commit"
+git push origin main
 
 # Create issues for the agents to work on
-# See docs/example-issues.md for the complete issue bodies and ready-to-run gh commands
-```
+gh issue create \
+  --title "Implement calculator core logic" \
+  --body "Create a basic calculator web app with HTML/CSS/JavaScript. Support add, subtract, multiply, divide operations. Use a clean, modern design."
 
-For the full issue creation commands and detailed issue bodies, see **[docs/example-issues.md](docs/example-issues.md)**.
+gh issue create \
+  --title "Add scientific calculator features" \
+  --body "Extend the calculator to support scientific operations: sin, cos, tan, sqrt, power, log. Add a toggle to switch between basic and scientific mode."
+
+# Verify issues were created
+gh issue list
+```
 
 ### Option B: Using GitHub Web UI
 
 1. Go to https://github.com/new
-2. Create a repository named `enterprise-inventory`
+2. Create a repository named `test-calculator`
 3. Make it public
 4. Initialize with a README
 5. Go to Issues tab
-6. Create 3 issues using the titles and descriptions from [docs/example-issues.md](docs/example-issues.md)
+6. Create 2 issues with the titles and descriptions from Option A
 
 ### 3. Update AgentFlow `.env`
 
@@ -214,7 +236,7 @@ nano .env
 
 Update the `GITHUB_REPOSITORY` line:
 ```env
-GITHUB_REPOSITORY=your-username/enterprise-inventory
+GITHUB_REPOSITORY=your-username/test-calculator
 ```
 
 ---
@@ -227,27 +249,18 @@ GITHUB_REPOSITORY=your-username/enterprise-inventory
 cd /path/to/AgentFlow
 
 # Build the project (first time only)
-cargo build --release --bin agentflow
+cargo build --release --bin real_test
 
 # Run the orchestration
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 **Expected output on startup:**
 
 ```
-2026-05-02T00:00:01.234Z  INFO agentflow: Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)
-2026-05-02T00:00:02.456Z  INFO agentflow: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-enterprise-inventory
-2026-05-02T00:00:02.789Z  INFO agentflow: Running orchestration loop for repository: your-username/enterprise-inventory
-2026-05-02T00:00:03.000Z  INFO agentflow: Each worker will use event-driven FORGE-SENTINEL pair with:
-2026-05-02T00:00:03.100Z  INFO agentflow:   - PLAN.md -> CONTRACT.md (plan review)
-2026-05-02T00:00:03.200Z  INFO agentflow:   - WORKLOG.md -> segment-N-eval.md (segment evaluation)
-2026-05-02T00:00:03.300Z  INFO agentflow:   - final-review.md (final approval)
-2026-05-02T00:00:03.400Z  INFO agentflow:   - STATUS.json (completion status)
-2026-05-02T00:00:03.500Z  INFO agentflow: VESSEL will handle merge gate:
-2026-05-02T00:00:03.600Z  INFO agentflow:   - CI status polling (10s interval, 10min timeout)
-2026-05-02T00:00:03.700Z  INFO agentflow:   - Squash merge with ticket reference
-2026-05-02T00:00:03.800Z  INFO agentflow:   - ticket_merged event emission
+2026-03-31T00:00:01.234Z  INFO real_test: Starting REAL End-to-End Orchestration (No Mocks)
+2026-03-31T00:00:02.456Z  INFO real_test: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-test-calculator
+2026-03-31T00:00:02.789Z  INFO real_test: Running orchestration loop for repository: your-username/test-calculator
 ```
 
 ### 2. Understanding the Workspace
@@ -257,22 +270,20 @@ AgentFlow creates an isolated workspace structure:
 ```
 ~/.agentflow/
 └── workspaces/
-    └── your-username-enterprise-inventory/
+    └── your-username-test-calculator/
         ├── main/                    # Main repository clone
         ├── worktrees/               # Isolated work areas for each agent
         │   ├── forge-1/             # FORGE worker #1 workspace
-        │   └── forge-2/             # FORGE worker #2 workspace
-        └── orchestration/
-            └── pairs/
-                └── forge-1/
-                    └── T-001/
-                        └── shared/  # FORGE-SENTINEL communication
-                            ├── PLAN.md
-                            ├── CONTRACT.md
-                            ├── WORKLOG.md
-                            ├── segment-1-eval.md
-                            ├── final-review.md
-                            └── STATUS.json
+        │   ├── forge-2/             # FORGE worker #2 workspace
+        │   └── ...
+        └── forge/
+            └── workers/
+                ├── forge-1/
+                │   ├── worker.log   # Detailed Claude Code logs
+                │   └── STATUS.json  # Work completion status
+                └── forge-2/
+                    ├── worker.log
+                    └── STATUS.json
 ```
 
 ---
@@ -284,20 +295,18 @@ AgentFlow creates an isolated workspace structure:
 **You'll see:**
 
 ```
-2026-05-02T00:00:05.123Z  INFO agent_nexus: Syncing worker slots from registry
-2026-05-02T00:00:05.234Z  INFO agent_nexus: Loaded 6 worker slots: ["nexus", "forge-1", "forge-2", "sentinel", "vessel", "lore"]
-2026-05-02T00:00:06.345Z  INFO agent_nexus: Fetching open issues from your-username/enterprise-inventory
-2026-05-02T00:00:07.456Z  INFO agent_nexus: Found 3 open issues
-2026-05-02T00:00:07.567Z  INFO agent_nexus: Synced new ticket from GitHub ticket_id=T-001 title="Implement backend authentication and authorization system"
-2026-05-02T00:00:07.678Z  INFO agent_nexus: Synced new ticket from GitHub ticket_id=T-002 title="Build inventory CRUD API with stock management and audit logging"
-2026-05-02T00:00:08.789Z  INFO agent_nexus: Synced new ticket from GitHub ticket_id=T-003 title="Build React frontend with dashboard, inventory management UI, and analytics"
-2026-05-02T00:00:08.890Z  INFO agent_nexus: Assigning issue #1 "Implement backend authentication and authorization system" to forge-1
+2026-03-31T00:00:05.123Z  INFO agent_nexus: Syncing worker slots from registry
+2026-03-31T00:00:05.234Z  INFO agent_nexus: Loaded 3 worker slots: ["forge-1", "forge-2", "forge-3"]
+2026-03-31T00:00:06.345Z  INFO agent_client::mcp: Initializing GitHub MCP server
+2026-03-31T00:00:07.456Z  INFO agent_nexus: Fetching open issues from your-username/test-calculator
+2026-03-31T00:00:08.567Z  INFO agent_nexus: Found 2 open issues
+2026-03-31T00:00:08.678Z  INFO agent_nexus: Assigning issue #1 "Implement calculator core logic" to forge-1
 ```
 
 **What's happening:**
-1. NEXUS loads worker slots from [`registry.json`](orchestration/agent/registry.json:1)
+1. NEXUS loads available worker slots from [`registry.json`](orchestration/agent/registry.json:1)
 2. Connects to GitHub via MCP server
-3. Fetches open issues from your repository and syncs them as tickets
+3. Fetches open issues from your repository
 4. Assigns first issue to `forge-1`
 
 **Output format:**
@@ -305,8 +314,10 @@ AgentFlow creates an isolated workspace structure:
 {
   "action": "work_assigned",
   "assign_to": "forge-1",
-  "ticket_id": "T-001",
-  "issue_url": "https://github.com/your-username/enterprise-inventory/issues/1"
+  "ticket": "T-001",
+  "issue_number": 1,
+  "title": "Implement calculator core logic",
+  "description": "Create a basic calculator..."
 }
 ```
 
@@ -315,10 +326,10 @@ AgentFlow creates an isolated workspace structure:
 **You'll see:**
 
 ```
-2026-05-02T00:00:10.123Z  INFO agent_forge: Processing work_assigned for worker forge-1
-2026-05-02T00:00:10.234Z  INFO pair_harness::worktree: Creating worktree for forge-1
-2026-05-02T00:00:11.345Z  INFO pair_harness::worktree: Worktree created at /home/christian/.agentflow/workspaces/your-username-enterprise-inventory/worktrees/forge-1
-2026-05-02T00:00:11.456Z  INFO pair_harness::worktree: Checked out new branch: forge-1/T-001
+2026-03-31T00:00:10.123Z  INFO agent_forge: Processing work_assigned for worker forge-1
+2026-03-31T00:00:10.234Z  INFO pair_harness::worktree: Creating worktree for forge-1
+2026-03-31T00:00:11.345Z  INFO pair_harness::worktree: Worktree created at /home/christian/.agentflow/workspaces/your-username-test-calculator/worktrees/forge-1
+2026-03-31T00:00:11.456Z  INFO pair_harness::worktree: Checked out new branch: forge-1/T-001
 ```
 
 **What's happening:**
@@ -331,10 +342,10 @@ AgentFlow creates an isolated workspace structure:
 **You'll see:**
 
 ```
-2026-05-02T00:00:12.567Z  INFO agent_forge: Spawning Claude Code for worker forge-1
-2026-05-02T00:00:12.678Z  INFO pair_harness::process: Running: claude run --persona /path/to/orchestration/agent/agents/forge.agent.md
-2026-05-02T00:00:13.789Z  INFO agent_forge: Claude Code process started (PID: 12345)
-2026-05-02T00:00:13.890Z  INFO agent_forge: Worker forge-1 is now working on T-001
+2026-03-31T00:00:12.567Z  INFO agent_forge: Spawning Claude Code for worker forge-1
+2026-03-31T00:00:12.678Z  INFO pair_harness::process: Running: claude run --persona /path/to/orchestration/agent/agents/forge.agent.md
+2026-03-31T00:00:13.789Z  INFO agent_forge: Claude Code process started (PID: 12345)
+2026-03-31T00:00:13.890Z  INFO agent_forge: Worker forge-1 is now working on T-001
 ```
 
 **What's happening:**
@@ -342,41 +353,29 @@ AgentFlow creates an isolated workspace structure:
 2. Provides the issue context
 3. Claude Code starts autonomous development
 
-**This step takes 5-15 minutes** depending on task complexity.
+**⏰ This step takes 5-15 minutes** depending on task complexity.
 
-### Step 4: FORGE-SENTINEL Pair Lifecycle
+### Step 4: Claude Code Works
 
-While Claude Code is working, the event-driven pair lifecycle proceeds:
-
-1. **FORGE writes PLAN.md** - Implementation plan with segment breakdown
-2. **SENTINEL reviews PLAN.md** - Writes CONTRACT.md with AGREED or CHANGES_REQUESTED
-3. **FORGE implements segments** - Writes WORKLOG.md with progress
-4. **SENTINEL evaluates each segment** - Writes segment-N-eval.md with APPROVED or CHANGES_REQUESTED
-5. **SENTINEL final review** - Writes final-review.md with overall verdict
-6. **FORGE opens PR** - Writes STATUS.json with completion status
-
-You can monitor progress:
+While Claude Code is working, you can monitor its progress:
 
 ```bash
 # Watch the worker log in real-time
-tail -f ~/.agentflow/workspaces/your-username-enterprise-inventory/forge/workers/forge-1/worker.log
+tail -f ~/.agentflow/workspaces/your-username-test-calculator/forge/workers/forge-1/worker.log
 ```
 
 **Example log snippets:**
 
 ```
-[Claude Code] Reading issue #1: Implement backend authentication and authorization system
+[Claude Code] Reading issue #1: Implement calculator core logic
 [Claude Code] Planning implementation...
-[Claude Code] Writing PLAN.md with 4 segments
-[Claude Code] Creating backend/src/models/User.js with auth schema
-[Claude Code] Writing backend/src/routes/auth.js with 6 endpoints
-[Claude Code] Adding backend/src/middleware/auth.js for JWT verification
-[Claude Code] Writing backend/src/controllers/authController.js
-[Claude Code] Creating backend/tests/auth.test.js with 15 test cases
+[Claude Code] Creating index.html with calculator UI
+[Claude Code] Writing calculator.js with operation logic
+[Claude Code] Adding styles.css for modern design
 [Claude Code] Running tests...
-[Claude Code] All 15 tests passed (87% coverage)
+[Claude Code] All tests passed
 [Claude Code] Committing changes...
-[Claude Code] Writing STATUS.json...
+[Claude Code] Creating STATUS.json...
 ```
 
 ### Step 5: Work Completion
@@ -384,71 +383,41 @@ tail -f ~/.agentflow/workspaces/your-username-enterprise-inventory/forge/workers
 **You'll see:**
 
 ```
-2026-05-02T00:15:45.123Z  INFO agent_forge: Worker forge-1 completed work on T-001
-2026-05-02T00:15:45.234Z  INFO agent_forge: STATUS.json found at /home/christian/.agentflow/workspaces/your-username-enterprise-inventory/orchestration/pairs/forge-1/T-001/shared/STATUS.json
-2026-05-02T00:15:45.345Z  INFO agent_forge: Work result: pr_opened, PR: https://github.com/your-username/enterprise-inventory/pull/1
+2026-03-31T00:15:45.123Z  INFO agent_forge: Worker forge-1 completed work on T-001
+2026-03-31T00:15:45.234Z  INFO agent_forge: STATUS.json found at /home/christian/.agentflow/workspaces/your-username-test-calculator/worktrees/forge-1/STATUS.json
+2026-03-31T00:15:45.345Z  INFO agent_forge: Work result: success, PR: https://github.com/your-username/test-calculator/pull/1
 ```
 
 **Output format:**
 ```json
 {
-  "status": "PR_OPENED",
-  "ticket_id": "T-001",
-  "pr_url": "https://github.com/your-username/enterprise-inventory/pull/1",
-  "pr_number": 1,
-  "branch": "forge-1/T-001",
-  "files_changed": 12,
-  "segments_completed": [
-    {"segment": 1, "status": "APPROVED", "eval_file": "segment-1-eval.md"},
-    {"segment": 2, "status": "APPROVED", "eval_file": "segment-2-eval.md"},
-    {"segment": 3, "status": "APPROVED", "eval_file": "segment-3-eval.md"},
-    {"segment": 4, "status": "APPROVED", "eval_file": "segment-4-eval.md"}
-  ],
-  "test_results": {"passed": 32, "failed": 0, "skipped": 0},
-  "sentinel_approved": true,
-  "context_resets": 0
+  "action": "pr_opened",
+  "worker": "forge-1",
+  "ticket": "T-001",
+  "pr_url": "https://github.com/your-username/test-calculator/pull/1",
+  "status": "complete"
 }
 ```
 
-### Step 6: VESSEL Handles Merge
+### Step 6: NEXUS Assigns More Work
 
 **You'll see:**
 
 ```
-2026-05-02T00:15:46.456Z  INFO agent_vessel: Processing pending PRs
-2026-05-02T00:15:46.567Z  INFO agent_vessel::ci_poller: Polling CI status for PR #1
-2026-05-02T00:15:56.678Z  INFO agent_vessel::ci_poller: CI status: success for PR #1
-2026-05-02T00:15:56.789Z  INFO agent_vessel::merger: Merging PR #1 with squash
-2026-05-02T00:15:57.890Z  INFO agent_vessel: PR #1 merged successfully
-2026-05-02T00:15:57.901Z  INFO agent_vessel: Emitted ticket_merged event for T-001
-```
-
-**What's happening:**
-1. VESSEL polls CI status (10s interval, 10min timeout)
-2. Detects merge conflicts early via GitHub's `mergeable` field
-3. Attempts conflict resolution if needed
-4. Squash-merges green PRs
-5. Emits `ticket_merged` event for dependency resolution
-
-### Step 7: NEXUS Assigns More Work
-
-**You'll see:**
-
-```
-2026-05-02T00:15:58.123Z  INFO agent_nexus: Worker forge-1 marked as available
-2026-05-02T00:15:58.234Z  INFO agent_nexus: Assigning issue #2 "Build inventory CRUD API with stock management and audit logging" to forge-2
+2026-03-31T00:15:46.456Z  INFO agent_nexus: Worker forge-1 marked as available
+2026-03-31T00:15:46.567Z  INFO agent_nexus: Assigning issue #2 "Add scientific calculator features" to forge-2
 ```
 
 The cycle repeats for each issue!
 
-### Step 8: All Work Complete
+### Step 7: All Work Complete
 
 **You'll see:**
 
 ```
-2026-05-02T00:30:12.123Z  INFO agent_nexus: No more open issues
-2026-05-02T00:30:12.234Z  INFO agent_nexus: All workers idle
-2026-05-02T00:30:12.345Z  INFO agentflow: Orchestration flow halted with action: no_work
+2026-03-31T00:30:12.123Z  INFO agent_nexus: No more open issues
+2026-03-31T00:30:12.234Z  INFO agent_nexus: All workers idle
+2026-03-31T00:30:12.345Z  INFO real_test: Orchestration flow halted with action: no_work
 ```
 
 ---
@@ -460,121 +429,113 @@ The cycle repeats for each issue!
 AgentFlow uses a specific directory structure for work completion:
 
 ```bash
-~/.agentflow/workspaces/your-username-enterprise-inventory/
+~/.agentflow/workspaces/your-username-test-calculator/
 ├── main/                    # Main repository clone
-├── worktrees/               # Agent work areas (CODE FILES)
-│   └── forge-1/             # Worker #1 isolated workspace
-│       ├── src/             # Generated source code
-│       ├── tests/           # Generated test files
-│       ├── PLAN.md          # Copy of implementation plan
-│       ├── WORKLOG.md       # Copy of progress log
-│       ├── CONTRACT.md      # Copy of SENTINEL-approved contract
-│       ├── segment-1-eval.md # Copy of segment evaluation
-│       ├── final-review.md  # Copy of final review
-│       └── STATUS.json      # Copy of completion status
-└── orchestration/           # Worker management directory
-    └── pairs/
+├── worktrees/              # Agent work areas
+│   └── forge-1/            # Files created by agent
+│       ├── index.html      # Calculator UI
+│       ├── calculator.js   # Core logic
+│       ├── styles.css      # Styling
+│       └── README.md       # Documentation
+└── forge/
+    └── workers/
         └── forge-1/
-            └── T-001/
-                └── shared/  # FORGE-SENTINEL communication (SOURCE OF TRUTH)
-                    ├── TICKET.md       # GitHub issue details
-                    ├── TASK.md         # Task instructions
-                    ├── PLAN.md         # Implementation plan
-                    ├── CONTRACT.md     # SENTINEL approval
+            ├── worker.log          # Detailed logs
+            └── T-005/             # Ticket-scoped artifacts
+                └── shared/             # Status and evaluation files
+                    ├── PLAN.md         # Initial implementation plan
                     ├── WORKLOG.md      # Progress tracking
-                    ├── segment-1-eval.md # Segment evaluation
-                    ├── final-review.md # Final review
-                    └── STATUS.json     # Completion status
+                    ├── CONTRACT.md     # SENTINEL-approved contract (if enabled)
+                    ├── segment-N-eval.md # SENTINEL segment reviews (if enabled)
+                    ├── final-review.md # SENTINEL final review (if enabled)
+                    └── STATUS.json     # Final work status
 ```
 
 ### 2. Check the Code Files
 
 ```bash
 # View the generated code
-cd ~/.agentflow/workspaces/your-username-enterprise-inventory/worktrees/forge-1
+cd ~/.agentflow/workspaces/your-username-test-calculator/worktrees/forge-1
 
 # List all files
 ls -la
 
 # View specific files
-cat backend/src/models/User.js
-cat backend/tests/auth.test.js
+cat index.html
+cat calculator.js
+cat styles.css
 ```
 
 ### 3. View STATUS.json (Work Completion)
 
 ```bash
-# STATUS.json is in the shared directory (source of truth)
-cat ~/.agentflow/workspaces/your-username-enterprise-inventory/orchestration/pairs/forge-1/T-001/shared/STATUS.json
+# STATUS.json is in the shared directory
+cat ~/.agentflow/workspaces/your-username-test-calculator/forge/workers/forge-1/shared/STATUS.json
 ```
 
 **Example content:**
 
 ```json
 {
-  "status": "PR_OPENED",
+  "pair": "forge-1",
   "ticket_id": "T-001",
-  "pr_url": "https://github.com/your-username/enterprise-inventory/pull/1",
+  "status": "PR_OPENED",
+  "pr_url": "https://github.com/your-username/test-calculator/pull/1",
   "pr_number": 1,
-  "branch": "forge-1/T-001",
-  "files_changed": 12,
-  "segments_completed": [
-    {"segment": 1, "status": "APPROVED", "eval_file": "segment-1-eval.md"},
-    {"segment": 2, "status": "APPROVED", "eval_file": "segment-2-eval.md"},
-    {"segment": 3, "status": "APPROVED", "eval_file": "segment-3-eval.md"},
-    {"segment": 4, "status": "APPROVED", "eval_file": "segment-4-eval.md"}
+  "files_changed": [
+    "index.html",
+    "calculator.js",
+    "styles.css",
+    "README.md"
   ],
-  "test_results": {"passed": 32, "failed": 0, "skipped": 0},
-  "sentinel_approved": true,
-  "context_resets": 0
+  "commits": [
+    "abc1234 Create calculator UI structure",
+    "def5678 Implement calculator logic",
+    "ghi9012 Add modern styling",
+    "jkl3456 Add README documentation"
+  ],
+  "summary": "Implemented basic calculator with HTML/CSS/JavaScript. Supports add, subtract, multiply, divide. Modern glassmorphism design."
 }
 ```
 
+### 4. View SENTINEL Evaluation Files (if SENTINEL is enabled)
 
-### 4. View SENTINEL Evaluation Files
+**Note**: In the current simplified configuration, SENTINEL may not be active. When enabled, you'll see these files:
 
 ```bash
-cd ~/.agentflow/workspaces/your-username-enterprise-inventory/orchestration/pairs/forge-1/T-001/shared
+cd ~/.agentflow/workspaces/your-username-test-calculator/forge/workers/forge-1/shared
 
 # View the implementation plan
 cat PLAN.md
 
-# View SENTINEL's contract approval
+# View SENTINEL's contract approval (if SENTINEL reviewed the plan)
 cat CONTRACT.md
 ```
 
-**Example CONTRACT.md:**
+**Example CONTRACT.md (when SENTINEL is enabled):**
 
 ```markdown
-# Contract for T-001: Implement backend authentication and authorization system
+# Contract for T-001: Implement calculator core logic
 
 status: AGREED
 
 ## Acceptance Criteria
 
-1. User registration with email validation and uniqueness constraint
-2. JWT access token (15min) and refresh token (7d) generation
-3. Password hashing with bcrypt (12 rounds)
-4. Role-based middleware (admin/manager/viewer)
-5. Rate limiting on auth endpoints (100 req/15min)
-6. Password reset flow with email verification
-7. Token blacklisting for logout
-8. All endpoints return standardized error responses
-9. Test coverage >= 80%
-10. Winston logging for auth attempts
+1. ✅ Basic operations: add, subtract, multiply, divide
+2. ✅ Clean, modern UI
+3. ✅ Responsive design
+4. ✅ Error handling for division by zero
+5. ✅ Clear documentation in README
 
 ## Definition of Done
 
-- All auth endpoints working correctly
-- Password never stored in plaintext
-- Role-based authorization blocks unauthorized access
-- Token refresh and rotation works correctly
-- All tests passing with >= 80% coverage
-- Error responses include actionable error codes
-- Auth attempts logged with Winston
+- All operations working correctly
+- UI passes visual inspection
+- No console errors
+- README includes usage instructions
 ```
 
-**Example segment-1-eval.md:**
+**Example segment-1-eval.md (when SENTINEL reviews segments):**
 
 ```markdown
 # Segment 1 Evaluation
@@ -582,38 +543,30 @@ status: AGREED
 verdict: APPROVED
 
 ## Correctness
-User model validates email uniqueness and format
-Password hashing uses bcrypt with 12 rounds
-JWT generation includes correct expiration times
-Role-based middleware correctly checks permissions
+✅ All calculator operations implemented correctly
+✅ Division by zero handled properly
 
 ## Test Coverage
-- User model: 8 unit tests passing
-- Auth routes: 12 integration tests passing
-- Middleware: 5 unit tests passing
-- Overall coverage: 87%
+✅ Manual testing shows all operations work
 
 ## Standards Compliance
-- Express.js follows MVC pattern
-- Proper error handling with try/catch
-- Input validation with express-validator
-- Winston logging on all auth events
+✅ Clean HTML structure
+✅ Proper CSS organization
+✅ JavaScript follows modern practices
 
 ## Code Quality
-- Well-organized module structure
-- Descriptive variable and function names
-- JSDoc comments on public methods
-- No hardcoded secrets (all from env vars)
+✅ Well-organized code
+✅ Good variable naming
+✅ Comments where needed
 
 ## No Regressions
-- Existing project structure preserved
-- No breaking changes to API contract
+✅ No existing functionality affected (new project)
 ```
 
-### 5. Check Git History
+### 3. Check Git History
 
 ```bash
-cd ~/.agentflow/workspaces/your-username-enterprise-inventory/worktrees/forge-1
+cd ~/.agentflow/workspaces/your-username-test-calculator/worktrees/forge-1
 
 # View commits
 git log --oneline -5
@@ -625,10 +578,10 @@ git status
 git diff origin/main
 ```
 
-### 6. Test the App Locally
+### 4. Test the App Locally
 
 ```bash
-cd ~/.agentflow/workspaces/your-username-enterprise-inventory/worktrees/forge-1
+cd ~/.agentflow/workspaces/your-username-test-calculator/worktrees/forge-1
 
 # For HTML/CSS/JS projects
 python3 -m http.server 8000
@@ -643,20 +596,20 @@ npm install
 npm run dev
 ```
 
-### 7. Review the Pull Request
+### 5. Review the Pull Request
 
 ```bash
 # List all PRs
-gh pr list --repo your-username/enterprise-inventory
+gh pr list --repo your-username/test-calculator
 
 # View PR details
-gh pr view 1 --repo your-username/enterprise-inventory
+gh pr view 1 --repo your-username/test-calculator
 
 # Review the code changes
-gh pr diff 1 --repo your-username/enterprise-inventory
+gh pr diff 1 --repo your-username/test-calculator
 
 # Merge the PR (when ready)
-gh pr merge 1 --repo your-username/enterprise-inventory --squash
+gh pr merge 1 --repo your-username/test-calculator --squash
 ```
 
 ---
@@ -690,10 +643,10 @@ cat .env | grep GITHUB_PERSONAL_ACCESS_TOKEN
 echo $GITHUB_REPOSITORY
 
 # Check issues exist
-gh issue list --repo your-username/enterprise-inventory
+gh issue list --repo your-username/test-calculator
 
 # Create an issue manually
-gh issue create --repo your-username/enterprise-inventory --title "Test Issue" --body "Test description"
+gh issue create --repo your-username/test-calculator --title "Test Issue" --body "Test description"
 ```
 
 ### Issue: "Claude Code CLI not found"
@@ -718,7 +671,7 @@ claude --version
 
 **Check the logs:**
 ```bash
-tail -100 ~/.agentflow/workspaces/your-username-enterprise-inventory/forge/workers/forge-1/worker.log
+tail -100 ~/.agentflow/workspaces/your-username-test-calculator/forge/workers/forge-1/worker.log
 ```
 
 **Common causes:**
@@ -730,7 +683,7 @@ tail -100 ~/.agentflow/workspaces/your-username-enterprise-inventory/forge/worke
 ```rust
 // In crates/agent-forge/src/lib.rs
 // Increase timeout from default (30 min) to 60 min
-let timeout_dur = std::time::Duration::from_secs(3600); // 60 minutes
+const WORK_TIMEOUT: Duration = Duration::from_secs(3600);
 ```
 
 ### Issue: "Permission denied" when creating worktree
@@ -759,10 +712,10 @@ chmod -R u+w ~/.agentflow/workspaces/
 ./scripts/start_proxy.sh
 
 # Terminal 2
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
-Ensure `.env` has `GATEWAY_URL` and `GATEWAY_API_KEY` set. See the [Proxy Configuration](#proxy-mode-recommended) section above.
+Ensure `.env` has `GATEWAY_URL` and `GATEWAY_API_KEY` set. See the [OpenAI-only gateways](#if-your-gateway-only-supports-openai-format) section above.
 
 ### Issue: "GitHub MCP server fails to start"
 
@@ -782,32 +735,6 @@ curl -H "Authorization: token $GITHUB_PERSONAL_ACCESS_TOKEN" \
 # Token needs: repo, workflow, write:packages
 ```
 
-### Issue: "CI setup required" or "No CI workflows found"
-
-**Cause:** Repository has no GitHub Actions workflows configured.
-
-**Fix:**
-AgentFlow will automatically inject a CI setup ticket (T-CI-001) that must be completed before any other work. The FORGE agent will create `.github/workflows/ci.yml` with build, test, and lint checks.
-
-If you want to skip this, create a basic CI workflow manually:
-```bash
-mkdir -p .github/workflows
-cat > .github/workflows/ci.yml << 'EOF'
-name: CI
-on: [push, pull_request]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: echo "Build step"
-EOF
-git add .github/workflows/ci.yml
-git commit -m "Add basic CI workflow"
-git push
-```
-
 ---
 
 ## Directory Structure Reference
@@ -817,84 +744,70 @@ AgentFlow/                                    # Orchestrator project
 ├── .env                                      # Your API keys (DO NOT COMMIT)
 ├── orchestration/agent/
 │   ├── agents/
-│   │   ├── nexus.agent.md                    # Orchestrator persona
-│   │   ├── forge.agent.md                    # Builder persona
-│   │   ├── sentinel.agent.md                 # Reviewer persona
-│   │   ├── vessel.agent.md                   # DevOps persona
-│   │   └── lore.agent.md                     # Writer persona
-│   ├── registry.json                         # Agent definitions with model routing
-│   └── standards/                            # Coding standards
-├── crates/
-│   ├── agent-nexus/                          # Orchestrator node
-│   ├── agent-forge/                          # Builder node (spawns Claude Code)
-│   ├── agent-sentinel/                       # Reviewer node (ephemeral)
-│   ├── agent-vessel/                         # Merge gatekeeper node
-│   ├── agent-lore/                           # Documentation node
-│   ├── agent-client/                         # LLM client + MCP integration
-│   ├── pair-harness/                         # Worktree + FORGE-SENTINEL lifecycle
-│   ├── pocketflow-core/                      # Flow engine, shared store, routing
-│   ├── config/                               # Configuration and state types
-│   └── github/                               # GitHub API client
-└── binary/src/bin/
-    ├── agentflow.rs                          # Main entry point
-    └── demo.rs                               # Mocked demonstration
+│   │   ├── nexus.agent.md                   # Orchestrator persona
+│   │   └── forge.agent.md                   # Builder persona
+│   └── registry.json                         # Worker slot definitions
+├── binary/src/bin/
+│   └── real_test.rs                          # Main entry point
+└── crates/                                   # Implementation crates
 
 ~/.agentflow/                                 # AgentFlow runtime directory
 └── workspaces/
-    └── your-username-enterprise-inventory/        # Target project workspace
+    └── your-username-test-calculator/        # Target project workspace
         ├── main/                             # Main repository clone
         │   ├── .git/
         │   └── README.md
         ├── worktrees/                        # Agent work areas (CODE FILES)
         │   ├── forge-1/                      # Worker #1 isolated workspace
-        │   │   ├── src/                      # Generated source code
-        │   │   ├── tests/                    # Generated test files
-        │   │   ├── PLAN.md                   # Copy of plan
-        │   │   ├── WORKLOG.md                # Copy of progress
-        │   │   ├── CONTRACT.md               # Copy of SENTINEL approval
-        │   │   ├── segment-1-eval.md         # Copy of evaluation
-        │   │   ├── final-review.md           # Copy of final review
-        │   │   └── STATUS.json               # Copy of completion status
+        │   │   ├── index.html                # Generated code files
+        │   │   ├── calculator.js
+        │   │   ├── styles.css
+        │   │   └── README.md
         │   └── forge-2/                      # Worker #2 isolated workspace
-        └── orchestration/                    # Worker management (SOURCE OF TRUTH)
-            └── pairs/
+        └── forge/                            # Worker management directory
+            └── workers/
                 ├── forge-1/
-                │   └── T-001/
-                │       └── shared/           # FORGE-SENTINEL communication
-                │           ├── TICKET.md     # GitHub issue details
-                │           ├── TASK.md       # Task instructions
-                │           ├── PLAN.md       # Implementation plan
-                │           ├── CONTRACT.md   # SENTINEL approval
-                │           ├── WORKLOG.md    # Progress tracking
-                │           ├── segment-1-eval.md # Segment evaluation
-                │           ├── final-review.md   # Final review
-                │           └── STATUS.json   # Completion status
+                │   ├── worker.log            # Detailed Claude Code logs
+                │   └── T-005/                 # Ticket-scoped artifacts
+                │       └── shared/               # Status & evaluation files
+                │           ├── PLAN.md           # Implementation plan
+                │           ├── WORKLOG.md        # Progress tracking
+                │           ├── CONTRACT.md       # SENTINEL approval (if enabled)
+                │           ├── segment-N-eval.md # SENTINEL reviews (if enabled)
+                │           ├── final-review.md   # Final review (if enabled)
+                │       └── STATUS.json       # ⭐ Work completion status
                 └── forge-2/
-                    └── T-002/
-                        └── shared/
-                            └── ...
+                    ├── worker.log
+                    └── shared/
+                        └── STATUS.json
 ```
 
 ---
 
 ## Next Steps
 
-1. **Customize Agent Personas**: Edit files in [`orchestration/agent/agents/`](orchestration/agent/agents/) to change how agents work
-2. **Add More Workers**: Edit [`orchestration/agent/registry.json`](orchestration/agent/registry.json:1) to change agent instances or add new agents
-3. **Configure Per-Agent Model Routing**: Set `model_backend` and `routing_key` in registry.json for LiteLLM proxy routing
+1. **Customize Agent Personas**: Edit [`orchestration/agent/agents/forge.agent.md`](orchestration/agent/agents/forge.agent.md:1) to change how the builder agent works
+2. **Add More Workers**: Edit [`orchestration/agent/registry.json`](orchestration/agent/registry.json:1) to add more parallel workers
+3. **Integrate SENTINEL**: Enable code review by uncommenting SENTINEL node in flow
 4. **Production Deployment**: Use `cargo build --release` and deploy with systemd or Docker
+
+---
+
+## Video Walkthrough
+
+🎥 **Want to see it in action?** Watch our video tutorial: [TODO: Add video link]
 
 ---
 
 ## Additional Resources
 
 - [DEMO.md](DEMO.md) - Quick demo guide
-- [CONTRIBUTING.md](CONTRIBUTING.md) - Development guidelines
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Development guidelines  
 - [docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md) - Architecture deep dive
 - [GitHub Discussions](https://github.com/The-AgenticFlow/AgentFlow/discussions) - Ask questions
 
 ---
 
-**Happy Building!**
+**Happy Building! 🚀**
 
 *Created by [The-AgenticFlow](https://github.com/The-AgenticFlow)*

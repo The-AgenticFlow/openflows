@@ -14,7 +14,7 @@ Before running, make sure you have completed the setup in [CONTRIBUTING.md](../C
 ## Starting the Flow
 
 ```bash
-cargo run --bin agentflow
+cargo run --bin real_test
 ```
 
 This starts the orchestration loop. The binary initialises the shared store, clones/updates the target repository workspace, and begins the NEXUS → FORGE-SENTINEL cycle.

@@ -518,6 +518,6 @@ VESSEL processes PR, detects conflicts, routes directly to FORGE-SENTINEL for re
 | Action constants | crates/pocketflow-core/src/action.rs |
 | Batch node framework | crates/pocketflow-core/src/batch.rs |
 | Flow routing engine | crates/pocketflow-core/src/flow.rs |
-| Flow definition (production) | binary/src/bin/agentflow.rs |
+| Flow definition (production) | binary/src/bin/real_test.rs |
 | Flow definition (dev/dry-run) | binary/src/main.rs |
 | Agent registry | orchestration/agent/registry.json |
