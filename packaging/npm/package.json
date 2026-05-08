@@ -1,6 +1,6 @@
 {
   "name": "@the-agenticflow/openflows",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Autonomous AI development team — turns GitHub issues into working PRs",
   "main": "index.js",
   "bin": {
