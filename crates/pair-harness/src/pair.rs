@@ -17,7 +17,7 @@ use crate::process::{ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
 use crate::types::{
-    Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
+    Blocker, Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
     Ticket, TimeoutProfile, VerificationResult, VerificationState,
 };
 use crate::watchdog::Watchdog;
@@ -946,6 +946,50 @@ impl ForgeSentinelPair {
                                 info!("FORGE exited after segment work - respawning to continue implementation");
                                 self.sentinel_retries.reset_all();
                                 *forge = self.spawn_forge_resume().await?;
+                            } else if !self.has_meaningful_worklog().await {
+                                // WORKLOG.md exists but is empty/meaningless - likely an API error
+                                if let Some(api_error) = self.check_forge_api_error().await {
+                                    error!(error = %api_error, "FORGE failed with API error - stopping pair");
+                                    self.write_error_feedback(
+                                        "api_error",
+                                        &api_error,
+                                        Some("Check your API key, credits, and model availability. Update .env with valid credentials."),
+                                    ).await?;
+                                    return Ok(PairOutcome::Blocked {
+                                        reason: format!("API error: {}", api_error),
+                                        blockers: vec![Blocker {
+                                            blocker_type: "api_error".to_string(),
+                                            description: api_error.clone(),
+                                            nexus_action: "Check API credentials and credits".to_string(),
+                                        }],
+                                    });
+                                }
+                                // No API error detected but no progress either - check for quick exit
+                                let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
+                                if forge_uptime < 10 {
+                                    warn!(
+                                        "FORGE exited quickly ({}s) with empty worklog - likely startup error",
+                                        forge_uptime
+                                    );
+                                    // Write error feedback and stop
+                                    self.write_error_feedback(
+                                        "startup_error",
+                                        &format!("FORGE exited after {}s without making progress", forge_uptime),
+                                        Some("Check the FORGE stdout log for errors. Ensure your API key has credits and the model is available."),
+                                    ).await?;
+                                    return Ok(PairOutcome::Blocked {
+                                        reason: "FORGE failed to start properly".to_string(),
+                                        blockers: vec![Blocker {
+                                            blocker_type: "startup_error".to_string(),
+                                            description: "FORGE exited without making progress".to_string(),
+                                            nexus_action: "Check FORGE logs for details".to_string(),
+                                        }],
+                                    });
+                                }
+                                info!("FORGE exited with empty worklog - respawning to try again");
+                                self.sentinel_retries.reset_all();
+                                *forge = self.spawn_forge_resume().await?;
+                                self.reset.increment_reset();
                             } else {
                                 info!("FORGE exited with partial worklog - respawning to continue implementation");
                                 self.sentinel_retries.reset_all();
@@ -1814,6 +1858,82 @@ impl ForgeSentinelPair {
         tokio::fs::read_to_string(&path)
             .await
             .is_ok_and(|c| c.contains("AWAITING_SENTINEL_REVIEW"))
+    }
+
+    /// Check FORGE stdout log for common API errors that would cause immediate exit.
+    /// Returns Some(error_message) if an API error is detected.
+    async fn check_forge_api_error(&self) -> Option<String> {
+        let log_path = self.config.shared.join("logs").join("forge-stdout.log");
+        if !log_path.exists() {
+            return None;
+        }
+
+        let content = tokio::fs::read_to_string(&log_path).await.ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Check the last few lines for error patterns
+        for line in lines.iter().rev().take(10) {
+            let line_lower = line.to_lowercase();
+            
+            // Fireworks errors
+            if line_lower.contains("credit balance is too low") {
+                return Some("Fireworks API: Insufficient credits".to_string());
+            }
+            if line_lower.contains("rate limit") || line_lower.contains("rate_limit") {
+                return Some("API rate limit exceeded".to_string());
+            }
+            if line_lower.contains("invalid api key") || line_lower.contains("authentication") {
+                return Some("API authentication error".to_string());
+            }
+            if line_lower.contains("model not found") || line_lower.contains("model not available") {
+                return Some("Model not available".to_string());
+            }
+            if line_lower.contains("quota exceeded") || line_lower.contains("usage limit") {
+                return Some("API quota exceeded".to_string());
+            }
+            
+            // Anthropic errors
+            if line_lower.contains("invalid anthropic api key") {
+                return Some("Anthropic API key invalid".to_string());
+            }
+            if line_lower.contains("anthropic api error") {
+                return Some(format!("Anthropic API error: {}", line));
+            }
+        }
+
+        None
+    }
+
+    /// Check if WORKLOG.md has meaningful content (not just header).
+    /// An empty or header-only worklog indicates FORGE didn't make progress.
+    async fn has_meaningful_worklog(&self) -> bool {
+        let path = self.config.shared.join("WORKLOG.md");
+        if !path.exists() {
+            return false;
+        }
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        // Check for actual content beyond just "# Worklog" header
+        let lines: Vec<&str> = content.lines().collect();
+        
+        // Filter out empty lines and the header
+        let content_lines: Vec<&str> = lines
+            .iter()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.is_empty() 
+                    && !trimmed.starts_with("# Worklog")
+                    && !trimmed.starts_with("#")
+            })
+            .map(|l| *l)
+            .collect();
+
+        // If we have at least one line of actual content, it's meaningful
+        !content_lines.is_empty()
     }
 
     /// Read STATUS.json and convert to PairOutcome.
