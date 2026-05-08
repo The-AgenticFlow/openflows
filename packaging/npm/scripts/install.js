@@ -292,7 +292,7 @@ async function main() {
     }
 
     // Rename binaries to match expected names
-    const binaries = ['agentflow', 'agentflow-setup', 'agentflow-dashboard', 'agentflow-doctor'];
+    const binaries = ['agentflow', 'agentflow-setup', 'agentflow-dashboard', 'agentflow-doctor', 'anthropic-proxy'];
     for (const bin of binaries) {
         const src = path.join(BIN_DIR, bin);
         const dst = path.join(BIN_DIR, `${bin}-bin`);
@@ -300,6 +300,12 @@ async function main() {
             fs.renameSync(src, dst);
             fs.chmodSync(dst, 0o755);
         }
+    }
+    
+    // Also ensure anthropic-proxy is executable even if not renamed
+    const proxyBin = path.join(BIN_DIR, 'anthropic-proxy');
+    if (fs.existsSync(proxyBin)) {
+        fs.chmodSync(proxyBin, 0o755);
     }
 
     if (fs.existsSync(tmpFile)) {

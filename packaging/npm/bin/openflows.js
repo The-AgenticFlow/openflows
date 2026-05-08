@@ -70,7 +70,7 @@ function needsProxy() {
 async function startProxy() {
     console.log('[openflows] Starting built-in API proxy...');
     
-    const proxyBinary = path.join(__dirname, '..', 'bin', 'anthropic-proxy-bin');
+    let proxyBinary = path.join(__dirname, '..', 'bin', 'anthropic-proxy-bin');
     
     // Check if proxy binary exists
     if (!fs.existsSync(proxyBinary)) {
@@ -80,6 +80,7 @@ async function startProxy() {
             console.log('[openflows] No built-in proxy found, skipping proxy startup');
             return null;
         }
+        proxyBinary = altProxy;
     }
     
     const proxy = spawn(proxyBinary, [], {
