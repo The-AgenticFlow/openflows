@@ -104,6 +104,7 @@ async fn main() {
                 handle_messages(headers, payload, url, key, map)
             }),
         )
+        .route("/v1/models", axum::routing::get(handle_models))
         .route("/health", axum::routing::get(|| async { "ok" }));
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -200,6 +201,62 @@ fn convert_anthropic_to_openai_messages(payload: &AnthropicRequest) -> Vec<Value
         }
     }
     openai_messages
+}
+
+/// Handle GET /v1/models — return a list of Claude models so that
+/// Claude Code's model validation succeeds when using the proxy.
+///
+/// Without this endpoint, Claude Code calls /v1/models to check whether
+/// the resolved model name (e.g. `claude-sonnet-4-5`) is available.
+/// A 404 response causes Claude Code to reject the model and exit
+/// instantly with "There's an issue with the selected model".
+async fn handle_models() -> Json<Value> {
+    // All Claude model names that Claude Code may resolve aliases to.
+    // The proxy maps any Claude model to PROXY_TARGET_MODEL, so all of
+    // these are "available" from the proxy's perspective.
+    let model_ids = [
+        // Sonnet family — the `sonnet` alias resolves here
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250514",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-20251022",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-latest",
+        // Haiku family
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-haiku-latest",
+        // Opus family
+        "claude-opus-4",
+        "claude-opus-4-20250514",
+        "claude-3-opus-20240229",
+        "claude-3-opus-latest",
+    ];
+
+    let data: Vec<Value> = model_ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "type": "model",
+                "display_name": id.replace('-', " "),
+                "created_at": "2024-01-01T00:00:00Z",
+                "max_input_tokens": 200_000,
+                "max_tokens": 8192
+            })
+        })
+        .collect();
+
+    let first = model_ids.first().unwrap_or(&"");
+    let last = model_ids.last().unwrap_or(&"");
+
+    Json(json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    }))
 }
 
 async fn handle_messages(
