@@ -1,0 +1,56 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Test artifacts
+coverage/
+*.profraw
+*.profdata
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Credentials (never include in image)
+.claude/
+*.pem
+*.key
+
+# Docs and packaging (not needed in runtime image)
+docs/
+packaging/
+image.png
+
+# CI
+.github/
+
+# Scripts (not needed in runtime)
+scripts/
+tests/
+
+# Makefile and build config
+Makefile
+.cargo/

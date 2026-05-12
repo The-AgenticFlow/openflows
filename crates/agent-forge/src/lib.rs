@@ -1,7 +1,7 @@
 // crates/agent-forge/src/lib.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use config::{
+use openflows_config::{
     state::{
         ACTION_EMPTY, ACTION_FAILED, ACTION_PR_OPENED, KEY_COMMAND_GATE, KEY_PENDING_PRS,
         KEY_TICKETS, KEY_WORKER_SLOTS,
@@ -93,7 +93,7 @@ impl ForgeNode {
     /// Resolve GitHub token for a specific worker.
     fn resolve_token_for_worker(&self, worker_id: &str) -> Result<String> {
         if let Some(registry_path) = &self.registry_path {
-            let registry = config::Registry::load(registry_path)?;
+            let registry = openflows_config::Registry::load(registry_path)?;
             registry.resolve_github_token(worker_id)
         } else {
             Ok(self.github_token.clone())
@@ -513,7 +513,7 @@ impl ForgePairNode {
     /// Resolve GitHub token for a specific worker.
     fn resolve_token_for_worker(&self, worker_id: &str) -> Result<String> {
         if let Some(registry_path) = &self.registry_path {
-            let registry = config::Registry::load(registry_path)?;
+            let registry = openflows_config::Registry::load(registry_path)?;
             registry.resolve_github_token(worker_id)
         } else {
             Ok(self.github_token.clone())
@@ -595,7 +595,7 @@ impl ForgePairNode {
     async fn fetch_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue> {
         // Use registry token if available, otherwise use the fallback token
         let token = if let Some(registry_path) = &self.registry_path {
-            config::Registry::load(registry_path)?
+            openflows_config::Registry::load(registry_path)?
                 .resolve_github_token("forge")
                 .unwrap_or_else(|_| self.github_token.clone())
         } else {
@@ -1419,7 +1419,53 @@ impl BatchNode for ForgePairNode {
         // Resolve token for this specific worker
         let worker_token = self.resolve_token_for_worker(&worker_id)?;
 
-        let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token);
+        // Check for proxy configuration from environment (set by openflows)
+        let proxy_url = std::env::var("PROXY_URL").ok();
+        let redis_url = std::env::var("REDIS_URL").ok();
+
+        // Get model from registry (e.g., "accounts/fireworks/models/glm-5")
+        let model_backend = if let Some(registry_path) = &self.registry_path {
+            openflows_config::Registry::load(registry_path)?
+                .get("forge")
+                .and_then(|e| e.model_backend.clone())
+        } else {
+            None
+        };
+
+        let config = match (&proxy_url, &redis_url) {
+            (Some(proxy), Some(redis)) => PairConfig::with_proxy(
+                &worker_id,
+                &ticket_id,
+                &self.workspace_root,
+                Some(redis.clone()),
+                proxy,
+                &worker_token,
+            ),
+            (Some(proxy), None) => PairConfig::with_proxy(
+                &worker_id,
+                &ticket_id,
+                &self.workspace_root,
+                None,
+                proxy,
+                &worker_token,
+            ),
+            (None, Some(redis)) => PairConfig::with_redis(
+                &worker_id,
+                &ticket_id,
+                &self.workspace_root,
+                redis,
+                &worker_token,
+            ),
+            (None, None) => PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token),
+        };
+
+        // Apply model from registry if available
+        let config = if let Some(model) = model_backend {
+            info!(worker = worker_id, model = %model, "Using model from registry for FORGE/SENTINEL");
+            config.with_model(model)
+        } else {
+            config
+        };
 
         let mut pair = ForgeSentinelPair::new(config);
         let outcome = pair

@@ -1,8 +1,12 @@
 [package]
-name = "agent-forge"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-forge"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Forge implementation agent for OpenFlows - executes code changes"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agent", "forge", "implementation", "coding"]
+categories  = ["development-tools"]
 
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }

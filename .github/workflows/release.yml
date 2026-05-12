@@ -1,0 +1,223 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build binaries for all platforms ─────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # Install musl tools for Linux static builds
+      - name: Install musl tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools libssl-dev pkg-config
+          if [[ "${{ matrix.target }}" == "aarch64"* ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Build binaries
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          --bin agentflow
+          --bin agentflow-setup
+          --bin agentflow-dashboard
+          --bin agentflow-doctor
+          --bin anthropic-proxy
+
+      - name: Create tarball
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          PLATFORM="${{ matrix.target }}"
+          ARCHIVE="openflows-${VERSION}-${PLATFORM}"
+          mkdir -p "dist/${ARCHIVE}"
+
+          for bin in agentflow agentflow-setup agentflow-dashboard agentflow-doctor anthropic-proxy; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
+          done
+
+          # Include orchestration config
+          cp -r orchestration "dist/${ARCHIVE}/"
+          cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
+
+          tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
+          echo "ARCHIVE_NAME=${ARCHIVE}.tar.gz" >> $GITHUB_ENV
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          sha256sum "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          retention-days: 5
+
+  # ── Docker image ─────────────────────────────────────────────────
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Sanitize version for Docker tags (replace / with -)
+          VERSION=$(echo "$VERSION" | sed 's|/|-|g')
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/the-agenticflow/openflows:latest
+            ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Create GitHub Release ────────────────────────────────────────
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build, docker]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")
+
+          echo "## What's Changed" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "### Changes since $PREV_TAG" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${VERSION}" >> CHANGELOG.md
+          else
+            echo "### Initial Release" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          fi
+
+          echo "" >> CHANGELOG.md
+          echo "## Installation" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo '```bash' >> CHANGELOG.md
+          echo 'curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash' >> CHANGELOG.md
+          echo '```' >> CHANGELOG.md
+
+          cat CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: "OpenFlows ${{ github.event.inputs.version || github.ref_name }}"
+          body_path: CHANGELOG.md
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          draft: false
+          prerelease: ${{ contains(github.event.inputs.version || github.ref_name, 'rc') || contains(github.event.inputs.version || github.ref_name, 'beta') || contains(github.event.inputs.version || github.ref_name, 'alpha') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Publish to crates.io ─────────────────────────────────────────
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !contains(github.event.inputs.version || github.ref_name, 'rc') && !contains(github.event.inputs.version || github.ref_name, 'beta') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Publish crates
+        run: |
+          cargo publish -p pocketflow-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p config --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-client --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p github --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-nexus --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-forge --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-sentinel --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-vessel --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agent-lore --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p pair-harness --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p agentflow-tui --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          cargo publish -p openflows --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

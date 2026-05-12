@@ -8,7 +8,6 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tracing::debug;
 
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
@@ -124,17 +123,17 @@ impl SharedStore {
 
     pub async fn get(&self, key: &str) -> Option<Value> {
         let v = self.backend.get(key).await;
-        debug!(key, found = v.is_some(), "store.get");
+        tracing::trace!(key, found = v.is_some(), "store.get");
         v
     }
 
     pub async fn set(&self, key: &str, value: Value) {
-        debug!(key, "store.set");
+        tracing::trace!(key, "store.set");
         self.backend.set(key, value).await;
     }
 
     pub async fn del(&self, key: &str) {
-        debug!(key, "store.del");
+        tracing::trace!(key, "store.del");
         self.backend.del(key).await;
     }
 

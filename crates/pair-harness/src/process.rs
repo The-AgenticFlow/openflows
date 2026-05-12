@@ -44,6 +44,10 @@ impl SentinelMode {
     }
 }
 
+/// Default model to use when spawning Claude CLI processes.
+/// Use 'sonnet' alias which is valid for Claude CLI - the proxy will map it to the target model.
+const DEFAULT_CLI_MODEL: &str = "sonnet";
+
 /// Manages FORGE and SENTINEL processes.
 pub struct ProcessManager {
     claude_path: PathBuf,
@@ -51,6 +55,10 @@ pub struct ProcessManager {
     redis_url: Option<String>,
     proxy_url: Option<String>,
     proxy_api_key: Option<String>,
+    /// Model to pass to Claude CLI via --model flag.
+    /// Should be a proxy-compatible alias (e.g., "claude-sonnet-4-5") that the proxy
+    /// will map to PROXY_TARGET_MODEL.
+    model: String,
 }
 
 impl ProcessManager {
@@ -62,6 +70,16 @@ impl ProcessManager {
 
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
+        
+        tracing::info!(
+            proxy_url = ?proxy_url,
+            proxy_api_key = ?proxy_api_key,
+            model = %model,
+            "ProcessManager::new - environment check"
+        );
 
         Self {
             claude_path,
@@ -69,6 +87,7 @@ impl ProcessManager {
             redis_url: None,
             proxy_url,
             proxy_api_key,
+            model,
         }
     }
 
@@ -80,6 +99,9 @@ impl ProcessManager {
 
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
 
         Self {
             claude_path,
@@ -87,6 +109,7 @@ impl ProcessManager {
             redis_url: Some(redis_url.into()),
             proxy_url,
             proxy_api_key,
+            model,
         }
     }
 
@@ -101,6 +124,9 @@ impl ProcessManager {
         Self::validate_claude_binary(&claude_path);
 
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
 
         Self {
             claude_path,
@@ -108,6 +134,31 @@ impl ProcessManager {
             redis_url,
             proxy_url: Some(proxy_url.into()),
             proxy_api_key,
+            model,
+        }
+    }
+
+    /// Create a ProcessManager with an explicit model override.
+    pub fn with_model(
+        github_token: impl Into<String>,
+        redis_url: Option<String>,
+        proxy_url: Option<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        let claude_path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
+        let claude_path = PathBuf::from(claude_path);
+
+        Self::validate_claude_binary(&claude_path);
+
+        let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+
+        Self {
+            claude_path,
+            github_token: github_token.into(),
+            redis_url,
+            proxy_url,
+            proxy_api_key,
+            model: model.into(),
         }
     }
 
@@ -147,11 +198,40 @@ impl ProcessManager {
         proxy_api_key: Option<&str>,
     ) {
         let base_url = proxy_url.trim_end_matches("/v1").trim_end_matches('/');
+        info!("Setting ANTHROPIC_BASE_URL={} for proxy", base_url);
         cmd.env("ANTHROPIC_BASE_URL", base_url);
-        if let Some(api_key) = proxy_api_key {
+        
+        // Set API key for proxy authentication
+        let api_key_value = proxy_api_key.unwrap_or(routing_key);
+        info!("Setting ANTHROPIC_API_KEY for proxy (key length: {})", api_key_value.len());
+        cmd.env("ANTHROPIC_API_KEY", api_key_value);
+        
+        // Also set the gateway URL and key for the proxy itself
+        if let Ok(gateway_url) = std::env::var("GATEWAY_URL") {
+            cmd.env("GATEWAY_URL", gateway_url);
+        }
+        if let Ok(gateway_key) = std::env::var("GATEWAY_API_KEY") {
+            cmd.env("GATEWAY_API_KEY", gateway_key);
+        }
+        if let Ok(model_map) = std::env::var("MODEL_MAP") {
+            cmd.env("MODEL_MAP", model_map);
+        }
+    }
+
+    /// Inject Fireworks configuration for CLI agents.
+    /// NOTE: Fireworks doesn't have a native Anthropic endpoint, so Claude CLI
+    /// requires a proxy. This function is kept for potential future use if
+    /// Fireworks adds Anthropic support, but currently should not be called.
+    #[allow(dead_code)]
+    fn inject_fireworks_anthropic_env(cmd: &mut Command) {
+        let base_url = std::env::var("FIREWORKS_API_URL")
+            .unwrap_or_else(|_| "https://api.fireworks.ai/inference/v1".to_string());
+        let base_url = base_url.trim_end_matches('/').trim_end_matches("/chat/completions").trim_end_matches('/').to_string();
+        
+        cmd.env("ANTHROPIC_BASE_URL", base_url);
+        
+        if let Ok(api_key) = std::env::var("FIREWORKS_API_KEY") {
             cmd.env("ANTHROPIC_API_KEY", api_key);
-        } else {
-            cmd.env("ANTHROPIC_API_KEY", routing_key);
         }
     }
 
@@ -198,6 +278,11 @@ impl ProcessManager {
         self.proxy_api_key.as_deref()
     }
 
+    /// Get the model that will be passed to Claude CLI via --model flag.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     fn plugin_dir(target: &Path) -> PathBuf {
         target.join(".claude").join("plugins").join("orchestration")
     }
@@ -225,6 +310,8 @@ impl ProcessManager {
         let mut cmd = Command::new(&self.claude_path);
         cmd.arg("--print")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -241,7 +328,13 @@ impl ProcessManager {
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
 
+        info!(
+            model = %self.model,
+            "FORGE process will use model"
+        );
+
         if let Some(proxy_url) = &self.proxy_url {
+            info!(proxy_url = %proxy_url, proxy_api_key = ?self.proxy_api_key, "Injecting proxy environment for FORGE");
             Self::inject_proxy_env(
                 &mut cmd,
                 "forge-key",
@@ -249,6 +342,7 @@ impl ProcessManager {
                 self.proxy_api_key.as_deref(),
             );
         } else {
+            info!("No proxy configured - using direct Anthropic API");
             cmd.env(
                 "ANTHROPIC_API_KEY",
                 std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
@@ -344,6 +438,8 @@ impl ProcessManager {
         let mut cmd = Command::new(&self.claude_path);
         cmd.arg("--print")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -360,6 +456,11 @@ impl ProcessManager {
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
 
+        info!(
+            model = %self.model,
+            "FORGE PR process will use model"
+        );
+
         if let Some(proxy_url) = &self.proxy_url {
             Self::inject_proxy_env(
                 &mut cmd,
@@ -368,10 +469,24 @@ impl ProcessManager {
                 self.proxy_api_key.as_deref(),
             );
         } else {
-            cmd.env(
-                "ANTHROPIC_API_KEY",
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            );
+            // For Claude CLI agents, we need either a proxy or direct Anthropic API
+            // Fireworks doesn't support native Anthropic format, so proxy is required
+            if std::env::var("FIREWORKS_API_KEY").is_ok() && std::env::var("ANTHROPIC_API_KEY").is_err() {
+                tracing::warn!("Fireworks API key set but no proxy configured. Claude CLI agents require proxy for Fireworks. Attempting auto-detection...");
+                // Try to use local proxy if running
+                if let Ok(port) = std::env::var("PORT") {
+                    let proxy_url = format!("http://localhost:{}/v1", port);
+                    Self::inject_proxy_env(&mut cmd, "forge-key", &proxy_url, std::env::var("FIREWORKS_API_KEY").ok().as_deref());
+                } else {
+                    // Fall back to trying default proxy port
+                    Self::inject_proxy_env(&mut cmd, "forge-key", "http://localhost:8765/v1", std::env::var("FIREWORKS_API_KEY").ok().as_deref());
+                }
+            } else {
+                cmd.env(
+                    "ANTHROPIC_API_KEY",
+                    std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+                );
+            }
             Self::inject_llm_env(&mut cmd);
         }
 
@@ -471,6 +586,8 @@ impl ProcessManager {
             .arg("--output-format")
             .arg("json")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -489,18 +606,37 @@ impl ProcessManager {
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token)
             .env("SPRINTLESS_SENTINEL_TIMEOUT_SECS", timeout_secs.to_string());
 
+        info!(
+            model = %self.model,
+            "SENTINEL process will use model"
+        );
+
         if let Some(proxy_url) = &self.proxy_url {
             Self::inject_proxy_env(
                 &mut cmd,
-                "sentinel-key",
+                "forge-key",
                 proxy_url,
                 self.proxy_api_key.as_deref(),
             );
         } else {
-            cmd.env(
-                "ANTHROPIC_API_KEY",
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            );
+            // For Claude CLI agents, we need either a proxy or direct Anthropic API
+            // Fireworks doesn't support native Anthropic format, so proxy is required
+            if std::env::var("FIREWORKS_API_KEY").is_ok() && std::env::var("ANTHROPIC_API_KEY").is_err() {
+                tracing::warn!("Fireworks API key set but no proxy configured. Claude CLI agents require proxy for Fireworks. Attempting auto-detection...");
+                // Try to use local proxy if running
+                if let Ok(port) = std::env::var("PORT") {
+                    let proxy_url = format!("http://localhost:{}/v1", port);
+                    Self::inject_proxy_env(&mut cmd, "forge-key", &proxy_url, std::env::var("FIREWORKS_API_KEY").ok().as_deref());
+                } else {
+                    // Fall back to trying default proxy port
+                    Self::inject_proxy_env(&mut cmd, "forge-key", "http://localhost:8765/v1", std::env::var("FIREWORKS_API_KEY").ok().as_deref());
+                }
+            } else {
+                cmd.env(
+                    "ANTHROPIC_API_KEY",
+                    std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+                );
+            }
             Self::inject_llm_env(&mut cmd);
         }
 

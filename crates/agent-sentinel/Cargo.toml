@@ -1,8 +1,12 @@
 [package]
-name = "agent-sentinel"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-sentinel"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Sentinel review agent for OpenFlows - reviews and validates code changes"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agent", "sentinel", "review", "validation"]
+categories  = ["development-tools"]
 
 [dependencies]
 anyhow = "1.0"

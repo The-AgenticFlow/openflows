@@ -1,0 +1,12 @@
+# Generated during postinstall - downloaded from GitHub releases
+*-bin
+.postinstall-done
+.tmp/
+
+# Extracted from release tarball
+bin/orchestration/
+bin/LICENSE
+bin/README.md
+
+# Local node_modules (if any)
+node_modules/

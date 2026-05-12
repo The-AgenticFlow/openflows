@@ -17,7 +17,7 @@ use crate::process::{ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
 use crate::types::{
-    Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
+    Blocker, Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
     Ticket, TimeoutProfile, VerificationResult, VerificationState,
 };
 use crate::watchdog::Watchdog;
@@ -357,23 +357,57 @@ impl ForgeSentinelPair {
         // Use the project_root from config (contains .git)
         let project_root = config.project_root.clone();
 
+        // Build ProcessManager with appropriate configuration
+        let process = match (&config.redis_url, &config.proxy_url, &config.model) {
+            // All three: redis + proxy + model
+            (Some(redis_url), Some(proxy_url), Some(model)) => ProcessManager::with_model(
+                &config.github_token,
+                Some(redis_url.clone()),
+                Some(proxy_url.clone()),
+                model,
+            ),
+            // Redis + proxy (no model)
+            (Some(redis_url), Some(proxy_url), None) => ProcessManager::with_proxy(
+                &config.github_token,
+                Some(redis_url.clone()),
+                proxy_url,
+            ),
+            // Redis only (no proxy, no model)
+            (Some(redis_url), None, None) => {
+                ProcessManager::with_redis(&config.github_token, redis_url)
+            }
+            // Proxy only (no redis)
+            (None, Some(proxy_url), Some(model)) => ProcessManager::with_model(
+                &config.github_token,
+                None,
+                Some(proxy_url.clone()),
+                model,
+            ),
+            (None, Some(proxy_url), None) => {
+                ProcessManager::with_proxy(&config.github_token, None, proxy_url)
+            }
+            // Model only (no redis, no proxy) - use model with direct API
+            (None, None, Some(model)) => ProcessManager::with_model(
+                &config.github_token,
+                None,
+                None,
+                model,
+            ),
+            // Nothing special - basic config
+            (None, None, None) => ProcessManager::new(&config.github_token),
+            // Redis + model (no proxy) - not a common case, use with_model
+            (Some(redis_url), None, Some(model)) => ProcessManager::with_model(
+                &config.github_token,
+                Some(redis_url.clone()),
+                None,
+                model,
+            ),
+        };
+
         Self {
             worktree: WorktreeManager::new(&project_root),
             locks: FileLockManager::new(&project_root),
-            process: match (&config.redis_url, &config.proxy_url) {
-                (Some(redis_url), Some(proxy_url)) => ProcessManager::with_proxy(
-                    &config.github_token,
-                    Some(redis_url.clone()),
-                    proxy_url,
-                ),
-                (Some(redis_url), None) => {
-                    ProcessManager::with_redis(&config.github_token, redis_url)
-                }
-                (None, Some(proxy_url)) => {
-                    ProcessManager::with_proxy(&config.github_token, None, proxy_url)
-                }
-                (None, None) => ProcessManager::new(&config.github_token),
-            },
+            process,
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
             watchdog: Watchdog::new(config.shared.clone(), config.watchdog_timeout_secs),
             verification_state: VerificationState::new(config.max_verify_attempts),
@@ -943,14 +977,85 @@ impl ForgeSentinelPair {
                                 // Written segments have evals, but PLAN has more segments to implement.
                                 // This is expected with --print mode: FORGE exits after each segment,
                                 // and we just respawn to continue the next one.
-                                info!("FORGE exited after segment work - respawning to continue implementation");
+                                // However, check for API errors first — if FORGE is failing on every
+                                // respawn due to credit/model issues, we must stop rather than loop.
+                                if let Some(api_error) = self.check_forge_api_error().await {
+                                    error!(error = %api_error, "FORGE failed with API error during segment respawn - stopping pair");
+                                    self.write_error_feedback(
+                                        "api_error",
+                                        &api_error,
+                                        Some("Check your API key, credits, and model availability. Update .env with valid credentials."),
+                                    ).await?;
+                                    return Ok(PairOutcome::Blocked {
+                                        reason: format!("API error: {}", api_error),
+                                        blockers: vec![Blocker {
+                                            blocker_type: "api_error".to_string(),
+                                            description: api_error.clone(),
+                                            nexus_action: "Check API credentials and credits".to_string(),
+                                        }],
+                                    });
+                                }
+                                let new_count = self.reset.increment_reset();
+                                info!(
+                                    reset_count = new_count,
+                                    max_resets = self.config.max_resets,
+                                    "FORGE exited after segment work - respawning to continue implementation"
+                                );
                                 self.sentinel_retries.reset_all();
                                 *forge = self.spawn_forge_resume().await?;
-                            } else {
-                                info!("FORGE exited with partial worklog - respawning to continue implementation");
+                            } else if !self.has_meaningful_worklog().await {
+                                // WORKLOG.md exists but is empty/meaningless - likely an API error
+                                if let Some(api_error) = self.check_forge_api_error().await {
+                                    error!(error = %api_error, "FORGE failed with API error - stopping pair");
+                                    self.write_error_feedback(
+                                        "api_error",
+                                        &api_error,
+                                        Some("Check your API key, credits, and model availability. Update .env with valid credentials."),
+                                    ).await?;
+                                    return Ok(PairOutcome::Blocked {
+                                        reason: format!("API error: {}", api_error),
+                                        blockers: vec![Blocker {
+                                            blocker_type: "api_error".to_string(),
+                                            description: api_error.clone(),
+                                            nexus_action: "Check API credentials and credits".to_string(),
+                                        }],
+                                    });
+                                }
+                                // No API error detected but no progress either - check for quick exit
+                                let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
+                                if forge_uptime < 10 {
+                                    warn!(
+                                        "FORGE exited quickly ({}s) with empty worklog - likely startup error",
+                                        forge_uptime
+                                    );
+                                    // Write error feedback and stop
+                                    self.write_error_feedback(
+                                        "startup_error",
+                                        &format!("FORGE exited after {}s without making progress", forge_uptime),
+                                        Some("Check the FORGE stdout log for errors. Ensure your API key has credits and the model is available."),
+                                    ).await?;
+                                    return Ok(PairOutcome::Blocked {
+                                        reason: "FORGE failed to start properly".to_string(),
+                                        blockers: vec![Blocker {
+                                            blocker_type: "startup_error".to_string(),
+                                            description: "FORGE exited without making progress".to_string(),
+                                            nexus_action: "Check FORGE logs for details".to_string(),
+                                        }],
+                                    });
+                                }
+                                info!("FORGE exited with empty worklog - respawning to try again");
                                 self.sentinel_retries.reset_all();
                                 *forge = self.spawn_forge_resume().await?;
                                 self.reset.increment_reset();
+                            } else {
+                                let new_count = self.reset.increment_reset();
+                                info!(
+                                    reset_count = new_count,
+                                    max_resets = self.config.max_resets,
+                                    "FORGE exited with partial worklog - respawning to continue implementation"
+                                );
+                                self.sentinel_retries.reset_all();
+                                *forge = self.spawn_forge_resume().await?;
                             }
                         } else {
                             info!("FORGE exited after making progress - respawning to continue");
@@ -1814,6 +1919,103 @@ impl ForgeSentinelPair {
         tokio::fs::read_to_string(&path)
             .await
             .is_ok_and(|c| c.contains("AWAITING_SENTINEL_REVIEW"))
+    }
+
+    /// Check FORGE stdout log for common API errors that would cause immediate exit.
+    /// Returns Some(error_message) if an API error is detected.
+    async fn check_forge_api_error(&self) -> Option<String> {
+        let log_path = self.config.shared.join("logs").join("forge-stdout.log");
+        if !log_path.exists() {
+            return None;
+        }
+
+        let content = tokio::fs::read_to_string(&log_path).await.ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Check the last few lines for error patterns
+        for line in lines.iter().rev().take(10) {
+            let line_lower = line.to_lowercase();
+            
+            // Claude CLI credit/model errors (direct Anthropic API without proxy)
+            if line_lower.contains("credit balance is too low") {
+                return Some("Claude CLI: Insufficient credits (check if proxy is configured correctly)".to_string());
+            }
+            if line_lower.contains("rate limit") || line_lower.contains("rate_limit") {
+                return Some("API rate limit exceeded".to_string());
+            }
+            if line_lower.contains("invalid api key") || line_lower.contains("authentication") {
+                return Some("API authentication error".to_string());
+            }
+            if line_lower.contains("model not found") || line_lower.contains("model not available") {
+                return Some("Model not available".to_string());
+            }
+            // Claude CLI model access errors: "There's an issue with the selected model"
+            if line_lower.contains("issue with the selected model") || line_lower.contains("may not exist or you may not have access") {
+                // Extract the model name from the error for better diagnostics
+                // Pattern: "issue with the selected model (model_name)"
+                if let Some(start) = line.find("model (") {
+                    if let Some(end) = line[start..].find(")") {
+                        let model_name = &line[start + 7..start + end];
+                        // Check for ANSI escape codes in model name (indicator of terminal capture bug)
+                        if model_name.contains("\x1b") || model_name.contains("[1m") || model_name.contains("[0m") {
+                            return Some(format!("Model name contains ANSI escape codes: '{}'. This is a bug in model configuration.", model_name));
+                        }
+                        return Some(format!("Model '{}' not available or no access", model_name));
+                    }
+                }
+                return Some("Model not available or no access".to_string());
+            }
+            if line_lower.contains("quota exceeded") || line_lower.contains("usage limit") {
+                return Some("API quota exceeded".to_string());
+            }
+            
+            // Anthropic errors
+            if line_lower.contains("invalid anthropic api key") {
+                return Some("Anthropic API key invalid".to_string());
+            }
+            if line_lower.contains("anthropic api error") {
+                return Some(format!("Anthropic API error: {}", line));
+            }
+            
+            // Fireworks-specific errors (when using proxy)
+            if line_lower.contains("fireworks") && line_lower.contains("error") {
+                return Some(format!("Fireworks API error: {}", line));
+            }
+        }
+
+        None
+    }
+
+    /// Check if WORKLOG.md has meaningful content (not just header).
+    /// An empty or header-only worklog indicates FORGE didn't make progress.
+    async fn has_meaningful_worklog(&self) -> bool {
+        let path = self.config.shared.join("WORKLOG.md");
+        if !path.exists() {
+            return false;
+        }
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        // Check for actual content beyond just "# Worklog" header
+        let lines: Vec<&str> = content.lines().collect();
+        
+        // Filter out empty lines and the header
+        let content_lines: Vec<&str> = lines
+            .iter()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.is_empty() 
+                    && !trimmed.starts_with("# Worklog")
+                    && !trimmed.starts_with("#")
+            })
+            .map(|l| *l)
+            .collect();
+
+        // If we have at least one line of actual content, it's meaningful
+        !content_lines.is_empty()
     }
 
     /// Read STATUS.json and convert to PairOutcome.

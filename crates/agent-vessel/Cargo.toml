@@ -1,8 +1,12 @@
 [package]
-name = "agent-vessel"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "agent-vessel"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Vessel merge agent for OpenFlows - handles PR merges and CI integration"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agent", "vessel", "merge", "ci"]
+categories  = ["development-tools"]
 
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }

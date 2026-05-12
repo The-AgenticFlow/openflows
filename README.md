@@ -8,22 +8,225 @@ An autonomous software development team composed of AI agents working in a unifi
 
 ## Quick Start
 
+### Option 1: One-Line Install (Recommended)
 ```bash
-# 1. Clone and setup
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+```
+This installs all binaries to `~/.local/bin` and offers to run the setup wizard.
+
+### Option 2: Homebrew (macOS)
+```bash
+brew tap The-AgenticFlow/openflows
+brew install openflows
+```
+
+### Option 3: Docker
+```bash
+docker run -it --rm \
+  -v "$HOME/.agentflow:/home/openflows/.agentflow" \
+  -v "$(pwd):/workspace" \
+  -e ANTHROPIC_API_KEY=your_key \
+  -e GITHUB_PERSONAL_ACCESS_TOKEN=your_token \
+  ghcr.io/the-agenticflow/openflows:latest setup
+```
+
+### Option 4: npm (Node.js Package Manager)
+
+Install globally via npm for easy updates and cross-platform support with automatic binary downloads:
+
+```bash
+# Install the package globally
+npm install -g @the-agenticflow/openflows
+
+# Verify installation
+openflows --version
+
+# Run the interactive setup wizard
+openflows-setup
+
+# Start the autonomous orchestration
+openflows
+
+# Monitor with the dashboard (optional, separate terminal)
+openflows-dashboard
+
+# Diagnose issues
+openflows-doctor
+```
+
+**What the npm install does:**
+1. Downloads platform-specific native binaries (`agentflow`, `agentflow-setup`, `agentflow-dashboard`, `agentflow-doctor`, `anthropic-proxy`) from GitHub Releases
+2. Installs `mcp-proxy` via the postinstall script for GitHub MCP connectivity
+3. Places wrapper scripts (`openflows`, `openflows-setup`, etc.) in your npm global bin directory
+4. The `openflows` wrapper auto-detects your API provider and starts the built-in proxy when needed (e.g., for Fireworks AI)
+
+**Updating via npm:**
+```bash
+npm update -g @the-agenticflow/openflows
+```
+
+**Uninstalling:**
+```bash
+npm uninstall -g @the-agenticflow/openflows
+```
+
+**Note:** The npm package includes platform-specific native binaries as optional dependencies. The correct binary for your platform (Linux x86_64/aarch64, macOS x86_64/Apple Silicon) is automatically downloaded during installation via the `postinstall` script.
+
+### Option 5: Build from Source
+```bash
 git clone https://github.com/The-AgenticFlow/AgentFlow.git
 cd AgentFlow
-cp .env.example .env
-# Edit .env with your API keys
+make release          # or: cargo build --release -p openflows
+make install          # installs to ~/.local/bin
+openflows-setup       # Guided setup wizard
+openflows             # Start orchestration
+```
 
-# 2. Start the local proxy (required when gateway doesn't support Anthropic format)
-source .env && ./scripts/start_proxy.sh &
-# Or if your provider supports Anthropic directly, skip this step
+### Option 6: Cargo Install
 
-# 3. Verify setup (optional but recommended)
-./scripts/check_setup.sh
+Build and install from crates.io:
 
-# 4. Run the orchestration
-cargo run --bin agentflow
+```bash
+cargo install openflows
+openflows-setup
+openflows
+```
+
+**What `cargo install` does:**
+1. Downloads the `openflows` crate source from crates.io
+2. Compiles all binaries from source (`agentflow`, `agentflow-setup`, `agentflow-dashboard`, `agentflow-doctor`, `anthropic-proxy`)
+3. Installs them to `~/.cargo/bin/`
+4. You still need to set up environment variables manually (no `.env` file is created automatically)
+
+**Note:** Cargo install compiles from source, which takes several minutes. The npm package provides pre-built binaries for faster installation.
+
+### After Installation
+
+#### Standard Commands (All Install Methods)
+
+1. **Configure** — Run `openflows-setup` (or `agentflow-setup`) for the guided TUI wizard
+2. **Verify** — Run `openflows-doctor` (or `agentflow-doctor`) to check your environment
+3. **Run** — Run `openflows` (or `agentflow`) to start the autonomous team
+4. **Monitor** — Run `openflows-dashboard` (or `agentflow-dashboard`) for live worker status
+
+#### Setup Wizard Flow
+
+The `openflows-setup` wizard guides you through these steps:
+
+1. **Welcome** — Introduction screen
+2. **Security Disclaimer** — Confirm understanding of security implications
+3. **Setup Mode** — Choose QuickStart (essentials only) or Advanced (full config including proxy)
+4. **Existing Config Check** — Detect and offer to use/edit existing configuration
+5. **Environment Check** — Verify system requirements
+6. **LLM Provider Selection** — Choose your AI backend:
+   - **Anthropic (Claude)** — Direct API access, no proxy needed
+   - **OpenAI** — Direct API access
+   - **Google Gemini** — Direct API access
+   - **Fireworks AI** — Auto-configures proxy with `PROXY_TARGET_MODEL` for model mapping
+   - **LiteLLM Proxy** — Custom proxy URL
+   - **Ollama (Local)** — Local model hosting
+7. **API Key Input** — Enter credentials for your chosen provider
+8. **Agent Configuration** — Set up team members, instances, and model backends
+9. **GitHub Authentication** — Configure PAT tokens for each agent
+10. **Repository Config** — Set target GitHub repository
+11. **Proxy Config** — *Always shown for Fireworks users, otherwise Advanced mode only:*
+    - **Proxy URL** — Local proxy endpoint (default: `http://localhost:8765/v1`)
+    - **Proxy API Key** — Authentication for the proxy
+    - **Target Model (PROXY_TARGET_MODEL)** — Single target model for all Claude requests
+    - **Gateway URL** — Upstream LLM gateway (default: Fireworks endpoint)
+    - **Gateway API Key** — Upstream gateway authentication
+12. **Completion** — Writes `.env`, `registry.json`, and agent files
+
+#### Fireworks AI Setup Details
+
+When you select **Fireworks AI** as your provider, the wizard automatically:
+- Shows the proxy configuration step (regardless of QuickStart/Advanced mode)
+- Pre-fills `PROXY_URL` as `http://localhost:8765/v1`
+- Pre-fills `GATEWAY_URL` as `https://api.fireworks.ai/inference/v1/`
+- Uses your Fireworks API key for both `PROXY_API_KEY` and `GATEWAY_API_KEY`
+- Writes `PROXY_TARGET_MODEL` to `.env` for dynamic model mapping
+- Also writes legacy `MODEL_MAP` entries for backward compatibility
+
+The built-in `anthropic-proxy` binary handles:
+1. **Protocol translation** — Converts Anthropic Messages API to OpenAI Chat Completions
+2. **ANSI code stripping** — Cleans model names that may contain terminal formatting
+3. **Model mapping** — Routes all Claude model names (`claude-*`, `opus`, `sonnet`, `haiku`) to your `PROXY_TARGET_MODEL`
+4. **Fallback** — Falls back to `MODEL_MAP` if `PROXY_TARGET_MODEL` is not set
+
+#### npm-Specific Workflow
+
+If you installed via npm, you can also use npx without global installation:
+
+```bash
+# Run setup wizard without installing (uses @the-agenticflow scope)
+npx @the-agenticflow/openflows-setup
+
+# Start orchestration directly
+npx @the-agenticflow/openflows
+
+# Check status
+npx @the-agenticflow/openflows-doctor
+```
+
+**Using npx with specific versions:**
+```bash
+# Run a specific version
+npx @the-agenticflow/openflows@0.1.2
+
+# Run the latest version
+npx @the-agenticflow/openflows@latest
+```
+
+**Package Scripts (if integrating into a Node.js project):**
+
+Add to your `package.json`:
+
+```json
+{
+  "scripts": {
+    "agent:setup": "openflows-setup",
+    "agent:start": "openflows",
+    "agent:doctor": "openflows-doctor",
+    "agent:dashboard": "openflows-dashboard"
+  },
+  "devDependencies": {
+    "@the-agenticflow/openflows": "^0.1.2"
+  }
+}
+```
+
+Or install as a dev dependency:
+```bash
+npm install --save-dev @the-agenticflow/openflows
+```
+
+Then run:
+```bash
+npm run agent:setup      # Configure the system
+npm run agent:start      # Start the orchestration
+npm run agent:doctor     # Check environment
+npm run agent:dashboard  # Monitor workers
+```
+
+**Programmatic API (Node.js):**
+
+```javascript
+const { spawn } = require('child_process');
+const path = require('path');
+
+// Run openflows commands programmatically
+const openflows = spawn('openflows', ['--version'], {
+  stdio: 'inherit',
+  env: {
+    ...process.env,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+  }
+});
+
+openflows.on('exit', (code) => {
+  console.log(`OpenFlows exited with code ${code}`);
+});
 ```
 
 ## Getting Started
@@ -380,6 +583,52 @@ When your provider adds native Anthropic support, change `PROXY_URL` to point di
 ### Disabling Proxy (Direct API Access)
 
 If `PROXY_URL` is not set, all agents use direct API access with `ANTHROPIC_API_KEY` — this is the default behavior and requires no proxy setup.
+
+### Fireworks AI Setup (Recommended for Cost-Effective Development)
+
+Fireworks AI provides OpenAI-compatible endpoints at lower cost. Since Claude Code CLI speaks the Anthropic Messages API, AgentFlow includes a built-in protocol translator (`anthropic-proxy`) that automatically starts when needed.
+
+**Quick setup via the wizard:**
+
+```bash
+openflows-setup
+# Select "Fireworks AI" as your provider
+# Enter your FIREWORKS_API_KEY
+# Enter your PROXY_TARGET_MODEL (e.g., accounts/fireworks/models/glm-5)
+# Complete the remaining setup steps
+```
+
+The wizard automatically configures:
+- `PORT=8765` — local proxy port
+- `PROXY_URL=http://localhost:8765/v1` — where Claude CLI sends requests
+- `PROXY_API_KEY=<your fireworks key>` — proxy authentication
+- `GATEWAY_URL=https://api.fireworks.ai/inference/v1/` — upstream Fireworks endpoint
+- `PROXY_TARGET_MODEL=<your chosen model>` — all Claude model names map to this single target
+- Legacy `MODEL_MAP` entries for backward compatibility
+
+**How `PROXY_TARGET_MODEL` works:**
+
+Instead of manually mapping each Claude model name to a Fireworks model, set `PROXY_TARGET_MODEL` once. The local proxy will:
+1. Strip any ANSI escape codes from incoming model names
+2. Detect Claude model patterns (`claude-*`, `opus`, `sonnet`, `haiku`)
+3. Route all of them to your specified target model
+
+```env
+# Simple — one variable replaces all MODEL_MAP entries
+PROXY_TARGET_MODEL=accounts/fireworks/models/glm-5
+```
+
+**Manual configuration (if not using the wizard):**
+
+```env
+FIREWORKS_API_KEY=fw_your_key_here
+PORT=8765
+PROXY_URL=http://localhost:8765/v1
+PROXY_API_KEY=fw_your_key_here
+GATEWAY_URL=https://api.fireworks.ai/inference/v1/
+GATEWAY_API_KEY=fw_your_key_here
+PROXY_TARGET_MODEL=accounts/fireworks/models/glm-5
+```
 
 ## Requirements
 

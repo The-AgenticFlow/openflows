@@ -102,15 +102,23 @@ impl Registry {
     }
 
     /// Resolve GitHub token for a given agent.
-    /// If the agent has `github_token_env` set, reads from that env var.
-    /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` for backward compatibility.
+    /// If the agent has `github_token_env` set, tries that env var first.
+    /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` if the agent-specific var is not set.
     /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
         let token = match self.get(base_id) {
             Some(entry) => match &entry.github_token_env {
-                Some(env_var) => std::env::var(env_var)
-                    .with_context(|| format!("{} not set for agent {}", env_var, agent_id))?,
+                Some(env_var) => {
+                    // Try agent-specific token first, fall back to generic token
+                    std::env::var(env_var).or_else(|_| {
+                        std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
+                            .with_context(|| format!(
+                                "Neither {} nor GITHUB_PERSONAL_ACCESS_TOKEN is set for agent {}",
+                                env_var, agent_id
+                            ))
+                    })?
+                }
                 None => std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
                     .context("GITHUB_PERSONAL_ACCESS_TOKEN not set (fallback for agent without github_token_env)")?,
             },

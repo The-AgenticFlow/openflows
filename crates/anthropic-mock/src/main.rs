@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use futures::StreamExt;
+use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -12,6 +13,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+/// Strip ANSI escape codes and terminal formatting artifacts from a string.
+/// This handles cases where model names may have terminal formatting codes embedded.
+/// Handles both real ANSI codes (\x1b[1m) and literal bracket patterns like [1m]
+fn strip_ansi_codes(s: &str) -> String {
+    // Match ANSI escape sequences: ESC [ followed by parameters and command character
+    static ANSI_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = ANSI_RE.get_or_init(|| {
+        // Match real ANSI codes and also literal bracket patterns like [1m], [0m, [32m, etc.
+        Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][\x30-\x3f]*|\[[0-9;]+[a-zA-Z]\]").unwrap()
+    });
+    re.replace_all(s, "").to_string()
+}
 
 #[derive(Debug, Deserialize)]
 struct AnthropicRequest {
@@ -61,6 +75,17 @@ fn parse_model_map() -> HashMap<String, String> {
         .collect()
 }
 
+/// Check if a model name is a Claude model variant or alias.
+/// This includes: claude-* models and common aliases (opus, sonnet, haiku)
+fn is_claude_model(model: &str) -> bool {
+    let model_lower = model.to_lowercase();
+    model_lower.starts_with("claude")
+        || model_lower.starts_with("claude-")
+        || model == "opus"
+        || model == "sonnet"
+        || model == "haiku"
+}
+
 #[tokio::main]
 async fn main() {
     match dotenvy::dotenv() {
@@ -73,8 +98,18 @@ async fn main() {
     let backend_url = resolve_backend_url();
     let backend_key = resolve_backend_key().expect("API key configuration error");
 
+    // Check for PROXY_TARGET_MODEL (simpler config) or fall back to MODEL_MAP
+    let target_model = std::env::var("PROXY_TARGET_MODEL").ok();
     let model_map = parse_model_map();
-    if !model_map.is_empty() {
+    
+    if let Some(ref target) = target_model {
+        if !target.is_empty() {
+            info!(
+                target_model = %target,
+                "Model mapping: ALL Claude models → target (PROXY_TARGET_MODEL)"
+            );
+        }
+    } else if !model_map.is_empty() {
         info!(
             mappings = model_map.len(),
             "Model name mapping loaded from MODEL_MAP"
@@ -83,9 +118,10 @@ async fn main() {
             info!(from = %from, to = %to, "Model map entry");
         }
     } else {
-        info!("No MODEL_MAP configured - forwarding model names unchanged");
+        info!("No model mapping configured - forwarding model names unchanged");
     }
     let model_map = Arc::new(RwLock::new(model_map));
+    let target_model = Arc::new(target_model);
 
     info!(
         backend_url = %backend_url,
@@ -101,9 +137,11 @@ async fn main() {
                 let url = backend_url_clone.clone();
                 let key = backend_key_clone.clone();
                 let map = model_map.clone();
-                handle_messages(headers, payload, url, key, map)
+                let target = target_model.clone();
+                handle_messages(headers, payload, url, key, map, target)
             }),
         )
+        .route("/v1/models", axum::routing::get(handle_models))
         .route("/health", axum::routing::get(|| async { "ok" }));
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -202,21 +240,102 @@ fn convert_anthropic_to_openai_messages(payload: &AnthropicRequest) -> Vec<Value
     openai_messages
 }
 
+/// Handle GET /v1/models — return a list of Claude models so that
+/// Claude Code's model validation succeeds when using the proxy.
+///
+/// Without this endpoint, Claude Code calls /v1/models to check whether
+/// the resolved model name (e.g. `claude-sonnet-4-5`) is available.
+/// A 404 response causes Claude Code to reject the model and exit
+/// instantly with "There's an issue with the selected model".
+async fn handle_models() -> Json<Value> {
+    // All Claude model names that Claude Code may resolve aliases to.
+    // The proxy maps any Claude model to PROXY_TARGET_MODEL, so all of
+    // these are "available" from the proxy's perspective.
+    let model_ids = [
+        // Sonnet family — the `sonnet` alias resolves here
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250514",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-20251022",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-latest",
+        // Haiku family
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-haiku-latest",
+        // Opus family
+        "claude-opus-4",
+        "claude-opus-4-20250514",
+        "claude-3-opus-20240229",
+        "claude-3-opus-latest",
+    ];
+
+    let data: Vec<Value> = model_ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "type": "model",
+                "display_name": id.replace('-', " "),
+                "created_at": "2024-01-01T00:00:00Z",
+                "max_input_tokens": 200_000,
+                "max_tokens": 8192
+            })
+        })
+        .collect();
+
+    let first = model_ids.first().unwrap_or(&"");
+    let last = model_ids.last().unwrap_or(&"");
+
+    debug!("Returning /v1/models list ({} models)", model_ids.len());
+
+    Json(json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    }))
+}
+
 async fn handle_messages(
     _headers: HeaderMap,
     Json(payload): Json<AnthropicRequest>,
     backend_url: String,
     backend_key: String,
     model_map: Arc<RwLock<HashMap<String, String>>>,
+    target_model: Arc<Option<String>>,
 ) -> (StatusCode, Json<Value>) {
+    // Strip any ANSI escape codes that may have leaked into the model name
+    let clean_model = strip_ansi_codes(&payload.model);
+    if clean_model != payload.model {
+        warn!(raw = %payload.model, clean = %clean_model, "Stripped ANSI codes from model name");
+    }
+    
+    // Resolve model name using PROXY_TARGET_MODEL or MODEL_MAP
     let resolved_model = {
-        let map = model_map.read().await;
-        map.get(&payload.model)
-            .cloned()
-            .unwrap_or_else(|| payload.model.clone())
+        // Check PROXY_TARGET_MODEL first
+        if let Some(ref target) = *target_model {
+            if !target.is_empty() && is_claude_model(&clean_model) {
+                target.clone()
+            } else {
+                // Not a Claude model or target is empty, try MODEL_MAP
+                let map = model_map.read().await;
+                map.get(&clean_model)
+                    .cloned()
+                    .unwrap_or_else(|| clean_model.clone())
+            }
+        } else {
+            // No PROXY_TARGET_MODEL, use MODEL_MAP
+            let map = model_map.read().await;
+            map.get(&clean_model)
+                .cloned()
+                .unwrap_or_else(|| clean_model.clone())
+        }
     };
-    if resolved_model != payload.model {
-        info!(requested = %payload.model, resolved = %resolved_model, "Model name mapped");
+    
+    if resolved_model != clean_model {
+        info!(requested = %clean_model, resolved = %resolved_model, "Model name mapped");
     }
     info!(
         turns = payload.messages.len(),

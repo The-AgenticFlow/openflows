@@ -129,9 +129,9 @@ This uses local mock servers for the LLM and MCP, and a mock Claude script for F
    ```
 
 2. **Run Demo**:
-   ```bash
-   cargo run -p agent-team --bin demo
-   ```
+    ```bash
+    cargo run -p openflows --bin demo
+    ```
 
 ### Option B: Real-World Orchestration
 This connects to live GitHub and live LLM providers.
@@ -139,7 +139,7 @@ This connects to live GitHub and live LLM providers.
 **If your gateway supports Anthropic protocol** (LiteLLM, native Anthropic API):
 ```bash
 # Just run — no proxy needed
-cargo run -p agent-team --bin agentflow
+cargo run -p openflows --bin agentflow
 ```
 
 **If your gateway only supports OpenAI protocol** (common for third-party gateways):
@@ -148,7 +148,7 @@ cargo run -p agent-team --bin agentflow
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run the orchestration
-cargo run -p agent-team --bin agentflow
+cargo run -p openflows --bin agentflow
 ```
 
 The proxy reads `GATEWAY_URL` and `GATEWAY_API_KEY` from `.env` automatically, translates Claude CLI's Anthropic-format requests into OpenAI format, and forwards them to your gateway. See [Local Anthropic Proxy](#local-anthropic-proxy-openai-only-gateways) below for details.
@@ -278,7 +278,7 @@ If you want to contribute, please follow these steps:
 2. **Verify the Environment**: Run all tests (unit and E2E) to ensure the current flow is running fine on your side:
    ```bash
    cargo test --workspace
-   cargo run -p agent-team --bin demo
+   cargo run -p openflows --bin demo
    ```
 3. **Get Assigned**: Create a new issue or comment on an existing one to express your interest. I will then add you to the repository as a contributor.
 4. **Implement**: Follow the standard agentic coding workflow (Plan -> Implement -> Verify -> Walkthrough).

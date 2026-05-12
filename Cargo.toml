@@ -12,6 +12,7 @@ members = [
     "crates/pair-harness",
     "binary",
     "crates/anthropic-mock",
+    "crates/agentflow-tui",
 ]
 
 [workspace.dependencies]

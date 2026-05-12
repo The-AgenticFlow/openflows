@@ -116,18 +116,21 @@ impl McpSession {
             }
             _ => {
                 info!("Spawning hosted GitHub MCP server via mcp-proxy bridge");
+                // Use sparfenyuk/mcp-proxy (Python tool from PyPI)
+                // It bridges stdio to HTTP MCP servers.
+                // Format: mcp-proxy --transport streamablehttp --headers Authorization 'Bearer TOKEN' URL
                 let mut child = Command::new("mcp-proxy")
-                    .arg("convert")
-                    .arg("https://api.githubcopilot.com/mcp/")
-                    .arg("--auth")
+                    .arg("--transport")
+                    .arg("streamablehttp")
+                    .arg("--headers")
+                    .arg("Authorization")
                     .arg(format!("Bearer {}", pat))
-                    .arg("--protocol")
-                    .arg("stream")
+                    .arg("https://api.githubcopilot.com/mcp")
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::inherit())
                     .spawn()
-                    .context("Failed to spawn hosted MCP npx bridge")?;
+                    .context("Failed to spawn hosted MCP bridge (mcp-proxy not installed? Run: uv tool install mcp-proxy)")?;
 
                 let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
                 let stdout =

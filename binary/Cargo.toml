@@ -1,8 +1,12 @@
 [package]
-name    = "agent-team"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "openflows"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "OpenFlows - Autonomous AI Dev Team orchestration framework"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agents", "orchestration", "automation", "development"]
+categories  = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "agentflow"
@@ -16,7 +20,20 @@ path = "src/main.rs"
 name = "demo"
 path = "src/bin/demo.rs"
 
+[[bin]]
+name = "agentflow-setup"
+path = "src/bin/setup.rs"
+
+[[bin]]
+name = "agentflow-dashboard"
+path = "src/bin/dashboard.rs"
+
+[[bin]]
+name = "agentflow-doctor"
+path = "src/bin/doctor.rs"
+
 [dependencies]
+agentflow-tui = { path = "../crates/agentflow-tui" }
 pocketflow-core = { path = "../crates/pocketflow-core" }
 config          = { path = "../crates/config" }
 agent-nexus     = { path = "../crates/agent-nexus" }

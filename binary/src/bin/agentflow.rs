@@ -20,13 +20,32 @@ async fn main() -> Result<()> {
         Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
-    tracing_subscriber::fmt::init();
+    // Initialize logging with INFO level by default (can override via RUST_LOG env var)
+    let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&log_filter))
+        .init();
 
     info!("Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)");
 
     // 1. Validate Environment
-    // Use registry to resolve per-agent token for FORGE
-    let registry_path = std::env::current_dir()?
+    // Resolve orchestrator_dir: first try relative to the binary itself (npm install),
+    // then fall back to current directory (dev mode).
+    let orchestrator_dir = {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            if dir.join("orchestration/agent/registry.json").exists() {
+                dir.clone()
+            } else {
+                std::env::current_dir()?
+            }
+        } else {
+            std::env::current_dir()?
+        }
+    };
+    let registry_path = orchestrator_dir
         .join("orchestration")
         .join("agent")
         .join("registry.json");
@@ -59,8 +78,6 @@ async fn main() -> Result<()> {
     std::env::set_var("AGENTFLOW_WORKSPACE_ROOT", &workspace_dir);
 
     // Set ORCHESTRATOR_DIR so pair harness can find the plugin
-    // This is needed because the workspace is a separate cloned repo
-    let orchestrator_dir = std::env::current_dir()?;
     std::env::set_var("ORCHESTRATOR_DIR", &orchestrator_dir);
 
     // 3. Initialize Nodes

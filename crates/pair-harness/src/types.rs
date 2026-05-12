@@ -53,6 +53,9 @@ pub struct PairConfig {
     pub shared: PathBuf,
     pub redis_url: Option<String>,
     pub proxy_url: Option<String>,
+    /// Model override from registry (e.g., "accounts/fireworks/models/glm-5").
+    /// When set, ProcessManager will use this model instead of CLAUDE_MODEL/ANTHROPIC_MODEL.
+    pub model: Option<String>,
     pub github_token: String,
     pub max_resets: u32,
     pub watchdog_timeout_secs: u64,
@@ -87,6 +90,7 @@ impl PairConfig {
             ticket_id,
             redis_url: None,
             proxy_url: None,
+            model: None,
             github_token: github_token.into(),
             max_resets: 10,
             watchdog_timeout_secs: 1200,
@@ -113,6 +117,7 @@ impl PairConfig {
             ticket_id,
             redis_url: Some(redis_url.into()),
             proxy_url: None,
+            model: None,
             github_token: github_token.into(),
             max_resets: 10,
             watchdog_timeout_secs: 1200,
@@ -139,12 +144,19 @@ impl PairConfig {
             ticket_id,
             redis_url,
             proxy_url: Some(proxy_url.into()),
+            model: None,
             github_token: github_token.into(),
             max_resets: 10,
             watchdog_timeout_secs: 1200,
             verify_command: None,
             max_verify_attempts: 3,
         }
+    }
+
+    /// Set the model override from registry.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 }
 

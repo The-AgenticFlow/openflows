@@ -1,8 +1,12 @@
 [package]
-name    = "pocketflow-core"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name        = "pocketflow-core"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+description = "Core library for building multi-agent AI orchestration flows"
+repository  = "https://github.com/The-AgenticFlow/OpenFlows"
+keywords    = ["ai", "agents", "orchestration", "flow", "workflow"]
+categories  = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio       = { workspace = true }
