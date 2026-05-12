@@ -44,6 +44,10 @@ impl SentinelMode {
     }
 }
 
+/// Default model to use when spawning Claude CLI processes.
+/// Use 'sonnet' alias which is valid for Claude CLI - the proxy will map it to the target model.
+const DEFAULT_CLI_MODEL: &str = "sonnet";
+
 /// Manages FORGE and SENTINEL processes.
 pub struct ProcessManager {
     claude_path: PathBuf,
@@ -51,6 +55,10 @@ pub struct ProcessManager {
     redis_url: Option<String>,
     proxy_url: Option<String>,
     proxy_api_key: Option<String>,
+    /// Model to pass to Claude CLI via --model flag.
+    /// Should be a proxy-compatible alias (e.g., "claude-sonnet-4-5") that the proxy
+    /// will map to PROXY_TARGET_MODEL.
+    model: String,
 }
 
 impl ProcessManager {
@@ -62,10 +70,14 @@ impl ProcessManager {
 
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
         
         tracing::info!(
             proxy_url = ?proxy_url,
             proxy_api_key = ?proxy_api_key,
+            model = %model,
             "ProcessManager::new - environment check"
         );
 
@@ -75,6 +87,7 @@ impl ProcessManager {
             redis_url: None,
             proxy_url,
             proxy_api_key,
+            model,
         }
     }
 
@@ -86,6 +99,9 @@ impl ProcessManager {
 
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
 
         Self {
             claude_path,
@@ -93,6 +109,7 @@ impl ProcessManager {
             redis_url: Some(redis_url.into()),
             proxy_url,
             proxy_api_key,
+            model,
         }
     }
 
@@ -107,6 +124,9 @@ impl ProcessManager {
         Self::validate_claude_binary(&claude_path);
 
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+        let model = std::env::var("CLAUDE_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_CLI_MODEL.to_string());
 
         Self {
             claude_path,
@@ -114,6 +134,31 @@ impl ProcessManager {
             redis_url,
             proxy_url: Some(proxy_url.into()),
             proxy_api_key,
+            model,
+        }
+    }
+
+    /// Create a ProcessManager with an explicit model override.
+    pub fn with_model(
+        github_token: impl Into<String>,
+        redis_url: Option<String>,
+        proxy_url: Option<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        let claude_path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
+        let claude_path = PathBuf::from(claude_path);
+
+        Self::validate_claude_binary(&claude_path);
+
+        let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
+
+        Self {
+            claude_path,
+            github_token: github_token.into(),
+            redis_url,
+            proxy_url,
+            proxy_api_key,
+            model: model.into(),
         }
     }
 
@@ -232,6 +277,11 @@ impl ProcessManager {
         self.proxy_api_key.as_deref()
     }
 
+    /// Get the model that will be passed to Claude CLI via --model flag.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     fn plugin_dir(target: &Path) -> PathBuf {
         target.join(".claude").join("plugins").join("orchestration")
     }
@@ -259,6 +309,8 @@ impl ProcessManager {
         let mut cmd = Command::new(&self.claude_path);
         cmd.arg("--print")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -274,6 +326,11 @@ impl ProcessManager {
             )
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
+
+        info!(
+            model = %self.model,
+            "FORGE process will use model"
+        );
 
         if let Some(proxy_url) = &self.proxy_url {
             info!(proxy_url = %proxy_url, proxy_api_key = ?self.proxy_api_key, "Injecting proxy environment for FORGE");
@@ -380,6 +437,8 @@ impl ProcessManager {
         let mut cmd = Command::new(&self.claude_path);
         cmd.arg("--print")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -395,6 +454,11 @@ impl ProcessManager {
             )
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
+
+        info!(
+            model = %self.model,
+            "FORGE PR process will use model"
+        );
 
         if let Some(proxy_url) = &self.proxy_url {
             Self::inject_proxy_env(
@@ -521,6 +585,8 @@ impl ProcessManager {
             .arg("--output-format")
             .arg("json")
             .arg("--dangerously-skip-permissions")
+            .arg("--model")
+            .arg(&self.model)
             .arg("--settings")
             .arg(&settings_path)
             .arg("--plugin-dir")
@@ -538,6 +604,11 @@ impl ProcessManager {
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token)
             .env("SPRINTLESS_SENTINEL_TIMEOUT_SECS", timeout_secs.to_string());
+
+        info!(
+            model = %self.model,
+            "SENTINEL process will use model"
+        );
 
         if let Some(proxy_url) = &self.proxy_url {
             Self::inject_proxy_env(
