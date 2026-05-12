@@ -222,6 +222,7 @@ impl ProcessManager {
     /// NOTE: Fireworks doesn't have a native Anthropic endpoint, so Claude CLI
     /// requires a proxy. This function is kept for potential future use if
     /// Fireworks adds Anthropic support, but currently should not be called.
+    #[allow(dead_code)]
     fn inject_fireworks_anthropic_env(cmd: &mut Command) {
         let base_url = std::env::var("FIREWORKS_API_URL")
             .unwrap_or_else(|_| "https://api.fireworks.ai/inference/v1".to_string());
