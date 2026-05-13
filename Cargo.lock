@@ -56,8 +56,10 @@ dependencies = [
  "agent-client",
  "anyhow",
  "async-trait",
+ "chrono",
  "config",
  "github",
+ "nexus-chat",
  "pocketflow-core",
  "serde",
  "serde_json",
@@ -1295,6 +1297,22 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nexus-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "config",
+ "pocketflow-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

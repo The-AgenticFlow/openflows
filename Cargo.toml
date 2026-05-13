@@ -10,6 +10,7 @@ members = [
     "crates/agent-vessel",
     "crates/agent-lore",
     "crates/pair-harness",
+    "crates/nexus-chat",
     "binary",
     "crates/anthropic-mock",
 ]
