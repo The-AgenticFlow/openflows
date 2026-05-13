@@ -704,11 +704,14 @@ impl GithubRestClient {
         let body = serde_json::json!({ "assignees": [assignee] });
         let resp: serde_json::Value = self.patch_json(&url, &body).await?;
         let assignees = resp["assignees"].as_array();
-        let assigned = assignees.map(|a| {
-            a.iter().any(|u| u["login"].as_str() == Some(assignee))
-        }).unwrap_or(false);
+        let assigned = assignees
+            .map(|a| a.iter().any(|u| u["login"].as_str() == Some(assignee)))
+            .unwrap_or(false);
         if assigned {
-            info!(issue = issue_number, assignee, "GitHub issue assigned successfully");
+            info!(
+                issue = issue_number,
+                assignee, "GitHub issue assigned successfully"
+            );
             Ok(())
         } else {
             warn!(
@@ -747,7 +750,10 @@ impl GithubRestClient {
         );
         let body = serde_json::json!({ "body": body_text });
         let _: serde_json::Value = self.post_json(&url, &body).await?;
-        info!(issue = issue_number, "GitHub issue comment added successfully");
+        info!(
+            issue = issue_number,
+            "GitHub issue comment added successfully"
+        );
         Ok(())
     }
 
