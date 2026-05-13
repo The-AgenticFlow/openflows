@@ -44,8 +44,14 @@ impl OpenAiClient {
     pub fn from_env() -> Result<Self> {
         let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY not set")?;
         let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        let api_url =
-            std::env::var("OPENAI_API_URL").unwrap_or_else(|_| DEFAULT_OPENAI_API_URL.to_string());
+        // Support both OPENAI_BASE_URL (preferred) and OPENAI_API_URL (legacy)
+        let api_url = if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+            format!("{}/chat/completions", base_url.trim_end_matches('/'))
+        } else if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
+            api_url
+        } else {
+            DEFAULT_OPENAI_API_URL.to_string()
+        };
         Ok(Self {
             http: Client::new(),
             api_url,

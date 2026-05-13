@@ -2,8 +2,8 @@
 //! Process management for FORGE and SENTINEL agents.
 //!
 //! Supports multiple CLI backends:
-//! - Claude Code CLI (default): `claude --dangerously-skip-permissions -p <prompt> --output-format stream-json`
-//! - OpenAI Codex CLI: `codex --approval-mode full-auto -q "<prompt>"`
+//! - Claude Code CLI (default): `claude --print --dangerously-skip-permissions --output-format stream-json`
+//! - OpenAI Codex CLI: `codex exec --full-auto --dangerously-bypass-approvals-and-sandbox "<prompt>"`
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -262,12 +262,23 @@ impl ProcessManager {
                 cmd.arg("--print")
                     .arg("--dangerously-skip-permissions")
                     .arg("--output-format")
-                    .arg("stream-json");
+                    .arg("stream-json")
+                    .arg("--verbose");
             }
             CliBackend::Codex => {
-                // Codex CLI flags
-                // codex --approval-mode full-auto -q "<prompt>"
-                cmd.arg("--approval-mode").arg("full-auto").arg("-q");
+                // Codex CLI flags - use 'exec' subcommand for non-interactive execution
+                // --full-auto enables fully autonomous mode (no approval prompts)
+                // Note: --full-auto and --dangerously-bypass-approvals-and-sandbox are mutually exclusive
+                cmd.arg("exec")
+                    .arg("--full-auto");
+
+                // Pass model from OPENAI_MODEL environment variable
+                if let Ok(model) = std::env::var("OPENAI_MODEL") {
+                    if !model.is_empty() {
+                        cmd.arg("-m").arg(&model);
+                        info!(model = %model, "Codex: using model from OPENAI_MODEL");
+                    }
+                }
             }
         }
 
@@ -295,7 +306,7 @@ impl ProcessManager {
                 }
             }
             CliBackend::Codex => {
-                // Codex uses OPENAI_API_KEY
+                // Codex uses OPENAI_API_KEY and OPENAI_BASE_URL
                 if let Some(proxy_url) = &self.proxy_url {
                     // Codex expects OpenAI-compatible endpoint
                     cmd.env(
@@ -306,10 +317,23 @@ impl ProcessManager {
                         cmd.env("OPENAI_API_KEY", api_key);
                     }
                 } else {
+                    // Pass through OPENAI_API_KEY from environment
                     cmd.env(
                         "OPENAI_API_KEY",
                         std::env::var("OPENAI_API_KEY").unwrap_or_default(),
                     );
+                    // Pass through OPENAI_BASE_URL from environment (for custom gateways like Fireworks)
+                    // Also support OPENAI_API_URL for backwards compatibility
+                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                        cmd.env("OPENAI_BASE_URL", base_url);
+                    } else if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
+                        // Convert chat/completions URL to base URL
+                        let base_url = api_url
+                            .trim_end_matches("/chat/completions")
+                            .trim_end_matches("/completions")
+                            .trim_end_matches('/');
+                        cmd.env("OPENAI_BASE_URL", base_url);
+                    }
                 }
             }
         }
@@ -645,7 +669,7 @@ impl ProcessManager {
             .await
     }
 
-    /// Spawn a SENTINEL process with an explicit timeout.
+    /// Spawn a SENTINEL process with an explicit timeout using the default backend.
     pub async fn spawn_sentinel_with_timeout(
         &self,
         pair_id: &str,
@@ -655,6 +679,21 @@ impl ProcessManager {
         shared: &Path,
         timeout_secs: u64,
     ) -> Result<Child> {
+        self.spawn_sentinel_with_backend(pair_id, ticket_id, mode, worktree, shared, timeout_secs, self.default_backend)
+            .await
+    }
+
+    /// Spawn a SENTINEL process with an explicit backend.
+    pub async fn spawn_sentinel_with_backend(
+        &self,
+        pair_id: &str,
+        ticket_id: &str,
+        mode: SentinelMode,
+        worktree: &Path,
+        shared: &Path,
+        timeout_secs: u64,
+        backend: CliBackend,
+    ) -> Result<Child> {
         let segment = mode.segment_value();
 
         info!(
@@ -662,27 +701,41 @@ impl ProcessManager {
             ticket = ticket_id,
             mode = ?mode,
             segment = %segment,
+            backend = ?backend,
             "Spawning SENTINEL process (ephemeral)"
         );
 
         // Build the initial prompt for SENTINEL based on mode
         let initial_prompt = self.build_sentinel_prompt(shared, &mode);
-        let settings_path = shared.join(".claude").join("settings.json");
-        let plugin_dir = Self::plugin_dir(shared);
 
-        let mut cmd = Command::new(&self.claude_path);
-        cmd.arg("--print")
-            .arg("--output-format")
-            .arg("json")
-            .arg("--dangerously-skip-permissions")
-            .arg("--settings")
-            .arg(&settings_path)
-            .arg("--plugin-dir")
-            .arg(&plugin_dir)
-            .arg("--add-dir")
-            .arg(worktree)
-            .args(["--no-session-persistence"])
-            .env("SPRINTLESS_PAIR_ID", pair_id)
+        let mut cmd = self.build_cli_command(backend, worktree, shared);
+
+        // Add backend-specific arguments
+        match backend {
+            CliBackend::Claude => {
+                let settings_path = shared.join(".claude").join("settings.json");
+                let plugin_dir = Self::plugin_dir(shared);
+                cmd.arg("--output-format")
+                    .arg("json")
+                    .arg("--settings")
+                    .arg(&settings_path)
+                    .arg("--plugin-dir")
+                    .arg(&plugin_dir)
+                    .arg("--add-dir")
+                    .arg(worktree)
+                    .arg("--no-session-persistence");
+            }
+            CliBackend::Codex => {
+                // Codex exec mode - additional flags for non-interactive execution
+                // The --dangerously-bypass-approvals-and-sandbox is already added in build_cli_command
+                cmd.arg("--json")
+                    .arg("--ephemeral")
+                    .arg("-C")
+                    .arg(shared);
+            }
+        }
+
+        cmd.env("SPRINTLESS_PAIR_ID", pair_id)
             .env("SPRINTLESS_TICKET_ID", ticket_id)
             .env("SPRINTLESS_SEGMENT", &segment)
             .env(
@@ -693,20 +746,7 @@ impl ProcessManager {
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token)
             .env("SPRINTLESS_SENTINEL_TIMEOUT_SECS", timeout_secs.to_string());
 
-        if let Some(proxy_url) = &self.proxy_url {
-            Self::inject_proxy_env(
-                &mut cmd,
-                "sentinel-key",
-                proxy_url,
-                self.proxy_api_key.as_deref(),
-            );
-        } else {
-            cmd.env(
-                "ANTHROPIC_API_KEY",
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            );
-            Self::inject_llm_env(&mut cmd);
-        }
+        self.inject_cli_env(&mut cmd, backend);
 
         cmd.current_dir(shared)
             .stdin(Stdio::piped())
