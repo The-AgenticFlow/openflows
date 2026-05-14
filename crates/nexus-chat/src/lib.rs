@@ -1,5 +1,6 @@
 mod chat_loop;
 mod discord_client;
+mod discord_gateway;
 mod message_types;
 mod mock;
 mod rate_limit;
@@ -8,6 +9,7 @@ mod whatsapp_client;
 
 pub use chat_loop::{run_chat_loop, KEY_HUMAN_MESSAGES};
 pub use discord_client::{DiscordClient, DiscordMessage};
+pub use discord_gateway::run_discord_gateway;
 pub use message_types::{ChannelType, ChatConfig, HumanCommand, HumanMessage, MessageType, NexusMessage};
 pub use mock::MockChatClient;
 pub use rate_limit::RateLimiter;
@@ -129,7 +131,11 @@ impl HumanChannel {
             .get_typed(KEY_HUMAN_MESSAGES)
             .await
             .unwrap_or_default();
-        messages.retain(|m| m.timestamp != msg.timestamp || m.user_id != msg.user_id);
+        // Compare by deterministic fields (not timestamp, which may drift through JSON
+        // round-trips with nanosecond precision).
+        messages.retain(|m| {
+            !(m.user_id == msg.user_id && m.channel_id == msg.channel_id && m.text == msg.text)
+        });
         self.store
             .set(KEY_HUMAN_MESSAGES, serde_json::json!(messages))
             .await;

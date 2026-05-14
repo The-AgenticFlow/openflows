@@ -67,7 +67,7 @@ impl DiscordClient {
                 "https://discord.com/api/v10/channels/{}/messages",
                 channel
             ))
-            .bearer_auth(token)
+            .header("Authorization", format!("Bot {}", token))
             .header("Content-Type", "application/json")
             .json(&json!({
                 "content": text,
@@ -104,7 +104,7 @@ impl DiscordClient {
         let response = self
             .client
             .get(&url)
-            .bearer_auth(token)
+            .header("Authorization", format!("Bot {}", token))
             .send()
             .await?;
 

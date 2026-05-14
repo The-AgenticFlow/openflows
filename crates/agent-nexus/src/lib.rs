@@ -923,7 +923,7 @@ impl NexusNode {
         Ok(())
     }
 
-    async fn process_human_commands(&self, store: &SharedStore) -> Result<()> {
+    pub async fn process_human_commands(&self, store: &SharedStore) -> Result<()> {
         if let Some(ref channel) = self.human_channel {
             let messages = channel.pending_messages().await;
             for msg in messages {
@@ -999,7 +999,15 @@ impl NexusNode {
                         _ => {}
                     }
                 } else {
-                    info!(user = msg.user_id, "Message from human not interpreted as command");
+                    info!(user = msg.user_id, text = %msg.text, "Message from human not interpreted as command");
+                    // Send a helpful reply so the user knows the message was received but not understood
+                    let help_text = format!(
+                        "I received your message but couldn't interpret it as a command. \
+                        Available commands: `pause T-XXX`, `resume T-XXX`, `approve forge-X`, \
+                        `block forge-X [reason]`, `reroute forge-X forge-Y`, `answer T-XXX <text>`. \
+                        You can also @mention me or start with my name."
+                    );
+                    self.notify_human(NexusMessage::status_update(&help_text)).await;
                 }
                 channel.ack_message(&msg).await;
             }
@@ -1027,18 +1035,26 @@ impl NexusNode {
     }
 
     fn try_pattern_match(&self, text: &str, lower: &str, msg: &HumanMessage) -> Option<HumanCommand> {
+        // Helper: check that lower starts with an exact command word (space or EOL after it)
+        let starts_with_cmd = |cmd: &str| lower == cmd || lower.starts_with(&format!("{} ", cmd));
+        // Helper: fuzzy match — first word starts with cmd (catches typos like "assigne", "assigning")
+        let fuzzy_cmd = |cmd: &str| {
+            let first = lower.split_whitespace().next().unwrap_or("");
+            first == cmd || first.starts_with(cmd)
+        };
+
         // Direct command patterns
-        if lower.starts_with("pause") {
+        if starts_with_cmd("pause") || fuzzy_cmd("pause") {
             let ticket_id = extract_ticket_id(text);
             return ticket_id.map(|id| HumanCommand::pause_workflow(&id, &msg.user_id, &msg.channel_id));
         }
 
-        if lower.starts_with("resume") {
+        if starts_with_cmd("resume") || fuzzy_cmd("resume") {
             let ticket_id = extract_ticket_id(text);
             return ticket_id.map(|id| HumanCommand::resume_workflow(&id, &msg.user_id, &msg.channel_id));
         }
 
-        if lower.starts_with("approve") {
+        if starts_with_cmd("approve") || fuzzy_cmd("approve") {
             let worker_id = extract_worker_id(text);
             return Some(HumanCommand::approve_command(
                 &worker_id.unwrap_or_else(|| "unknown".to_string()),
@@ -1047,7 +1063,7 @@ impl NexusNode {
             ));
         }
 
-        if lower.starts_with("reject") || lower.starts_with("deny") {
+        if starts_with_cmd("reject") || starts_with_cmd("deny") || fuzzy_cmd("reject") || fuzzy_cmd("deny") {
             let worker_id = extract_worker_id(text);
             return Some(HumanCommand {
                 command: MessageType::BlockAgent,
@@ -1061,7 +1077,7 @@ impl NexusNode {
             });
         }
 
-        if lower.starts_with("block") {
+        if starts_with_cmd("block") || fuzzy_cmd("block") {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
                 let worker_id = parts[1].to_string();
@@ -1070,16 +1086,20 @@ impl NexusNode {
             }
         }
 
-        if lower.starts_with("reroute") || lower.starts_with("reassign") {
+        if starts_with_cmd("reroute") || starts_with_cmd("reassign") || starts_with_cmd("assign")
+            || fuzzy_cmd("reroute") || fuzzy_cmd("reassign") || fuzzy_cmd("assign")
+        {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 3 {
-                let from_worker = parts[1].to_string();
-                let to_worker = parts[2].to_string();
-                return Some(HumanCommand::reroute_agent(&from_worker, &to_worker, &msg.user_id, &msg.channel_id));
+                // Try to read worker IDs allowing "forge 1" → "forge-1" (space-separated digit)
+                let (from_worker, to_worker) = extract_two_workers(&parts);
+                if from_worker.contains('-') && to_worker.contains('-') {
+                    return Some(HumanCommand::reroute_agent(&from_worker, &to_worker, &msg.user_id, &msg.channel_id));
+                }
             }
         }
 
-        if lower.starts_with("answer") {
+        if starts_with_cmd("answer") || fuzzy_cmd("answer") {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
                 let ticket_id = extract_ticket_id(text).unwrap_or_else(|| parts[1].trim_end_matches(':').to_string());
@@ -1089,7 +1109,7 @@ impl NexusNode {
         }
 
         // Question/answer format: "yes", "no", "option 1", etc.
-        if lower == "yes" || lower == "no" || lower.starts_with("option") {
+        if lower == "yes" || lower == "no" || lower.starts_with("option ") {
             // This is likely an answer to a question
             // Try to find the most recent question context
             return Some(HumanCommand {
@@ -1115,20 +1135,28 @@ Parse the following message into a structured command.
 
 Human message: "{}"
 
-Available command types:
-- pause_workflow: Pause a ticket (needs ticket_id like T-001)
-- resume_workflow: Resume a paused ticket (needs ticket_id)
-- approve_command: Approve a pending command (needs worker_id like forge-1)
-- block_agent: Block a worker (needs worker_id and optional reason)
-- reroute_agent: Reroute work from one worker to another (needs from_worker:to_worker)
-- answer_question: Answer a question (needs ticket_id and answer text)
-- status_query: Just asking about status (no action needed)
-- general_message: Just a general message (no action needed)
+Available command types and required fields:
+- pause_workflow: needs ticket_id (string, e.g. "T-001")
+- resume_workflow: needs ticket_id (string)
+- approve_command: needs worker_id (string, e.g. "forge-1")
+- block_agent: needs worker_id (string), optional reason in payload (string)
+- reroute_agent: needs from_worker in worker_id (string), to_worker in payload (string)
+- answer_question: needs ticket_id (string), answer in payload (string)
+- status_query: no fields needed
+- general_message: no fields needed
 
-Respond with ONLY a JSON object in this format:
+RULES:
+1. ALL field values must be simple strings or null. NEVER use nested JSON objects.
+2. For reroute_agent, put the source worker in "worker_id" and destination worker in "payload".
+3. If a worker is mentioned as "forge 1", normalize it to "forge-1".
+4. If the message is vague or missing required fields, use general_message.
+
+Respond with ONLY a JSON object. No markdown, no explanations.
+
+Example valid responses:
 {{"command_type": "pause_workflow", "ticket_id": "T-001", "worker_id": null, "payload": null}}
-
-If the message is not a command, respond with:
+{{"command_type": "reroute_agent", "ticket_id": null, "worker_id": "forge-1", "payload": "forge-2"}}
+{{"command_type": "block_agent", "ticket_id": null, "worker_id": "forge-1", "payload": "stuck on test failure"}}
 {{"command_type": "general_message", "ticket_id": null, "worker_id": null, "payload": null}}"#,
             text
         );
@@ -1234,11 +1262,62 @@ fn extract_worker_id(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
     let parts: Vec<&str> = lower.split_whitespace().collect();
     for part in parts.iter().skip(1) {
-        if part.contains('-') && !part.starts_with("t-") && !part.starts_with("ticket-") {
-            return Some(part.to_string());
+        if !part.starts_with("t-") && !part.starts_with("ticket-") {
+            return Some(normalize_worker_id(part));
         }
     }
     None
+}
+
+/// Normalize informal worker IDs like "forge1" → "forge-1".
+fn normalize_worker_id(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    // Insert a hyphen between letters and trailing digits (e.g. forge1 -> forge-1)
+    let mut result = String::new();
+    let mut prev_was_digit = false;
+    let mut prev_was_letter = false;
+    for ch in lower.chars() {
+        let is_digit = ch.is_ascii_digit();
+        let is_letter = ch.is_ascii_alphabetic();
+        if is_digit && prev_was_letter && !prev_was_digit {
+            result.push('-');
+        }
+        result.push(ch);
+        prev_was_digit = is_digit;
+        prev_was_letter = is_letter;
+    }
+    result
+}
+
+/// Extract two worker IDs from a word slice, handling "forge 1" → "forge-1" and skipping filler words.
+fn extract_two_workers(parts: &[&str]) -> (String, String) {
+    if parts.len() < 3 {
+        return (String::new(), String::new());
+    }
+    let (from_worker, next_idx) = read_worker(parts, 1);
+    let (to_worker, _) = read_worker(parts, next_idx);
+    (from_worker, to_worker)
+}
+
+fn read_worker(parts: &[&str], start: usize) -> (String, usize) {
+    if start >= parts.len() {
+        return (String::new(), start);
+    }
+    let token = parts[start].to_lowercase();
+    // Skip filler words
+    if token == "to" || token == "into" || token == "from" {
+        return read_worker(parts, start + 1);
+    }
+    let normalized = normalize_worker_id(parts[start]);
+    if normalized.contains('-') {
+        return (normalized, start + 1);
+    }
+    // Check if next part is a digit that should be joined (e.g. "forge 1")
+    if start + 1 < parts.len() && parts[start + 1].parse::<u64>().is_ok() {
+        let joined = format!("{}{}", parts[start], parts[start + 1]);
+        return (normalize_worker_id(&joined), start + 2);
+    }
+    (normalized, start + 1)
 }
 
 #[async_trait]
@@ -1425,13 +1504,53 @@ impl Node for NexusNode {
                 if let Some(ticket_id) = &decision.ticket_id {
                     info!(worker_id, ticket_id, "Nexus: Assigning ticket to worker");
 
-                    self.notify_human(NexusMessage::workflow_started(
+                    let workflow_msg = NexusMessage::workflow_started(
                         ticket_id,
                         worker_id,
                         &decision.notes,
                         decision.issue_url.as_deref(),
-                    ))
-                    .await;
+                    );
+                    let assign_msg = NexusMessage::agent_assigned(
+                        worker_id,
+                        ticket_id,
+                        &format!("{} has been assigned to work on {}", worker_id, ticket_id),
+                    );
+
+                    let wf_ok = if let Some(ref channel) = self.human_channel {
+                        match channel.notify(workflow_msg).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to send workflow notification");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    let assign_ok = if let Some(ref channel) = self.human_channel {
+                        match channel.notify(assign_msg).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to send assignment notification");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    info!(
+                        worker_id,
+                        ticket_id,
+                        human_channel = ?self.human_channel.is_some(),
+                        workflow_notification_sent = wf_ok,
+                        assignment_notification_sent = assign_ok,
+                        "📢 NEXUS → HUMAN: {} assigned to {} (workflow_sent={}, assignment_sent={})",
+                        ticket_id,
+                        worker_id,
+                        wf_ok,
+                        assign_ok
+                    );
 
                     let mut tickets: Vec<Ticket> =
                         store.get_typed(KEY_TICKETS).await.unwrap_or_default();

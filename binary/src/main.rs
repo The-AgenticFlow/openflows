@@ -3,9 +3,11 @@ mod nodes;
 mod state;
 
 use anyhow::Result;
+use nexus_chat::{run_chat_loop, ChatConfig};
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::nodes::{ForgeNode, LoreNode, NexusNode, VesselConfig, VesselNode};
@@ -101,9 +103,11 @@ async fn main() -> Result<()> {
     // 4. Build Flow - use orchestration/agent directory for personas
     let orchestrator_dir = std::env::current_dir()?;
     let registry_path = orchestrator_dir.join("orchestration/agent/registry.json");
-    let nexus = Arc::new(NexusNode::new(
+    let nexus = Arc::new(NexusNode::with_chat(
         orchestrator_dir.join("orchestration/agent/agents/nexus.agent.md"),
         registry_path.clone(),
+        store.clone(),
+        ChatConfig::from_env(),
     ));
     let forge = Arc::new(ForgeNode::new_with_registry(
         &workspace_dir,
@@ -165,11 +169,26 @@ async fn main() -> Result<()> {
         )
         .max_steps(20);
 
-    // 5. Run Flow
+    // 5. Start chat loop for receiving human messages
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let chat_config = ChatConfig::from_env();
+    if chat_config.enabled {
+        let store_clone = store.clone();
+        let config_clone = chat_config.clone();
+        tokio::spawn(async move {
+            run_chat_loop(store_clone, config_clone, shutdown_rx).await;
+        });
+        info!("NEXUS chat loop started - listening for human commands");
+    }
+
+    // 6. Run Flow
     info!("Starting Flow execution loop...");
     let _final_action = flow.run(&store).await?;
 
-    // 6. Results
+    // Signal chat loop to shutdown
+    let _ = shutdown_tx.send(()).await;
+
+    // 7. Results
     let final_slots: HashMap<String, WorkerSlot> =
         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 

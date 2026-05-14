@@ -8,9 +8,11 @@ use config::{
     ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
+use nexus_chat::{run_chat_loop, ChatConfig};
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::info;
 
 #[tokio::main]
@@ -63,7 +65,14 @@ async fn main() -> Result<()> {
     let orchestrator_dir = std::env::current_dir()?;
     std::env::set_var("ORCHESTRATOR_DIR", &orchestrator_dir);
 
-    // 3. Initialize Nodes
+    // 3. Initialize Shared Store (needed for NexusNode::with_chat)
+    let store = SharedStore::new_in_memory();
+    store.set("repository", serde_json::json!(repo)).await;
+    store.set(KEY_TICKETS, serde_json::json!([])).await;
+    store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
+    store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+
+    // 4. Initialize Nodes
     // NEXUS: Orchestrator that assigns work
     // ForgePairNode: Event-driven FORGE-SENTINEL pair with full review lifecycle
     // VesselNode: Merge gatekeeper - polls CI, merges PRs, emits ticket_merged events
@@ -77,7 +86,12 @@ async fn main() -> Result<()> {
         .join("agent")
         .join("registry.json");
 
-    let nexus = Arc::new(NexusNode::new(persona_path, registry_path.clone()));
+    let nexus = Arc::new(NexusNode::with_chat(
+        persona_path,
+        registry_path.clone(),
+        store.clone(),
+        ChatConfig::from_env(),
+    ));
     let forge_pair = Arc::new(ForgePairNode::new(&workspace_dir, &github_token));
     let vessel = Arc::new(VesselNode::from_env());
     let lore = Arc::new(LoreNode::new_with_registry(
@@ -103,7 +117,7 @@ async fn main() -> Result<()> {
     let flow = Flow::new("nexus")
         .add_node(
             "nexus",
-            nexus,
+            nexus.clone(),
             vec![
                 (ACTION_WORK_ASSIGNED, "forge_pair"),
                 (ACTION_MERGE_PRS, "vessel"),
@@ -141,14 +155,32 @@ async fn main() -> Result<()> {
             vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
         );
 
-    // 5. Initialize Shared Store
-    let store = SharedStore::new_in_memory();
-    store.set("repository", serde_json::json!(repo)).await;
+    // 5. Start chat loop for receiving human messages
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let chat_config = ChatConfig::from_env();
+    if chat_config.enabled {
+        let store_clone = store.clone();
+        let config_clone = chat_config.clone();
+        tokio::spawn(async move {
+            run_chat_loop(store_clone, config_clone, shutdown_rx).await;
+        });
+        info!("NEXUS chat loop started - listening for human commands");
 
-    // Initial tickets list - Nexus will fetch from GitHub if this is empty
-    store.set(KEY_TICKETS, serde_json::json!([])).await;
-    store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
-    store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+        // Background task: process human commands even when flow is at other nodes
+        let nexus_bg = nexus.clone();
+        let store_bg = store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(e) = nexus_bg.process_human_commands(&store_bg).await {
+                    tracing::warn!("Background human command processing error: {}", e);
+                }
+            }
+        });
+        info!("NEXUS background command processor started");
+    }
 
     // 6. Run Flow
     info!("Running orchestration loop for repository: {}", repo);
@@ -163,6 +195,9 @@ async fn main() -> Result<()> {
     info!("  - ticket_merged event emission");
 
     let final_action = flow.run(&store).await?;
+
+    // Signal chat loop to shutdown
+    let _ = shutdown_tx.send(()).await;
 
     info!("Orchestration flow halted with action: {}", final_action);
 

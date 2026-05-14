@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }
 config = { path = "../config" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -15,6 +15,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
