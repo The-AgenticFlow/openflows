@@ -201,6 +201,26 @@ openflows.on('exit', (code) => {
 
 ---
 
+## 📅 Roadmap
+
+We're building OpenFlows in public. See where we're going and how you can help:
+
+**[View Full Roadmap →](ROADMAP.md)**
+
+### Current Focus (May 2026)
+- 🔄 **PR-Issue Auto-close** — Enforce `Closes #N` in PRs
+- 🔄 **Milestone Awareness** — Sprint planning in NEXUS
+- 🔄 **10+ Contributors** — Following the Steinberger model
+
+### Up Next (Q2 2026)
+- ⏳ **AgentFlow Hub** — Marketplace for skills and plugins
+- ⏳ **Docker Images** — Multi-arch containers on ghcr.io
+- ⏳ **Install Script** — One-liner: `curl -sL https://get.openflows.dev | sh`
+
+**[See all milestones →](ROADMAP.md)**
+
+---
+
 ## ⚙️ How It Works (The Autonomous Flow)
 
 ```
