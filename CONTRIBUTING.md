@@ -3,7 +3,7 @@
 > Welcome! We're building the future of autonomous software development, and we need your help.
 
 [![Stars](https://img.shields.io/github/stars/The-AgenticFlow/OpenFlows?style=social)](https://github.com/The-AgenticFlow/OpenFlows/stargazers)
-[![Discord](https://img.shields.io/discord/123456789?color=7289da&label=discord&logo=discord&logoColor=white)](https://discord.gg/openflows)
+[![Discord](https://img.shields.io/discord/123456789?color=7289da&label=discord&logo=discord&logoColor=white)](https://discord.gg/Zf6PTQAgE)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## 🎯 What is OpenFlows?
@@ -260,7 +260,7 @@ Contributors will be:
 
 ## 💬 Get Help
 
-- **Discord**: [Join our community](https://discord.gg/openflows)
+- **Discord**: [Join our community](https://discord.gg/Zf6PTQAgE)
 - **GitHub Discussions**: [Ask questions](https://github.com/The-AgenticFlow/OpenFlows/discussions)
 - **Issues**: [Report bugs](https://github.com/The-AgenticFlow/OpenFlows/issues)
 
