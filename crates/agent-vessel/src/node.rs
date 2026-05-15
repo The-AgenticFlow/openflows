@@ -274,9 +274,21 @@ impl Node for VesselNode {
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, ticket_id).await;
 
-                    self.update_ticket_status(store, ticket_id, "merged").await;
-                    self.close_github_issue(store, ticket_id).await;
-                    self.remove_from_pending_prs(store, *pr_number).await;
+                    // Parallelize post-merge operations for reduced latency
+                    // Run GitHub issue close concurrently with store updates
+                    let ticket_id_clone = ticket_id.clone();
+                    let pr_number_val = *pr_number;
+                    tokio::join!(
+                        // GitHub API call - network I/O
+                        async {
+                            self.close_github_issue(store, &ticket_id_clone).await;
+                        },
+                        // Store operations - local I/O
+                        async {
+                            self.update_ticket_status(store, &ticket_id_clone, "merged").await;
+                            self.remove_from_pending_prs(store, pr_number_val).await;
+                        }
+                    );
 
                     if let Some(pr) = pending_prs
                         .iter()
@@ -795,6 +807,7 @@ impl VesselNode {
     }
 
     /// Process a single PR: poll CI → detect conflicts → resolve if possible → merge if green → return outcome.
+    /// For Docs PRs: short-circuit CI polling if conflicts detected to save time.
     async fn process_single_pr(
         &self,
         owner: &str,
@@ -810,6 +823,28 @@ impl VesselNode {
         };
 
         info!(pr_number, ticket_id = ?ticket_id, "Processing PR");
+
+        // Short-circuit for Docs PRs: check mergeability first to skip CI polling if conflicts exist
+        if Self::is_docs_pr(&pr_info) {
+            if pr_info.has_conflicts() {
+                warn!(
+                    pr_number,
+                    "Docs PR has conflicts — short-circuiting CI poll and closing"
+                );
+                return self.close_docs_pr_with_conflicts(owner, repo, &pr_info).await;
+            }
+            // Re-fetch PR to get fresh mergeability status if not yet computed
+            if pr_info.mergeable.is_none() {
+                let fresh_pr = self.client.get_pull_request(owner, repo, pr_number).await?;
+                if fresh_pr.has_conflicts() {
+                    warn!(
+                        pr_number,
+                        "Docs PR has conflicts (after re-fetch) — short-circuiting CI poll and closing"
+                    );
+                    return self.close_docs_pr_with_conflicts(owner, repo, &fresh_pr).await;
+                }
+            }
+        }
 
         let poll_result = self
             .poller
