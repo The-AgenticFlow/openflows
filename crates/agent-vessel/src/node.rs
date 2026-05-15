@@ -285,7 +285,8 @@ impl Node for VesselNode {
                         },
                         // Store operations - local I/O
                         async {
-                            self.update_ticket_status(store, &ticket_id_clone, "merged").await;
+                            self.update_ticket_status(store, &ticket_id_clone, "merged")
+                                .await;
                             self.remove_from_pending_prs(store, pr_number_val).await;
                         }
                     );
@@ -831,7 +832,9 @@ impl VesselNode {
                     pr_number,
                     "Docs PR has conflicts — short-circuiting CI poll and closing"
                 );
-                return self.close_docs_pr_with_conflicts(owner, repo, &pr_info).await;
+                return self
+                    .close_docs_pr_with_conflicts(owner, repo, &pr_info)
+                    .await;
             }
             // Re-fetch PR to get fresh mergeability status if not yet computed
             if pr_info.mergeable.is_none() {
@@ -841,7 +844,9 @@ impl VesselNode {
                         pr_number,
                         "Docs PR has conflicts (after re-fetch) — short-circuiting CI poll and closing"
                     );
-                    return self.close_docs_pr_with_conflicts(owner, repo, &fresh_pr).await;
+                    return self
+                        .close_docs_pr_with_conflicts(owner, repo, &fresh_pr)
+                        .await;
                 }
             }
         }
