@@ -1,0 +1,936 @@
+{
+  "version": "2.0.0",
+  "description": "AgentFlow Command Registry — single source of truth for all commands, actions, agents, routing, and human-interpretable commands.",
+  "agents": [
+    {
+      "id": "nexus",
+      "role": "orchestrator",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "accounts/fireworks/models/qwen3p6-plus",
+      "routing_key": "nexus-key",
+      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
+      "persona_file": "orchestration/agent/agents/nexus.agent.md",
+      "permissions": {
+        "allow": ["Read", "Write", "Bash", "Edit", "Slack"],
+        "deny": ["GitPush"]
+      },
+      "responsibilities": [
+        "Sprint orchestration and ticket assignment",
+        "Flow recovery (detecting and resuming broken pipelines)",
+        "Blocker classification and automated resolution",
+        "Command approval gating (security authority)",
+        "Human communication via Slack, Discord, and WhatsApp",
+        "Question/answer loop for ambiguity resolution",
+        "Real-time status broadcasting to human stakeholders",
+        "Human-initiated pause/resume/reroute handling",
+        "File ownership and conflict prevention"
+      ],
+      "commands": {
+        "human_to_nexus": [
+          {
+            "name": "pause",
+            "description": "Pause a ticket's workflow",
+            "syntax": "pause T-XXX",
+            "pattern_match": ["pause", "hold", "stop"],
+            "llm_action": "pause_workflow",
+            "required_fields": ["ticket_id"],
+            "example": "pause T-001"
+          },
+          {
+            "name": "resume",
+            "description": "Resume a paused ticket's workflow",
+            "syntax": "resume T-XXX",
+            "pattern_match": ["resume", "continue", "restart"],
+            "llm_action": "resume_workflow",
+            "required_fields": ["ticket_id"],
+            "example": "resume T-001"
+          },
+          {
+            "name": "approve",
+            "description": "Approve a worker's pending command",
+            "syntax": "approve [forge-X]",
+            "pattern_match": ["approve", "ok", "yes", "go ahead"],
+            "llm_action": "approve_command",
+            "required_fields": ["worker_id"],
+            "example": "approve forge-1"
+          },
+          {
+            "name": "reject",
+            "description": "Reject a worker's pending command",
+            "syntax": "reject [forge-X]",
+            "pattern_match": ["reject", "deny", "no", "stop", "block"],
+            "llm_action": "reject_command",
+            "required_fields": [],
+            "example": "reject forge-1"
+          },
+          {
+            "name": "block",
+            "description": "Block a worker from executing commands",
+            "syntax": "block forge-X [reason]",
+            "pattern_match": ["block"],
+            "llm_action": "block_agent",
+            "required_fields": ["worker_id"],
+            "example": "block forge-1 stuck on test failure"
+          },
+          {
+            "name": "reroute",
+            "description": "Reroute work from one worker to another",
+            "syntax": "reroute forge-X forge-Y",
+            "pattern_match": ["reroute", "reassign", "move", "transfer"],
+            "llm_action": "reroute_agent",
+            "required_fields": ["from_worker", "to_worker"],
+            "example": "reroute forge-1 forge-2"
+          },
+          {
+            "name": "assign",
+            "description": "Assign a worker to a ticket (single worker)",
+            "syntax": "assign forge-X [to T-XXX]",
+            "pattern_match": ["assign"],
+            "llm_action": "approve_command",
+            "required_fields": ["worker_id"],
+            "example": "assign forge-1 to T-001"
+          },
+          {
+            "name": "answer",
+            "description": "Answer a question about a ticket",
+            "syntax": "answer T-XXX <response>",
+            "pattern_match": ["answer"],
+            "llm_action": "answer_question",
+            "required_fields": ["ticket_id", "payload"],
+            "example": "answer T-001 yes"
+          },
+          {
+            "name": "status",
+            "description": "Query current system status",
+            "syntax": "status",
+            "pattern_match": ["status", "what", "how"],
+            "llm_action": "status_query",
+            "required_fields": [],
+            "example": "status"
+          }
+        ]
+      }
+    },
+    {
+      "id": "forge",
+      "role": "builder",
+      "cli": "claude",
+      "active": true,
+      "instances": 2,
+      "model_backend": "accounts/fireworks/models/qwen3p6-plus",
+      "routing_key": "forge-key",
+      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
+      "persona_file": "orchestration/agent/agents/forge.agent.md",
+      "permissions": {
+        "allow": ["Read", "Write", "Bash", "Edit", "GitPush", "MCP_Github"],
+        "deny": ["Slack"]
+      },
+      "responsibilities": [
+        "Implement ticket requirements as code",
+        "Write comprehensive tests",
+        "Create pull requests for review",
+        "Write STATUS.json with completion state",
+        "Follow CODING.md standards"
+      ],
+      "valid_status_values": [
+        "PR_OPENED",
+        "COMPLETE",
+        "BLOCKED",
+        "FUEL_EXHAUSTED",
+        "PENDING_REVIEW",
+        "AWAITING_SENTINEL_REVIEW",
+        "APPROVED_READY",
+        "SEGMENT_N_DONE"
+      ]
+    },
+    {
+      "id": "sentinel",
+      "role": "reviewer",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "accounts/fireworks/models/qwen3p6-plus",
+      "routing_key": "sentinel-key",
+      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
+      "persona_file": "orchestration/agent/agents/sentinel.agent.md",
+      "permissions": {
+        "allow": ["Read", "Bash", "Reviews", "MCP_Github"],
+        "deny": ["Write", "GitPush", "Edit", "Slack"]
+      },
+      "responsibilities": [
+        "Review FORGE's pull requests",
+        "Verify implementation matches ticket spec",
+        "Run static analysis and security checks",
+        "Post inline GitHub review comments",
+        "Write STATUS.json with review outcome"
+      ]
+    },
+    {
+      "id": "vessel",
+      "role": "devops",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "accounts/fireworks/models/qwen3p6-plus",
+      "routing_key": "vessel-key",
+      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
+      "persona_file": "orchestration/agent/agents/vessel.agent.md",
+      "permissions": {
+        "allow": ["Read", "Write", "Bash", "Actions"],
+        "deny": ["EditAppCode", "Slack"]
+      },
+      "responsibilities": [
+        "CI/CD pipeline triggering and polling",
+        "Deployment orchestration",
+        "Merge conflict detection and resolution",
+        "Branch update and rebase orchestration",
+        "Auto-rollback on deployment failure"
+      ]
+    },
+    {
+      "id": "lore",
+      "role": "documenter",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "accounts/fireworks/models/qwen3p6-plus",
+      "routing_key": "lore-key",
+      "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
+      "persona_file": "orchestration/agent/agents/lore.agent.md",
+      "permissions": {
+        "allow": ["Read", "Write", "Bash", "DocCommit"],
+        "deny": ["EditAppCode", "EditInfraCode", "Slack"]
+      },
+      "responsibilities": [
+        "Write ADRs for architectural decisions",
+        "Update CHANGELOG.md for deployments",
+        "Generate sprint retrospectives",
+        "Maintain documentation-as-code"
+      ]
+    }
+  ],
+  "actions": {
+    "description": "All valid Action strings that agents can return. These drive Flow routing.",
+    "nexus_actions": [
+      {
+        "action": "work_assigned",
+        "description": "NEXUS assigned a ticket to a FORGE worker",
+        "routes_to": "forge_pair",
+        "required_fields": ["assign_to", "ticket_id", "issue_url"]
+      },
+      {
+        "action": "merge_prs",
+        "description": "NEXUS detected unmerged PRs requiring VESSEL merge",
+        "routes_to": "vessel",
+        "required_fields": []
+      },
+      {
+        "action": "no_work",
+        "description": "No work available (triggers to stop after threshold)",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "approve_command",
+        "description": "NEXUS approved a worker's pending command",
+        "routes_to": "forge_pair",
+        "required_fields": ["assign_to"]
+      },
+      {
+        "action": "reject_command",
+        "description": "NEXUS rejected a worker's pending command",
+        "routes_to": "nexus",
+        "required_fields": []
+      }
+    ],
+    "forge_pair_actions": [
+      {
+        "action": "pr_opened",
+        "description": "FORGE opened a PR, ready for VESSEL merge",
+        "routes_to": "vessel",
+        "required_fields": []
+      },
+      {
+        "action": "failed",
+        "description": "FORGE pair failed, needs NEXUS intervention",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "suspended",
+        "description": "FORGE pair suspended, awaiting human",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "no_tickets",
+        "description": "No tickets available for FORGE pair",
+        "routes_to": "nexus",
+        "required_fields": []
+      }
+    ],
+    "vessel_actions": [
+      {
+        "action": "deployed",
+        "description": "VESSEL successfully merged and deployed",
+        "routes_to": "lore",
+        "required_fields": []
+      },
+      {
+        "action": "deploy_failed",
+        "description": "VESSEL deployment failed",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "ci_fix_needed",
+        "description": "CI failed, FORGE needs to fix",
+        "routes_to": "forge_pair",
+        "required_fields": []
+      },
+      {
+        "action": "merge_blocked",
+        "description": "Merge blocked, needs NEXUS intervention",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "conflicts_detected",
+        "description": "Merge conflicts detected, FORGE needs to resolve",
+        "routes_to": "forge_pair",
+        "required_fields": []
+      },
+      {
+        "action": "awaiting_human",
+        "description": "VESSEL needs human intervention",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "no_work",
+        "description": "No PRs to merge",
+        "routes_to": "nexus",
+        "required_fields": []
+      }
+    ],
+    "lore_actions": [
+      {
+        "action": "docs_complete",
+        "description": "LORE finished documentation updates",
+        "routes_to": "nexus",
+        "required_fields": []
+      },
+      {
+        "action": "no_work",
+        "description": "No documentation work available",
+        "routes_to": "nexus",
+        "required_fields": []
+      }
+    ]
+  },
+  "shared_store_keys": {
+    "description": "All SharedStore key names used across the system",
+    "keys": [
+      {
+        "key": "tickets",
+        "type": "Vec<Ticket>",
+        "description": "List of all GitHub issue tickets",
+        "used_by": ["nexus", "forge_pair", "vessel"]
+      },
+      {
+        "key": "worker_slots",
+        "type": "HashMap<String, WorkerSlot>",
+        "description": "Worker slot status map",
+        "used_by": ["nexus", "forge_pair"]
+      },
+      {
+        "key": "pending_prs",
+        "type": "Vec<Value>",
+        "description": "List of pending PRs awaiting merge",
+        "used_by": ["nexus", "vessel"]
+      },
+      {
+        "key": "command_gate",
+        "type": "HashMap<String, Value>",
+        "description": "Pending command approvals",
+        "used_by": ["nexus"]
+      },
+      {
+        "key": "documentation_queue",
+        "type": "Vec<Value>",
+        "description": "Documentation tasks for LORE",
+        "used_by": ["nexus", "lore"]
+      },
+      {
+        "key": "ci_readiness",
+        "type": "CiReadiness",
+        "description": "CI workflow readiness state",
+        "used_by": ["nexus"]
+      },
+      {
+        "key": "repository",
+        "type": "String",
+        "description": "GitHub repository identifier (owner/repo)",
+        "used_by": ["nexus"]
+      },
+      {
+        "key": "_no_work_count",
+        "type": "u32",
+        "description": "Consecutive no_work counter (triggers stop at threshold)",
+        "used_by": ["nexus"]
+      },
+      {
+        "key": "human_messages",
+        "type": "Vec<HumanMessage>",
+        "description": "Pending human messages from chat channels",
+        "used_by": ["nexus"]
+      }
+    ]
+  },
+  "ticket_statuses": {
+    "description": "All valid TicketStatus enum variants",
+    "terminal": [
+      {
+        "status": "open",
+        "description": "Ticket is unassigned and ready for work",
+        "fields": []
+      },
+      {
+        "status": "assigned",
+        "description": "Ticket is assigned to a worker",
+        "fields": ["worker_id"]
+      },
+      {
+        "status": "in_progress",
+        "description": "Ticket is actively being worked on",
+        "fields": ["worker_id"]
+      },
+      {
+        "status": "merged",
+        "description": "Fully complete, PR was merged",
+        "fields": ["worker_id", "pr_number"]
+      },
+      {
+        "status": "completed",
+        "description": "Implementation done, PR is open",
+        "fields": ["worker_id", "outcome"]
+      },
+      {
+        "status": "exhausted",
+        "description": "Ticket exceeded max retries",
+        "fields": ["worker_id", "attempts"]
+      },
+      {
+        "status": "awaiting_human",
+        "description": "Ticket needs human intervention",
+        "fields": ["worker_id", "reason", "attempts"]
+      }
+    ],
+    "non_terminal": [
+      {
+        "status": "failed",
+        "description": "Ticket failed but can be retried",
+        "fields": ["worker_id", "reason", "attempts"]
+      }
+    ]
+  },
+  "worker_statuses": {
+    "description": "All valid WorkerStatus enum variants",
+    "statuses": [
+      {
+        "status": "idle",
+        "description": "Worker is available for assignment",
+        "fields": []
+      },
+      {
+        "status": "assigned",
+        "description": "Worker has been assigned but not started",
+        "fields": ["ticket_id", "issue_url"]
+      },
+      {
+        "status": "working",
+        "description": "Worker is actively working",
+        "fields": ["ticket_id", "issue_url"]
+      },
+      {
+        "status": "done",
+        "description": "Worker completed its task (auto-recycled to idle)",
+        "fields": ["ticket_id", "outcome"]
+      },
+      {
+        "status": "suspended",
+        "description": "Worker is waiting for command approval",
+        "fields": ["ticket_id", "reason", "issue_url"]
+      }
+    ]
+  },
+  "llm_command_schema": {
+    "description": "Schema for LLM-interpreted human commands. The LLM must output JSON matching this structure.",
+    "fields": {
+      "action": {
+        "type": "string",
+        "description": "The command type (e.g., 'pause_workflow', 'reroute_agent')",
+        "required": true,
+        "enum": [
+          "pause_workflow",
+          "resume_workflow",
+          "approve_command",
+          "block_agent",
+          "reroute_agent",
+          "answer_question",
+          "status_query",
+          "general_message"
+        ]
+      },
+      "notes": {
+        "type": "string",
+        "description": "Additional context, parameters, or reason",
+        "required": true
+      },
+      "assign_to": {
+        "type": "string|null",
+        "description": "Worker ID for approve/block/reroute commands",
+        "required": false
+      },
+      "ticket_id": {
+        "type": "string|null",
+        "description": "Ticket ID (e.g., 'T-001')",
+        "required": false
+      },
+      "issue_url": {
+        "type": "string|null",
+        "description": "GitHub issue URL",
+        "required": false
+      }
+    },
+    "examples": [
+      {
+        "action": "pause_workflow",
+        "notes": "",
+        "assign_to": null,
+        "ticket_id": "T-001",
+        "issue_url": null
+      },
+      {
+        "action": "reroute_agent",
+        "notes": "forge-2",
+        "assign_to": "forge-1",
+        "ticket_id": null,
+        "issue_url": null
+      },
+      {
+        "action": "block_agent",
+        "notes": "stuck on test failure",
+        "assign_to": "forge-1",
+        "ticket_id": null,
+        "issue_url": null
+      },
+      {
+        "action": "general_message",
+        "notes": "",
+        "assign_to": null,
+        "ticket_id": null,
+        "issue_url": null
+      }
+    ]
+  },
+  "agent_decision_schema": {
+    "description": "Schema for AgentDecision returned by AgentRunner.run(). All agents must output JSON matching this structure.",
+    "fields": {
+      "action": {
+        "type": "string",
+        "description": "The PocketFlow Action to return",
+        "required": true,
+        "examples": ["work_assigned", "merge_prs", "no_work", "pr_opened", "deployed", "docs_complete"]
+      },
+      "notes": {
+        "type": "string",
+        "description": "Human-readable notes for logging or downstream agents",
+        "required": true
+      },
+      "assign_to": {
+        "type": "string|null",
+        "description": "Worker ID for work_assigned or approve_command actions",
+        "required": false
+      },
+      "ticket_id": {
+        "type": "string|null",
+        "description": "Ticket ID for work_assigned actions",
+        "required": false
+      },
+      "issue_url": {
+        "type": "string|null",
+        "description": "GitHub issue URL for work_assigned actions",
+        "required": false
+      }
+    }
+  },
+  "flow_routing": {
+    "description": "Complete flow routing table mapping actions to target nodes",
+    "nodes": {
+      "nexus": {
+        "routes": {
+          "work_assigned": "forge_pair",
+          "merge_prs": "vessel",
+          "no_work": "nexus",
+          "approve_command": "forge_pair",
+          "reject_command": "nexus"
+        }
+      },
+      "forge_pair": {
+        "routes": {
+          "pr_opened": "vessel",
+          "failed": "nexus",
+          "suspended": "nexus",
+          "no_tickets": "nexus"
+        }
+      },
+      "vessel": {
+        "routes": {
+          "deployed": "lore",
+          "deploy_failed": "nexus",
+          "ci_fix_needed": "forge_pair",
+          "merge_blocked": "nexus",
+          "conflicts_detected": "forge_pair",
+          "awaiting_human": "nexus",
+          "no_work": "nexus"
+        }
+      },
+      "lore": {
+        "routes": {
+          "docs_complete": "nexus",
+          "no_work": "nexus"
+        }
+      }
+    }
+  },
+  "pipeline_phases": {
+    "description": "The AgentFlow pipeline phases and their transitions",
+    "phases": [
+      {
+        "phase": "Implementation",
+        "agent": "FORGE-SENTINEL pair",
+        "trigger": "work_assigned from NEXUS",
+        "completion_signal": "PR opened on GitHub (pr_opened action)",
+        "next_phase": "Merge"
+      },
+      {
+        "phase": "Merge",
+        "agent": "VESSEL",
+        "trigger": "merge_prs or pr_opened",
+        "completion_signal": "PR merged, CI green (deployed action)",
+        "next_phase": "Documentation"
+      },
+      {
+        "phase": "Documentation",
+        "agent": "LORE",
+        "trigger": "deployed from VESSEL",
+        "completion_signal": "ADRs written, CHANGELOG updated (docs_complete action)",
+        "next_phase": "Done"
+      },
+      {
+        "phase": "Done",
+        "agent": "—",
+        "trigger": "docs_complete from LORE",
+        "completion_signal": "Ticket status = merged",
+        "next_phase": "—"
+      }
+    ]
+  },
+  "ci_readiness": {
+    "description": "CI readiness states and their meanings",
+    "states": [
+      {
+        "state": "ready",
+        "description": "CI workflows exist in repository, proceed normally"
+      },
+      {
+        "state": "missing",
+        "description": "No CI workflows found, CI setup ticket must be assigned first"
+      },
+      {
+        "state": "setup_in_progress",
+        "description": "CI setup is being worked on, only assign CI setup tickets"
+      }
+    ],
+    "priority_rule": "If ci_readiness is 'missing' or ci_must_go_first is true, ONLY assign CI setup tickets (IDs starting with T-CI-)"
+  },
+  "human_command_patterns": {
+    "description": "All patterns that trigger human command interpretation in NEXUS",
+    "pattern_rules": [
+      {
+        "command": "pause",
+        "patterns": ["pause", "hold", "stop"],
+        "fuzzy_patterns": ["paus", "pausw"],
+        "required_parts": 1,
+        "extract": "ticket_id",
+        "action": "pause_workflow"
+      },
+      {
+        "command": "resume",
+        "patterns": ["resume", "continue", "restart"],
+        "fuzzy_patterns": ["resum"],
+        "required_parts": 1,
+        "extract": "ticket_id",
+        "action": "resume_workflow"
+      },
+      {
+        "command": "approve",
+        "patterns": ["approve", "ok", "yes", "go ahead"],
+        "fuzzy_patterns": ["approv"],
+        "required_parts": 0,
+        "extract": "worker_id",
+        "action": "approve_command"
+      },
+      {
+        "command": "reject",
+        "patterns": ["reject", "deny", "no", "stop", "block"],
+        "fuzzy_patterns": ["reject", "deny"],
+        "required_parts": 0,
+        "extract": "worker_id",
+        "action": "reject_command"
+      },
+      {
+        "command": "block",
+        "patterns": ["block"],
+        "fuzzy_patterns": ["bloc"],
+        "required_parts": 2,
+        "extract": "worker_id + reason",
+        "action": "block_agent"
+      },
+      {
+        "command": "reroute",
+        "patterns": ["reroute", "reassign", "move", "transfer"],
+        "fuzzy_patterns": ["rerout", "reassign", "assign"],
+        "required_parts": 3,
+        "extract": "from_worker + to_worker",
+        "action": "reroute_agent"
+      },
+      {
+        "command": "assign",
+        "patterns": ["assign"],
+        "fuzzy_patterns": ["assigne", "assigning"],
+        "required_parts": 2,
+        "extract": "worker_id + optional ticket_id",
+        "action": "approve_command"
+      },
+      {
+        "command": "answer",
+        "patterns": ["answer"],
+        "fuzzy_patterns": ["answ"],
+        "required_parts": 2,
+        "extract": "ticket_id + answer",
+        "action": "answer_question"
+      }
+    ]
+  },
+  "worker_id_normalization": {
+    "description": "Rules for normalizing informal worker IDs",
+    "rules": [
+      {
+        "input_pattern": "forge1",
+        "output": "forge-1",
+        "description": "Insert hyphen between letters and trailing digits"
+      },
+      {
+        "input_pattern": "forge 1",
+        "output": "forge-1",
+        "description": "Join space-separated worker name and number"
+      },
+      {
+        "input_pattern": "forge-1",
+        "output": "forge-1",
+        "description": "Already normalized, no change"
+      }
+    ]
+  },
+  "notification_messages": {
+    "description": "All NexusMessage types sent to human operators",
+    "types": [
+      {
+        "type": "WorkflowStarted",
+        "fields": ["ticket_id", "worker_id", "content", "metadata.issue_url"],
+        "description": "NEXUS started a workflow"
+      },
+      {
+        "type": "AgentAssigned",
+        "fields": ["worker_id", "ticket_id", "content"],
+        "description": "Worker assigned to a ticket"
+      },
+      {
+        "type": "AgentCompleted",
+        "fields": ["worker_id", "ticket_id", "content"],
+        "description": "Worker completed a ticket"
+      },
+      {
+        "type": "WorkflowError",
+        "fields": ["worker_id", "ticket_id", "content"],
+        "description": "Error occurred in workflow"
+      },
+      {
+        "type": "QuestionToHuman",
+        "fields": ["ticket_id", "content", "metadata.options"],
+        "description": "NEXUS needs human input"
+      },
+      {
+        "type": "StatusUpdate",
+        "fields": ["content"],
+        "description": "General status broadcast"
+      },
+      {
+        "type": "ApprovalRequest",
+        "fields": ["worker_id", "content", "metadata.command", "metadata.reason"],
+        "description": "Worker command awaiting approval"
+      }
+    ]
+  },
+  "chat_channels": {
+    "description": "Supported human communication channels",
+    "channels": [
+      {
+        "type": "Slack",
+        "config_vars": ["NEXUS_CHAT_SLACK_BOT_TOKEN", "NEXUS_CHAT_SLACK_CHANNEL_ID", "NEXUS_CHAT_SLACK_SIGNING_SECRET"],
+        "description": "Slack bot integration"
+      },
+      {
+        "type": "Discord",
+        "config_vars": ["NEXUS_CHAT_DISCORD_BOT_TOKEN", "NEXUS_CHAT_DISCORD_CHANNEL_ID"],
+        "description": "Discord bot integration"
+      },
+      {
+        "type": "WhatsApp",
+        "config_vars": ["NEXUS_CHAT_WHATSAPP_API_KEY", "NEXUS_CHAT_WHATSAPP_PHONE_NUMBER", "NEXUS_CHAT_WHATSAPP_API_URL"],
+        "description": "WhatsApp Business API integration"
+      }
+    ],
+    "dev_mode": {
+      "description": "When NEXUS_CHAT_DEV_MODE=true, uses MockChatClient for testing",
+      "config_var": "NEXUS_CHAT_DEV_MODE"
+    },
+    "enable_flag": "NEXUS_CHAT_ENABLED"
+  },
+  "environment_variables": {
+    "description": "All environment variables used by AgentFlow",
+    "required": [
+      {
+        "var": "GITHUB_REPOSITORY",
+        "description": "GitHub repository in owner/repo format",
+        "example": "The-AgenticFlow/template-counterapp"
+      }
+    ],
+    "agent_tokens": [
+      {
+        "var": "AGENT_NEXUS_GITHUB_TOKEN",
+        "description": "GitHub token for NEXUS orchestrator"
+      },
+      {
+        "var": "AGENT_FORGE_GITHUB_TOKEN",
+        "description": "GitHub token for FORGE builder"
+      },
+      {
+        "var": "AGENT_SENTINEL_GITHUB_TOKEN",
+        "description": "GitHub token for SENTINEL reviewer"
+      },
+      {
+        "var": "AGENT_VESSEL_GITHUB_TOKEN",
+        "description": "GitHub token for VESSEL devops"
+      },
+      {
+        "var": "AGENT_LORE_GITHUB_TOKEN",
+        "description": "GitHub token for LORE documenter"
+      }
+    ],
+    "fallback": [
+      {
+        "var": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "description": "Fallback token when agent-specific token not configured"
+      }
+    ],
+    "llm": [
+      {
+        "var": "LLM_PROVIDER",
+        "description": "LLM provider name (default: openai)",
+        "default": "openai"
+      },
+      {
+        "var": "ANTHROPIC_API_KEY",
+        "description": "Anthropic API key (for direct Anthropic calls)"
+      },
+      {
+        "var": "OPENAI_API_KEY",
+        "description": "OpenAI API key (for direct OpenAI calls)"
+      },
+      {
+        "var": "FIREWORKS_API_KEY",
+        "description": "Fireworks AI API key (for Fireworks model calls)"
+      },
+      {
+        "var": "GEMINI_API_KEY",
+        "description": "Google Gemini API key (for Gemini model calls)"
+      }
+    ],
+    "proxy": [
+      {
+        "var": "PROXY_URL",
+        "description": "LiteLLM proxy URL (enables proxy-based routing)"
+      }
+    ],
+    "chat": [
+      {
+        "var": "NEXUS_CHAT_ENABLED",
+        "description": "Enable human chat channels (default: false)",
+        "default": "false"
+      },
+      {
+        "var": "NEXUS_CHAT_DEV_MODE",
+        "description": "Use mock chat client for testing (default: false)",
+        "default": "false"
+      },
+      {
+        "var": "NEXUS_CHAT_SLACK_BOT_TOKEN",
+        "description": "Slack bot OAuth token"
+      },
+      {
+        "var": "NEXUS_CHAT_SLACK_CHANNEL_ID",
+        "description": "Slack channel ID"
+      },
+      {
+        "var": "NEXUS_CHAT_SLACK_SIGNING_SECRET",
+        "description": "Slack signing secret"
+      },
+      {
+        "var": "NEXUS_CHAT_DISCORD_BOT_TOKEN",
+        "description": "Discord bot token"
+      },
+      {
+        "var": "NEXUS_CHAT_DISCORD_CHANNEL_ID",
+        "description": "Discord channel ID"
+      },
+      {
+        "var": "NEXUS_CHAT_WHATSAPP_API_KEY",
+        "description": "WhatsApp Business API key"
+      },
+      {
+        "var": "NEXUS_CHAT_WHATSAPP_PHONE_NUMBER",
+        "description": "WhatsApp phone number"
+      },
+      {
+        "var": "NEXUS_CHAT_WHATSAPP_API_URL",
+        "description": "WhatsApp API URL (default: https://graph.facebook.com/v18.0)",
+        "default": "https://graph.facebook.com/v18.0"
+      }
+    ],
+    "paths": [
+      {
+        "var": "AGENTFLOW_WORKSPACE_ROOT",
+        "description": "Root directory for workspace (set automatically by agentflow binary)"
+      },
+      {
+        "var": "ORCHESTRATOR_DIR",
+        "description": "Directory containing orchestration config (set automatically)"
+      }
+    ]
+  }
+}

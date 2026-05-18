@@ -1091,10 +1091,31 @@ impl NexusNode {
         {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 3 {
-                // Try to read worker IDs allowing "forge 1" → "forge-1" (space-separated digit)
+                // Try to read two worker IDs (reroute case): "reroute forge-1 forge-2"
                 let (from_worker, to_worker) = extract_two_workers(&parts);
                 if from_worker.contains('-') && to_worker.contains('-') {
                     return Some(HumanCommand::reroute_agent(&from_worker, &to_worker, &msg.user_id, &msg.channel_id));
+                }
+
+                // Single worker assignment case: "assign forge2 to a ticket" or "assign forge-1 to T-001"
+                // Try to extract one worker ID and an optional ticket ID
+                if parts.len() >= 2 {
+                    let worker_id = normalize_worker_id(parts[1]);
+                    if worker_id.starts_with("forge-") || worker_id.starts_with("agent-") {
+                        let ticket_id = extract_ticket_id(text);
+                        // For single worker assignment, we'll use approve_command as the command type
+                        // since it's the closest match - approving a worker to work on something
+                        return Some(HumanCommand {
+                            command: MessageType::ApproveCommand,
+                            ticket_id,
+                            worker_id: Some(worker_id),
+                            payload: Some("assigned by human".to_string()),
+                            user_id: msg.user_id.clone(),
+                            channel_id: msg.channel_id.clone(),
+                            thread_ts: None,
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
                 }
             }
         }
@@ -1129,35 +1150,37 @@ impl NexusNode {
 
     async fn interpret_with_llm(&self, text: &str, msg: &HumanMessage) -> Option<HumanCommand> {
         // Build a prompt asking the LLM to interpret the message
+        // Output must match AgentDecision schema: {action, notes, assign_to, ticket_id, issue_url}
         let prompt = format!(
             r#"You are NEXUS, interpreting a message from a human operator.
 Parse the following message into a structured command.
 
 Human message: "{}"
 
-Available command types and required fields:
-- pause_workflow: needs ticket_id (string, e.g. "T-001")
-- resume_workflow: needs ticket_id (string)
-- approve_command: needs worker_id (string, e.g. "forge-1")
-- block_agent: needs worker_id (string), optional reason in payload (string)
-- reroute_agent: needs from_worker in worker_id (string), to_worker in payload (string)
-- answer_question: needs ticket_id (string), answer in payload (string)
+Available action types and required fields:
+- pause_workflow: set ticket_id (string, e.g. "T-001")
+- resume_workflow: set ticket_id (string)
+- approve_command: set assign_to to worker_id (string, e.g. "forge-1")
+- block_agent: set assign_to to worker_id (string), put reason in notes (string)
+- reroute_agent: set assign_to to from_worker (string, e.g. "forge-1"), put to_worker in notes (string, e.g. "forge-2")
+- answer_question: set ticket_id (string), put answer in notes (string)
 - status_query: no fields needed
-- general_message: no fields needed
+- general_message: no fields needed (use when message is not a command)
 
 RULES:
 1. ALL field values must be simple strings or null. NEVER use nested JSON objects.
-2. For reroute_agent, put the source worker in "worker_id" and destination worker in "payload".
+2. For reroute_agent, put the source worker in "assign_to" and destination worker in "notes".
 3. If a worker is mentioned as "forge 1", normalize it to "forge-1".
 4. If the message is vague or missing required fields, use general_message.
+5. Put any additional context or parameters in the "notes" field.
 
-Respond with ONLY a JSON object. No markdown, no explanations.
+Respond with ONLY a JSON object matching this schema. No markdown, no explanations.
 
 Example valid responses:
-{{"command_type": "pause_workflow", "ticket_id": "T-001", "worker_id": null, "payload": null}}
-{{"command_type": "reroute_agent", "ticket_id": null, "worker_id": "forge-1", "payload": "forge-2"}}
-{{"command_type": "block_agent", "ticket_id": null, "worker_id": "forge-1", "payload": "stuck on test failure"}}
-{{"command_type": "general_message", "ticket_id": null, "worker_id": null, "payload": null}}"#,
+{{"action": "pause_workflow", "notes": "", "assign_to": null, "ticket_id": "T-001", "issue_url": null}}
+{{"action": "reroute_agent", "notes": "forge-2", "assign_to": "forge-1", "ticket_id": null, "issue_url": null}}
+{{"action": "block_agent", "notes": "stuck on test failure", "assign_to": "forge-1", "ticket_id": null, "issue_url": null}}
+{{"action": "general_message", "notes": "", "assign_to": null, "ticket_id": null, "issue_url": null}}"#,
             text
         );
 
@@ -1234,10 +1257,28 @@ Example valid responses:
         });
 
         let decision: AgentDecision = runner.run(&persona, context, 5).await?;
-        let notes = &decision.notes;
 
-        // Try to parse the notes as JSON
-        serde_json::from_str(notes).map_err(|e| anyhow::anyhow!("Failed to parse LLM response as JSON: {}", e))
+        // decision.action contains the command type (e.g. "pause_workflow")
+        // decision.notes contains additional context or parameters
+        // decision.assign_to contains worker_id when applicable
+        // decision.ticket_id contains ticket_id when applicable
+        let mut result = serde_json::Map::new();
+        result.insert("action".to_string(), Value::String(decision.action.clone()));
+        result.insert("notes".to_string(), Value::String(decision.notes.clone()));
+        result.insert(
+            "assign_to".to_string(),
+            decision.assign_to.map(Value::String).unwrap_or(Value::Null),
+        );
+        result.insert(
+            "ticket_id".to_string(),
+            decision.ticket_id.map(Value::String).unwrap_or(Value::Null),
+        );
+        result.insert(
+            "issue_url".to_string(),
+            decision.issue_url.map(Value::String).unwrap_or(Value::Null),
+        );
+
+        Ok(Value::Object(result))
     }
 }
 
