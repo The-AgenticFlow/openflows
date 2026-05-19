@@ -4,7 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
+    AgentDef, Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
+    ACTION_NO_WORK,
 };
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
@@ -558,6 +559,120 @@ impl NexusNode {
         }
     }
 
+    /// Sync work assignment to GitHub by assigning the issue to the forge worker,
+    /// adding a comment indicating assignment, and optionally adding labels.
+    /// The forge worker's GitHub username is loaded from the agent definition (forge.agent.md).
+    async fn sync_assignment_to_github(
+        &self,
+        worker_id: &str,
+        ticket_id: &str,
+        issue_url: &str,
+    ) -> Result<()> {
+        // Parse owner/repo from issue URL and extract issue number
+        // Expected format: https://github.com/{owner}/{repo}/issues/{number}
+        let url_parts: Vec<&str> = issue_url.split('/').collect();
+        if url_parts.len() < 2 {
+            anyhow::bail!("Invalid issue URL format: {}", issue_url);
+        }
+
+        // Extract owner, repo, and issue number from URL
+        let repo_idx = url_parts.iter().position(|&p| p == "github.com");
+        let (owner, repo, issue_number) = match repo_idx {
+            Some(idx) if url_parts.len() > idx + 3 => {
+                let owner = url_parts[idx + 1];
+                let repo = url_parts[idx + 2];
+                // Issue number is the last component
+                let number = url_parts
+                    .last()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("Could not parse issue number from URL"))?;
+                (owner, repo, number)
+            }
+            _ => anyhow::bail!("Could not parse owner/repo from issue URL: {}", issue_url),
+        };
+
+        let token = match self.resolve_github_token() {
+            Ok(t) => t,
+            Err(e) => {
+                anyhow::bail!("GitHub token not configured: {}", e);
+            }
+        };
+
+        let client = github::GithubRestClient::new(&token);
+
+        // Load the agent definition to get the GitHub username for the worker
+        // Worker IDs are typically in format "forge-1", "forge-2", etc.
+        let agent_type = worker_id.split('-').next().unwrap_or("forge");
+        let agent_def_path = self
+            .registry_path
+            .parent()
+            .map(|p| p.join("agents").join(format!("{}.agent.md", agent_type)))
+            .unwrap_or_else(|| {
+                PathBuf::from(format!(
+                    "orchestration/agent/agents/{}.agent.md",
+                    agent_type
+                ))
+            });
+
+        let github_username = match AgentDef::load(&agent_def_path) {
+            Ok(def) => def.github.trim().to_string(),
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    agent_type,
+                    path = %agent_def_path.display(),
+                    error = %e,
+                    "Failed to load agent definition — using empty GitHub username"
+                );
+                String::new()
+            }
+        };
+
+        // Only attempt assignment if a valid GitHub username is configured
+        let assignee_display = if !github_username.is_empty() {
+            match client
+                .assign_issue(owner, repo, issue_number, &github_username)
+                .await
+            {
+                Ok(_) => github_username.clone(),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    // Check if it's a 422 validation error (invalid assignee)
+                    if err_str.contains("422") || err_str.contains("Validation Failed") {
+                        warn!(
+                            worker_id,
+                            ticket_id,
+                            github_username,
+                            error = %e,
+                            "GitHub user '{}' is not a valid assignee for this repository — skipping assignment",
+                            github_username
+                        );
+                        // Continue without failing - assignment is not critical
+                        github_username.clone()
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            warn!(
+                worker_id,
+                ticket_id, "No GitHub username configured for worker — skipping assignment"
+            );
+            "FORGE".to_string()
+        };
+
+        info!(
+            worker_id,
+            ticket_id,
+            issue_url,
+            assignee = assignee_display,
+            "Successfully synced assignment to GitHub"
+        );
+
+        Ok(())
+    }
+
     fn ensure_ci_setup_ticket(
         &self,
         _store: &SharedStore,
@@ -1003,6 +1118,22 @@ impl Node for NexusNode {
                             .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
                             .await;
                         info!(worker_id, ticket_id, issue_url = ?decision.issue_url, "Nexus: Store updated with NEW worker assignment");
+                    }
+
+                    // Sync assignment to GitHub: assign issue, add comment, and label
+                    if let Some(issue_url) = &decision.issue_url {
+                        if let Err(e) = self
+                            .sync_assignment_to_github(worker_id, ticket_id, issue_url)
+                            .await
+                        {
+                            warn!(
+                                worker_id,
+                                ticket_id,
+                                issue_url,
+                                error = %e,
+                                "Failed to sync assignment to GitHub — continuing anyway"
+                            );
+                        }
                     }
                 }
             }
