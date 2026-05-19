@@ -51,6 +51,10 @@ pub struct CiPollConfig {
     pub interval_secs: u64,
     /// Maximum number of poll attempts before timeout
     pub max_attempts: u32,
+    /// Per-repository polling interval overrides (repo_name -> interval_secs)
+    /// Allows faster polling for repos with known-fast CI
+    #[serde(default)]
+    pub repo_intervals: std::collections::HashMap<String, u64>,
 }
 
 impl Default for CiPollConfig {
@@ -58,7 +62,19 @@ impl Default for CiPollConfig {
         Self {
             interval_secs: 10,
             max_attempts: 60, // 10 minutes total
+            repo_intervals: std::collections::HashMap::new(),
         }
+    }
+}
+
+impl CiPollConfig {
+    /// Get the polling interval for a specific repository.
+    /// Returns the per-repo override if configured, otherwise the default interval.
+    pub fn interval_for_repo(&self, repo: &str) -> u64 {
+        self.repo_intervals
+            .get(repo)
+            .copied()
+            .unwrap_or(self.interval_secs)
     }
 }
 
