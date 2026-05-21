@@ -94,7 +94,7 @@ impl WhatsAppPlugin {
 
         let response = self
             .client
-            .post(&format!("{}/{}/messages", self.api_url, self.phone_number))
+            .post(format!("{}/{}/messages", self.api_url, self.phone_number))
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/json")
             .json(&json!({

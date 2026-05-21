@@ -24,10 +24,11 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
-  agent-team:
+  openflows:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: openflows
     ports:
       - "3000:3000"
     volumes:

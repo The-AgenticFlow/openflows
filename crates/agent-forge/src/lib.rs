@@ -346,6 +346,22 @@ impl BatchNode for ForgeNode {
 
                         let pr_number = res["pr_number"].as_u64().unwrap_or(0);
                         let branch = res["branch"].as_str().unwrap_or("");
+
+                        // Emit notification event for bridge
+                        store
+                            .emit(
+                                "forge",
+                                "work_completed",
+                                json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "outcome": outcome,
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                }),
+                            )
+                            .await;
+
                         if pr_number > 0 {
                             opened_prs.push(json!({
                                 "number": pr_number,
@@ -377,6 +393,75 @@ impl BatchNode for ForgeNode {
                             issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
                         };
                         command_gate.insert(worker_id.to_string(), res.clone());
+
+                        // Emit notification event for bridge
+                        store
+                            .emit(
+                                "forge",
+                                "work_suspended",
+                                json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "reason": reason,
+                                }),
+                            )
+                            .await;
+                    }
+                    "fuel_exhausted" => {
+                        let reason = res["reason"].as_str().unwrap_or("timeout");
+                        warn!(
+                            worker = worker_id,
+                            ticket = ticket_id,
+                            reason,
+                            "Fuel exhausted"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        all_success = false;
+
+                        // Emit notification event for bridge
+                        store
+                            .emit(
+                                "forge",
+                                "fuel_exhausted",
+                                json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "reason": reason,
+                                }),
+                            )
+                            .await;
+
+                        let prev_attempts = tickets
+                            .iter()
+                            .find(|t| t.id == ticket_id)
+                            .map(|t| t.attempts)
+                            .unwrap_or(0)
+                            + 1;
+                        if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                            ticket_updates.push((
+                                ticket_id.to_string(),
+                                TicketStatus::Exhausted {
+                                    worker_id: worker_id.to_string(),
+                                    attempts: prev_attempts,
+                                },
+                            ));
+                        } else {
+                            ticket_updates.push((
+                                ticket_id.to_string(),
+                                TicketStatus::Failed {
+                                    worker_id: worker_id.to_string(),
+                                    reason: "fuel_exhausted".to_string(),
+                                    attempts: prev_attempts,
+                                },
+                            ));
+                        }
+                        if let Err(e) =
+                            worktree_mgr.remove_worktree_for_ticket(worker_id, ticket_id)
+                        {
+                            warn!(worker = worker_id, error = %e, "Failed to cleanup worktree");
+                        } else {
+                            info!(worker = worker_id, "Worktree cleaned up");
+                        }
                     }
                     "idle" => {}
                     _ => {
@@ -395,6 +480,19 @@ impl BatchNode for ForgeNode {
                             .unwrap_or(0)
                             + 1;
                         if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                            // Emit notification for exhausted ticket
+                            store
+                                .emit(
+                                    "forge",
+                                    "ticket_exhausted",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "attempts": prev_attempts,
+                                    }),
+                                )
+                                .await;
+
                             ticket_updates.push((
                                 ticket_id.to_string(),
                                 TicketStatus::Exhausted {
@@ -403,6 +501,19 @@ impl BatchNode for ForgeNode {
                                 },
                             ));
                         } else {
+                            // Emit notification for failed work
+                            store
+                                .emit(
+                                    "forge",
+                                    "work_failed",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": outcome,
+                                    }),
+                                )
+                                .await;
+
                             ticket_updates.push((
                                 ticket_id.to_string(),
                                 TicketStatus::Failed {
@@ -1421,11 +1532,32 @@ impl BatchNode for ForgePairNode {
 
         let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token);
 
-        let mut pair = ForgeSentinelPair::new(config);
-        let outcome = pair
-            .run(&ticket)
-            .await
-            .map_err(|e| anyhow!("Pair lifecycle failed: {:#}", e))?;
+        // Run the pair lifecycle inside a blocking task. The pair lifecycle uses a
+        // SharedDirWatcher (inotify/std::sync::mpsc) and runs a long-lived event loop
+        // that holds the async task. When multiple pairs run concurrently via join_all
+        // on the same tokio runtime, the first pair's event loop starves the second.
+        // Using spawn_blocking with a current-thread runtime gives each pair its own
+        // thread and reactor, preventing starvation and allowing true parallelism.
+        let config_clone = config.clone();
+        let ticket_clone = ticket.clone();
+
+        let handle = tokio::task::spawn_blocking(move || -> Result<PairOutcome> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow!("Failed to create current-thread runtime in spawn_blocking: {}", e))?;
+
+            rt.block_on(async {
+                let mut pair = ForgeSentinelPair::new(config_clone);
+                pair.run(&ticket_clone).await
+            })
+        });
+
+        let outcome = match handle.await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Err(anyhow!("Pair lifecycle failed: {:#}", e)),
+            Err(e) => return Err(anyhow!("Pair task join error: {}", e)),
+        };
 
         match outcome {
             PairOutcome::PrOpened {
@@ -1601,6 +1733,22 @@ impl BatchNode for ForgePairNode {
                         // Add PR to pending_prs for VESSEL
                         let pr_number = res["pr_number"].as_u64().unwrap_or(0);
                         let branch = res["branch"].as_str().unwrap_or("");
+
+                        // Emit notification event for bridge
+                        store
+                            .emit(
+                                "forge",
+                                "work_completed",
+                                json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "outcome": "pr_opened",
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                }),
+                            )
+                            .await;
+
                         if pr_number > 0 {
                             opened_prs.push(json!({
                                 "number": pr_number,
@@ -1625,6 +1773,19 @@ impl BatchNode for ForgePairNode {
                             issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
                         };
                         command_gate.insert(worker_id.to_string(), res.clone());
+
+                        // Emit notification event for bridge
+                        store
+                            .emit(
+                                "forge",
+                                "work_suspended",
+                                json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "reason": reason,
+                                }),
+                            )
+                            .await;
                     }
                     "idle" => {}
                     "fuel_exhausted" => {
@@ -1659,10 +1820,39 @@ impl BatchNode for ForgePairNode {
                                     "worker_id": worker_id,
                                     "pr_url": pr_url,
                                 }));
+
+                                // Emit notification — PR found despite fuel exhaustion
+                                store
+                                    .emit(
+                                        "forge",
+                                        "work_completed",
+                                        json!({
+                                            "worker_id": worker_id,
+                                            "ticket_id": ticket_id,
+                                            "outcome": "pr_opened",
+                                            "pr_number": pr_number,
+                                            "branch": branch,
+                                        }),
+                                    )
+                                    .await;
                             }
                             _ => {
                                 slot.status = WorkerStatus::Idle;
                                 all_success = false;
+
+                                // Emit fuel exhausted notification
+                                store
+                                    .emit(
+                                        "forge",
+                                        "fuel_exhausted",
+                                        json!({
+                                            "worker_id": worker_id,
+                                            "ticket_id": ticket_id,
+                                            "reason": "fuel_exhausted",
+                                        }),
+                                    )
+                                    .await;
+
                                 let prev_attempts = tickets
                                     .iter()
                                     .find(|t| t.id == ticket_id)
@@ -1670,6 +1860,19 @@ impl BatchNode for ForgePairNode {
                                     .unwrap_or(0)
                                     + 1;
                                 if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                                    // Emit exhausted notification
+                                    store
+                                        .emit(
+                                            "forge",
+                                            "ticket_exhausted",
+                                            json!({
+                                                "worker_id": worker_id,
+                                                "ticket_id": ticket_id,
+                                                "attempts": prev_attempts,
+                                            }),
+                                        )
+                                        .await;
+
                                     ticket_updates.push((
                                         ticket_id.to_string(),
                                         TicketStatus::Exhausted {
@@ -1706,6 +1909,19 @@ impl BatchNode for ForgePairNode {
                             .unwrap_or(0)
                             + 1;
                         if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                            // Emit exhausted notification
+                            store
+                                .emit(
+                                    "forge",
+                                    "ticket_exhausted",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "attempts": prev_attempts,
+                                    }),
+                                )
+                                .await;
+
                             ticket_updates.push((
                                 ticket_id.to_string(),
                                 TicketStatus::Exhausted {
@@ -1714,6 +1930,19 @@ impl BatchNode for ForgePairNode {
                                 },
                             ));
                         } else {
+                            // Emit failed notification
+                            store
+                                .emit(
+                                    "forge",
+                                    "work_failed",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": outcome,
+                                    }),
+                                )
+                                .await;
+
                             ticket_updates.push((
                                 ticket_id.to_string(),
                                 TicketStatus::Failed {

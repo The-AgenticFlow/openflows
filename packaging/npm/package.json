@@ -1,0 +1,50 @@
+{
+  "name": "@the-agenticflow/openflows",
+  "version": "0.1.2",
+  "description": "Autonomous AI development team — turns GitHub issues into working PRs",
+  "main": "index.js",
+  "bin": {
+    "openflows": "./bin/openflows.js",
+    "openflows-setup": "./bin/openflows-setup.js",
+    "openflows-dashboard": "./bin/openflows-dashboard.js",
+    "openflows-doctor": "./bin/openflows-doctor.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/The-AgenticFlow/AgentFlow.git"
+  },
+  "keywords": [
+    "ai",
+    "autonomous",
+    "development",
+    "agents",
+    "github"
+  ],
+  "author": "The AgenticFlow Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/The-AgenticFlow/AgentFlow/issues"
+  },
+  "homepage": "https://openflows.dev",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "optionalDependencies": {
+    "@openflows/linux-x64-gnu": "0.1.0",
+    "@openflows/linux-x64-musl": "0.1.0",
+    "@openflows/linux-arm64-gnu": "0.1.0",
+    "@openflows/darwin-x64": "0.1.0",
+    "@openflows/darwin-arm64": "0.1.0"
+  }
+}

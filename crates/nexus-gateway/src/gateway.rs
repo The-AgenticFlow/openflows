@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex};
 use anyhow::Result;
 use tracing::{info, warn};
 
@@ -13,7 +13,7 @@ use crate::plugin::ChannelPlugin;
 /// Kept compatible with existing `nexus-chat` usage.
 pub const KEY_HUMAN_MESSAGES: &str = "human_messages";
 
-use std::sync::Mutex;
+
 
 pub struct Gateway {
     plugins: HashMap<String, Arc<dyn ChannelPlugin>>,
@@ -65,7 +65,7 @@ impl Gateway {
 
     /// Await the next inbound message (blocking).
     pub async fn recv_inbound(&self) -> Option<InboundMessage> {
-        let mut guard = self.inbound_rx.lock().unwrap();
+        let mut guard = self.inbound_rx.lock().await;
         if let Some(ref mut rx) = guard.as_mut() {
             rx.recv().await
         } else {
@@ -75,12 +75,9 @@ impl Gateway {
 
     /// Non-blocking check for inbound messages.
     pub fn try_recv_inbound(&self) -> Option<InboundMessage> {
-        let mut guard = self.inbound_rx.lock().unwrap();
+        let mut guard = self.inbound_rx.try_lock().ok()?;
         if let Some(ref mut rx) = guard.as_mut() {
-            match rx.try_recv() {
-                Ok(msg) => Some(msg),
-                Err(_) => None,
-            }
+            rx.try_recv().ok()
         } else {
             None
         }

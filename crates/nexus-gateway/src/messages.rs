@@ -30,6 +30,7 @@ pub struct OutboundMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutboundMessageType {
+    // Original variants
     WorkflowStarted,
     AgentAssigned,
     AgentCompleted,
@@ -43,6 +44,18 @@ pub enum OutboundMessageType {
     ApproveCommand,
     RerouteAgent,
     BlockAgent,
+    // New variants for comprehensive stakeholder notifications
+    PrOpened,            // FORGE opened a PR
+    PrMerged,            // VESSEL merged a PR
+    CiFailed,            // CI checks failed on a PR
+    CiTimeout,           // CI polling timed out
+    CiMissing,           // No CI workflows configured in repo
+    MergeBlocked,        // GitHub API blocked the merge
+    ConflictsDetected,   // Merge conflicts detected
+    TicketFailed,        // Ticket marked as failed
+    TicketExhausted,     // Ticket exceeded max attempts
+    FuelExhausted,       // Agent ran out of fuel/time
+    WorkerSuspended,     // Worker needs human approval
 }
 
 // ── SystemCommand (replaces HumanCommand) ───────────────────────────────────

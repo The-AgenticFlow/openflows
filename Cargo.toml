@@ -13,6 +13,7 @@ members = [
     "crates/nexus-gateway",
     "binary",
     "crates/anthropic-mock",
+    "crates/agentflow-tui",
 ]
 
 [workspace.dependencies]

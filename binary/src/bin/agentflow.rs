@@ -8,7 +8,7 @@ use config::{
     ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
-use nexus_gateway::{Gateway, GatewayConfig};
+use nexus_gateway::{Gateway, GatewayConfig, run_notification_bridge};
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
@@ -26,8 +26,23 @@ async fn main() -> Result<()> {
     info!("Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)");
 
     // 1. Validate Environment
-    // Use registry to resolve per-agent token for FORGE
-    let registry_path = std::env::current_dir()?
+    // Resolve orchestrator_dir: first try relative to the binary itself (npm install),
+    // then fall back to current directory (dev mode).
+    let orchestrator_dir = {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            if dir.join("orchestration/agent/registry.json").exists() {
+                dir.clone()
+            } else {
+                std::env::current_dir()?
+            }
+        } else {
+            std::env::current_dir()?
+        }
+    };
+    let registry_path = orchestrator_dir
         .join("orchestration")
         .join("agent")
         .join("registry.json");
@@ -60,8 +75,6 @@ async fn main() -> Result<()> {
     std::env::set_var("AGENTFLOW_WORKSPACE_ROOT", &workspace_dir);
 
     // Set ORCHESTRATOR_DIR so pair harness can find the plugin
-    // This is needed because the workspace is a separate cloned repo
-    let orchestrator_dir = std::env::current_dir()?;
     std::env::set_var("ORCHESTRATOR_DIR", &orchestrator_dir);
 
     // 3. Initialize Shared Store (needed for NexusNode::with_chat)
@@ -197,24 +210,60 @@ async fn main() -> Result<()> {
         let handles = gateway.start_listeners().await;
         info!(channels = ?gateway.active_channels(), "Gateway listeners started");
 
-        // Background task: process gateway messages even when flow is at other nodes
+        // ── Notification Bridge ──────────────────────────────────────────
+        // Bridges SharedStore events (from vessel/forge) to gateway notifications.
+        // This ensures Discord (and other channels) receive stakeholder notifications
+        // for ALL activity: PR opened, PR merged, CI failed, conflicts detected, etc.
+        {
+            let bridge_store = store.clone();
+            let bridge_gateway = gateway.clone();
+            tokio::spawn(async move {
+                run_notification_bridge(bridge_store, bridge_gateway).await;
+            });
+            info!("NotificationBridge started — forwarding store events to gateway");
+        }
+
+        // Background task: process gateway messages even when flow is at other nodes.
+        // Uses process_gateway_messages_with_runner to:
+        // 1. Skip AgentRunner creation when no messages are pending (avoids
+        //    spawning a throwaway GitHub MCP server every 3 seconds)
+        // 2. Reuse the AgentRunner across iterations (MCP server persists
+        //    between message bursts, reducing startup latency)
         let nexus_bg = nexus.clone();
         let store_bg = store.clone();
         let registry_path_bg = registry_path.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut runner: Option<agent_client::AgentRunner> = None;
+            let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
-                if let Some(gw) = nexus_bg.gateway() {
-                    if let Err(e) = agent_nexus::react_loop::process_gateway_messages(
-                        gw,
-                        &store_bg,
-                        &registry_path_bg,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Background gateway message processing error: {}", e);
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Some(gw) = nexus_bg.gateway() {
+                            match agent_nexus::react_loop::process_gateway_messages_with_runner(
+                                gw,
+                                &store_bg,
+                                &registry_path_bg,
+                                &mut runner,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!("Background gateway message processing error: {}", e);
+                                    // Discard the failed runner so it's recreated on next message
+                                    runner = None;
+                                }
+                            }
+                        }
+                    }
+                    _ = heartbeat_interval.tick() => {
+                        tracing::info!(
+                            runner_active = runner.is_some(),
+                            "NEXUS background gateway processor heartbeat"
+                        );
                     }
                 }
             }

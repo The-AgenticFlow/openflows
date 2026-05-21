@@ -1,287 +1,283 @@
-# Contributing to AgentFlow
+# 🤝 Contributing to OpenFlows
 
-> 🌐 Official site: [openflows.dev](https://openflows.dev)
+> Welcome! We're building the future of autonomous software development, and we need your help.
 
-This guide explains how to set up your environment, run the project in different modes, and contribute effectively.
+[![Stars](https://img.shields.io/github/stars/The-AgenticFlow/OpenFlows?style=social)](https://github.com/The-AgenticFlow/OpenFlows/stargazers)
+[![Discord](https://img.shields.io/discord/123456789?color=7289da&label=discord&logo=discord&logoColor=white)](https://discord.gg/Zf6PTQAgE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 🛠️ Prerequisites
+## 🎯 What is OpenFlows?
 
-1. **Rust**: [Install Rust](https://rustup.rs/) (latest stable).
-2. **Node.js**: Required for Claude Code CLI and MCP servers (v18+).
-3. **Python 3**: Required for running mock servers.
-4. **Claude Code CLI** (Required for Forge workers):
-   The FORGE agent spawns Claude Code processes to implement code. Without this binary,
-   Forge workers will fail with `Failed to spawn FORGE process`.
+OpenFlows is an **autonomous AI development team** that turns GitHub issues into working code with pull requests — all without human intervention.
 
-   ```bash
-   # Install Claude Code CLI globally
-   npm install -g @anthropic-ai/claude-code
+Think of it as having a team of AI agents (NEXUS, FORGE, VESSEL, SENTINEL, LORE) that collaborate to build software just like a human team would.
 
-   # Authenticate (required on first run)
-   claude auth login
+**🌐 Official site:** [openflows.dev](https://openflows.dev)
 
-   # Verify installation
-   claude --version
-   ```
+---
 
-   Then set `CLAUDE_PATH` in your `.env` to the absolute path:
-   ```bash
-   # Find the path
-   which claude
+## 🚀 Quick Start for Contributors
 
-   # Set it in .env (example output)
-   CLAUDE_PATH=/home/user/.nvm/versions/node/v24.14.1/bin/claude
-   ```
-
-   **Troubleshooting**: If you see `Failed to spawn FORGE process` in logs, the most
-   common cause is that the `claude` binary cannot be found. Verify:
-   - `claude --version` works from the same terminal you run `cargo` from
-   - `CLAUDE_PATH` in `.env` points to an existing, executable binary
-   - The binary has execute permissions (`chmod +x <path>` on Linux/macOS)
-
-## ⚙️ Environment Setup
-
-1. **Copy Template**:
-   ```bash
-   cp .env.example .env
-   ```
-
-2. **Choose Your Mode**:
-
-   ### Mode 1: Proxy (Recommended — always preferred)
-   Routes all LLM calls through a proxy. Direct API keys serve as **fallback** when the proxy has transient errors.
-
-   ```env
-   PROXY_URL=http://localhost:8080/v1      # Required - enables proxy mode
-   PROXY_API_KEY=your-key                   # Highest priority key
-   MODEL_PROVIDER_MAP=glm=openai,...        # Maps model names to client format
-
-   # Optional fallback keys (used only when proxy fails)
-   ANTHROPIC_API_KEY=your-anthropic-key     # Fallback for Anthropic
-   GEMINI_API_KEY=your-gemini-key           # Fallback for Gemini
-   ```
-
-   ### Mode 2: Direct (Fallback only)
-   Calls LLM providers directly. **Requires individual API keys.**
-
-   ```env
-   # PROXY_URL not set (or commented out)
-   LLM_FALLBACK=anthropic,gemini,openai     # Provider order
-   ANTHROPIC_API_KEY=your-key               # Required for anthropic
-   GEMINI_API_KEY=your-key                  # Required for gemini
-   OPENAI_API_KEY=your-key                  # Required for openai
-   ```
-
-3. **Required Variables** (both modes):
-   - `GITHUB_PERSONAL_ACCESS_TOKEN`: For GitHub API (issues, PRs, CI polling)
-   - `GITHUB_REPOSITORY`: Target repository (e.g., `owner/repo`)
-   - `CLAUDE_PATH`: Path to Claude CLI binary (for Forge workers)
-
-## 🔑 Environment Variables Reference
-
-| Variable | Proxy Mode | Direct Mode | Description |
-|----------|------------|-------------|-------------|
-| `PROXY_URL` | **Required** | Not set | Enables proxy mode |
-| `PROXY_API_KEY` | **Recommended** | N/A | Auth key for proxy (highest priority) |
-| `GATEWAY_API_KEY` | Optional | N/A | Upstream gateway key (second priority) |
-| `ANTHROPIC_API_KEY` | Fallback | Required* | Anthropic/Claude API key |
-| `OPENAI_API_KEY` | Fallback | Required* | OpenAI API key |
-| `GEMINI_API_KEY` | Fallback | Required* | Google Gemini API key |
-| `LLM_FALLBACK` | N/A | Optional | Provider fallback order |
-| `MODEL_PROVIDER_MAP` | Optional | Optional | Model→provider mapping |
-
-*Required only if listed in `LLM_FALLBACK`
-
-**Key priority order**: `PROXY_API_KEY` > `GATEWAY_API_KEY` > `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`. When `PROXY_URL` is set, the proxy client is tried first. Direct API key clients are appended as fallbacks, so a transient proxy error (503, timeout) doesn't block the orchestration pipeline.
-
-## 🔒 Secret Protection
-
-The system enforces multiple layers of protection against pushing secrets to GitHub. These protections are **generic** — they apply to any file anywhere in the worktree, not just known directories like `.claude/`:
-
-1. **Worktree .gitignore** — Known credential directories (`.claude/`, `.env.local`) are automatically added to each worktree's `.gitignore` during pair provisioning. Any directory containing a redacted file is also dynamically added.
-
-2. **Whole-worktree secret scanning** — Before any commit in the push/PR flow, `scan_and_scrub_secrets()` recursively scans **all** text files in the worktree for known secret patterns (GitHub PATs, AWS keys, OpenAI keys, etc.) and replaces them with placeholder references. This catches secrets in any file — source code, config, env files, Terraform, etc.
-
-3. **Safe git add** — `git_add_safe()` checks all tracked files (`git ls-files`) for secrets and untracks any that contain them before staging, preventing already-tracked secret files from being committed regardless of directory.
-
-4. **Push rejection recovery** — If GitHub rejects a push due to secret scanning (GH013), the agent detects this, scans the entire worktree, redacts secrets, untracks offending files, rewrites git history to remove those files from prior commits, then retries the push. This prevents the infinite retry loop where NEXUS would blindly re-approve the same failing action.
-
-5. **Accurate blocked reasons** — When a push fails, the blocked reason now contains the actual GitHub error (e.g., "Push rejected: secrets detected in git history — GH013: ...") instead of the generic "needs push/PR creation", enabling NEXUS to make informed decisions.
-
-6. **Force-push policy** — `--force-with-lease` is only used for genuine non-fast-forward rejections, never for secret scanning violations.
-
-See [`orchestration/agent/standards/SECURITY.md`](orchestration/agent/standards/SECURITY.md) for the full security policy.
-
-## 🚀 Running the Project
-
-**New contributors**: Read the **[live flow walkthrough](docs/demo.md)** first — it explains what you will see in the logs at each stage and where files end up on disk.
-
-### Option A: Local Mock Demo (Safe, No API Keys Needed)
-This uses local mock servers for the LLM and MCP, and a mock Claude script for Forge.
-
-1. **Start Mock Infrastructure**:
-   ```bash
-   # Terminal 1: Mock LLM (OpenAI-compatible)
-   python3 scripts/mock_llm.py
-   
-   # Terminal 2: Mock GitHub MCP
-   # (The demo binary starts this automatically via GITHUB_MCP_CMD)
-   ```
-
-2. **Run Demo**:
-   ```bash
-   cargo run -p agent-team --bin demo
-   ```
-
-### Option B: Real-World Orchestration
-This connects to live GitHub and live LLM providers.
-
-**If your gateway supports Anthropic protocol** (LiteLLM, native Anthropic API):
+### Step 1: Fork & Clone
 ```bash
-# Just run — no proxy needed
-cargo run -p agent-team --bin agentflow
+git clone https://github.com/YOUR_USERNAME/OpenFlows.git
+cd OpenFlows
 ```
 
-**If your gateway only supports OpenAI protocol** (common for third-party gateways):
+### Step 2: Set Up Environment
 ```bash
-# Terminal 1: Start the local Anthropic-to-OpenAI proxy
-./scripts/start_proxy.sh
+# Copy environment template
+cp .env.example .env
 
-# Terminal 2: Run the orchestration
-cargo run -p agent-team --bin agentflow
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install Claude Code CLI (required for Forge workers)
+npm install -g @anthropic-ai/claude-code
+claude auth login
 ```
 
-The proxy reads `GATEWAY_URL` and `GATEWAY_API_KEY` from `.env` automatically, translates Claude CLI's Anthropic-format requests into OpenAI format, and forwards them to your gateway. See [Local Anthropic Proxy](#local-anthropic-proxy-openai-only-gateways) below for details.
+### Step 3: Configure
+Edit `.env` with your API keys:
+```bash
+# Required: GitHub access
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_REPOSITORY=your-org/your-repo
 
-## 🧪 Testing
+# Required: Path to Claude CLI
+CLAUDE_PATH=$(which claude)
+
+# Choose your LLM mode:
+# Option A: Proxy mode (recommended)
+PROXY_URL=http://localhost:8080/v1
+PROXY_API_KEY=your-key
+
+# Option B: Direct mode (fallback)
+ANTHROPIC_API_KEY=your-key
+OPENAI_API_KEY=your-key
+```
+
+### Step 4: Build & Test
+```bash
+# Build the project
+cargo build --release
+
+# Run tests
+cargo test --workspace
+
+# Run the demo (uses mock servers, no API keys needed!)
+cargo run -p openflows --bin demo
+```
+
+---
+
+## 🎓 New Contributor? Start Here!
+
+### Good First Issues
+Look for issues labeled:
+- `good first issue` — Simple tasks to get started
+- `help wanted` — We need community help
+- `documentation` — Improve docs, no code required
+- `rust` — Rust-specific improvements
+
+### First Contribution Ideas
+1. **Fix a typo** in documentation
+2. **Add a test** for existing functionality
+3. **Improve error messages** for better UX
+4. **Add logging** to help with debugging
+5. **Write a tutorial** based on your experience
+
+---
+
+## 📋 Contribution Workflow
+
+### 1. Find or Create an Issue
+- Check [existing issues](https://github.com/The-AgenticFlow/OpenFlows/issues)
+- Comment on an issue to express interest
+- Or [create a new issue](https://github.com/The-AgenticFlow/OpenFlows/issues/new) for bugs/features
+
+### 2. Get Assigned
+- Wait for a maintainer to assign you
+- This prevents duplicate work
+- We'll add you as a contributor once you complete your first PR
+
+### 3. Create a Branch
+```bash
+git checkout -b feature/your-feature-name
+# or
+git checkout -b fix/issue-description
+```
+
+### 4. Make Changes
+- Follow Rust best practices
+- Add tests for new functionality
+- Update documentation if needed
+- Keep commits focused and atomic
+
+### 5. Test Your Changes
+```bash
+# Run all tests
+cargo test --workspace
+
+# Check formatting
+cargo fmt -- --check
+
+# Run linter
+cargo clippy -- -D warnings
+
+# Run the demo to verify
+cargo run -p openflows --bin demo
+```
+
+### 6. Commit & Push
+```bash
+git add .
+git commit -m "feat: add feature description"
+git push origin feature/your-feature-name
+```
+
+**Commit message format:**
+- `feat:` — New feature
+- `fix:` — Bug fix
+- `docs:` — Documentation changes
+- `test:` — Adding tests
+- `refactor:` — Code refactoring
+- `chore:` — Maintenance tasks
+
+### 7. Create a Pull Request
+- Go to GitHub and create a PR from your branch
+- Fill out the PR template
+- Link to the issue you're fixing
+- Request review from maintainers
+
+---
+
+## 🏗️ Project Architecture
+
+### Core Components
+
+| Component | Role | Description |
+|-----------|------|-------------|
+| **NEXUS** | Orchestrator | Assigns work to agents, manages workflow |
+| **FORGE** | Developer | Spawns Claude Code to implement code |
+| **VESSEL** | Merger | Merges approved PRs, handles CI |
+| **SENTINEL** | Reviewer | Evaluates code quality |
+| **LORE** | Documenter | Writes docs and ADRs |
+
+### Key Concepts
+
+**SharedStore**: Central key-value store where agents exchange state
+- `tickets` — GitHub issues converted to work items
+- `worker_slots` — Agent worker assignments
+- `pending_prs` — Pull requests awaiting merge
+
+**PocketFlow**: The engine that executes the agent graph and manages state transitions.
+
+For deep technical details, see:
+- [SharedStore Documentation](docs/shared-store.md)
+- [Architecture Overview](docs/architecture.md)
+- [API Reference](docs/api.md)
+
+---
+
+## 🧪 Testing Guide
 
 ### Unit Tests
 ```bash
+# Run all unit tests
 cargo test --workspace
+
+# Run tests for a specific crate
+cargo test -p agent-nexus
+cargo test -p agent-forge
 ```
 
 ### End-to-End Tests
-We have specific E2E tests for core logic:
 ```bash
 # Test Nexus decision making
-cargo test -p agent-nexus
+cargo test -p agent-nexus --test nexus_e2e
 
-# Test Forge suspension logic (mocked)
+# Test Forge suspension logic
 cargo test -p agent-forge --test forge_claude_e2e
 ```
 
-## 📂 Architecture Overview
-- **SharedStore**: A key-value store where agents exchange state (e.g., [`worker_slots`](docs/shared-store.md#workerslot-schema) and [`tickets`](docs/shared-store.md#ticket-schema)). For comprehensive details, see the [SharedStore Documentation](docs/shared-store.md).
-- **Graph Nodes**: Each agent is a `BatchNode` that reads from the store and writes back "actions" (e.g., `work_assigned`).
-- **PocketFlow**: The engine that executes the graph and manages state transitions.
-
-### Understanding SharedStore
-
-The SharedStore is the central nervous system of AgentFlow. All agents communicate through it:
-
-1. **NEXUS** reads `worker_slots` and `tickets`, assigns work, writes back assignments
-2. **FORGE** reads assigned tickets, spawns workers, writes results and `pending_prs`
-3. **VESSEL** reads `pending_prs`, merges approved PRs, updates ticket status
-4. **SENTINEL** (ephemeral) evaluates code quality, writes review results
-5. **LORE** reads event history, writes documentation and ADRs
-
-See [docs/shared-store.md](docs/shared-store.md) for:
-- Complete API reference with code examples
-- Key namespace schemas (`tickets`, `worker_slots`, `pending_prs`, etc.)
-- Agent interaction patterns with real implementation snippets
-- Event system documentation (1000-event ring buffer)
-- Testing patterns with in-memory backend
-- Production Redis setup guide
-
-## 📜 Development Workflow
-
-### <a id="per-agent-llm-routing-litellm-proxy"></a>Per-Agent LLM Routing (LiteLLM Proxy)
-
-AgentFlow supports routing each agent to a different LLM backend through a LiteLLM proxy. This allows cheaper models for simpler tasks.
-
-**Registry configuration** (`orchestration/agent/registry.json`):
-
-```json
-{ "id": "forge",    "model_backend": "anthropic/claude-sonnet-4-5",     "routing_key": "forge-key" },
-{ "id": "sentinel", "model_backend": "gemini/gemini-2.5-pro",          "routing_key": "sentinel-key" },
-{ "id": "vessel",   "model_backend": "groq/llama-3.3-70b-versatile",   "routing_key": "vessel-key" },
-{ "id": "lore",     "model_backend": "openai/gpt-4o-mini",             "routing_key": "lore-key" }
-```
-
-**How it works**:
-
-1. `model_backend` is sent to the LLM client as the model name
-2. `MODEL_PROVIDER_MAP` determines which client format to use (e.g., `glm=openai` sends OpenAI-format requests)
-3. `routing_key` maps to backend models in your proxy's `litellm_config.yaml`
-
-**Quick setup** (self-hosted LiteLLM):
-
+### Demo Mode (No API Keys Needed)
 ```bash
-# .env
-PROXY_URL=http://localhost:4000/v1
+# Terminal 1: Start mock LLM
+python3 scripts/mock_llm.py
 
-# litellm_config.yaml
-model_list:
-  - model_name: forge-key
-    litellm_params:
-      model: anthropic/claude-sonnet-4-5
-      api_key: os.environ/ANTHROPIC_API_KEY
+# Terminal 2: Run demo
+cargo run -p openflows --bin demo
 ```
-
-### <a id="local-anthropic-proxy-openai-only-gateways"></a>Local Anthropic Proxy (OpenAI-Only Gateways)
-
-Claude CLI speaks the Anthropic Messages API (`/v1/messages`). If your LLM gateway only supports the OpenAI Chat Completions format (`/v1/chat/completions`), Claude CLI will get a `403`/`404` and exit immediately.
-
-AgentFlow includes a local proxy that translates between the two protocols:
-
-```
-Claude CLI ──Anthropic format──> localhost:8080 ──OpenAI format──> Gateway
-```
-
-**Setup** — add these to `.env`:
-
-```env
-# Points Claude CLI and Nexus at the LOCAL proxy
-PROXY_URL=http://localhost:8080/v1
-PROXY_API_KEY=your-gateway-api-key
-
-# Tells the LOCAL proxy where to FORWARD (the remote gateway)
-GATEWAY_URL=https://api.ai.camer.digital/v1/
-GATEWAY_API_KEY=your-gateway-api-key
-```
-
-**Run** — two terminals:
-
-```bash
-# Terminal 1: Start proxy (reads .env automatically)
-./scripts/start_proxy.sh
-
-# Terminal 2: Run orchestration
-cargo run --bin agentflow
-```
-
-**When your provider adds native Anthropic support**, just change `PROXY_URL` to the gateway directly and remove `GATEWAY_*`:
-
-```env
-PROXY_URL=https://api.ai.camer.digital/v1/
-PROXY_API_KEY=your-gateway-api-key
-# Remove GATEWAY_URL and GATEWAY_API_KEY — no longer needed
-```
-
-**Also see**: `MODEL_PROVIDER_MAP` in `.env.example` for routing non-Anthropic models (like `glm-5`) through `OpenAiClient` instead of `AnthropicClient` within the Nexus agent.
 
 ---
 
-If you want to contribute, please follow these steps:
+## 🔧 Development Tips
 
-1. **Understand the Architecture**: Read the [design.pdf](file:///home/christian/sandbox/Soft-Dev/docs/design.pdf) (provided in the repository) to get a deep understanding of the PocketFlow engine and agent roles.
-2. **Verify the Environment**: Run all tests (unit and E2E) to ensure the current flow is running fine on your side:
-   ```bash
-   cargo test --workspace
-   cargo run -p agent-team --bin demo
-   ```
-3. **Get Assigned**: Create a new issue or comment on an existing one to express your interest. I will then add you to the repository as a contributor.
-4. **Implement**: Follow the standard agentic coding workflow (Plan -> Implement -> Verify -> Walkthrough).
+### Running in Different Modes
+
+**Mock Mode** (safe, no API keys):
+```bash
+cargo run -p openflows --bin demo
+```
+
+**Real Mode** (connects to live LLMs):
+```bash
+cargo run -p openflows --bin agentflow
+```
+
+**Dashboard** (monitor workers):
+```bash
+cargo run -p openflows --bin dashboard
+```
+
+### Common Issues & Solutions
+
+**Issue**: `Failed to spawn FORGE process`
+**Solution**: Check `CLAUDE_PATH` in `.env` points to valid `claude` binary
+
+**Issue**: Build failures
+**Solution**: 
+```bash
+rustup update
+cargo clean
+cargo build --release
+```
+
+**Issue**: Test failures
+**Solution**: Ensure all prerequisites are installed (Rust, Node.js, Python 3)
 
 ---
-For more specific rules, see `orchestration/agent/standards/`.
+
+## 🎖️ Recognition
+
+Contributors will be:
+- Listed in [CONTRIBUTORS.md](CONTRIBUTORS.md)
+- Mentioned in release notes
+- Added to the organization after 3+ quality contributions
+
+---
+
+## 💬 Get Help
+
+- **Discord**: [Join our community](https://discord.gg/Zf6PTQAgE)
+- **GitHub Discussions**: [Ask questions](https://github.com/The-AgenticFlow/OpenFlows/discussions)
+- **Issues**: [Report bugs](https://github.com/The-AgenticFlow/OpenFlows/issues)
+
+---
+
+## 📚 Additional Resources
+
+- [Official Website](https://openflows.dev)
+- [Tutorial](TUTORIAL.md)
+- [Demo Walkthrough](DEMO.md)
+- [Packaging Guide](PACKAGING.md)
+- [Security Policy](orchestration/agent/standards/SECURITY.md)
+
+---
+
+## 🙏 Thank You!
+
+Every contribution matters — whether it's fixing a typo, adding a test, or building a major feature. You're helping shape the future of autonomous software development.
+
+**Ready to contribute?** [Pick an issue](https://github.com/The-AgenticFlow/OpenFlows/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) and let's build something amazing together! 🚀

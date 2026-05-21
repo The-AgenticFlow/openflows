@@ -30,6 +30,7 @@ impl CiPoller {
     /// Poll CI status until it reaches a terminal state or times out.
     /// Also checks mergeability on each iteration — if the PR has conflicts,
     /// returns `Conflicts` immediately instead of waiting for timeout.
+    /// Uses per-repo polling interval if configured, otherwise default.
     pub async fn poll_until_terminal(
         &self,
         owner: &str,
@@ -37,6 +38,8 @@ impl CiPoller {
         pr_info: &PrInfo,
     ) -> Result<CiPollResult> {
         let mut attempts = 0u32;
+        // Use per-repo interval if configured, otherwise default
+        let interval_secs = self.config.interval_for_repo(repo);
 
         loop {
             if attempts >= self.config.max_attempts {
@@ -77,7 +80,7 @@ impl CiPoller {
             }
 
             attempts += 1;
-            tokio::time::sleep(std::time::Duration::from_secs(self.config.interval_secs)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     }
 

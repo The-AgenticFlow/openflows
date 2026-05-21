@@ -4,7 +4,28 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Process-wide mutex to serialize git worktree creation across concurrent pairs.
+///
+/// Git uses lock files (`.git/index.lock`) that prevent concurrent operations on
+/// the same repository. When two FORGE workers try to create worktrees simultaneously,
+/// the second one fails with a lock contention error. This mutex ensures only one
+/// pair creates a worktree at a time.
+///
+/// Uses `std::sync::Mutex` rather than `tokio::sync::Mutex` because the critical
+/// section contains synchronous blocking operations (`Command::output()`,
+/// `std::thread::sleep` for retries). A tokio mutex held across blocking calls
+/// would starve the async runtime when called from non-`spawn_blocking` contexts.
+static GIT_WORKTREE_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Maximum number of retries when git commands fail due to lock contention.
+const GIT_LOCK_RETRY_COUNT: u32 = 5;
+
+/// Base delay in milliseconds between retries for git lock contention.
+const GIT_LOCK_RETRY_BASE_DELAY_MS: u64 = 200;
 
 /// Manages Git worktrees for pair isolation.
 pub struct WorktreeManager {
@@ -150,6 +171,11 @@ impl WorktreeManager {
     /// Implements worktree reuse: when a pair gets a new ticket, the existing
     /// worktree is reused by fetching origin/main and creating a new branch.
     ///
+    /// This method acquires a process-wide mutex to serialize git operations
+    /// across concurrent pairs, preventing lock contention on the shared `.git`
+    /// directory. When git lock contention is detected, the operation is retried
+    /// with exponential backoff.
+    ///
     /// # Arguments
     /// * `pair_id` - Pair identifier (e.g., "pair-1", "forge-1")
     /// * `ticket_id` - Ticket identifier (e.g., "T-42")
@@ -163,13 +189,58 @@ impl WorktreeManager {
         ticket_id: &str,
         github_token: &str,
     ) -> Result<WorktreeSetupResult> {
+        // Phase 1: Synchronous git operations under the process-wide mutex.
+        // The std::sync::Mutex guard cannot be held across .await points,
+        // so all async work (configure_git_identity) must happen after the
+        // guard is dropped. We collect the result in a separate scope.
+        let (worktree_path, warnings) = {
+            let _guard = GIT_WORKTREE_MUTEX
+                .lock()
+                .map_err(|e| anyhow!("GIT_WORKTREE_MUTEX poisoned: {}", e))?;
+
+            self.create_worktree_sync(pair_id, ticket_id)?
+        };
+
+        // Phase 2: Async configuration (identity, remote URL) — outside the mutex
+        // since these are HTTP calls that don't touch the .git index.
+        if let Err(e) = self
+            .configure_git_identity(&worktree_path, github_token)
+            .await
+        {
+            warn!(error = %e, "Failed to configure git identity from PAT, using local git config");
+        }
+
+        if let Err(e) = self.configure_remote_with_token(&worktree_path, github_token) {
+            warn!(error = %e, "Failed to configure remote URL with token");
+        }
+
+        Ok(WorktreeSetupResult {
+            path: worktree_path,
+            warnings,
+        })
+    }
+
+    /// Synchronous portion of worktree creation — must be called under GIT_WORKTREE_MUTEX.
+    ///
+    /// Performs all git commands (fetch, merge, worktree add) and returns the
+    /// worktree path and any warnings. Does not perform async operations.
+    fn create_worktree_sync(
+        &self,
+        pair_id: &str,
+        ticket_id: &str,
+    ) -> Result<(PathBuf, Vec<SetupWarning>)> {
         let worktree_path = self.worktrees_dir.join(pair_id);
         let branch_name = Self::branch_name(pair_id, ticket_id);
         let mut warnings = Vec::new();
 
-        info!(pair_id, ticket_id, branch = %branch_name, "Creating worktree");
+        info!(pair_id, ticket_id, branch = %branch_name, "Creating worktree (under global mutex)");
 
-        if let Err(e) = self.run_git_in_main(&["fetch", "origin", "main"]) {
+        // Retry git operations that may fail due to transient lock contention
+        // even under the mutex (e.g., another process outside our control).
+        let fetch_result = Self::retry_git_operation(|| {
+            self.run_git_in_main(&["fetch", "origin", "main"])
+        });
+        if let Err(e) = fetch_result {
             warn!(error = %e, "git fetch origin/main failed, continuing");
             warnings.push(SetupWarning {
                 phase: "fetch_origin_main".to_string(),
@@ -177,7 +248,11 @@ impl WorktreeManager {
                 affected_files: vec![],
             });
         }
-        if let Err(e) = self.run_git_in_main(&["merge", "origin/main"]) {
+
+        let merge_result = Self::retry_git_operation(|| {
+            self.run_git_in_main(&["merge", "origin/main"])
+        });
+        if let Err(e) = merge_result {
             warn!(error = %e, "git merge origin/main failed, continuing");
             let affected_files = self.list_unmerged_files_in_main();
             warnings.push(SetupWarning {
@@ -195,20 +270,19 @@ impl WorktreeManager {
                         branch = %branch_name,
                         "Worktree already on correct branch - reusing"
                     );
-                    return Ok(WorktreeSetupResult {
-                        path: worktree_path,
-                        warnings,
-                    });
+                    return Ok((worktree_path, warnings));
                 }
+                // Reuse requires async configure_git_identity which can't happen
+                // under the mutex. Return the path; the caller handles identity.
                 info!(
                     path = %worktree_path.display(),
                     current = %current,
                     new_branch = %branch_name,
-                    "Reusing existing worktree for new ticket"
+                    "Existing worktree needs reuse for new ticket"
                 );
-                return self
-                    .reuse_worktree(&worktree_path, &branch_name, github_token)
-                    .await;
+                // For reuse, we still need to do the git operations synchronously
+                self.reuse_worktree_sync(&worktree_path, &branch_name)?;
+                return Ok((worktree_path, warnings));
             }
             warn!(path = %worktree_path.display(), "Worktree exists but branch unknown, replacing");
             self.remove_worktree_by_path(&worktree_path, "unknown")?;
@@ -220,19 +294,35 @@ impl WorktreeManager {
         std::fs::create_dir_all(&self.worktrees_dir)
             .context("Failed to create worktrees directory")?;
 
-        let output = Command::new("git")
-            .args(["worktree", "add"])
-            .arg(&worktree_path)
-            .args(["-b", &branch_name])
-            .current_dir(&self.project_root)
-            .output()
-            .context("Failed to run git worktree add")?;
+        // Retry worktree add with backoff — lock contention from concurrent
+        // git processes (even outside our mutex) can still cause transient failures.
+        // The closure handles both lock-retriable errors and the "already exists"
+        // fallback (create worktree from existing branch) inline, so after
+        // retry_git_operation returns Ok(()) the worktree is guaranteed created.
+        Self::retry_git_operation(|| -> Result<()> {
+            let o = Command::new("git")
+                .args(["worktree", "add"])
+                .arg(&worktree_path)
+                .args(["-b", &branch_name])
+                .current_dir(&self.project_root)
+                .output()
+                .context("Failed to run git worktree add")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            if o.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&o.stderr);
+
+            // Lock contention → retriable
+            if Self::is_git_lock_error(&stderr) {
+                return Err(anyhow!("git lock contention: {}", stderr));
+            }
+
+            // Branch already exists → try creating worktree from existing branch
             if stderr.contains("already exists") {
                 info!(branch = %branch_name, "Branch exists, creating worktree from existing branch");
-                let output = Command::new("git")
+                let o2 = Command::new("git")
                     .args(["worktree", "add"])
                     .arg(&worktree_path)
                     .arg(&branch_name)
@@ -240,30 +330,28 @@ impl WorktreeManager {
                     .output()
                     .context("Failed to run git worktree add from existing branch")?;
 
-                if !output.status.success() {
+                if o2.status.success() {
+                    return Ok(());
+                }
+
+                let stderr2 = String::from_utf8_lossy(&o2.stderr);
+                if Self::is_git_lock_error(&stderr2) {
                     return Err(anyhow!(
-                        "Failed to create worktree from existing branch: {}",
-                        String::from_utf8_lossy(&output.stderr)
+                        "git lock contention on existing-branch add: {}",
+                        stderr2
                     ));
                 }
-            } else {
-                return Err(anyhow!("Failed to create worktree: {}", stderr));
+                return Err(anyhow!(
+                    "Failed to create worktree from existing branch: {}",
+                    stderr2
+                ));
             }
-        }
 
-        // Configure git identity from the PAT so commits show the PAT owner's identity
-        if let Err(e) = self
-            .configure_git_identity(&worktree_path, github_token)
-            .await
-        {
-            warn!(error = %e, "Failed to configure git identity from PAT, using local git config");
-        }
+            // Non-retriable, non-"already exists" error
+            Err(anyhow!("git worktree add failed: {}", stderr))
+        })?;
 
-        // Configure remote URL with the token for push authentication
-        if let Err(e) = self.configure_remote_with_token(&worktree_path, github_token) {
-            warn!(error = %e, "Failed to configure remote URL with token");
-        }
-
+        // Check for dirty worktree state
         let status = Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&worktree_path)
@@ -285,13 +373,72 @@ impl WorktreeManager {
         }
 
         info!(path = %worktree_path.display(), branch = %branch_name, "Worktree created successfully");
-        Ok(WorktreeSetupResult {
-            path: worktree_path,
-            warnings,
-        })
+        Ok((worktree_path, warnings))
+    }
+
+    /// Synchronous portion of worktree reuse — must be called under GIT_WORKTREE_MUTEX.
+    fn reuse_worktree_sync(&self, worktree_path: &Path, new_branch: &str) -> Result<()> {
+        self.fetch_and_reset_to_main(worktree_path)?;
+        self.create_branch_from_main(worktree_path, new_branch)?;
+        info!(
+            path = %worktree_path.display(),
+            branch = %new_branch,
+            "Worktree reused successfully (sync phase)"
+        );
+        Ok(())
+    }
+
+    /// Check if a git stderr indicates lock contention.
+    fn is_git_lock_error(stderr: &str) -> bool {
+        stderr.contains("index.lock")
+            || (stderr.contains("Unable to create") && stderr.contains(".lock"))
+            || stderr.contains("fatal: Unable to create")
+            || stderr.contains("Another git process seems to be running")
+    }
+
+    /// Retry a git operation with exponential backoff when lock contention is detected.
+    ///
+    /// This handles the case where an external git process (not controlled by our
+    /// mutex) holds a lock on the repository. The retry uses exponential backoff
+    /// starting at `GIT_LOCK_RETRY_BASE_DELAY_MS` with up to `GIT_LOCK_RETRY_COUNT`
+    /// attempts.
+    fn retry_git_operation<F, T>(mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Result<T>,
+    {
+        let mut last_err = None;
+        for attempt in 0..=GIT_LOCK_RETRY_COUNT {
+            match op() {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if Self::is_git_lock_error(&err_str) && attempt < GIT_LOCK_RETRY_COUNT {
+                        let delay_ms =
+                            GIT_LOCK_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
+                        warn!(
+                            attempt,
+                            delay_ms,
+                            error = %e,
+                            "Git lock contention detected, retrying after delay"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    // Not a lock error, or we've exhausted retries
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("git retry exhausted without capturing error")))
     }
 
     /// Reuse an existing worktree by fetching origin/main and creating a new branch.
+    ///
+    /// This is the full (async) version used by callers that are NOT under the
+    /// GIT_WORKTREE_MUTEX. The sync-only version `reuse_worktree_sync` is used
+    /// inside the mutex. Kept for direct callers who need async identity config.
+    #[allow(dead_code)]
     async fn reuse_worktree(
         &self,
         worktree_path: &Path,
@@ -918,5 +1065,76 @@ mod tests {
             WorktreeManager::branch_name("pair-1", "T-42"),
             "forge-pair-1/T-42"
         );
+    }
+
+    #[test]
+    fn test_is_git_lock_error_detects_index_lock() {
+        assert!(WorktreeManager::is_git_lock_error(
+            "fatal: Unable to create '/path/.git/index.lock': File exists."
+        ));
+    }
+
+    #[test]
+    fn test_is_git_lock_error_detects_another_git_process() {
+        assert!(WorktreeManager::is_git_lock_error(
+            "fatal: Another git process seems to be running in this repository"
+        ));
+    }
+
+    #[test]
+    fn test_is_git_lock_error_rejects_other_errors() {
+        assert!(!WorktreeManager::is_git_lock_error(
+            "fatal: not a git repository"
+        ));
+        assert!(!WorktreeManager::is_git_lock_error(
+            "error: pathspec 'foo' did not match any file(s) known to git"
+        ));
+    }
+
+    #[test]
+    fn test_retry_git_operation_succeeds_immediately() {
+        let call_count = std::cell::Cell::new(0);
+        let result = WorktreeManager::retry_git_operation(|| {
+            call_count.set(call_count.get() + 1);
+            Ok(42)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.get(), 1);
+    }
+
+    #[test]
+    fn test_retry_git_operation_retries_on_lock_error() {
+        let call_count = std::cell::Cell::new(0);
+        let result = WorktreeManager::retry_git_operation(|| {
+            call_count.set(call_count.get() + 1);
+            if call_count.get() < 3 {
+                Err(anyhow!("fatal: Unable to create '.git/index.lock': File exists."))
+            } else {
+                Ok(99)
+            }
+        });
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(call_count.get(), 3);
+    }
+
+    #[test]
+    fn test_retry_git_operation_exhausts_retries() {
+        let result: Result<i32> = WorktreeManager::retry_git_operation(|| {
+            Err(anyhow!("fatal: Unable to create '.git/index.lock': File exists."))
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("index.lock"));
+    }
+
+    #[test]
+    fn test_retry_git_operation_does_not_retry_non_lock_errors() {
+        let call_count = std::cell::Cell::new(0);
+        let result: Result<i32> = WorktreeManager::retry_git_operation(|| {
+            call_count.set(call_count.get() + 1);
+            Err(anyhow!("fatal: not a git repository"))
+        });
+        assert!(result.is_err());
+        // Should have been called only once (no retry for non-lock errors)
+        assert_eq!(call_count.get(), 1);
     }
 }

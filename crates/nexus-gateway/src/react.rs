@@ -50,6 +50,14 @@ impl ReActLoop {
         self
     }
 
+    /// Consume the ReActLoop and return the underlying AgentRunner.
+    ///
+    /// This allows the caller to reuse the same AgentRunner across multiple
+    /// ReActLoop instances, avoiding repeated MCP server spawning.
+    pub fn into_runner(self) -> AgentRunner {
+        self.runner
+    }
+
     /// Run the ReAct loop for a single inbound message.
     pub async fn run(&mut self, msg: &InboundMessage, store: &SharedStore, gateway: Option<&Gateway>) -> Result<Vec<ReActStep>> {
         let mut steps = Vec::new();
@@ -151,42 +159,24 @@ impl ReActLoop {
 
     /// Decide whether to Act, Respond, or be Done based on the reasoning.
     async fn decide(&self, steps: &[ReActStep], _store: &SharedStore) -> Result<ReActDecision> {
-        // If the last thought suggests a command action, try to extract it
         if let Some(ReActStep::Reason { thought }) = steps.last() {
             let lower = thought.to_lowercase();
 
-            // Simple heuristic: if the thought mentions "respond", "reply", "answer", send a response
-            if lower.contains("respond")
-                || lower.contains("reply")
-                || lower.contains("answer")
-                || lower.contains("inform")
-            {
-                return Ok(ReActDecision::Respond {
-                    content: thought.clone(),
-                });
-            }
-
-            // If thought mentions "done" or "no further action", finish
+            // If thought mentions "done" or "no further action", finish quietly
             if lower.contains("done")
                 || lower.contains("no further action")
                 || lower.contains("complete")
+                || lower.contains("nothing more")
             {
                 return Ok(ReActDecision::Done);
             }
 
-            // Heuristic: if the thought is very short, it's probably a natural response
-            if thought.len() < 80 {
-                return Ok(ReActDecision::Respond {
-                    content: thought.clone(),
-                });
-            }
-        }
-
-        // Default: try to interpret the last observation as a command using the interpreter
-        if let Some(ReActStep::Observe { .. }) = steps.iter().rev().find(|s| matches!(s, ReActStep::Observe { .. })) {
-            // We would need the original message here — for now, default to responding
+            // Always respond with the actual thought content — the agent's reasoning
+            // IS the meaningful message the user should see. The crude keyword
+            // heuristics were discarding informative responses like re-routing
+            // confirmations and status updates.
             return Ok(ReActDecision::Respond {
-                content: "I've processed your message.".to_string(),
+                content: thought.clone(),
             });
         }
 

@@ -6,7 +6,6 @@ use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
-use nexus_gateway::messages::{OutboundMessage, OutboundMessageType};
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,7 +14,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-mod command_executor;
 pub mod react_loop;
 
 const NO_WORK_THRESHOLD: u32 = 3;
@@ -221,14 +219,6 @@ impl NexusNode {
     fn resolve_github_token(&self) -> Result<String> {
         let registry = Registry::load(&self.registry_path)?;
         registry.resolve_github_token("nexus")
-    }
-
-    async fn notify_human(&self, msg: OutboundMessage) {
-        if let Some(ref gateway) = self.gateway {
-            if let Err(e) = gateway.broadcast(&msg).await {
-                warn!("Failed to send human notification via gateway: {}", e);
-            }
-        }
     }
 
     async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
@@ -818,12 +808,11 @@ impl Node for NexusNode {
             warn!("Failed to sync registry: {}", e);
         }
 
-        // Process gateway messages via ReAct loop
-        if let Some(gateway) = self.gateway.as_deref() {
-            if let Err(e) = react_loop::process_gateway_messages(gateway, store, &self.registry_path).await {
-                warn!("Failed to process gateway messages: {}", e);
-            }
-        }
+        // Gateway messages are processed by the background task in agentflow.rs
+        // via process_gateway_messages_with_runner(). We no longer consume
+        // from the gateway channel here to avoid racing with the background
+        // task for the same mpsc channel (messages would be silently lost
+        // by whichever consumer doesn't win the race).
 
         let repository = store.get("repository").await.unwrap_or(json!(""));
 
@@ -982,6 +971,17 @@ impl Node for NexusNode {
                 pending_prs.len()
             );
 
+            // Emit notification event for bridge
+            store
+                .emit(
+                    "nexus",
+                    "merge_routing",
+                    json!({
+                        "pr_count": pending_prs.len(),
+                    }),
+                )
+                .await;
+
             return Ok(Action::new(ACTION_MERGE_PRS));
         }
 
@@ -994,41 +994,37 @@ impl Node for NexusNode {
                 if let Some(ticket_id) = &decision.ticket_id {
                     info!(worker_id, ticket_id, "Nexus: Assigning ticket to worker");
 
-                    let workflow_msg = OutboundMessage {
-                        message_type: OutboundMessageType::WorkflowStarted,
-                        target_channel: None,
-                        target_conversation: None,
-                        content: decision.notes.clone(),
-                        ticket_id: Some(ticket_id.clone()),
-                        worker_id: Some(worker_id.clone()),
-                        metadata: serde_json::json!({ "issue_url": decision.issue_url }),
-                    };
-                    let assign_msg = OutboundMessage {
-                        message_type: OutboundMessageType::AgentAssigned,
-                        target_channel: None,
-                        target_conversation: None,
-                        content: format!("{} has been assigned to work on {}", worker_id, ticket_id),
-                        ticket_id: Some(ticket_id.clone()),
-                        worker_id: Some(worker_id.clone()),
-                        metadata: serde_json::Value::Null,
-                    };
-
-                    let wf_ok = self.gateway.is_some();
-                    let assign_ok = self.gateway.is_some();
-                    self.notify_human(workflow_msg).await;
-                    self.notify_human(assign_msg).await;
+                    // Emit notification events — the NotificationBridge routes
+                    // these to Discord/Slack/etc. via the gateway.
+                    store
+                        .emit(
+                            "nexus",
+                            "work_assigned",
+                            json!({
+                                "ticket_id": ticket_id,
+                                "worker_id": worker_id,
+                                "notes": decision.notes,
+                                "issue_url": decision.issue_url,
+                            }),
+                        )
+                        .await;
+                    store
+                        .emit(
+                            "nexus",
+                            "worker_assigned",
+                            json!({
+                                "ticket_id": ticket_id,
+                                "worker_id": worker_id,
+                            }),
+                        )
+                        .await;
 
                     info!(
                         worker_id,
                         ticket_id,
-                        gateway = ?self.gateway.is_some(),
-                        workflow_notification_sent = wf_ok,
-                        assignment_notification_sent = assign_ok,
-                        "📢 NEXUS → HUMAN: {} assigned to {} (workflow_sent={}, assignment_sent={})",
+                        "📢 NEXUS → HUMAN: {} assigned to {} (via bridge)",
                         ticket_id,
-                        worker_id,
-                        wf_ok,
-                        assign_ok
+                        worker_id
                     );
 
                     let mut tickets: Vec<Ticket> =
@@ -1107,24 +1103,21 @@ impl Node for NexusNode {
                     "CommandGate processing"
                 );
 
-                self.notify_human(OutboundMessage {
-                    message_type: OutboundMessageType::StatusUpdate,
-                    target_channel: None,
-                    target_conversation: None,
-                    content: format!(
-                        "Command {} for {}",
-                        if decision.action == "approve_command" {
-                            "approved"
-                        } else {
-                            "rejected"
-                        },
-                        worker_id
-                    ),
-                    ticket_id: None,
-                    worker_id: Some(worker_id.clone()),
-                    metadata: serde_json::Value::Null,
-                })
-                .await;
+                // Emit notification event for bridge
+                store
+                    .emit(
+                        "nexus",
+                        "command_decision",
+                        json!({
+                            "worker_id": worker_id,
+                            "decision": if decision.action == "approve_command" {
+                                "approved"
+                            } else {
+                                "rejected"
+                            },
+                        }),
+                    )
+                    .await;
 
                 gate.remove(&worker_id);
                 store.set(KEY_COMMAND_GATE, json!(gate)).await;
