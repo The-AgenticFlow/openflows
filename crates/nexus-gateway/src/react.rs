@@ -5,9 +5,9 @@ use agent_client::{AgentDecision, AgentPersona, AgentRunner};
 use pocketflow_core::SharedStore;
 use serde_json::json;
 
-use crate::messages::{InboundMessage, OutboundMessage, OutboundMessageType, SystemCommand};
 use crate::gateway::Gateway;
 use crate::knowledge::KnowledgeStore;
+use crate::messages::{InboundMessage, OutboundMessage, OutboundMessageType, SystemCommand};
 
 /// A single step in the ReAct loop.
 #[derive(Debug, Clone)]
@@ -59,34 +59,47 @@ impl ReActLoop {
     }
 
     /// Run the ReAct loop for a single inbound message.
-    pub async fn run(&mut self, msg: &InboundMessage, store: &SharedStore, gateway: Option<&Gateway>) -> Result<Vec<ReActStep>> {
+    pub async fn run(
+        &mut self,
+        msg: &InboundMessage,
+        store: &SharedStore,
+        gateway: Option<&Gateway>,
+    ) -> Result<Vec<ReActStep>> {
         let mut steps = Vec::new();
 
         // Step 1: Observe
         let observation = self.observe(store, msg).await?;
-        steps.push(ReActStep::Observe { input: observation.clone() });
+        steps.push(ReActStep::Observe {
+            input: observation.clone(),
+        });
 
         let mut iteration = 0;
         loop {
             if iteration >= self.max_iterations {
-                warn!("ReAct loop reached max iterations ({}) — stopping", self.max_iterations);
+                warn!(
+                    "ReAct loop reached max iterations ({}) — stopping",
+                    self.max_iterations
+                );
                 break;
             }
             iteration += 1;
 
             // Step 2: Reason
             let thought = self.reason(&steps).await?;
-            steps.push(ReActStep::Reason { thought: thought.clone() });
+            steps.push(ReActStep::Reason {
+                thought: thought.clone(),
+            });
 
             // Step 3: Decide on action or response
             let decision = self.decide(&steps, store).await?;
 
             match decision {
                 ReActDecision::Act { action } => {
-                    steps.push(ReActStep::Act { action: action.clone() });
+                    steps.push(ReActStep::Act {
+                        action: action.clone(),
+                    });
                     if let Err(e) = self.act(&action, store).await {
                         warn!("ReAct act failed: {}", e);
-                        // Include the error in the observation for the next iteration
                         let error_obs = format!("Action failed: {}", e);
                         steps.push(ReActStep::Observe { input: error_obs });
                     }
@@ -102,7 +115,9 @@ impl ReActLoop {
                         worker_id: None,
                         metadata: serde_json::Value::Null,
                     };
-                    steps.push(ReActStep::Respond { message: outbound.clone() });
+                    steps.push(ReActStep::Respond {
+                        message: outbound.clone(),
+                    });
 
                     if let Some(gw) = gateway {
                         if let Err(e) = gw.send(&outbound).await {
@@ -139,9 +154,13 @@ impl ReActLoop {
         for step in steps {
             match step {
                 ReActStep::Observe { input } => context.push_str(&format!("\nObserve: {}", input)),
-                ReActStep::Reason { thought } => context.push_str(&format!("\nReason: {}", thought)),
+                ReActStep::Reason { thought } => {
+                    context.push_str(&format!("\nReason: {}", thought))
+                }
                 ReActStep::Act { action } => context.push_str(&format!("\nAct: {:?}", action)),
-                ReActStep::Respond { message } => context.push_str(&format!("\nRespond: {}", message.content)),
+                ReActStep::Respond { message } => {
+                    context.push_str(&format!("\nRespond: {}", message.content))
+                }
                 ReActStep::Done => context.push_str("\nDone"),
             }
         }
@@ -191,7 +210,8 @@ impl ReActLoop {
 
         match action {
             SystemCommand::PauseWorkflow { ticket_id } => {
-                let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                let mut tickets: Vec<Ticket> =
+                    store.get_typed(KEY_TICKETS).await.unwrap_or_default();
                 if let Some(ticket) = tickets.iter_mut().find(|t| t.id == *ticket_id) {
                     let worker_id = match &ticket.status {
                         TicketStatus::InProgress { worker_id } => worker_id.clone(),
@@ -218,7 +238,8 @@ impl ReActLoop {
                 }
             }
             SystemCommand::ResumeWorkflow { ticket_id } => {
-                let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                let mut tickets: Vec<Ticket> =
+                    store.get_typed(KEY_TICKETS).await.unwrap_or_default();
                 if let Some(ticket) = tickets.iter_mut().find(|t| t.id == *ticket_id) {
                     if let TicketStatus::AwaitingHuman { worker_id, .. } = &ticket.status {
                         let worker_id = worker_id.clone();
@@ -244,7 +265,7 @@ impl ReActLoop {
                     store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                 if let Some(slot) = slots.get_mut(worker_id) {
                     if let WorkerStatus::Assigned { ticket_id, .. }
-                        | WorkerStatus::Working { ticket_id, .. } = &slot.status
+                    | WorkerStatus::Working { ticket_id, .. } = &slot.status
                     {
                         let tid = ticket_id.clone();
                         let mut tickets: Vec<Ticket> =
@@ -267,7 +288,10 @@ impl ReActLoop {
                     }
                 }
             }
-            SystemCommand::RerouteAgent { from_worker, to_worker } => {
+            SystemCommand::RerouteAgent {
+                from_worker,
+                to_worker,
+            } => {
                 let mut slots: HashMap<String, WorkerSlot> =
                     store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                 let ticket_id = if let Some(from_slot) = slots.get(from_worker) {
@@ -319,8 +343,13 @@ impl ReActLoop {
 
 #[derive(Debug, Clone)]
 enum ReActDecision {
-    Act { action: SystemCommand },
-    Respond { content: String },
+    #[allow(dead_code)]
+    Act {
+        action: SystemCommand,
+    },
+    Respond {
+        content: String,
+    },
     Done,
 }
 

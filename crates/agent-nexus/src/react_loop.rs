@@ -38,11 +38,9 @@ pub async fn process_gateway_messages(
     let model_backend = registry.get("nexus").and_then(|e| e.model_backend.clone());
     let github_token = registry.resolve_github_token("nexus")?;
 
-    let runner = agent_client::AgentRunner::from_env_with_token(
-        model_backend.as_deref(),
-        &github_token,
-    )
-    .await?;
+    let runner =
+        agent_client::AgentRunner::from_env_with_token(model_backend.as_deref(), &github_token)
+            .await?;
 
     let mut react_loop = ReActLoop::new(runner, 8);
 

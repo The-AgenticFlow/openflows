@@ -16,8 +16,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
-futures-util = "0.3"
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-native-roots"] }
+twilight-model = "0.17"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

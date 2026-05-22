@@ -1,14 +1,12 @@
-// crates/nexus-gateway/src/notification_bridge.rs
-//
-// NotificationBridge — bridges SharedStore events to gateway notifications.
-//
-// VesselNotifier and ForgeNode emit events to the SharedStore's ring buffer
-// via `store.emit()`. This bridge polls those events and routes them as
-// OutboundMessages through the gateway to Discord (and any other channel).
-//
-// This decouples domain logic (forge, vessel, pair-harness) from
-// notification delivery. Nodes just emit store events; the bridge
-// handles the gateway routing.
+//! NotificationBridge — bridges SharedStore events to gateway notifications.
+//!
+//! VesselNotifier and ForgeNode emit events to the SharedStore's ring buffer
+//! via `store.emit()`. This bridge polls those events and routes them as
+//! OutboundMessages through the gateway to Discord (and any other channel).
+//!
+//! This decouples domain logic (forge, vessel, pair-harness) from
+//! notification delivery. Nodes just emit store events; the bridge
+//! handles the gateway routing.
 
 use pocketflow_core::SharedStore;
 use tracing::{info, warn};
@@ -19,7 +17,11 @@ use crate::messages::{OutboundMessage, OutboundMessageType};
 /// Maps a `StoreEvent` (agent + event_type + payload) to an `OutboundMessage`.
 /// Returns `None` for events that should NOT generate a stakeholder notification
 /// (e.g. internal bookkeeping events).
-fn map_event_to_message(agent: &str, event_type: &str, payload: &serde_json::Value) -> Option<OutboundMessage> {
+fn map_event_to_message(
+    agent: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<OutboundMessage> {
     match (agent, event_type) {
         // ── Vessel events ────────────────────────────────────────────
         ("vessel", "ticket_merged") => {
@@ -95,7 +97,10 @@ fn map_event_to_message(agent: &str, event_type: &str, payload: &serde_json::Val
                 message_type: OutboundMessageType::CiMissing,
                 target_channel: None,
                 target_conversation: None,
-                content: format!("No CI workflows for PR #{} — merged without validation", pr_number),
+                content: format!(
+                    "No CI workflows for PR #{} — merged without validation",
+                    pr_number
+                ),
                 ticket_id: Some(ticket_id.to_string()),
                 worker_id: None,
                 metadata: serde_json::json!({
@@ -172,6 +177,22 @@ fn map_event_to_message(agent: &str, event_type: &str, payload: &serde_json::Val
                 metadata: serde_json::json!({}),
             })
         }
+        ("forge", "human_intervention") => {
+            let ticket_id = payload["ticket_id"].as_str().unwrap_or("?");
+            let worker_id = payload["worker_id"].as_str().unwrap_or("?");
+            let reason = payload["reason"]
+                .as_str()
+                .unwrap_or("needs human intervention");
+            Some(OutboundMessage {
+                message_type: OutboundMessageType::HumanIntervention,
+                target_channel: None,
+                target_conversation: None,
+                content: format!("{} blocked on {}: {}", worker_id, ticket_id, reason),
+                ticket_id: Some(ticket_id.to_string()),
+                worker_id: Some(worker_id.to_string()),
+                metadata: serde_json::json!({}),
+            })
+        }
         ("forge", "work_failed") => {
             let ticket_id = payload["ticket_id"].as_str().unwrap_or("?");
             let worker_id = payload["worker_id"].as_str().unwrap_or("?");
@@ -194,7 +215,10 @@ fn map_event_to_message(agent: &str, event_type: &str, payload: &serde_json::Val
                 message_type: OutboundMessageType::TicketExhausted,
                 target_channel: None,
                 target_conversation: None,
-                content: format!("{} exceeded max attempts ({}) on {}", worker_id, attempts, ticket_id),
+                content: format!(
+                    "{} exceeded max attempts ({}) on {}",
+                    worker_id, attempts, ticket_id
+                ),
                 ticket_id: Some(ticket_id.to_string()),
                 worker_id: Some(worker_id.to_string()),
                 metadata: serde_json::json!({}),
@@ -312,7 +336,8 @@ pub async fn run_bridge(store: SharedStore, gateway: std::sync::Arc<Gateway>) {
         let new_cursor = cursor + events.len();
 
         for event in &events {
-            if let Some(msg) = map_event_to_message(&event.agent, &event.event_type, &event.payload) {
+            if let Some(msg) = map_event_to_message(&event.agent, &event.event_type, &event.payload)
+            {
                 info!(
                     agent = %event.agent,
                     event_type = %event.event_type,
@@ -337,7 +362,6 @@ pub async fn run_bridge(store: SharedStore, gateway: std::sync::Arc<Gateway>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pocketflow_core::SharedStore;
 
     #[test]
     fn test_map_vessel_ticket_merged() {
@@ -400,6 +424,18 @@ mod tests {
         });
         let msg = map_event_to_message("forge", "work_suspended", &payload).unwrap();
         assert_eq!(msg.message_type, OutboundMessageType::WorkerSuspended);
+    }
+
+    #[test]
+    fn test_map_forge_human_intervention() {
+        let payload = serde_json::json!({
+            "ticket_id": "T-043",
+            "worker_id": "forge-1",
+            "reason": "Worker forge-1 is blocked on T-043 without specific blockers",
+        });
+        let msg = map_event_to_message("forge", "human_intervention", &payload).unwrap();
+        assert_eq!(msg.message_type, OutboundMessageType::HumanIntervention);
+        assert_eq!(msg.worker_id.as_deref(), Some("forge-1"));
     }
 
     #[test]
@@ -484,51 +520,63 @@ mod tests {
     async fn test_bridge_forwards_events() {
         use crate::plugin::ChannelPlugin;
         use async_trait::async_trait;
-        use tokio::sync::{mpsc, watch};
         use std::sync::{Arc, Mutex};
+        use tokio::sync::{mpsc, watch};
 
-        // Create a capturing plugin to verify messages received
+        // ── Capture test plugin ────────────────────────────────────────
         struct CapturePlugin {
             messages: Arc<Mutex<Vec<String>>>,
         }
 
         #[async_trait]
         impl ChannelPlugin for CapturePlugin {
-            fn channel_id(&self) -> &str { "capture" }
+            fn channel_id(&self) -> &str {
+                "capture"
+            }
             async fn start_listener(
                 &self,
                 _tx: mpsc::Sender<crate::messages::InboundMessage>,
                 _shutdown: watch::Receiver<bool>,
-            ) -> anyhow::Result<()> { Ok(()) }
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
             async fn send(&self, msg: &OutboundMessage) -> anyhow::Result<()> {
                 self.messages.lock().unwrap().push(msg.content.clone());
                 Ok(())
             }
             async fn ask_human(
-                &self, _q: &str, _opts: &[&str], _ticket: &str, _timeout: u64,
-            ) -> Option<String> { None }
+                &self,
+                _q: &str,
+                _opts: &[&str],
+                _ticket: &str,
+                _timeout: u64,
+            ) -> Option<String> {
+                None
+            }
         }
 
         let store = SharedStore::new_in_memory();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut gateway = Gateway::new(store.clone());
-        gateway.register_plugin(Arc::new(CapturePlugin { messages: captured.clone() }));
+        gateway.register_plugin(Arc::new(CapturePlugin {
+            messages: captured.clone(),
+        }));
         let gateway = Arc::new(gateway);
 
-        // Emit a vessel ticket_merged event
-        store.emit(
-            "vessel",
-            "ticket_merged",
-            serde_json::json!({
-                "ticket_id": "T-100",
-                "pr_number": 50,
-                "sha": "deadbeef",
-                "pr_title": "Test PR",
-                "pr_body": null,
-            }),
-        ).await;
+        store
+            .emit(
+                "vessel",
+                "ticket_merged",
+                serde_json::json!({
+                    "ticket_id": "T-100",
+                    "pr_number": 50,
+                    "sha": "deadbeef",
+                    "pr_title": "Test PR",
+                    "pr_body": null,
+                }),
+            )
+            .await;
 
-        // Run bridge for one tick
         let store_clone = store.clone();
         let gateway_clone = gateway.clone();
         tokio::spawn(async move {
@@ -536,7 +584,9 @@ mod tests {
             interval.tick().await;
             let events = store_clone.get_events_since(0).await;
             for event in &events {
-                if let Some(msg) = map_event_to_message(&event.agent, &event.event_type, &event.payload) {
+                if let Some(msg) =
+                    map_event_to_message(&event.agent, &event.event_type, &event.payload)
+                {
                     let _ = gateway_clone.broadcast(&msg).await;
                 }
             }
@@ -546,6 +596,9 @@ mod tests {
 
         let msgs = captured.lock().unwrap();
         assert!(!msgs.is_empty(), "Bridge should have forwarded the event");
-        assert!(msgs[0].contains("T-100"), "Message should reference ticket T-100");
+        assert!(
+            msgs[0].contains("T-100"),
+            "Message should reference ticket T-100"
+        );
     }
 }

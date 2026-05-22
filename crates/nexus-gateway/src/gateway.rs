@@ -1,7 +1,7 @@
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
-use anyhow::Result;
 use tracing::{info, warn};
 
 use pocketflow_core::SharedStore;
@@ -12,8 +12,6 @@ use crate::plugin::ChannelPlugin;
 /// Shared key used to store pending inbound messages in SharedStore.
 /// Kept compatible with existing `nexus-chat` usage.
 pub const KEY_HUMAN_MESSAGES: &str = "human_messages";
-
-
 
 pub struct Gateway {
     plugins: HashMap<String, Arc<dyn ChannelPlugin>>,
@@ -108,7 +106,11 @@ impl Gateway {
 
         // Emit event to store
         self.store
-            .emit("nexus_gateway", "message_sent", serde_json::to_value(msg).unwrap_or_default())
+            .emit(
+                "nexus_gateway",
+                "message_sent",
+                serde_json::to_value(msg).unwrap_or_default(),
+            )
             .await;
 
         if let Some(e) = last_error {
@@ -153,17 +155,35 @@ impl Gateway {
 mod tests {
     use super::*;
     use crate::messages::{OutboundMessage, OutboundMessageType};
-    use crate::plugin::{ChannelPlugin, GatewayConfig};
+    use crate::plugin::ChannelPlugin;
     use async_trait::async_trait;
 
     struct DummyPlugin;
 
     #[async_trait]
     impl ChannelPlugin for DummyPlugin {
-        fn channel_id(&self) -> &str { "dummy" }
-        async fn start_listener(&self, _tx: mpsc::Sender<InboundMessage>, _shutdown: watch::Receiver<bool>) -> Result<()> { Ok(()) }
-        async fn send(&self, _msg: &OutboundMessage) -> Result<()> { Ok(()) }
-        async fn ask_human(&self, _q: &str, _opts: &[&str], _ticket: &str, _timeout: u64) -> Option<String> { None }
+        fn channel_id(&self) -> &str {
+            "dummy"
+        }
+        async fn start_listener(
+            &self,
+            _tx: mpsc::Sender<InboundMessage>,
+            _shutdown: watch::Receiver<bool>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &OutboundMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn ask_human(
+            &self,
+            _q: &str,
+            _opts: &[&str],
+            _ticket: &str,
+            _timeout: u64,
+        ) -> Option<String> {
+            None
+        }
     }
 
     #[tokio::test]

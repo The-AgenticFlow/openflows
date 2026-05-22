@@ -12,8 +12,10 @@ pub use channels::mock::MockPlugin;
 pub use gateway::Gateway;
 pub use interpreter::CommandInterpreter;
 pub use knowledge::{KnowledgeStore, StubKnowledgeStore};
-pub use messages::{InboundMessage, OutboundMessage, OutboundMessageType, SystemCommand, InterpretedCommand};
+pub use messages::{
+    InboundMessage, InterpretedCommand, OutboundMessage, OutboundMessageType, SystemCommand,
+};
 pub use notification_bridge::run_bridge as run_notification_bridge;
 pub use plugin::{ChannelPlugin, GatewayConfig};
-pub use react::{ReActLoop, ReActStep};
 pub use rate_limit::RateLimiter;
+pub use react::{ReActLoop, ReActStep};

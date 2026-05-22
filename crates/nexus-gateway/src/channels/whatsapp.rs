@@ -39,7 +39,8 @@ impl WhatsAppPlugin {
     pub fn from_config(config: &serde_json::Value) -> Option<Self> {
         let api_key = config.get("api_key")?.as_str()?;
         let phone = config.get("phone_number")?.as_str()?;
-        let api_url = config.get("api_url")
+        let api_url = config
+            .get("api_url")
             .and_then(|v| v.as_str())
             .unwrap_or("https://graph.facebook.com/v18.0")
             .to_string();
@@ -160,10 +161,7 @@ impl WhatsAppPlugin {
     }
 
     async fn fetch_messages(&self, last_ts: &Option<String>) -> Result<Vec<WhatsAppMessage>> {
-        let mut url = format!(
-            "{}/{}/messages?limit=50",
-            self.api_url, self.phone_number
-        );
+        let mut url = format!("{}/{}/messages?limit=50", self.api_url, self.phone_number);
         if let Some(ts) = last_ts {
             url.push_str(&format!("&after={}", ts));
         }
@@ -192,16 +190,19 @@ impl WhatsAppPlugin {
             .filter_map(|m| {
                 let from = m.get("from").and_then(|f| f.as_str())?.to_string();
                 let id = m.get("id").and_then(|f| f.as_str())?.to_string();
-                let text = m.get("text")
+                let text = m
+                    .get("text")
                     .and_then(|t| t.get("body"))
                     .and_then(|b| b.as_str())?
                     .to_string();
-                let timestamp = m.get("timestamp")
+                let timestamp = m
+                    .get("timestamp")
                     .and_then(|t| t.as_str())
                     .and_then(|t| t.parse::<i64>().ok())
                     .map(|t| DateTime::from_timestamp(t, 0).unwrap_or_else(Utc::now))
                     .unwrap_or_else(Utc::now);
-                let phone_number_id = m.get("messaging_product")
+                let phone_number_id = m
+                    .get("messaging_product")
                     .and_then(|p| p.as_str())
                     .unwrap_or(&self.phone_number)
                     .to_string();

@@ -237,9 +237,8 @@ impl WorktreeManager {
 
         // Retry git operations that may fail due to transient lock contention
         // even under the mutex (e.g., another process outside our control).
-        let fetch_result = Self::retry_git_operation(|| {
-            self.run_git_in_main(&["fetch", "origin", "main"])
-        });
+        let fetch_result =
+            Self::retry_git_operation(|| self.run_git_in_main(&["fetch", "origin", "main"]));
         if let Err(e) = fetch_result {
             warn!(error = %e, "git fetch origin/main failed, continuing");
             warnings.push(SetupWarning {
@@ -249,9 +248,8 @@ impl WorktreeManager {
             });
         }
 
-        let merge_result = Self::retry_git_operation(|| {
-            self.run_git_in_main(&["merge", "origin/main"])
-        });
+        let merge_result =
+            Self::retry_git_operation(|| self.run_git_in_main(&["merge", "origin/main"]));
         if let Err(e) = merge_result {
             warn!(error = %e, "git merge origin/main failed, continuing");
             let affected_files = self.list_unmerged_files_in_main();
@@ -413,8 +411,7 @@ impl WorktreeManager {
                 Err(e) => {
                     let err_str = e.to_string();
                     if Self::is_git_lock_error(&err_str) && attempt < GIT_LOCK_RETRY_COUNT {
-                        let delay_ms =
-                            GIT_LOCK_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
+                        let delay_ms = GIT_LOCK_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
                         warn!(
                             attempt,
                             delay_ms,
@@ -1108,7 +1105,9 @@ mod tests {
         let result = WorktreeManager::retry_git_operation(|| {
             call_count.set(call_count.get() + 1);
             if call_count.get() < 3 {
-                Err(anyhow!("fatal: Unable to create '.git/index.lock': File exists."))
+                Err(anyhow!(
+                    "fatal: Unable to create '.git/index.lock': File exists."
+                ))
             } else {
                 Ok(99)
             }
@@ -1120,7 +1119,9 @@ mod tests {
     #[test]
     fn test_retry_git_operation_exhausts_retries() {
         let result: Result<i32> = WorktreeManager::retry_git_operation(|| {
-            Err(anyhow!("fatal: Unable to create '.git/index.lock': File exists."))
+            Err(anyhow!(
+                "fatal: Unable to create '.git/index.lock': File exists."
+            ))
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("index.lock"));

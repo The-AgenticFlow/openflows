@@ -1,4 +1,3 @@
-// crates/agent-forge/src/lib.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use config::{
@@ -154,13 +153,10 @@ impl BatchNode for ForgeNode {
             _ => return Ok(json!({"outcome": "idle", "worker_id": worker_id})),
         };
 
-        // Create worktree manager
         let worktree_mgr = WorktreeManager::new(&self.workspace_root);
 
-        // Resolve token for this specific worker
         let worker_token = self.resolve_token_for_worker(&worker_id)?;
 
-        // Create worktree for this worker
         let setup_result = worktree_mgr
             .create_worktree(&worker_id, &ticket_id, &worker_token)
             .await
@@ -184,10 +180,8 @@ impl BatchNode for ForgeNode {
 
         info!(worker = worker_id, ticket = ticket_id, issue_url = ?issue_url, "Spawning Claude Code...");
 
-        // Load the persona from the agent definition file (source of truth)
         let persona_content = self.load_persona().await?;
 
-        // 1. Prepare command - build prompt from persona + task context
         let issue_context = if let Some(url) = &issue_url {
             format!("Issue URL: {}. Use your MCP tools (e.g. `get_issue` or `read_url`) to fetch the full description.", url)
         } else {
@@ -196,16 +190,15 @@ impl BatchNode for ForgeNode {
 
         let branch_name = WorktreeManager::branch_name(&worker_id, &ticket_id);
 
-        // Combine persona with task-specific context
         let prompt = format!(
             "{}\n\n---\n\n# Current Task\n\nYou are FORGE agent {} (worker slot).\nImplement ticket {}.\n{}\nBranch: {}.\nWhen done, open a PR and write STATUS.json.",
             persona_content, worker_id, ticket_id, issue_context, branch_name
         );
 
-        // Use CLI flags to grant permissions
-        // Note: When using --allowedTools with comma-separated values, Claude Code
-        // doesn't properly recognize the prompt as a positional argument.
-        // We must pass the prompt via stdin instead.
+        // Use CLI flags to grant permissions.
+        // When using --allowedTools with comma-separated values, Claude Code
+        // doesn't properly recognize the prompt as a positional argument,
+        // so the prompt must be passed via stdin instead.
         let mut child = tokio::process::Command::new("claude")
             .args(["--print", "--output-format", "json"])
             .arg("--dangerously-skip-permissions")
@@ -221,7 +214,6 @@ impl BatchNode for ForgeNode {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn Claude Code: {:#}", e))?;
 
-        // Write prompt to stdin
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin
@@ -229,11 +221,6 @@ impl BatchNode for ForgeNode {
                 .await
                 .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
         }
-
-        // MONITORING: Since we redirected stdout/stderr to a file, we can't easily
-        // monitor for "Dangerous command" strings in real-time within this process
-        // without tailing the file. For now, we'll let it run and check the STATUS.json
-        // or the log file afterwards.
 
         let timeout_dur = std::time::Duration::from_secs(1800); // 30 minutes
 
@@ -347,7 +334,6 @@ impl BatchNode for ForgeNode {
                         let pr_number = res["pr_number"].as_u64().unwrap_or(0);
                         let branch = res["branch"].as_str().unwrap_or("");
 
-                        // Emit notification event for bridge
                         store
                             .emit(
                                 "forge",
@@ -381,31 +367,95 @@ impl BatchNode for ForgeNode {
                     }
                     "suspended" | "blocked" => {
                         let reason = res["reason"].as_str().unwrap_or("unknown");
-                        info!(
-                            worker = worker_id,
-                            ticket = ticket_id,
-                            reason,
-                            "Work suspended for approval"
-                        );
-                        slot.status = WorkerStatus::Suspended {
-                            ticket_id: ticket_id.to_string(),
-                            reason: reason.to_string(),
-                            issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
-                        };
-                        command_gate.insert(worker_id.to_string(), res.clone());
+                        let blockers = res["blockers"].as_array();
+                        let has_specific_blockers =
+                            blockers.map(|b| !b.is_empty()).unwrap_or(false);
+                        let has_meaningful_reason =
+                            !reason.is_empty() && reason != "See blockers" && reason != "unknown";
 
-                        // Emit notification event for bridge
-                        store
-                            .emit(
-                                "forge",
-                                "work_suspended",
-                                json!({
-                                    "worker_id": worker_id,
-                                    "ticket_id": ticket_id,
-                                    "reason": reason,
-                                }),
-                            )
-                            .await;
+                        if has_specific_blockers || has_meaningful_reason {
+                            info!(
+                                worker = worker_id,
+                                ticket = ticket_id,
+                                reason,
+                                has_blockers = has_specific_blockers,
+                                "Work suspended for approval"
+                            );
+                            slot.status = WorkerStatus::Suspended {
+                                ticket_id: ticket_id.to_string(),
+                                reason: reason.to_string(),
+                                issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
+                            };
+                            command_gate.insert(worker_id.to_string(), res.clone());
+
+                            store
+                                .emit(
+                                    "forge",
+                                    "work_suspended",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": reason,
+                                    }),
+                                )
+                                .await;
+                        } else {
+                            warn!(
+                                worker = worker_id,
+                                ticket = ticket_id,
+                                reason,
+                                "Work blocked without specific blockers or meaningful reason — releasing worker slot"
+                            );
+                            slot.status = WorkerStatus::Idle;
+                            all_success = false;
+
+                            let prev_attempts = tickets
+                                .iter()
+                                .find(|t| t.id == ticket_id)
+                                .map(|t| t.attempts)
+                                .unwrap_or(0)
+                                + 1;
+                            if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                                ticket_updates.push((
+                                    ticket_id.to_string(),
+                                    TicketStatus::Exhausted {
+                                        worker_id: worker_id.to_string(),
+                                        attempts: prev_attempts,
+                                    },
+                                ));
+                            } else {
+                                ticket_updates.push((
+                                    ticket_id.to_string(),
+                                    TicketStatus::Failed {
+                                        worker_id: worker_id.to_string(),
+                                        reason: format!("blocked_without_blockers: {}", reason),
+                                        attempts: prev_attempts,
+                                    },
+                                ));
+                            }
+                            if let Err(e) =
+                                worktree_mgr.remove_worktree_for_ticket(worker_id, ticket_id)
+                            {
+                                warn!(worker = worker_id, error = %e, "Failed to cleanup worktree");
+                            } else {
+                                info!(
+                                    worker = worker_id,
+                                    "Worktree cleaned up after blocked (no blockers)"
+                                );
+                            }
+
+                            store
+                                .emit(
+                                    "forge",
+                                    "human_intervention",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": format!("{} — worker slot released, ticket marked for retry", reason),
+                                    }),
+                                )
+                                .await;
+                        }
                     }
                     "fuel_exhausted" => {
                         let reason = res["reason"].as_str().unwrap_or("timeout");
@@ -418,7 +468,6 @@ impl BatchNode for ForgeNode {
                         slot.status = WorkerStatus::Idle;
                         all_success = false;
 
-                        // Emit notification event for bridge
                         store
                             .emit(
                                 "forge",
@@ -480,7 +529,6 @@ impl BatchNode for ForgeNode {
                             .unwrap_or(0)
                             + 1;
                         if prev_attempts >= Ticket::MAX_ATTEMPTS {
-                            // Emit notification for exhausted ticket
                             store
                                 .emit(
                                     "forge",
@@ -501,7 +549,6 @@ impl BatchNode for ForgeNode {
                                 },
                             ));
                         } else {
-                            // Emit notification for failed work
                             store
                                 .emit(
                                     "forge",
@@ -1545,7 +1592,12 @@ impl BatchNode for ForgePairNode {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| anyhow!("Failed to create current-thread runtime in spawn_blocking: {}", e))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to create current-thread runtime in spawn_blocking: {}",
+                        e
+                    )
+                })?;
 
             rt.block_on(async {
                 let mut pair = ForgeSentinelPair::new(config_clone);
@@ -1687,6 +1739,8 @@ impl BatchNode for ForgePairNode {
             std::collections::HashSet::new();
         let mut all_success = true;
 
+        let worktree_mgr = WorktreeManager::new(&self.workspace_root);
+
         // Collect ticket status updates to apply
         let mut ticket_updates: Vec<(String, TicketStatus)> = Vec::new();
 
@@ -1734,7 +1788,6 @@ impl BatchNode for ForgePairNode {
                         let pr_number = res["pr_number"].as_u64().unwrap_or(0);
                         let branch = res["branch"].as_str().unwrap_or("");
 
-                        // Emit notification event for bridge
                         store
                             .emit(
                                 "forge",
@@ -1761,31 +1814,108 @@ impl BatchNode for ForgePairNode {
                     }
                     "blocked" => {
                         let reason = res["reason"].as_str().unwrap_or("unknown");
+                        let blockers = res["blockers"].as_array();
+                        let has_specific_blockers =
+                            blockers.map(|b| !b.is_empty()).unwrap_or(false);
+                        let has_meaningful_reason =
+                            !reason.is_empty() && reason != "See blockers" && reason != "unknown";
+
                         info!(
                             worker = worker_id,
                             ticket = ticket_id,
                             reason,
+                            has_blockers = has_specific_blockers,
                             "Pair blocked - needs intervention"
                         );
-                        slot.status = WorkerStatus::Suspended {
-                            ticket_id: ticket_id.to_string(),
-                            reason: reason.to_string(),
-                            issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
-                        };
-                        command_gate.insert(worker_id.to_string(), res.clone());
 
-                        // Emit notification event for bridge
-                        store
-                            .emit(
-                                "forge",
-                                "work_suspended",
-                                json!({
-                                    "worker_id": worker_id,
-                                    "ticket_id": ticket_id,
-                                    "reason": reason,
-                                }),
-                            )
-                            .await;
+                        if has_specific_blockers || has_meaningful_reason {
+                            // Specific blockers or meaningful reason — suspend for human intervention
+                            slot.status = WorkerStatus::Suspended {
+                                ticket_id: ticket_id.to_string(),
+                                reason: reason.to_string(),
+                                issue_url: res["issue_url"].as_str().map(|s| s.to_string()),
+                            };
+                            command_gate.insert(worker_id.to_string(), res.clone());
+
+                            store
+                                .emit(
+                                    "forge",
+                                    "work_suspended",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": reason,
+                                    }),
+                                )
+                                .await;
+                        } else {
+                            // No specific blockers and no meaningful reason — release the
+                            // worker slot so it can be reassigned. Mark the ticket as
+                            // Failed so it can be retried on the next cycle. Keeping the
+                            // worker Suspended with empty blockers and an ambiguous reason
+                            // creates a deadlock: no human can diagnose what to unblock,
+                            // and the worker slot is permanently unavailable.
+                            warn!(
+                                worker = worker_id,
+                                ticket = ticket_id,
+                                reason,
+                                "Pair blocked without specific blockers or meaningful reason — releasing worker slot"
+                            );
+                            slot.status = WorkerStatus::Idle;
+                            all_success = false;
+
+                            let prev_attempts = tickets
+                                .iter()
+                                .find(|t| t.id == ticket_id)
+                                .map(|t| t.attempts)
+                                .unwrap_or(0)
+                                + 1;
+                            if prev_attempts >= Ticket::MAX_ATTEMPTS {
+                                ticket_updates.push((
+                                    ticket_id.to_string(),
+                                    TicketStatus::Exhausted {
+                                        worker_id: worker_id.to_string(),
+                                        attempts: prev_attempts,
+                                    },
+                                ));
+                            } else {
+                                ticket_updates.push((
+                                    ticket_id.to_string(),
+                                    TicketStatus::Failed {
+                                        worker_id: worker_id.to_string(),
+                                        reason: format!("blocked_without_blockers: {}", reason),
+                                        attempts: prev_attempts,
+                                    },
+                                ));
+                            }
+
+                            if let Err(e) =
+                                worktree_mgr.remove_worktree_for_ticket(worker_id, ticket_id)
+                            {
+                                warn!(worker = worker_id, error = %e, "Failed to cleanup worktree");
+                            } else {
+                                info!(
+                                    worker = worker_id,
+                                    "Worktree cleaned up after blocked (no blockers)"
+                                );
+                            }
+
+                            store
+                                .emit(
+                                    "forge",
+                                    "human_intervention",
+                                    json!({
+                                        "worker_id": worker_id,
+                                        "ticket_id": ticket_id,
+                                        "reason": if reason == "See blockers" || reason.is_empty() {
+                                            format!("Worker {} blocked on {} without specific blockers — released slot, ticket marked for retry", worker_id, ticket_id)
+                                        } else {
+                                            format!("{} — worker slot released, ticket marked for retry", reason)
+                                        },
+                                    }),
+                                )
+                                .await;
+                        }
                     }
                     "idle" => {}
                     "fuel_exhausted" => {
@@ -1821,7 +1951,6 @@ impl BatchNode for ForgePairNode {
                                     "pr_url": pr_url,
                                 }));
 
-                                // Emit notification — PR found despite fuel exhaustion
                                 store
                                     .emit(
                                         "forge",
@@ -1840,7 +1969,6 @@ impl BatchNode for ForgePairNode {
                                 slot.status = WorkerStatus::Idle;
                                 all_success = false;
 
-                                // Emit fuel exhausted notification
                                 store
                                     .emit(
                                         "forge",
@@ -1860,7 +1988,6 @@ impl BatchNode for ForgePairNode {
                                     .unwrap_or(0)
                                     + 1;
                                 if prev_attempts >= Ticket::MAX_ATTEMPTS {
-                                    // Emit exhausted notification
                                     store
                                         .emit(
                                             "forge",
@@ -1909,7 +2036,6 @@ impl BatchNode for ForgePairNode {
                             .unwrap_or(0)
                             + 1;
                         if prev_attempts >= Ticket::MAX_ATTEMPTS {
-                            // Emit exhausted notification
                             store
                                 .emit(
                                     "forge",
@@ -1930,7 +2056,6 @@ impl BatchNode for ForgePairNode {
                                 },
                             ));
                         } else {
-                            // Emit failed notification
                             store
                                 .emit(
                                     "forge",

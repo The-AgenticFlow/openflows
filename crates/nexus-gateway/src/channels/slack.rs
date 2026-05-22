@@ -49,16 +49,32 @@ impl SlackPlugin {
     fn format_message(&self, msg: &OutboundMessage) -> String {
         match msg.message_type {
             OutboundMessageType::WorkflowStarted => {
-                format!("🚀 Starting ticket {}: {}", msg.ticket_id.as_deref().unwrap_or("?"), msg.content)
+                format!(
+                    "🚀 Starting ticket {}: {}",
+                    msg.ticket_id.as_deref().unwrap_or("?"),
+                    msg.content
+                )
             }
             OutboundMessageType::AgentAssigned => {
-                format!("👷 {} assigned to {}", msg.worker_id.as_deref().unwrap_or("?"), msg.content)
+                format!(
+                    "👷 {} assigned to {}",
+                    msg.worker_id.as_deref().unwrap_or("?"),
+                    msg.content
+                )
             }
             OutboundMessageType::AgentCompleted => {
-                format!("✅ {} completed: {}", msg.worker_id.as_deref().unwrap_or("?"), msg.content)
+                format!(
+                    "✅ {} completed: {}",
+                    msg.worker_id.as_deref().unwrap_or("?"),
+                    msg.content
+                )
             }
             OutboundMessageType::WorkflowError => {
-                format!("❌ {}: {}", msg.worker_id.as_deref().unwrap_or("?"), msg.content)
+                format!(
+                    "❌ {}: {}",
+                    msg.worker_id.as_deref().unwrap_or("?"),
+                    msg.content
+                )
             }
             OutboundMessageType::QuestionToHuman => {
                 format!("🤔 {}", msg.content)
@@ -90,7 +106,9 @@ impl SlackPlugin {
                 })]
             }
             OutboundMessageType::QuestionToHuman => {
-                let options = msg.metadata.get("options")
+                let options = msg
+                    .metadata
+                    .get("options")
                     .and_then(|o| o.as_array())
                     .map(|arr| {
                         arr.iter()

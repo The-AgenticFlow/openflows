@@ -8,7 +8,7 @@ use config::{
     ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
-use nexus_gateway::{Gateway, GatewayConfig, run_notification_bridge};
+use nexus_gateway::{run_notification_bridge, Gateway, GatewayConfig};
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
@@ -95,7 +95,9 @@ async fn main() -> Result<()> {
             match channel_id.as_str() {
                 "slack" => {
                     if let Some(config) = gateway_config.channels.get("slack") {
-                        if let Some(plugin) = nexus_gateway::channels::slack::SlackPlugin::from_config(config) {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::slack::SlackPlugin::from_config(config)
+                        {
                             gateway.register_plugin(Arc::new(plugin));
                             info!("Gateway registered SlackPlugin");
                         }
@@ -103,7 +105,9 @@ async fn main() -> Result<()> {
                 }
                 "discord" => {
                     if let Some(config) = gateway_config.channels.get("discord") {
-                        if let Some(plugin) = nexus_gateway::channels::discord::DiscordPlugin::from_config(config) {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::discord::DiscordPlugin::from_config(config)
+                        {
                             gateway.register_plugin(Arc::new(plugin));
                             info!("Gateway registered DiscordPlugin");
                         }
@@ -111,7 +115,9 @@ async fn main() -> Result<()> {
                 }
                 "whatsapp" => {
                     if let Some(config) = gateway_config.channels.get("whatsapp") {
-                        if let Some(plugin) = nexus_gateway::channels::whatsapp::WhatsAppPlugin::from_config(config) {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::whatsapp::WhatsAppPlugin::from_config(config)
+                        {
                             gateway.register_plugin(Arc::new(plugin));
                             info!("Gateway registered WhatsAppPlugin");
                         }

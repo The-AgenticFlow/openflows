@@ -1,7 +1,7 @@
+use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
-use anyhow::Result;
 
 use crate::messages::{InboundMessage, OutboundMessage};
 
@@ -37,7 +37,7 @@ pub trait ChannelPlugin: Send + Sync {
 pub struct GatewayConfig {
     pub enabled: bool,
     pub dev_mode: bool,
-    pub channels: HashMap<String, serde_json::Value>,  // channel_id → config blob
+    pub channels: HashMap<String, serde_json::Value>, // channel_id → config blob
 }
 
 impl GatewayConfig {
@@ -131,5 +131,3 @@ impl GatewayConfig {
         }
     }
 }
-
-

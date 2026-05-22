@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::messages::{InboundMessage, OutboundMessage};
@@ -134,9 +134,7 @@ mod tests {
         plugin.inject_inbound(inbound.clone()).await;
 
         let plugin_arc = Arc::new(plugin);
-        let handle = tokio::spawn(async move {
-            plugin_arc.start_listener(tx, shutdown_rx).await
-        });
+        let handle = tokio::spawn(async move { plugin_arc.start_listener(tx, shutdown_rx).await });
 
         // Wait a bit for the listener to poll and send
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;

@@ -7,19 +7,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMessage {
     pub message_id: String,
-    pub channel_id: String,       // which plugin sent it ("slack", "discord", ...)
+    pub channel_id: String,
     pub user_id: String,
-    pub conversation_id: String,  // channel/thread/group ID
+    pub conversation_id: String,
     pub text: String,
     pub timestamp: DateTime<Utc>,
-    pub metadata: serde_json::Value,  // channel-specific extras
+    pub metadata: serde_json::Value,
 }
 
 /// An outbound message to be routed to channel plugins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {
     pub message_type: OutboundMessageType,
-    pub target_channel: Option<String>,  // None = all channels
+    pub target_channel: Option<String>,
     pub target_conversation: Option<String>,
     pub content: String,
     pub ticket_id: Option<String>,
@@ -44,18 +44,18 @@ pub enum OutboundMessageType {
     ApproveCommand,
     RerouteAgent,
     BlockAgent,
-    // New variants for comprehensive stakeholder notifications
-    PrOpened,            // FORGE opened a PR
-    PrMerged,            // VESSEL merged a PR
-    CiFailed,            // CI checks failed on a PR
-    CiTimeout,           // CI polling timed out
-    CiMissing,           // No CI workflows configured in repo
-    MergeBlocked,        // GitHub API blocked the merge
-    ConflictsDetected,   // Merge conflicts detected
-    TicketFailed,        // Ticket marked as failed
-    TicketExhausted,     // Ticket exceeded max attempts
-    FuelExhausted,       // Agent ran out of fuel/time
-    WorkerSuspended,     // Worker needs human approval
+    PrOpened,
+    PrMerged,
+    CiFailed,
+    CiTimeout,
+    CiMissing,
+    MergeBlocked,
+    ConflictsDetected,
+    TicketFailed,
+    TicketExhausted,
+    FuelExhausted,
+    WorkerSuspended,
+    HumanIntervention,
 }
 
 // ── SystemCommand (replaces HumanCommand) ───────────────────────────────────
@@ -63,14 +63,31 @@ pub enum OutboundMessageType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemCommand {
-    PauseWorkflow { ticket_id: String },
-    ResumeWorkflow { ticket_id: String },
-    ApproveCommand { worker_id: String },
-    BlockAgent { worker_id: String, reason: String },
-    RerouteAgent { from_worker: String, to_worker: String },
-    AnswerQuestion { ticket_id: String, answer: String },
+    PauseWorkflow {
+        ticket_id: String,
+    },
+    ResumeWorkflow {
+        ticket_id: String,
+    },
+    ApproveCommand {
+        worker_id: String,
+    },
+    BlockAgent {
+        worker_id: String,
+        reason: String,
+    },
+    RerouteAgent {
+        from_worker: String,
+        to_worker: String,
+    },
+    AnswerQuestion {
+        ticket_id: String,
+        answer: String,
+    },
     StatusQuery,
-    GeneralMessage { text: String },
+    GeneralMessage {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]

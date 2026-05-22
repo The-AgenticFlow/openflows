@@ -34,7 +34,11 @@ impl RateLimiter {
         let now = Instant::now();
         let commands = self.user_commands.get(user_id);
         let count = commands
-            .map(|cmds| cmds.iter().filter(|&&t| now.duration_since(t) < self.window).count())
+            .map(|cmds| {
+                cmds.iter()
+                    .filter(|&&t| now.duration_since(t) < self.window)
+                    .count()
+            })
             .unwrap_or(0);
         self.max_commands.saturating_sub(count as u32)
     }

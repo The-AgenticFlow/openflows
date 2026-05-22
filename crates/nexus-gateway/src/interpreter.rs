@@ -1,7 +1,7 @@
 use agent_client::{AgentDecision, AgentPersona, AgentRunner};
 
-use crate::messages::{InboundMessage, InterpretedCommand, SystemCommand};
 use crate::knowledge::{KnowledgeStore, StubKnowledgeStore};
+use crate::messages::{InboundMessage, InterpretedCommand, SystemCommand};
 
 /// Layered command interpreter: pattern match → RAG → LLM.
 pub struct CommandInterpreter {
@@ -100,7 +100,11 @@ impl CommandInterpreter {
         }
 
         // reject / deny
-        if starts_with_cmd("reject") || starts_with_cmd("deny") || fuzzy_cmd("reject") || fuzzy_cmd("deny") {
+        if starts_with_cmd("reject")
+            || starts_with_cmd("deny")
+            || fuzzy_cmd("reject")
+            || fuzzy_cmd("deny")
+        {
             let worker_id = extract_worker_id(text);
             return Some(InterpretedCommand {
                 command: SystemCommand::BlockAgent {
@@ -127,15 +131,22 @@ impl CommandInterpreter {
         }
 
         // reroute / reassign / assign
-        if starts_with_cmd("reroute") || starts_with_cmd("reassign") || starts_with_cmd("assign")
-            || fuzzy_cmd("reroute") || fuzzy_cmd("reassign") || fuzzy_cmd("assign")
+        if starts_with_cmd("reroute")
+            || starts_with_cmd("reassign")
+            || starts_with_cmd("assign")
+            || fuzzy_cmd("reroute")
+            || fuzzy_cmd("reassign")
+            || fuzzy_cmd("assign")
         {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 3 {
                 let (from_worker, to_worker) = extract_two_workers(&parts);
                 if from_worker.contains('-') && to_worker.contains('-') {
                     return Some(InterpretedCommand {
-                        command: SystemCommand::RerouteAgent { from_worker, to_worker },
+                        command: SystemCommand::RerouteAgent {
+                            from_worker,
+                            to_worker,
+                        },
                         source: msg.clone(),
                         confidence: 1.0,
                     });
@@ -159,7 +170,8 @@ impl CommandInterpreter {
         if starts_with_cmd("answer") || fuzzy_cmd("answer") {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
-                let ticket_id = extract_ticket_id(text).unwrap_or_else(|| parts[1].trim_end_matches(':').to_string());
+                let ticket_id = extract_ticket_id(text)
+                    .unwrap_or_else(|| parts[1].trim_end_matches(':').to_string());
                 let answer = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
                 return Some(InterpretedCommand {
                     command: SystemCommand::AnswerQuestion { ticket_id, answer },
@@ -235,9 +247,7 @@ Example valid responses:
         });
 
         match self.runner.run(&self.persona, context, 5).await {
-            Ok(decision) => {
-                self.decision_to_command(decision, msg)
-            }
+            Ok(decision) => self.decision_to_command(decision, msg),
             Err(e) => {
                 tracing::warn!("LLM interpretation failed: {}", e);
                 None
@@ -245,35 +255,56 @@ Example valid responses:
         }
     }
 
-    fn decision_to_command(&self, decision: AgentDecision, msg: &InboundMessage) -> Option<InterpretedCommand> {
+    fn decision_to_command(
+        &self,
+        decision: AgentDecision,
+        msg: &InboundMessage,
+    ) -> Option<InterpretedCommand> {
         let cmd = match decision.action.as_str() {
-            "pause_workflow" => {
-                decision.ticket_id.map(|id| SystemCommand::PauseWorkflow { ticket_id: id })
-            }
-            "resume_workflow" => {
-                decision.ticket_id.map(|id| SystemCommand::ResumeWorkflow { ticket_id: id })
-            }
+            "pause_workflow" => decision
+                .ticket_id
+                .map(|id| SystemCommand::PauseWorkflow { ticket_id: id }),
+            "resume_workflow" => decision
+                .ticket_id
+                .map(|id| SystemCommand::ResumeWorkflow { ticket_id: id }),
             "approve_command" | "approve" => {
                 let worker_id = decision.assign_to.unwrap_or_else(|| "unknown".to_string());
                 Some(SystemCommand::ApproveCommand { worker_id })
             }
             "block_agent" | "block" | "reject" => {
                 let worker_id = decision.assign_to.unwrap_or_else(|| "unknown".to_string());
-                let reason = if decision.notes.is_empty() { "blocked_by_human".to_string() } else { decision.notes };
+                let reason = if decision.notes.is_empty() {
+                    "blocked_by_human".to_string()
+                } else {
+                    decision.notes
+                };
                 Some(SystemCommand::BlockAgent { worker_id, reason })
             }
             "reroute_agent" | "reroute" => {
                 let from_worker = decision.assign_to.unwrap_or_else(|| "unknown".to_string());
-                let to_worker = if decision.notes.is_empty() { "unknown".to_string() } else { decision.notes };
-                Some(SystemCommand::RerouteAgent { from_worker, to_worker })
+                let to_worker = if decision.notes.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    decision.notes
+                };
+                Some(SystemCommand::RerouteAgent {
+                    from_worker,
+                    to_worker,
+                })
             }
             "answer_question" => {
                 let ticket_id = decision.ticket_id.unwrap_or_else(|| "unknown".to_string());
-                let answer = if decision.notes.is_empty() { "yes".to_string() } else { decision.notes };
+                let answer = if decision.notes.is_empty() {
+                    "yes".to_string()
+                } else {
+                    decision.notes
+                };
                 Some(SystemCommand::AnswerQuestion { ticket_id, answer })
             }
             "status_query" => Some(SystemCommand::StatusQuery),
-            _ => Some(SystemCommand::GeneralMessage { text: msg.text.clone() }),
+            _ => Some(SystemCommand::GeneralMessage {
+                text: msg.text.clone(),
+            }),
         };
 
         cmd.map(|c| InterpretedCommand {
