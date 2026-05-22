@@ -1,0 +1,23 @@
+{
+  "model": {
+    "review_model": "glm-5p1",
+    "summary_model": "qwen3p6-plus",
+    "endpoint": "https://api.ai.camer.digital/v1"
+  },
+  "index": {
+    "exclude_patterns": [
+      "target",
+      "node_modules",
+      "vendor",
+      ".git",
+      "build",
+      ".gradle",
+      ".mvn",
+      "dist",
+      "out",
+      "coverage",
+      "assets",
+      ".vscode"
+    ]
+  }
+}
