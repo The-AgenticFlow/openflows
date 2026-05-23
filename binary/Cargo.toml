@@ -36,7 +36,9 @@ agent-nexus     = { path = "../crates/agent-nexus" }
 agent-forge     = { path = "../crates/agent-forge" }
 agent-vessel    = { path = "../crates/agent-vessel" }
 agent-lore      = { path = "../crates/agent-lore" }
+agent-client    = { path = "../crates/agent-client" }
 pair-harness    = { path = "../crates/pair-harness" }
+nexus-gateway   = { path = "../crates/nexus-gateway" }
 
 anyhow      = { workspace = true }
 serde_json  = { workspace = true }

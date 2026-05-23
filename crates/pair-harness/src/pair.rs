@@ -1,4 +1,3 @@
-// crates/pair-harness/src/pair.rs
 //! ForgeSentinelPair - the main pair lifecycle manager.
 //!
 //! Implements the v3 event-driven architecture where:
@@ -26,6 +25,7 @@ use crate::worktree::{MergeMainResult, SetupWarning, WorktreeManager};
 
 const DEFAULT_SENTINEL_TIMEOUT_SECS: u64 = 120;
 const FORGE_STARTUP_TIMEOUT_SECS: u64 = 300;
+const MAX_STARTUP_RESPAWNS: u32 = 3;
 const MAX_SENTINEL_RETRIES: u32 = 2;
 const MIN_SENTINEL_RETRY_INTERVAL_SECS: u64 = 30;
 
@@ -343,6 +343,7 @@ pub struct ForgeSentinelPair {
     sentinel_retries: SentinelRetryState,
     last_sentinel_spawn_time: Option<Instant>,
     last_sentinel_failure: Option<SentinelFailureInfo>,
+    startup_respawn_count: u32,
     ticket_id: String,
     plan_approved: bool,
     final_approved: bool,
@@ -384,6 +385,7 @@ impl ForgeSentinelPair {
             sentinel_retries: SentinelRetryState::new(),
             last_sentinel_spawn_time: None,
             last_sentinel_failure: None,
+            startup_respawn_count: 0,
             ticket_id: String::new(),
             plan_approved: false,
             final_approved: false,
@@ -670,12 +672,34 @@ impl ForgeSentinelPair {
                     FORGE_STARTUP_TIMEOUT_SECS
                 );
 
+                if self.startup_respawn_count >= MAX_STARTUP_RESPAWNS {
+                    warn!(
+                        respawn_count = self.startup_respawn_count,
+                        max = MAX_STARTUP_RESPAWNS,
+                        "Max startup respawns exceeded - fuel exhausted"
+                    );
+                    let _ = self.process.kill(forge).await;
+                    self.cleanup(forge).await?;
+                    return Ok(PairOutcome::FuelExhausted {
+                        reason: format!(
+                            "FORGE failed to produce PLAN.md after {} startup respawns ({}s timeout each)",
+                            self.startup_respawn_count, FORGE_STARTUP_TIMEOUT_SECS
+                        ),
+                        reset_count: self.reset.reset_count(),
+                    });
+                }
+
                 // Check if FORGE is still running
                 if self.process.is_running(forge).await {
-                    warn!("Killing stuck FORGE process and respawning");
+                    warn!(
+                        respawn = self.startup_respawn_count + 1,
+                        max = MAX_STARTUP_RESPAWNS,
+                        "Killing stuck FORGE process and respawning"
+                    );
                     self.process.kill(forge).await?;
                     self.sentinel_retries.reset_all();
                     *forge = self.spawn_forge_resume().await?;
+                    self.startup_respawn_count += 1;
                     self.reset.increment_reset();
                 }
             }
@@ -820,6 +844,7 @@ impl ForgeSentinelPair {
                 while let Some(evt) = watcher.try_recv() {
                     match evt {
                         FsEvent::PlanWritten => {
+                            self.startup_respawn_count = 0;
                             if !self.plan_approved && self.sentinel_tracker.is_none() {
                                 info!("PLAN.md written (drained after FORGE exit) - spawning SENTINEL for plan review");
                                 self.spawn_sentinel_for_plan().await?;

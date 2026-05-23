@@ -1,0 +1,23 @@
+[package]
+name = "nexus-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pocketflow-core = { path = "../pocketflow-core" }
+config = { path = "../config" }
+agent-client = { path = "../agent-client" }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-native-roots"] }
+twilight-model = "0.17"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

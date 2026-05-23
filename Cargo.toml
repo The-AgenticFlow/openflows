@@ -10,6 +10,7 @@ members = [
     "crates/agent-vessel",
     "crates/agent-lore",
     "crates/pair-harness",
+    "crates/nexus-gateway",
     "binary",
     "crates/anthropic-mock",
     "crates/agentflow-tui",

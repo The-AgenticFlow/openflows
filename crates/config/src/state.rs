@@ -26,6 +26,10 @@ impl Ticket {
             _ => false,
         }
     }
+
+    pub fn is_awaiting_human(&self) -> bool {
+        matches!(self.status, TicketStatus::AwaitingHuman { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

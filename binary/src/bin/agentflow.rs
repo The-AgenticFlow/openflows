@@ -8,6 +8,7 @@ use config::{
     ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
+use nexus_gateway::{run_notification_bridge, Gateway, GatewayConfig};
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
@@ -76,7 +77,59 @@ async fn main() -> Result<()> {
     // Set ORCHESTRATOR_DIR so pair harness can find the plugin
     std::env::set_var("ORCHESTRATOR_DIR", &orchestrator_dir);
 
-    // 3. Initialize Nodes
+    // 3. Initialize Shared Store (needed for NexusNode::with_chat)
+    let store = SharedStore::new_in_memory();
+    store.set("repository", serde_json::json!(repo)).await;
+    store.set(KEY_TICKETS, serde_json::json!([])).await;
+    store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
+    store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+
+    // 4. Build Gateway and register channel plugins
+    let gateway_config = GatewayConfig::from_env();
+    let mut gateway = Gateway::new(store.clone());
+    if gateway_config.dev_mode || gateway_config.channels.is_empty() {
+        gateway.register_plugin(Arc::new(nexus_gateway::MockPlugin::new()));
+        info!("Gateway registered MockPlugin (dev mode)");
+    } else {
+        for channel_id in gateway_config.active_channels() {
+            match channel_id.as_str() {
+                "slack" => {
+                    if let Some(config) = gateway_config.channels.get("slack") {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::slack::SlackPlugin::from_config(config)
+                        {
+                            gateway.register_plugin(Arc::new(plugin));
+                            info!("Gateway registered SlackPlugin");
+                        }
+                    }
+                }
+                "discord" => {
+                    if let Some(config) = gateway_config.channels.get("discord") {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::discord::DiscordPlugin::from_config(config)
+                        {
+                            gateway.register_plugin(Arc::new(plugin));
+                            info!("Gateway registered DiscordPlugin");
+                        }
+                    }
+                }
+                "whatsapp" => {
+                    if let Some(config) = gateway_config.channels.get("whatsapp") {
+                        if let Some(plugin) =
+                            nexus_gateway::channels::whatsapp::WhatsAppPlugin::from_config(config)
+                        {
+                            gateway.register_plugin(Arc::new(plugin));
+                            info!("Gateway registered WhatsAppPlugin");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let gateway = Arc::new(gateway);
+
+    // 5. Initialize Nodes
     // NEXUS: Orchestrator that assigns work
     // ForgePairNode: Event-driven FORGE-SENTINEL pair with full review lifecycle
     // VesselNode: Merge gatekeeper - polls CI, merges PRs, emits ticket_merged events
@@ -90,13 +143,17 @@ async fn main() -> Result<()> {
         .join("agent")
         .join("registry.json");
 
-    let nexus = Arc::new(NexusNode::new(persona_path, registry_path.clone()));
+    let nexus = Arc::new(NexusNode::with_gateway(
+        persona_path,
+        registry_path.clone(),
+        gateway.clone(),
+    ));
     let forge_pair = Arc::new(ForgePairNode::new(&workspace_dir, &github_token));
     let vessel = Arc::new(VesselNode::from_env());
     let lore = Arc::new(LoreNode::new_with_registry(
         &workspace_dir,
         orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
-        registry_path,
+        registry_path.clone(),
     )?);
 
     // 4. Setup Flow with Routing
@@ -116,7 +173,7 @@ async fn main() -> Result<()> {
     let flow = Flow::new("nexus")
         .add_node(
             "nexus",
-            nexus,
+            nexus.clone(),
             vec![
                 (ACTION_WORK_ASSIGNED, "forge_pair"),
                 (ACTION_MERGE_PRS, "vessel"),
@@ -154,16 +211,76 @@ async fn main() -> Result<()> {
             vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
         );
 
-    // 5. Initialize Shared Store
-    let store = SharedStore::new_in_memory();
-    store.set("repository", serde_json::json!(repo)).await;
+    // 6. Start Gateway listeners for receiving human messages
+    let listener_handles = if gateway_config.enabled {
+        let handles = gateway.start_listeners().await;
+        info!(channels = ?gateway.active_channels(), "Gateway listeners started");
 
-    // Initial tickets list - Nexus will fetch from GitHub if this is empty
-    store.set(KEY_TICKETS, serde_json::json!([])).await;
-    store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
-    store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+        // ── Notification Bridge ──────────────────────────────────────────
+        // Bridges SharedStore events (from vessel/forge) to gateway notifications.
+        // This ensures Discord (and other channels) receive stakeholder notifications
+        // for ALL activity: PR opened, PR merged, CI failed, conflicts detected, etc.
+        {
+            let bridge_store = store.clone();
+            let bridge_gateway = gateway.clone();
+            tokio::spawn(async move {
+                run_notification_bridge(bridge_store, bridge_gateway).await;
+            });
+            info!("NotificationBridge started — forwarding store events to gateway");
+        }
 
-    // 6. Run Flow
+        // Background task: process gateway messages even when flow is at other nodes.
+        // Uses process_gateway_messages_with_runner to:
+        // 1. Skip AgentRunner creation when no messages are pending (avoids
+        //    spawning a throwaway GitHub MCP server every 3 seconds)
+        // 2. Reuse the AgentRunner across iterations (MCP server persists
+        //    between message bursts, reducing startup latency)
+        let nexus_bg = nexus.clone();
+        let store_bg = store.clone();
+        let registry_path_bg = registry_path.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut runner: Option<agent_client::AgentRunner> = None;
+            let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Some(gw) = nexus_bg.gateway() {
+                            match agent_nexus::react_loop::process_gateway_messages_with_runner(
+                                gw,
+                                &store_bg,
+                                &registry_path_bg,
+                                &mut runner,
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    tracing::warn!("Background gateway message processing error: {}", e);
+                                    // Discard the failed runner so it's recreated on next message
+                                    runner = None;
+                                }
+                            }
+                        }
+                    }
+                    _ = heartbeat_interval.tick() => {
+                        tracing::info!(
+                            runner_active = runner.is_some(),
+                            "NEXUS background gateway processor heartbeat"
+                        );
+                    }
+                }
+            }
+        });
+        info!("NEXUS background gateway processor started");
+        handles
+    } else {
+        vec![]
+    };
+
+    // 7. Run Flow
     info!("Running orchestration loop for repository: {}", repo);
     info!("Each worker will use event-driven FORGE-SENTINEL pair with:");
     info!("  - PLAN.md -> CONTRACT.md (plan review)");
@@ -176,6 +293,13 @@ async fn main() -> Result<()> {
     info!("  - ticket_merged event emission");
 
     let final_action = flow.run(&store).await?;
+
+    // Signal gateway shutdown
+    gateway.shutdown().await?;
+    for handle in listener_handles {
+        handle.abort();
+    }
+    info!("Gateway listeners stopped");
 
     info!("Orchestration flow halted with action: {}", final_action);
 

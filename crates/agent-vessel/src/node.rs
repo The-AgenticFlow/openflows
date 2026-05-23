@@ -1,7 +1,5 @@
-// crates/agent-vessel/src/node.rs
-//
-// VesselNode — orchestrates CI polling, merging, and notification.
-// Implements the Node trait for integration with the Flow.
+//! VesselNode — orchestrates CI polling, merging, and notification.
+//! Implements the Node trait for integration with the Flow.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -43,6 +41,10 @@ const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
 
 /// Maximum number of CI fix attempts before giving up.
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
+
+/// SharedStore key for PRs queued for CI fix (waiting for an idle forge worker).
+/// VESSEL re-checks this queue on each cycle and assigns workers as they become idle.
+const KEY_CI_FIX_QUEUE: &str = "ci_fix_queue";
 
 /// Lightweight struct to carry PR identification info for CI_FIX.md writing.
 struct CiFixPrInfo {
@@ -419,24 +421,18 @@ impl Node for VesselNode {
                         self.increment_ci_fix_attempts(store, *pr_number).await;
                         any_ci_fix = true;
                     } else {
-                        warn!(
+                        // No idle forge worker — queue the PR for CI fix instead of
+                        // immediately failing the ticket. On the next VESSEL cycle,
+                        // the queue is drained and workers are assigned as they
+                        // become idle. This prevents cascading failures when
+                        // resuming pre-existing repos with many open PRs.
+                        info!(
                             pr_number,
                             ticket_id = %tid,
-                            "No worker available for CI fix — marking ticket as failed"
+                            "No idle forge worker for CI fix — queuing for next cycle"
                         );
-                        if !failed_ticket_ids.contains(&tid) {
-                            self.mark_ticket_failed(
-                                store,
-                                &tid,
-                                &format!(
-                                    "CI failed for PR #{} — no worker available for fix",
-                                    pr_number
-                                ),
-                            )
-                            .await;
-                            failed_ticket_ids.push(tid);
-                        }
-                        any_failure = true;
+                        self.enqueue_ci_fix(store, *pr_number, &tid, reason).await;
+                        any_ci_fix = true; // still counts as ci_fix_needed action
                     }
                 }
                 VesselOutcome::MergeBlocked {
@@ -581,24 +577,14 @@ impl Node for VesselNode {
                         self.increment_ci_fix_attempts(store, *pr_number).await;
                         any_ci_fix = true;
                     } else {
-                        warn!(
+                        info!(
                             pr_number,
                             ticket_id = %tid,
-                            "No worker available for CI timeout fix — marking ticket as failed"
+                            "No idle forge worker for CI timeout fix — queuing for next cycle"
                         );
-                        if !failed_ticket_ids.contains(&tid) {
-                            self.mark_ticket_failed(
-                                store,
-                                &tid,
-                                &format!(
-                                    "CI timed out for PR #{} — no worker available for fix",
-                                    pr_number
-                                ),
-                            )
+                        self.enqueue_ci_fix(store, *pr_number, &tid, "CI timed out")
                             .await;
-                            failed_ticket_ids.push(tid);
-                        }
-                        any_failure = true;
+                        any_ci_fix = true;
                     }
                 }
                 VesselOutcome::CiMissing {
@@ -729,21 +715,14 @@ impl Node for VesselNode {
                             .await;
                         any_conflicts = true;
                     } else {
-                        warn!(
+                        info!(
                             pr_number,
                             ticket_id = %tid,
-                            "No worker available for conflict rework — marking ticket as failed"
+                            "No idle forge worker for conflict rework — queuing for next cycle"
                         );
-                        self.mark_ticket_failed(
-                            store,
-                            &tid,
-                            &format!(
-                                "Merge conflicts on PR #{} — no worker available for rework",
-                                pr_number
-                            ),
-                        )
-                        .await;
-                        any_failure = true;
+                        self.enqueue_ci_fix(store, *pr_number, &tid, "Merge conflicts need rework")
+                            .await;
+                        any_conflicts = true;
                     }
                 }
                 VesselOutcome::DocsPrClosed { pr_number, reason } => {
@@ -765,11 +744,27 @@ impl Node for VesselNode {
         } else if any_success {
             Ok(Action::DEPLOYED.into())
         } else if any_ci_fix {
+            // Drain any queued CI fixes that can now be assigned to idle workers.
+            // This happens when previous cycle queued items because all forge
+            // workers were busy, and now workers may have become available.
+            let _ = self.drain_ci_fix_queue(store).await;
             Ok(Action::new(ACTION_CI_FIX_NEEDED))
         } else if any_failure {
-            Ok(Action::DEPLOY_FAILED.into())
+            // Drain CI fix queue even on failure — queued items might be assignable now
+            let queue_drained = self.drain_ci_fix_queue(store).await;
+            if queue_drained {
+                Ok(Action::new(ACTION_CI_FIX_NEEDED))
+            } else {
+                Ok(Action::DEPLOY_FAILED.into())
+            }
         } else {
-            Ok(Action::new("no_work"))
+            // No work from this batch — drain queue as a final check
+            let queue_drained = self.drain_ci_fix_queue(store).await;
+            if queue_drained {
+                Ok(Action::new(ACTION_CI_FIX_NEEDED))
+            } else {
+                Ok(Action::new("no_work"))
+            }
         }
     }
 }
@@ -1193,15 +1188,12 @@ impl VesselNode {
         };
 
         let branch = &pr_info.head_branch;
-        let parts: Vec<&str> = branch.splitn(2, '/').collect();
-        if parts.len() != 2 {
-            warn!(
-                branch,
-                "Cannot parse branch for pair_id — skipping CONFLICT_RESOLUTION.md"
-            );
-            return false;
-        }
-        let pair_id = parts[0];
+        let (pair_id, _branch_ticket_id) = if branch.contains('/') {
+            let parts: Vec<&str> = branch.splitn(2, '/').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (String::new(), String::new())
+        };
 
         let ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
             if let Some(fb) = fallback_ticket_id {
@@ -1222,12 +1214,21 @@ impl VesselNode {
             }
         });
 
-        let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
-            .join(pair_id)
-            .join(&ticket_id)
-            .join("shared");
+        let shared_dir = if pair_id.is_empty() {
+            PathBuf::from(&workspace_root)
+                .join("orchestration")
+                .join("pairs")
+                .join("_unassigned")
+                .join(&ticket_id)
+                .join("shared")
+        } else {
+            PathBuf::from(&workspace_root)
+                .join("orchestration")
+                .join("pairs")
+                .join(&pair_id)
+                .join(&ticket_id)
+                .join("shared")
+        };
 
         if !shared_dir.exists() {
             if let Err(e) = tokio::fs::create_dir_all(&shared_dir).await {
@@ -1524,17 +1525,39 @@ impl VesselNode {
         }
     }
 
+    /// Derive a worker_id from a branch name by extracting the prefix before `/`.
+    ///
+    /// Only returns the prefix if it looks like a system-managed worker slot
+    /// (i.e. matches the pattern `forge-N/...`). For branches from resumed
+    /// projects that were NOT created by the system (e.g. `feature/bilingual-support`,
+    /// `feat/implement_buyer_workflow`, `device-revocation`), returns `None` so
+    /// the caller falls through to `find_idle_forge_worker` instead of trying
+    /// to assign a non-existent worker slot.
     fn derive_worker_id_from_branch(head_branch: &str) -> Option<String> {
         let parts: Vec<&str> = head_branch.splitn(2, '/').collect();
         if parts.len() == 2 {
-            Some(parts[0].to_string())
+            let prefix = parts[0];
+            // Only trust prefixes that match system worker slot naming conventions.
+            // Current convention: "forge-N" (e.g. forge-1, forge-2).
+            // Branches like "feature/...", "feat/...", "bugfix/..." come from
+            // pre-existing repos and should NOT be used as worker IDs.
+            if prefix.starts_with("forge-") {
+                Some(prefix.to_string())
+            } else {
+                debug!(
+                    branch = head_branch,
+                    prefix,
+                    "Branch prefix is not a system worker slot — skipping derived worker assignment"
+                );
+                None
+            }
         } else {
             None
         }
     }
 
     async fn find_idle_forge_worker(&self, store: &SharedStore) -> Option<String> {
-        let slots: HashMap<String, WorkerSlot> =
+        let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
         let mut forge_slots: Vec<_> = slots
@@ -1543,11 +1566,38 @@ impl VesselNode {
             .collect();
         forge_slots.sort_by_key(|(id, _)| id.as_str());
 
+        let mut recoverable_id: Option<String> = None;
         for (id, slot) in forge_slots {
             if matches!(slot.status, WorkerStatus::Idle | WorkerStatus::Done { .. }) {
                 return Some(id.clone());
             }
+            // Recover Suspended workers with ambiguous/empty blockers back to Idle.
+            // These workers were blocked without actionable information and should
+            // be recycled rather than held indefinitely.
+            if let WorkerStatus::Suspended { reason, .. } = &slot.status {
+                if reason == "See blockers"
+                    || reason.is_empty()
+                    || reason == "unknown"
+                    || reason.contains("without specific blockers")
+                {
+                    warn!(
+                        worker_id = id,
+                        reason, "Recycling Suspended worker with ambiguous reason back to Idle"
+                    );
+                    recoverable_id = Some(id.clone());
+                    break;
+                }
+            }
         }
+
+        if let Some(id) = recoverable_id {
+            if let Some(slot) = slots.get_mut(&id) {
+                slot.status = WorkerStatus::Idle;
+                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+            }
+            return Some(id);
+        }
+
         None
     }
 
@@ -1684,6 +1734,145 @@ impl VesselNode {
         store.get_typed::<u32>(&key).await.unwrap_or(0)
     }
 
+    /// Enqueue a PR for CI fix when no idle forge worker is currently available.
+    /// The queue is drained at the start of each VESSEL cycle (in `prep`),
+    /// assigning workers to queued items as forge slots become idle.
+    async fn enqueue_ci_fix(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        ticket_id: &str,
+        reason: &str,
+    ) {
+        let mut queue: Vec<Value> = store.get_typed(KEY_CI_FIX_QUEUE).await.unwrap_or_default();
+
+        // Avoid duplicate entries for the same PR
+        if queue
+            .iter()
+            .any(|q| q["pr_number"].as_u64() == Some(pr_number))
+        {
+            debug!(pr_number, "PR already in CI fix queue — skipping duplicate");
+            return;
+        }
+
+        queue.push(json!({
+            "pr_number": pr_number,
+            "ticket_id": ticket_id,
+            "reason": reason,
+        }));
+
+        info!(
+            pr_number,
+            ticket_id,
+            queue_len = queue.len(),
+            "Queued PR for CI fix (no idle forge worker)"
+        );
+        store.set(KEY_CI_FIX_QUEUE, json!(queue)).await;
+    }
+
+    /// Drain the CI fix queue by assigning idle forge workers to queued PRs.
+    /// Returns true if any items were assigned (caller should route to forge_pair).
+    async fn drain_ci_fix_queue(&self, store: &SharedStore) -> bool {
+        let queue: Vec<Value> = store.get_typed(KEY_CI_FIX_QUEUE).await.unwrap_or_default();
+        if queue.is_empty() {
+            return false;
+        }
+
+        let mut assigned_any = false;
+        let mut remaining = Vec::new();
+
+        for item in &queue {
+            let pr_number = item["pr_number"].as_u64().unwrap_or(0);
+            let ticket_id = item["ticket_id"].as_str().unwrap_or("");
+            let reason = item["reason"].as_str().unwrap_or("CI fix needed");
+
+            if pr_number == 0 || ticket_id.is_empty() {
+                continue;
+            }
+
+            // Check if this PR has exceeded max CI fix attempts
+            let current_attempts = self.get_ci_fix_attempts(store, pr_number).await;
+            if current_attempts >= MAX_CI_FIX_ATTEMPTS {
+                warn!(
+                    pr_number,
+                    ticket_id,
+                    attempts = current_attempts,
+                    "Queued PR exceeded max CI fix attempts — marking ticket as failed"
+                );
+                self.mark_ticket_failed(
+                    store,
+                    ticket_id,
+                    &format!(
+                        "CI failed for PR #{} after {} fix attempts",
+                        pr_number, current_attempts
+                    ),
+                )
+                .await;
+                continue;
+            }
+
+            // Try to find an idle forge worker
+            if let Some(forge_id) = self.find_idle_forge_worker(store).await {
+                info!(
+                    pr_number,
+                    ticket_id,
+                    worker_id = %forge_id,
+                    "Assigning idle forge worker to queued CI fix"
+                );
+                if self
+                    .assign_worker_for_ci_fix(store, &forge_id, ticket_id)
+                    .await
+                {
+                    self.increment_ci_fix_attempts(store, pr_number).await;
+
+                    // Write CI_FIX.md for the assigned worker
+                    // Derive a branch name using the forge worker's convention
+                    let head_branch = format!("{}/{}", forge_id, ticket_id);
+                    let ci_fix_written = self
+                        .write_ci_fix_md(
+                            &CiFixPrInfo {
+                                pr_number,
+                                head_branch,
+                                ticket_id: Some(ticket_id.to_string()),
+                            },
+                            reason,
+                            None,
+                        )
+                        .await;
+
+                    if ci_fix_written {
+                        info!(pr_number, ticket_id, "CI_FIX.md written for queued PR");
+                    }
+
+                    assigned_any = true;
+                } else {
+                    // Assignment failed (race condition) — re-queue
+                    remaining.push(item.clone());
+                }
+            } else {
+                // Still no idle worker — keep in queue
+                remaining.push(item.clone());
+            }
+        }
+
+        // Update queue with remaining items
+        store.set(KEY_CI_FIX_QUEUE, json!(remaining)).await;
+
+        if assigned_any {
+            info!(
+                remaining = remaining.len(),
+                "CI fix queue drained — some items assigned"
+            );
+        } else if !remaining.is_empty() {
+            info!(
+                remaining = remaining.len(),
+                "CI fix queue still pending — no idle forge workers yet"
+            );
+        }
+
+        assigned_any
+    }
+
     async fn write_ci_fix_md(
         &self,
         pr_placeholder: &CiFixPrInfo,
@@ -1698,29 +1887,55 @@ impl VesselNode {
             }
         };
 
-        // Extract pair_id from branch name (e.g., "forge-1/T-005" -> "forge-1")
+        // Extract pair_id from branch name (e.g., "forge-1/T-005" -> "forge-1").
+        // For non-system branches (e.g., "feature/bilingual-support", "prodetails",
+        // "device-revocation") from resumed pre-existing repos, we use the branch
+        // prefix as pair_id if it looks like a worker slot, or fall back to a
+        // generated forge-N convention.
         let branch = &pr_placeholder.head_branch;
-        let parts: Vec<&str> = branch.splitn(2, '/').collect();
-        if parts.len() != 2 {
-            warn!(
-                branch,
-                "Cannot parse branch for pair_id — skipping CI_FIX.md"
-            );
-            return false;
-        }
-        let pair_id = parts[0];
+        let (pair_id, _branch_ticket_id) = if branch.contains('/') {
+            let parts: Vec<&str> = branch.splitn(2, '/').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            // No slash — branch doesn't follow system convention.
+            // This happens with pre-existing repo branches like "prodetails"
+            // or "device-revocation". We can't derive a pair_id, so we
+            // create the CI_FIX.md in a generic location using the ticket_id.
+            // The pair_id will be set when a forge worker is actually assigned.
+            (String::new(), String::new())
+        };
 
         // Use ticket_id from PR info (extracted from title), not from branch name.
         // The branch name may be stale or mismatched with the actual ticket.
-        // Fall back to branch-derived ticket_id if not available.
-        let ticket_id = pr_placeholder.ticket_id.as_deref().unwrap_or(parts[1]);
+        // Fall back to a synthetic ticket_id derived from the PR number.
+        let ticket_id = match pr_placeholder.ticket_id.as_deref() {
+            Some(tid) => tid.to_string(),
+            None if !_branch_ticket_id.is_empty() => _branch_ticket_id.clone(),
+            None => format!("T-{}", pr_placeholder.pr_number),
+        };
 
-        let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
-            .join(pair_id)
-            .join(ticket_id)
-            .join("shared");
+        // If pair_id is empty (non-system branch), we can't create the CI_FIX.md
+        // in the standard pair directory structure. However, the CI fix is still
+        // useful — we write it to a fallback location keyed by ticket_id.
+        let shared_dir = if pair_id.is_empty() {
+            // No pair_id from branch — the CI_FIX.md will be written when
+            // a forge worker is actually assigned (via drain_ci_fix_queue).
+            // For now, write to a ticket-level fallback path that the
+            // assigned worker will pick up.
+            PathBuf::from(&workspace_root)
+                .join("orchestration")
+                .join("pairs")
+                .join("_unassigned")
+                .join(&ticket_id)
+                .join("shared")
+        } else {
+            PathBuf::from(&workspace_root)
+                .join("orchestration")
+                .join("pairs")
+                .join(&pair_id)
+                .join(&ticket_id)
+                .join("shared")
+        };
 
         // Ensure the shared directory exists before writing CI_FIX.md.
         // The directory may not exist yet if the pair hasn't been provisioned
@@ -1967,7 +2182,9 @@ mod tests {
         });
 
         let action = node.post(&store, exec_result).await.unwrap();
-        assert_eq!(action.as_str(), Action::DEPLOY_FAILED);
+        // When no forge worker is available, the CI fix is queued instead of
+        // immediately failing the ticket — action routes to forge_pair
+        assert_eq!(action.as_str(), ACTION_CI_FIX_NEEDED);
 
         let events = store.get_events_since(0).await;
         assert!(events.iter().any(|e| e.event_type == "ci_failed"));

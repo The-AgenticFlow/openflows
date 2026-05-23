@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
+
+pub mod react_loop;
 
 const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
@@ -185,6 +188,7 @@ pub struct FlowRecovery {
 pub struct NexusNode {
     pub persona_path: PathBuf,
     pub registry_path: PathBuf,
+    gateway: Option<Arc<nexus_gateway::Gateway>>,
 }
 
 impl NexusNode {
@@ -192,7 +196,24 @@ impl NexusNode {
         Self {
             persona_path: persona_path.into(),
             registry_path: registry_path.into(),
+            gateway: None,
         }
+    }
+
+    pub fn with_gateway(
+        persona_path: impl Into<PathBuf>,
+        registry_path: impl Into<PathBuf>,
+        gateway: Arc<nexus_gateway::Gateway>,
+    ) -> Self {
+        Self {
+            persona_path: persona_path.into(),
+            registry_path: registry_path.into(),
+            gateway: Some(gateway),
+        }
+    }
+
+    pub fn gateway(&self) -> Option<&nexus_gateway::Gateway> {
+        self.gateway.as_deref()
     }
 
     fn resolve_github_token(&self) -> Result<String> {
@@ -787,6 +808,12 @@ impl Node for NexusNode {
             warn!("Failed to sync registry: {}", e);
         }
 
+        // Gateway messages are processed by the background task in agentflow.rs
+        // via process_gateway_messages_with_runner(). We no longer consume
+        // from the gateway channel here to avoid racing with the background
+        // task for the same mpsc channel (messages would be silently lost
+        // by whichever consumer doesn't win the race).
+
         let repository = store.get("repository").await.unwrap_or(json!(""));
 
         let (owner, repo_name) = repository
@@ -944,6 +971,17 @@ impl Node for NexusNode {
                 pending_prs.len()
             );
 
+            // Emit notification event for bridge
+            store
+                .emit(
+                    "nexus",
+                    "merge_routing",
+                    json!({
+                        "pr_count": pending_prs.len(),
+                    }),
+                )
+                .await;
+
             return Ok(Action::new(ACTION_MERGE_PRS));
         }
 
@@ -955,6 +993,39 @@ impl Node for NexusNode {
             if let Some(worker_id) = &decision.assign_to {
                 if let Some(ticket_id) = &decision.ticket_id {
                     info!(worker_id, ticket_id, "Nexus: Assigning ticket to worker");
+
+                    // Emit notification events — the NotificationBridge routes
+                    // these to Discord/Slack/etc. via the gateway.
+                    store
+                        .emit(
+                            "nexus",
+                            "work_assigned",
+                            json!({
+                                "ticket_id": ticket_id,
+                                "worker_id": worker_id,
+                                "notes": decision.notes,
+                                "issue_url": decision.issue_url,
+                            }),
+                        )
+                        .await;
+                    store
+                        .emit(
+                            "nexus",
+                            "worker_assigned",
+                            json!({
+                                "ticket_id": ticket_id,
+                                "worker_id": worker_id,
+                            }),
+                        )
+                        .await;
+
+                    info!(
+                        worker_id,
+                        ticket_id,
+                        "📢 NEXUS → HUMAN: {} assigned to {} (via bridge)",
+                        ticket_id,
+                        worker_id
+                    );
 
                     let mut tickets: Vec<Ticket> =
                         store.get_typed(KEY_TICKETS).await.unwrap_or_default();
@@ -1031,6 +1102,23 @@ impl Node for NexusNode {
                     action = decision.action,
                     "CommandGate processing"
                 );
+
+                // Emit notification event for bridge
+                store
+                    .emit(
+                        "nexus",
+                        "command_decision",
+                        json!({
+                            "worker_id": worker_id,
+                            "decision": if decision.action == "approve_command" {
+                                "approved"
+                            } else {
+                                "rejected"
+                            },
+                        }),
+                    )
+                    .await;
+
                 gate.remove(&worker_id);
                 store.set(KEY_COMMAND_GATE, json!(gate)).await;
 
