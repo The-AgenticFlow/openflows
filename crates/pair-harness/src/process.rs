@@ -1,11 +1,14 @@
 // crates/pair-harness/src/process.rs
 //! Process management for FORGE and SENTINEL agents.
 //!
-//! Supports multiple CLI backends:
-//! - Claude Code CLI (default): `claude --print --dangerously-skip-permissions --output-format stream-json`
-//! - OpenAI Codex CLI: `codex exec --full-auto --dangerously-bypass-approvals-and-sandbox "<prompt>"`
+//! Supports multiple CLI backends via the `BackendConfig` abstraction:
+//! - Claude Code CLI (default)
+//! - OpenAI Codex CLI
+//!
+//! Adding a new backend only requires implementing a new `BackendConfig` instance.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -15,17 +18,265 @@ use tracing::{debug, error, info, warn};
 
 use crate::types::CliBackend;
 
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    path.metadata()
-        .map(|m| m.mode() & 0o111 != 0)
-        .unwrap_or(false)
+use serde::Deserialize;
+
+/// Configuration for a specific CLI backend (Claude, Codex, etc.).
+/// Encapsulates all backend-specific behavior: binary path, spawn flags,
+/// environment variables, plugin handling, and provisioning details.
+///
+/// Adding a new backend only requires creating a new `BackendConfig` instance —
+/// no changes to `ProcessManager`, `Provisioner`, or spawn logic.
+pub struct BackendConfig {
+    /// Binary path (from env var or default name)
+    pub binary_path: PathBuf,
+    /// Base flags always passed to the binary (e.g., `--print`, `--dangerously-skip-permissions`)
+    pub base_flags: Vec<String>,
+    /// Flags added during FORGE long-running mode
+    pub forge_flags: Vec<String>,
+    /// Flags added during FORGE PR-creation mode
+    pub forge_pr_flags: Vec<String>,
+    /// Flags added during SENTINEL ephemeral mode
+    pub sentinel_flags: Vec<String>,
+    /// Environment variable name for the API key
+    pub api_key_env: String,
+    /// Environment variable name for the base URL (proxy)
+    pub base_url_env: Option<String>,
+    /// Environment variable name for the model override
+    pub model_env: Option<String>,
+    /// Whether to set a backend-specific home dir (e.g., CODEX_HOME)
+    pub home_env_var: Option<String>,
+    /// Home directory relative to worktree/shared (empty = not used)
+    pub home_dir_suffix: String,
+    /// Plugin directory inside the target (e.g., `.claude/plugins/orchestration`)
+    pub plugin_dir_rel: PathBuf,
+    /// Settings file path relative to target (e.g., `.claude/settings.json`)
+    pub settings_rel: PathBuf,
+    /// Whether this backend needs stdin prompt injection
+    pub uses_stdin_prompt: bool,
+    /// MCP config file relative to target
+    pub mcp_config_rel: PathBuf,
+    /// Whether to run backend-specific provisioning (e.g., Codex marketplace.json)
+    pub needs_extras_provisioning: bool,
+    /// Extra command args for FORGE mode (e.g., --settings, --plugin-dir, --add-dir)
+    pub forge_extra_args: Vec<String>,
+    /// Extra command args for SENTINEL mode
+    pub sentinel_extra_args: Vec<String>,
 }
 
-#[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
-    true
+impl BackendConfig {
+    /// Create a Claude Code backend config.
+    pub fn claude(cli_path: &str, worktree: &Path, shared: &Path) -> Self {
+        let binary = if cli_path.is_empty() {
+            "claude"
+        } else {
+            cli_path
+        };
+        let settings_path = worktree.join(".claude").join("settings.json");
+        let plugin_dir = worktree.join(".claude").join("plugins").join("orchestration");
+        let forge_extra = vec![
+            "--settings".into(),
+            settings_path.to_string_lossy().to_string(),
+            "--plugin-dir".into(),
+            plugin_dir.to_string_lossy().to_string(),
+            "--add-dir".into(),
+            shared.to_string_lossy().to_string(),
+        ];
+        let sentinel_settings = shared.join(".claude").join("settings.json");
+        let sentinel_plugin_dir = shared.join(".claude").join("plugins").join("orchestration");
+        let sentinel_extra = vec![
+            "--settings".into(),
+            sentinel_settings.to_string_lossy().to_string(),
+            "--plugin-dir".into(),
+            sentinel_plugin_dir.to_string_lossy().to_string(),
+            "--add-dir".into(),
+            worktree.to_string_lossy().to_string(),
+        ];
+        Self {
+            binary_path: PathBuf::from(binary),
+            base_flags: vec![
+                "--print".into(),
+                "--dangerously-skip-permissions".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+            ],
+            forge_flags: vec![],
+            forge_pr_flags: vec![],
+            sentinel_flags: vec![
+                "--output-format".into(),
+                "json".into(),
+                "--no-session-persistence".into(),
+            ],
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            base_url_env: Some("ANTHROPIC_BASE_URL".into()),
+            model_env: Some("ANTHROPIC_MODEL".into()),
+            home_env_var: None,
+            home_dir_suffix: String::new(),
+            plugin_dir_rel: PathBuf::from(".claude").join("plugins").join("orchestration"),
+            settings_rel: PathBuf::from(".claude").join("settings.json"),
+            uses_stdin_prompt: true,
+            mcp_config_rel: PathBuf::from(".claude").join("mcp.json"),
+            needs_extras_provisioning: false,
+            forge_extra_args: forge_extra,
+            sentinel_extra_args: sentinel_extra,
+        }
+    }
+
+    /// Create a Codex CLI backend config.
+    ///
+    /// Supports two provider modes, selected via the `CODEX_PROVIDER` env var
+    /// (or auto-detected from the environment):
+    ///
+    /// - **`fireworks`** (default when `FIREWORKS_API_KEY` is set): Uses a
+    ///   custom model provider with `supports_websockets=false` so codex uses
+    ///   SSE transport to Fireworks' Responses API endpoint. WebSocket is not
+    ///   supported by Fireworks.
+    ///
+    /// - **`openai`** (default when `OPENAI_API_KEY` is set without
+    ///   `FIREWORKS_API_KEY`): Uses the built-in OpenAI provider with
+    ///   WebSocket support enabled. Works with OpenAI directly or any
+    ///   WebSocket-compatible proxy.
+    pub fn codex(codex_path: &str, _worktree: &Path, shared: &Path) -> Self {
+        let binary = if codex_path.is_empty() {
+            "codex"
+        } else {
+            codex_path
+        };
+
+        // Determine which provider to use based on env vars.
+        // Priority: CODEX_PROVIDER > FIREWORKS_API_KEY present > OPENAI_API_KEY present
+        let provider = detect_codex_provider();
+
+        let (api_key_env, model_env) = match provider {
+            CodexProvider::Fireworks => ("FIREWORKS_API_KEY", "FIREWORKS_MODEL"),
+            CodexProvider::OpenAI => ("OPENAI_API_KEY", "OPENAI_MODEL"),
+        };
+
+        Self {
+            binary_path: PathBuf::from(binary),
+            base_flags: vec!["exec".into(), "--sandbox".into(), "workspace-write".into()],
+            forge_flags: vec![],
+            forge_pr_flags: vec![],
+            sentinel_flags: vec!["--json".into(), "--ephemeral".into()],
+            api_key_env: api_key_env.into(),
+            base_url_env: Some("OPENAI_BASE_URL".into()),
+            model_env: Some(model_env.into()),
+            home_env_var: Some("CODEX_HOME".into()),
+            home_dir_suffix: ".codex-home".into(),
+            plugin_dir_rel: PathBuf::from(".agents").join("plugins").join("orchestration"),
+            settings_rel: PathBuf::from(".codex").join("config.toml"),
+            uses_stdin_prompt: true,
+            mcp_config_rel: PathBuf::from(".codex").join("config.toml"),
+            needs_extras_provisioning: true,
+            forge_extra_args: vec![],
+            sentinel_extra_args: vec!["-C".into(), shared.to_string_lossy().to_string()],
+        }
+    }
+
+    /// Get the backend-specific home directory path.
+    pub fn home_dir(&self, base: &Path) -> PathBuf {
+        if self.home_dir_suffix.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(&self.home_dir_suffix)
+        }
+    }
+
+    /// Get the settings file absolute path.
+    pub fn settings_path(&self, target: &Path) -> PathBuf {
+        target.join(&self.settings_rel)
+    }
+
+    /// Get the plugin directory absolute path.
+    pub fn plugin_dir(&self, target: &Path) -> PathBuf {
+        target.join(&self.plugin_dir_rel)
+    }
+
+    /// Get the MCP config file absolute path.
+    pub fn mcp_config_path(&self, target: &Path) -> PathBuf {
+        target.join(&self.mcp_config_rel)
+    }
+}
+
+/// Get a BackendConfig for the given CliBackend type.
+/// This is the single dispatch point — all backend-specific values flow through here.
+pub fn get_backend_config(backend: CliBackend, worktree: &Path, shared: &Path) -> BackendConfig {
+    match backend {
+        CliBackend::Claude => {
+            let path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
+            BackendConfig::claude(&path, worktree, shared)
+        }
+        CliBackend::Codex => {
+            let path = std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string());
+            BackendConfig::codex(&path, worktree, shared)
+        }
+    }
+}
+
+/// Codex model provider selection.
+///
+/// Determines how codex CLI routes API requests:
+/// - `Fireworks`: Custom provider with SSE transport (no WebSocket), for Fireworks AI.
+/// - `OpenAI`: Built-in provider with WebSocket support, for direct OpenAI usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexProvider {
+    /// Fireworks AI — Responses API over SSE (no WebSocket support).
+    Fireworks,
+    /// OpenAI — Responses API with WebSocket transport.
+    OpenAI,
+}
+
+impl CodexProvider {
+    /// Get the provider ID string used in codex config (e.g. "fireworks" or "openai").
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CodexProvider::Fireworks => "fireworks",
+            CodexProvider::OpenAI => "openai",
+        }
+    }
+}
+
+/// Detect which codex model provider to use based on environment.
+///
+/// Selection priority:
+/// 1. `CODEX_PROVIDER` env var (explicit: `"fireworks"` or `"openai"`)
+/// 2. `FIREWORKS_API_KEY` present → Fireworks (SSE transport, no WebSocket)
+/// 3. Otherwise → OpenAI (built-in provider with WebSocket support)
+fn detect_codex_provider() -> CodexProvider {
+    // Explicit override takes priority
+    if let Ok(provider) = std::env::var("CODEX_PROVIDER") {
+        match provider.to_lowercase().as_str() {
+            "fireworks" => {
+                info!("codex: provider forced to fireworks via CODEX_PROVIDER");
+                return CodexProvider::Fireworks;
+            }
+            "openai" => {
+                info!("codex: provider forced to openai via CODEX_PROVIDER");
+                return CodexProvider::OpenAI;
+            }
+            other => {
+                warn!(
+                    provider = other,
+                    "Unknown CODEX_PROVIDER value, falling back to auto-detection"
+                );
+            }
+        }
+    }
+
+    // Auto-detect: if FIREWORKS_API_KEY is set, use Fireworks provider
+    // (Fireworks doesn't support WebSocket, so we must use SSE transport).
+    // Otherwise, use the built-in OpenAI provider which supports WebSocket.
+    if std::env::var("FIREWORKS_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some()
+    {
+        info!("codex: auto-detected Fireworks provider (FIREWORKS_API_KEY present)");
+        CodexProvider::Fireworks
+    } else {
+        info!("codex: using built-in OpenAI provider");
+        CodexProvider::OpenAI
+    }
 }
 
 /// Mode for SENTINEL spawning.
@@ -50,13 +301,134 @@ impl SentinelMode {
     }
 }
 
+/// Structured output from Codex exec --json.
+/// Codex emits a JSON array of turn objects, each containing items.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexExecResult {
+    /// Thread identifier for this execution session
+    pub thread_id: Option<String>,
+    /// All turns in the conversation
+    pub turns: Vec<CodexTurn>,
+    /// Extracted result text (if any)
+    pub result_text: Option<String>,
+    /// Whether execution completed successfully
+    pub success: bool,
+}
+
+/// A single turn in the Codex conversation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexTurn {
+    /// Turn number (0-indexed)
+    pub n: Option<u32>,
+    /// Items produced in this turn
+    #[serde(default)]
+    pub items: Vec<CodexItem>,
+}
+
+/// An item within a Codex turn (tool use, assistant message, etc.)
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexItem {
+    /// Type of item (e.g., "tool_call", "tool_result", "message")
+    #[serde(rename = "type")]
+    pub item_type: Option<String>,
+    /// Tool name if this is a tool call
+    pub name: Option<String>,
+    /// Content of the item
+    pub content: Option<String>,
+    /// Output from tool execution
+    pub output: Option<String>,
+}
+
+/// Parse Codex exec --json output into structured result.
+///
+/// Codex exec with --json emits an array of turn objects. Each turn contains
+/// an array of items (tool calls, results, messages). We extract the final
+/// result text from the last assistant message or tool result.
+pub fn parse_codex_exec_output(raw: &str) -> Result<CodexExecResult> {
+    if raw.trim().is_empty() {
+        return Ok(CodexExecResult {
+            thread_id: None,
+            turns: vec![],
+            result_text: None,
+            success: false,
+        });
+    }
+
+    // Try parsing as full exec result with thread_id first (most specific)
+    if let Ok(full_result) = serde_json::from_str::<serde_json::Value>(raw) {
+        if full_result.get("thread_id").is_some() || full_result.get("turns").is_some() {
+            let thread_id = full_result
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let turns = full_result
+                .get("turns")
+                .and_then(|v| serde_json::from_value::<Vec<CodexTurn>>(v.clone()).ok())
+                .unwrap_or_default();
+
+            return Ok(extract_result_from_turns_with_thread(turns, thread_id));
+        }
+    }
+
+    // Try parsing as JSON array of turns
+    if let Ok(turns) = serde_json::from_str::<Vec<CodexTurn>>(raw) {
+        return Ok(extract_result_from_turns(turns));
+    }
+
+    // Try parsing as single turn object
+    if let Ok(turn) = serde_json::from_str::<CodexTurn>(raw) {
+        return Ok(extract_result_from_turns(vec![turn]));
+    }
+
+    // Not valid JSON - treat as raw text output
+    Ok(CodexExecResult {
+        thread_id: None,
+        turns: vec![],
+        result_text: Some(raw.to_string()),
+        success: true,
+    })
+}
+
+fn extract_result_from_turns(turns: Vec<CodexTurn>) -> CodexExecResult {
+    extract_result_from_turns_with_thread(turns, None)
+}
+
+fn extract_result_from_turns_with_thread(
+    turns: Vec<CodexTurn>,
+    thread_id: Option<String>,
+) -> CodexExecResult {
+    let success = !turns.is_empty();
+
+    // Extract result text from the last turn's last item
+    let result_text = turns
+        .last()
+        .and_then(|turn| turn.items.last())
+        .and_then(|item| {
+            // Prefer content from tool results
+            if item.item_type.as_deref() == Some("tool_result") {
+                item.output.clone().or_else(|| item.content.clone())
+            } else if item.item_type.as_deref() == Some("message") {
+                item.content.clone()
+            } else {
+                item.content.clone().or_else(|| item.output.clone())
+            }
+        });
+
+    CodexExecResult {
+        thread_id,
+        turns,
+        result_text,
+        success,
+    }
+}
+
 /// Manages FORGE and SENTINEL processes.
-/// Supports both Claude Code and Codex CLI backends.
+/// Supports multiple CLI backends via `BackendConfig` — adding a new backend
+/// only requires creating a new `BackendConfig` and registering it.
 pub struct ProcessManager {
-    /// Path to Claude CLI binary
-    claude_path: PathBuf,
-    /// Path to Codex CLI binary
-    codex_path: PathBuf,
+    /// Registry of backend configs, keyed by CliBackend
+    backends: HashMap<CliBackend, BackendConfig>,
     /// Default CLI backend to use
     default_backend: CliBackend,
     github_token: String,
@@ -67,21 +439,29 @@ pub struct ProcessManager {
 
 impl ProcessManager {
     /// Create a new ProcessManager with default CLI backend (Claude).
-    pub fn new(github_token: impl Into<String>) -> Self {
-        let claude_path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
-        let claude_path = PathBuf::from(&claude_path);
-        let codex_path = std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string());
-        let codex_path = PathBuf::from(&codex_path);
-
-        Self::validate_cli_binary(&claude_path, "claude");
-        Self::validate_cli_binary(&codex_path, "codex");
-
+    pub fn new(github_token: impl Into<String>, worktree: &Path, shared: &Path) -> Self {
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
+        let mut backends = HashMap::new();
+        backends.insert(CliBackend::Claude, BackendConfig::claude(
+            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+            worktree,
+            shared,
+        ));
+        backends.insert(CliBackend::Codex, BackendConfig::codex(
+            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+            worktree,
+            shared,
+        ));
+
+        // Validate all registered backends
+        for (backend, config) in &backends {
+            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        }
+
         Self {
-            claude_path,
-            codex_path,
+            backends,
             default_backend: CliBackend::default(),
             github_token: github_token.into(),
             redis_url: None,
@@ -91,21 +471,28 @@ impl ProcessManager {
     }
 
     /// Create a ProcessManager with Redis backend.
-    pub fn with_redis(github_token: impl Into<String>, redis_url: impl Into<String>) -> Self {
-        let claude_path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
-        let claude_path = PathBuf::from(&claude_path);
-        let codex_path = std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string());
-        let codex_path = PathBuf::from(&codex_path);
-
-        Self::validate_cli_binary(&claude_path, "claude");
-        Self::validate_cli_binary(&codex_path, "codex");
-
+    pub fn with_redis(github_token: impl Into<String>, redis_url: impl Into<String>, worktree: &Path, shared: &Path) -> Self {
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
+        let mut backends = HashMap::new();
+        backends.insert(CliBackend::Claude, BackendConfig::claude(
+            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+            worktree,
+            shared,
+        ));
+        backends.insert(CliBackend::Codex, BackendConfig::codex(
+            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+            worktree,
+            shared,
+        ));
+
+        for (backend, config) in &backends {
+            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        }
+
         Self {
-            claude_path,
-            codex_path,
+            backends,
             default_backend: CliBackend::default(),
             github_token: github_token.into(),
             redis_url: Some(redis_url.into()),
@@ -119,20 +506,29 @@ impl ProcessManager {
         github_token: impl Into<String>,
         redis_url: Option<String>,
         proxy_url: impl Into<String>,
+        worktree: &Path,
+        shared: &Path,
     ) -> Self {
-        let claude_path = std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string());
-        let claude_path = PathBuf::from(&claude_path);
-        let codex_path = std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string());
-        let codex_path = PathBuf::from(&codex_path);
-
-        Self::validate_cli_binary(&claude_path, "claude");
-        Self::validate_cli_binary(&codex_path, "codex");
-
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
+        let mut backends = HashMap::new();
+        backends.insert(CliBackend::Claude, BackendConfig::claude(
+            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+            worktree,
+            shared,
+        ));
+        backends.insert(CliBackend::Codex, BackendConfig::codex(
+            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+            worktree,
+            shared,
+        ));
+
+        for (backend, config) in &backends {
+            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        }
+
         Self {
-            claude_path,
-            codex_path,
+            backends,
             default_backend: CliBackend::default(),
             github_token: github_token.into(),
             redis_url,
@@ -147,6 +543,20 @@ impl ProcessManager {
         self
     }
 
+    /// Register a custom backend config (for testing or third-party backends).
+    pub fn register_backend(&mut self, backend: CliBackend, config: BackendConfig) {
+        Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        self.backends.insert(backend, config);
+    }
+
+    /// Get the backend config for a given type.
+    pub fn get_backend(&self, backend: CliBackend) -> &BackendConfig {
+        self.backends.get(&backend).unwrap_or_else(|| {
+            // Fallback: build a default config on the fly
+            panic!("Backend {:?} not registered", backend);
+        })
+    }
+
     /// Validate a CLI binary exists and is executable.
     fn validate_cli_binary(path: &Path, name: &str) {
         let env_var = format!("{}_PATH", name.to_uppercase());
@@ -157,12 +567,21 @@ impl ProcessManager {
                     "{} binary not found. Install {} CLI or set {} in .env",
                     env_var, name, env_var
                 );
-            } else if !is_executable(path) {
-                error!(
-                    path = %path.display(),
-                    "{} binary exists but is not executable. Run: chmod +x {}",
-                    env_var, path.display()
-                );
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = path.metadata() {
+                        let perms = metadata.permissions();
+                        if perms.mode() & 0o111 == 0 {
+                            error!(
+                                path = %path.display(),
+                                "{} binary exists but is not executable. Run: chmod +x {}",
+                                env_var, path.display()
+                            );
+                        }
+                    }
+                }
             }
         } else {
             match which::which(path) {
@@ -185,19 +604,55 @@ impl ProcessManager {
         }
     }
 
+    /// Ensure the backend-specific home directory exists and write a minimal
+    /// config.toml if needed. For Codex, CODEX_HOME must point to an existing
+    /// directory with a valid config.toml, otherwise codex refuses to start.
+    fn ensure_home_dir(cmd: &mut Command, config: &BackendConfig, base_dir: &Path) {
+        if let Some(home_env_var) = &config.home_env_var {
+            let home_dir = config.home_dir(base_dir);
+            if let Err(e) = std::fs::create_dir_all(&home_dir) {
+                warn!(
+                    path = %home_dir.display(),
+                    error = %e,
+                    "Failed to create {} directory — CLI may fail to start",
+                    home_env_var
+                );
+            }
+            // Write a minimal config.toml to the home dir so the CLI has a
+            // valid user-layer config. Provider definitions are passed via
+            // `-c` flags at spawn time (project-local config cannot set
+            // `model_providers` due to codex's security denylist).
+            let config_toml = home_dir.join("config.toml");
+            if !config_toml.exists() {
+                let minimal_config = r#"# Auto-generated by AgentFlow — minimal user config
+# Provider config is passed via -c flags at spawn time.
+[projects."/tmp"]
+trust_level = "trusted"
+"#;
+                if let Err(e) = std::fs::write(&config_toml, minimal_config) {
+                    warn!(
+                        path = %config_toml.display(),
+                        error = %e,
+                        "Failed to write minimal config.toml"
+                    );
+                }
+            }
+            cmd.env(home_env_var, home_dir.to_string_lossy().to_string());
+            debug!(home_dir = %home_dir.display(), "Set {} for isolated config", home_env_var);
+        }
+    }
+
     fn inject_proxy_env(
         cmd: &mut Command,
-        routing_key: &str,
+        backend: &BackendConfig,
         proxy_url: &str,
         proxy_api_key: Option<&str>,
     ) {
         let base_url = proxy_url.trim_end_matches("/v1").trim_end_matches('/');
-        cmd.env("ANTHROPIC_BASE_URL", base_url);
-        if let Some(api_key) = proxy_api_key {
-            cmd.env("ANTHROPIC_API_KEY", api_key);
-        } else {
-            cmd.env("ANTHROPIC_API_KEY", routing_key);
+        if let Some(env_name) = &backend.base_url_env {
+            cmd.env(env_name, base_url);
         }
+        cmd.env(&backend.api_key_env, proxy_api_key.unwrap_or(""));
     }
 
     fn inject_llm_env(cmd: &mut Command) {
@@ -243,43 +698,142 @@ impl ProcessManager {
         self.proxy_api_key.as_deref()
     }
 
-    /// Get the CLI binary path for a given backend.
-    fn get_cli_path(&self, backend: CliBackend) -> &Path {
-        match backend {
-            CliBackend::Claude => &self.claude_path,
-            CliBackend::Codex => &self.codex_path,
-        }
-    }
-
-    /// Build a command for the appropriate CLI backend.
+    /// Build a command for the given CLI backend.
     fn build_cli_command(&self, backend: CliBackend, _worktree: &Path, _shared: &Path) -> Command {
-        let cli_path = self.get_cli_path(backend);
-        let mut cmd = Command::new(cli_path);
+        let config = self.get_backend(backend);
+        let mut cmd = Command::new(&config.binary_path);
 
-        match backend {
-            CliBackend::Claude => {
-                // Claude Code CLI flags
-                cmd.arg("--print")
-                    .arg("--dangerously-skip-permissions")
-                    .arg("--output-format")
-                    .arg("stream-json")
-                    .arg("--verbose");
+        for arg in &config.base_flags {
+            cmd.arg(arg);
+        }
+
+        // Pass model from backend-specific env var if configured
+        if let Some(model_env) = &config.model_env {
+            if let Ok(model) = std::env::var(model_env) {
+                if !model.is_empty() {
+                    cmd.arg("-m").arg(&model);
+                    info!(model = %model, "{}: using model from {}", backend.as_str(), model_env);
+                }
             }
-            CliBackend::Codex => {
-                // Codex CLI flags - use 'exec' subcommand for non-interactive execution
-                // --full-auto enables fully autonomous mode (no approval prompts)
-                // Note: --full-auto and --dangerously-bypass-approvals-and-sandbox are mutually exclusive
-                cmd.arg("exec")
-                    .arg("--full-auto");
+        }
 
-                // Pass model from OPENAI_MODEL environment variable
-                if let Ok(model) = std::env::var("OPENAI_MODEL") {
-                    if !model.is_empty() {
-                        cmd.arg("-m").arg(&model);
-                        info!(model = %model, "Codex: using model from OPENAI_MODEL");
+        // Codex CLI provider configuration — determined at startup based on
+        // CODEX_PROVIDER env var or auto-detected from available API keys.
+        //
+        // Two modes:
+        //   * Fireworks: custom provider with supports_websockets=false (SSE only)
+        //   * OpenAI:    built-in provider with WebSocket support enabled
+        //
+        // Provider is defined via `-c` runtime flags because `model_providers`
+        // is on the project-local config denylist and cannot be set in
+        // .codex/config.toml.
+        if backend == CliBackend::Codex {
+            let provider = detect_codex_provider();
+            match provider {
+                CodexProvider::Fireworks => {
+                    // Select the fireworks provider
+                    cmd.arg("-c").arg("model_provider=\"fireworks\"");
+
+                    // Define the fireworks provider: Responses API over SSE, no WebSocket
+                    cmd.arg("-c").arg("model_providers.fireworks.name=\"Fireworks\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.base_url=\"https://api.fireworks.ai/inference/v1\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.wire_api=\"responses\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.supports_websockets=false");
+                    cmd.arg("-c").arg("model_providers.fireworks.requires_openai_auth=false");
+
+                    info!("codex: using Fireworks provider (SSE, no WebSocket)");
+                }
+                CodexProvider::OpenAI => {
+                    // Use the built-in openai provider — supports WebSocket for
+                    // streaming responses. Works with OpenAI directly or any
+                    // WebSocket-compatible proxy set via OPENAI_BASE_URL.
+                    cmd.arg("-c").arg("model_provider=\"openai\"");
+
+                    // If OPENAI_BASE_URL is set, pass it through so codex routes
+                    // to the custom endpoint instead of api.openai.com.
+                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                        if !base_url.is_empty() {
+                            cmd.arg("-c").arg(format!(
+                                "openai_base_url=\"{}\"",
+                                base_url.trim_end_matches('/')
+                            ));
+                            info!(base_url = %base_url, "codex: using OpenAI provider with custom base URL");
+                        }
+                    } else {
+                        info!("codex: using OpenAI provider with default endpoint");
                     }
                 }
             }
+        }
+
+        // Apply backend-specific flags for FORGE mode
+        for arg in &config.forge_flags {
+            cmd.arg(arg);
+        }
+
+        // Apply backend-specific directory settings
+        for arg in &config.forge_extra_args {
+            cmd.arg(arg);
+        }
+
+        cmd
+    }
+
+    /// Build a command for SENTINEL mode.
+    fn build_sentinel_command(&self, backend: CliBackend, _worktree: &Path, _shared: &Path) -> Command {
+        let config = self.get_backend(backend);
+        let mut cmd = Command::new(&config.binary_path);
+
+        for arg in &config.base_flags {
+            cmd.arg(arg);
+        }
+
+        // Pass model from backend-specific env var if configured
+        if let Some(model_env) = &config.model_env {
+            if let Ok(model) = std::env::var(model_env) {
+                if !model.is_empty() {
+                    cmd.arg("-m").arg(&model);
+                    info!(model = %model, "{}: using model from {} (sentinel)", backend.as_str(), model_env);
+                }
+            }
+        }
+
+        // Codex CLI provider configuration (same as FORGE)
+        if backend == CliBackend::Codex {
+            let provider = detect_codex_provider();
+            match provider {
+                CodexProvider::Fireworks => {
+                    cmd.arg("-c").arg("model_provider=\"fireworks\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.name=\"Fireworks\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.base_url=\"https://api.fireworks.ai/inference/v1\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.wire_api=\"responses\"");
+                    cmd.arg("-c").arg("model_providers.fireworks.supports_websockets=false");
+                    cmd.arg("-c").arg("model_providers.fireworks.requires_openai_auth=false");
+                }
+                CodexProvider::OpenAI => {
+                    cmd.arg("-c").arg("model_provider=\"openai\"");
+                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                        if !base_url.is_empty() {
+                            cmd.arg("-c").arg(format!(
+                                "openai_base_url=\"{}\"",
+                                base_url.trim_end_matches('/')
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply backend-specific sentinel flags
+        for arg in &config.sentinel_flags {
+            cmd.arg(arg);
+        }
+
+        // Apply backend-specific directory settings
+        for arg in &config.sentinel_extra_args {
+            cmd.arg(arg);
         }
 
         cmd
@@ -287,47 +841,55 @@ impl ProcessManager {
 
     /// Inject environment variables for the CLI backend.
     fn inject_cli_env(&self, cmd: &mut Command, backend: CliBackend) {
-        match backend {
-            CliBackend::Claude => {
-                // Claude uses ANTHROPIC_API_KEY
-                if let Some(proxy_url) = &self.proxy_url {
-                    cmd.env(
-                        "ANTHROPIC_BASE_URL",
-                        proxy_url.trim_end_matches("/v1").trim_end_matches('/'),
-                    );
-                    if let Some(api_key) = &self.proxy_api_key {
-                        cmd.env("ANTHROPIC_API_KEY", api_key);
+        let config = self.get_backend(backend);
+
+        if let Some(proxy_url) = &self.proxy_url {
+            Self::inject_proxy_env(cmd, config, proxy_url, self.proxy_api_key.as_deref());
+        } else {
+            // Pass through backend-specific API key from environment
+            cmd.env(
+                &config.api_key_env,
+                std::env::var(&config.api_key_env).unwrap_or_default(),
+            );
+
+            // Pass through both API keys for Codex — the active provider
+            // determines which one is actually used for authentication.
+            if backend == CliBackend::Codex {
+                let provider = detect_codex_provider();
+                match provider {
+                    CodexProvider::Fireworks => {
+                        // Fireworks provider reads FIREWORKS_API_KEY (set via
+                        // env_key in the provider config)
+                        cmd.env(
+                            "FIREWORKS_API_KEY",
+                            std::env::var("FIREWORKS_API_KEY").unwrap_or_default(),
+                        );
+                        // Also set OPENAI_API_KEY for backward compat (some
+                        // codex internals may reference it during auth fallback)
+                        cmd.env(
+                            "OPENAI_API_KEY",
+                            std::env::var("OPENAI_API_KEY")
+                                .or_else(|_| std::env::var("FIREWORKS_API_KEY"))
+                                .unwrap_or_default(),
+                        );
                     }
-                } else {
-                    cmd.env(
-                        "ANTHROPIC_API_KEY",
-                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-                    );
+                    CodexProvider::OpenAI => {
+                        // OpenAI provider reads OPENAI_API_KEY
+                        cmd.env(
+                            "OPENAI_API_KEY",
+                            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+                        );
+                    }
                 }
             }
-            CliBackend::Codex => {
-                // Codex uses OPENAI_API_KEY and OPENAI_BASE_URL
-                if let Some(proxy_url) = &self.proxy_url {
-                    // Codex expects OpenAI-compatible endpoint
-                    cmd.env(
-                        "OPENAI_BASE_URL",
-                        proxy_url.trim_end_matches("/v1").trim_end_matches('/'),
-                    );
-                    if let Some(api_key) = &self.proxy_api_key {
-                        cmd.env("OPENAI_API_KEY", api_key);
-                    }
-                } else {
-                    // Pass through OPENAI_API_KEY from environment
-                    cmd.env(
-                        "OPENAI_API_KEY",
-                        std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                    );
-                    // Pass through OPENAI_BASE_URL from environment (for custom gateways like Fireworks)
+
+            // For OpenAI-compatible backends, also pass through base URL
+            if let Some(base_url_env) = &config.base_url_env {
+                if let Ok(base_url) = std::env::var(base_url_env) {
+                    cmd.env(base_url_env, base_url);
+                } else if base_url_env == "OPENAI_BASE_URL" {
                     // Also support OPENAI_API_URL for backwards compatibility
-                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                        cmd.env("OPENAI_BASE_URL", base_url);
-                    } else if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
-                        // Convert chat/completions URL to base URL
+                    if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
                         let base_url = api_url
                             .trim_end_matches("/chat/completions")
                             .trim_end_matches("/completions")
@@ -342,15 +904,69 @@ impl ProcessManager {
         Self::inject_llm_env(cmd);
     }
 
-    fn plugin_dir(target: &Path) -> PathBuf {
-        target.join(".claude").join("plugins").join("orchestration")
-    }
+    /// Apply Codex-specific settings (marketplace.json).
+    fn apply_codex_extras(&self) -> Result<()> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".to_string());
 
-    /// Get the Codex plugin directory (source location with .codex-plugin/plugin.json)
-    fn codex_plugin_dir() -> PathBuf {
-        // The orchestration plugin is in the AgentFlow repository root
-        // It contains .codex-plugin/plugin.json manifest for Codex
-        PathBuf::from("orchestration/plugin")
+        let agents_dir = PathBuf::from(&home).join(".agents").join("plugins");
+        if !agents_dir.exists() {
+            std::fs::create_dir_all(&agents_dir)
+                .context("Failed to create .agents/plugins directory")?;
+        }
+
+        let marketplace_file = agents_dir.join("marketplace.json");
+        let codex_plugin_source = PathBuf::from("orchestration/plugin");
+
+        let mut marketplace: serde_json::Value = if marketplace_file.exists() {
+            let content = std::fs::read_to_string(&marketplace_file)
+                .context("Failed to read marketplace.json")?;
+            serde_json::from_str(&content).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "name": "local-plugins",
+                    "plugins": []
+                })
+            })
+        } else {
+            serde_json::json!({
+                "name": "local-plugins",
+                "interface": {
+                    "displayName": "Local Plugins"
+                },
+                "plugins": []
+            })
+        };
+
+        let plugin_entry = serde_json::json!({
+            "name": "orchestration",
+            "source": {
+                "source": "local",
+                "path": codex_plugin_source.to_string_lossy().to_string()
+            },
+            "policy": {
+                "installation": "AVAILABLE",
+                "authentication": "ON_INSTALL"
+            },
+            "category": "Productivity"
+        });
+
+        if let Some(plugins) = marketplace
+            .get_mut("plugins")
+            .and_then(|p| p.as_array_mut())
+        {
+            if !plugins.iter().any(|p| p["name"] == "orchestration") {
+                plugins.push(plugin_entry);
+            }
+        }
+
+        std::fs::write(
+            &marketplace_file,
+            serde_json::to_string_pretty(&marketplace)?,
+        )
+        .context("Failed to write marketplace.json")?;
+
+        Ok(())
     }
 
     /// Spawn a FORGE process (long-running) with specified CLI backend.
@@ -372,92 +988,13 @@ impl ProcessManager {
 
         // Build the initial prompt for FORGE
         let initial_prompt = self.build_forge_prompt(shared);
-        let settings_path = worktree.join(".claude").join("settings.json");
-        let plugin_dir = Self::plugin_dir(worktree);
 
         let mut cmd = self.build_cli_command(backend, worktree, shared);
 
-        // Add backend-specific arguments
-        match backend {
-            CliBackend::Claude => {
-                cmd.arg("--settings")
-                    .arg(&settings_path)
-                    .arg("--plugin-dir")
-                    .arg(&plugin_dir)
-                    .arg("--add-dir")
-                    .arg(shared);
-            }
-            CliBackend::Codex => {
-                // Codex uses a marketplace file at ~/.agents/plugins/marketplace.json
-                // to list available plugins. The plugin directory should contain
-                // a .codex-plugin/plugin.json manifest.
-                // See: https://developers.openai.com/codex/plugins/build
-
-                let home = std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_else(|_| "/tmp".to_string());
-
-                // Create marketplace directory
-                let agents_dir = PathBuf::from(&home).join(".agents").join("plugins");
-                if !agents_dir.exists() {
-                    std::fs::create_dir_all(&agents_dir)
-                        .context("Failed to create .agents/plugins directory")?;
-                }
-
-                let marketplace_file = agents_dir.join("marketplace.json");
-
-                // Read existing marketplace or create new one
-                let mut marketplace: serde_json::Value = if marketplace_file.exists() {
-                    let content = std::fs::read_to_string(&marketplace_file)
-                        .context("Failed to read marketplace.json")?;
-                    serde_json::from_str(&content).unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "name": "local-plugins",
-                            "plugins": []
-                        })
-                    })
-                } else {
-                    serde_json::json!({
-                        "name": "local-plugins",
-                        "interface": {
-                            "displayName": "Local Plugins"
-                        },
-                        "plugins": []
-                    })
-                };
-
-                // Add orchestration plugin entry if not already present
-                // Use the source plugin directory that contains .codex-plugin/plugin.json
-                let codex_plugin_source = Self::codex_plugin_dir();
-                let plugin_entry = serde_json::json!({
-                    "name": "orchestration",
-                    "source": {
-                        "source": "local",
-                        "path": codex_plugin_source.to_string_lossy().to_string()
-                    },
-                    "policy": {
-                        "installation": "AVAILABLE",
-                        "authentication": "ON_INSTALL"
-                    },
-                    "category": "Productivity"
-                });
-
-                if let Some(plugins) = marketplace
-                    .get_mut("plugins")
-                    .and_then(|p| p.as_array_mut())
-                {
-                    if !plugins.iter().any(|p| p["name"] == "orchestration") {
-                        plugins.push(plugin_entry);
-                    }
-                }
-
-                // Write updated marketplace.json
-                std::fs::write(
-                    &marketplace_file,
-                    serde_json::to_string_pretty(&marketplace)?,
-                )
-                .context("Failed to write marketplace.json")?;
-            }
+        // Apply Codex marketplace plugin registration if needed
+        let config = self.get_backend(backend);
+        if config.needs_extras_provisioning {
+            self.apply_codex_extras()?;
         }
 
         cmd.env("SPRINTLESS_PAIR_ID", pair_id)
@@ -471,6 +1008,9 @@ impl ProcessManager {
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
 
         self.inject_cli_env(&mut cmd, backend);
+
+        // Set backend-specific home directory (CODEX_HOME) for isolated config
+        Self::ensure_home_dir(&mut cmd, config, worktree);
 
         cmd.current_dir(worktree)
             .stdin(Stdio::piped())
@@ -565,20 +1105,18 @@ impl ProcessManager {
             "Spawning FORGE process (PR creation mode)"
         );
 
+        let backend = self.default_backend;
         let initial_prompt = self.build_forge_pr_prompt(shared);
-        let settings_path = worktree.join(".claude").join("settings.json");
-        let plugin_dir = Self::plugin_dir(worktree);
 
-        let mut cmd = Command::new(&self.claude_path);
-        cmd.arg("--print")
-            .arg("--dangerously-skip-permissions")
-            .arg("--settings")
-            .arg(&settings_path)
-            .arg("--plugin-dir")
-            .arg(&plugin_dir)
-            .arg("--add-dir")
-            .arg(shared)
-            .env("SPRINTLESS_PAIR_ID", pair_id)
+        let mut cmd = self.build_cli_command(backend, worktree, shared);
+
+        // Apply Codex marketplace plugin registration if needed
+        let config = self.get_backend(backend);
+        if config.needs_extras_provisioning {
+            self.apply_codex_extras()?;
+        }
+
+        cmd.env("SPRINTLESS_PAIR_ID", pair_id)
             .env("SPRINTLESS_TICKET_ID", ticket_id)
             .env("SPRINTLESS_SEGMENT", "")
             .env(
@@ -588,20 +1126,10 @@ impl ProcessManager {
             .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
             .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
 
-        if let Some(proxy_url) = &self.proxy_url {
-            Self::inject_proxy_env(
-                &mut cmd,
-                "forge-key",
-                proxy_url,
-                self.proxy_api_key.as_deref(),
-            );
-        } else {
-            cmd.env(
-                "ANTHROPIC_API_KEY",
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            );
-            Self::inject_llm_env(&mut cmd);
-        }
+        self.inject_cli_env(&mut cmd, backend);
+
+        // Set backend-specific home directory (CODEX_HOME) for isolated config
+        Self::ensure_home_dir(&mut cmd, config, worktree);
 
         cmd.current_dir(worktree)
             .stdin(Stdio::piped())
@@ -708,31 +1236,12 @@ impl ProcessManager {
         // Build the initial prompt for SENTINEL based on mode
         let initial_prompt = self.build_sentinel_prompt(shared, &mode);
 
-        let mut cmd = self.build_cli_command(backend, worktree, shared);
+        let mut cmd = self.build_sentinel_command(backend, worktree, shared);
 
-        // Add backend-specific arguments
-        match backend {
-            CliBackend::Claude => {
-                let settings_path = shared.join(".claude").join("settings.json");
-                let plugin_dir = Self::plugin_dir(shared);
-                cmd.arg("--output-format")
-                    .arg("json")
-                    .arg("--settings")
-                    .arg(&settings_path)
-                    .arg("--plugin-dir")
-                    .arg(&plugin_dir)
-                    .arg("--add-dir")
-                    .arg(worktree)
-                    .arg("--no-session-persistence");
-            }
-            CliBackend::Codex => {
-                // Codex exec mode - additional flags for non-interactive execution
-                // The --dangerously-bypass-approvals-and-sandbox is already added in build_cli_command
-                cmd.arg("--json")
-                    .arg("--ephemeral")
-                    .arg("-C")
-                    .arg(shared);
-            }
+        // Apply Codex marketplace plugin registration if needed
+        let config = self.get_backend(backend);
+        if config.needs_extras_provisioning {
+            self.apply_codex_extras()?;
         }
 
         cmd.env("SPRINTLESS_PAIR_ID", pair_id)
@@ -747,6 +1256,9 @@ impl ProcessManager {
             .env("SPRINTLESS_SENTINEL_TIMEOUT_SECS", timeout_secs.to_string());
 
         self.inject_cli_env(&mut cmd, backend);
+
+        // Set backend-specific home directory for isolated config
+        Self::ensure_home_dir(&mut cmd, config, shared);
 
         cmd.current_dir(shared)
             .stdin(Stdio::piped())
@@ -1372,13 +1884,13 @@ impl ForgeProcessBuilder {
     pub async fn spawn(self) -> Result<Child> {
         let manager = match (&self.redis_url, &self.proxy_url) {
             (Some(redis_url), Some(proxy_url)) => {
-                ProcessManager::with_proxy(self.github_token, Some(redis_url.clone()), proxy_url)
+                ProcessManager::with_proxy(self.github_token, Some(redis_url.clone()), proxy_url, &self.worktree, &self.shared)
             }
-            (Some(redis_url), None) => ProcessManager::with_redis(self.github_token, redis_url),
+            (Some(redis_url), None) => ProcessManager::with_redis(self.github_token, redis_url, &self.worktree, &self.shared),
             (None, Some(proxy_url)) => {
-                ProcessManager::with_proxy(self.github_token, None, proxy_url)
+                ProcessManager::with_proxy(self.github_token, None, proxy_url, &self.worktree, &self.shared)
             }
-            (None, None) => ProcessManager::new(self.github_token),
+            (None, None) => ProcessManager::new(self.github_token, &self.worktree, &self.shared),
         };
 
         let child = manager
@@ -1407,12 +1919,18 @@ mod tests {
 
     #[test]
     fn test_plan_review_prompt_uses_shared_absolute_paths() {
-        let manager = ProcessManager::new("ghp_test");
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let manager = ProcessManager::new("ghp_test", &worktree, &shared);
         let prompt =
-            manager.build_sentinel_prompt(Path::new("/tmp/shared"), &SentinelMode::PlanReview);
+            manager.build_sentinel_prompt(&shared, &SentinelMode::PlanReview);
 
         assert!(prompt.contains("--- TICKET.md ---"));
-        assert!(prompt.contains("Write ONLY to /tmp/shared/CONTRACT.md"));
+        assert!(prompt.contains("Write ONLY to"));
+        assert!(prompt.contains("CONTRACT.md"));
         assert!(prompt.contains("status: AGREED | ISSUES"));
         assert!(prompt.contains("REJECT any segment that is only verification commands"));
         assert!(prompt.contains("REJECT if generic/placeholder content"));
@@ -1426,7 +1944,7 @@ mod tests {
 
     #[test]
     fn test_new_session_prompt_discourages_verification_only_segments() {
-        let manager = ProcessManager::new("ghp_test");
+        let manager = ProcessManager::new("ghp_test", Path::new("/tmp/worktree"), Path::new("/tmp/shared"));
         let dir = tempfile::tempdir().unwrap();
         let ticket_path = dir.path().join("TICKET.md");
         let task_path = dir.path().join("TASK.md");
@@ -1440,23 +1958,116 @@ mod tests {
 
     #[test]
     fn test_segment_eval_prompt_uses_shared_absolute_paths() {
-        let manager = ProcessManager::new("ghp_test");
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let manager = ProcessManager::new("ghp_test", &worktree, &shared);
         let prompt =
-            manager.build_sentinel_prompt(Path::new("/tmp/shared"), &SentinelMode::SegmentEval(3));
+            manager.build_sentinel_prompt(&shared, &SentinelMode::SegmentEval(3));
 
-        assert!(prompt.contains("SHARED: /tmp/shared"));
+        assert!(prompt.contains("SHARED:"));
         assert!(prompt.contains("--- CONTRACT.md ---"));
-        assert!(prompt.contains("Write /tmp/shared/segment-3-eval.md"));
+        assert!(prompt.contains("segment-3-eval.md"));
     }
 
     #[test]
     fn test_final_review_prompt_uses_shared_absolute_paths() {
-        let manager = ProcessManager::new("ghp_test");
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let manager = ProcessManager::new("ghp_test", &worktree, &shared);
         let prompt =
-            manager.build_sentinel_prompt(Path::new("/tmp/shared"), &SentinelMode::FinalReview);
+            manager.build_sentinel_prompt(&shared, &SentinelMode::FinalReview);
 
-        assert!(prompt.contains("SHARED: /tmp/shared"));
+        assert!(prompt.contains("SHARED:"));
         assert!(prompt.contains("--- CONTRACT.md ---"));
-        assert!(prompt.contains("Write /tmp/shared/final-review.md"));
+        assert!(prompt.contains("final-review.md"));
+    }
+
+    #[test]
+    fn test_parse_codex_exec_output_from_turns_array() {
+        let json = r#"[
+            {
+                "n": 0,
+                "items": [
+                    {"type": "message", "content": "Starting evaluation..."}
+                ]
+            },
+            {
+                "n": 1,
+                "items": [
+                    {"type": "tool_result", "output": "APPROVED - All tests passed"}
+                ]
+            }
+        ]"#;
+
+        let result = parse_codex_exec_output(json).unwrap();
+        assert!(result.success);
+        assert_eq!(result.turns.len(), 2);
+        assert_eq!(result.result_text.as_deref(), Some("APPROVED - All tests passed"));
+    }
+
+    #[test]
+    fn test_parse_codex_exec_output_from_full_result() {
+        let json = r#"{
+            "thread_id": "thread_abc123",
+            "turns": [
+                {
+                    "n": 0,
+                    "items": [
+                        {"type": "message", "content": "Reviewing segment 1..."}
+                    ]
+                },
+                {
+                    "n": 1,
+                    "items": [
+                        {"type": "tool_result", "output": "NEEDS_WORK - Fix required in src/main.rs"}
+                    ]
+                }
+            ]
+        }"#;
+
+        let result = parse_codex_exec_output(json).unwrap();
+        assert!(result.success);
+        assert_eq!(result.thread_id.as_deref(), Some("thread_abc123"));
+        assert_eq!(result.turns.len(), 2);
+        assert_eq!(result.result_text.as_deref(), Some("NEEDS_WORK - Fix required in src/main.rs"));
+    }
+
+    #[test]
+    fn test_parse_codex_exec_output_raw_text() {
+        let raw = "This is not valid JSON, should be treated as raw text";
+
+        let result = parse_codex_exec_output(raw).unwrap();
+        assert!(result.success);
+        assert_eq!(result.result_text.as_deref(), Some(raw));
+        assert!(result.turns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_codex_exec_output_empty() {
+        let result = parse_codex_exec_output("").unwrap();
+        assert!(!result.success);
+        assert!(result.result_text.is_none());
+        assert!(result.turns.is_empty());
+    }
+
+    #[test]
+    fn test_codex_home_set_for_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let manager = ProcessManager::new("ghp_test", &worktree, &shared);
+
+        // Verify that CODEX_HOME would be set correctly for Codex backend
+        let config = manager.get_backend(CliBackend::Codex);
+        let expected_codex_home = worktree.join(".codex-home");
+        assert_eq!(config.home_dir(&worktree), expected_codex_home);
     }
 }

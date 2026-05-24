@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// CLI backend type for agent execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum CliBackend {
     /// Claude Code CLI (default)
@@ -41,6 +41,22 @@ impl CliBackend {
         match self {
             CliBackend::Claude => "claude",
             CliBackend::Codex => "codex",
+        }
+    }
+
+    /// Get the CLI binary name/path.
+    pub fn binary_name(&self) -> &'static str {
+        match self {
+            CliBackend::Claude => "claude",
+            CliBackend::Codex => "codex",
+        }
+    }
+
+    /// Get the environment variable for CLI path override.
+    pub fn path_env_var(&self) -> &'static str {
+        match self {
+            CliBackend::Claude => "CLAUDE_PATH",
+            CliBackend::Codex => "CODEX_PATH",
         }
     }
 }

@@ -4,59 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// CLI backend type for agent execution.
-/// Determines which CLI tool is used to spawn agent processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CliBackend {
-    /// Claude Code CLI (default)
-    #[default]
-    Claude,
-    /// OpenAI Codex CLI
-    Codex,
-}
-
-impl std::str::FromStr for CliBackend {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_lowercase().as_str() {
-            "codex" => CliBackend::Codex,
-            "claude" => CliBackend::Claude,
-            _ => CliBackend::Claude, // Default fallback
-        })
-    }
-}
-
-impl CliBackend {
-    /// Parse from string, with fallback to default.
-    pub fn parse(s: &str) -> Self {
-        s.parse().unwrap_or(CliBackend::Claude)
-    }
-
-    /// Convert to string for display.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            CliBackend::Claude => "claude",
-            CliBackend::Codex => "codex",
-        }
-    }
-
-    /// Get the CLI binary name/path.
-    pub fn binary_name(&self) -> &'static str {
-        match self {
-            CliBackend::Claude => "claude",
-            CliBackend::Codex => "codex",
-        }
-    }
-
-    /// Get the environment variable for CLI path override.
-    pub fn path_env_var(&self) -> &'static str {
-        match self {
-            CliBackend::Claude => "CLAUDE_PATH",
-            CliBackend::Codex => "CODEX_PATH",
-        }
-    }
-}
+// Re-export CliBackend from the config crate — single source of truth.
+pub use config::registry::CliBackend;
 
 /// Filesystem events detected by the watcher.
 /// These drive the event-driven harness state machine.

@@ -371,7 +371,13 @@ pub struct ForgeSentinelPair {
     contract_timeout: Option<TimeoutProfile>,
     error_feedback_attempts: u32,
     verification_state: VerificationState,
+    /// Counts consecutive rapid FORGE exits (<30s). Used to break infinite
+    /// respawn loops when progress files are stale from a previous lifecycle.
+    rapid_exit_count: u32,
 }
+
+/// Maximum consecutive rapid FORGE exits before giving up.
+const MAX_RAPID_EXITS: u32 = 5;
 
 impl ForgeSentinelPair {
     /// Create a new ForgeSentinelPair.
@@ -388,18 +394,20 @@ impl ForgeSentinelPair {
                     &config.github_token,
                     Some(redis_url.clone()),
                     proxy_url,
+                    &config.worktree,
+                    &config.shared,
                 )
                 .with_default_backend(cli_backend),
                 (Some(redis_url), None) => {
-                    ProcessManager::with_redis(&config.github_token, redis_url)
+                    ProcessManager::with_redis(&config.github_token, redis_url, &config.worktree, &config.shared)
                         .with_default_backend(cli_backend)
                 }
                 (None, Some(proxy_url)) => {
-                    ProcessManager::with_proxy(&config.github_token, None, proxy_url)
+                    ProcessManager::with_proxy(&config.github_token, None, proxy_url, &config.worktree, &config.shared)
                         .with_default_backend(cli_backend)
                 }
                 (None, None) => {
-                    ProcessManager::new(&config.github_token).with_default_backend(cli_backend)
+                    ProcessManager::new(&config.github_token, &config.worktree, &config.shared).with_default_backend(cli_backend)
                 }
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
@@ -417,6 +425,7 @@ impl ForgeSentinelPair {
             final_approved: false,
             contract_timeout: None,
             error_feedback_attempts: 0,
+            rapid_exit_count: 0,
         }
     }
 
@@ -930,10 +939,44 @@ impl ForgeSentinelPair {
                     }
                 } else if self.has_progress_files().await {
                     // FORGE made progress - determine what SENTINEL action is needed
-                    if self.sentinel_tracker.is_some() {
+                    //
+                    // IMPORTANT: progress files may be stale from a previous lifecycle.
+                    // If FORGE ran for less than 30 seconds, it almost certainly didn't
+                    // complete a segment — it likely crashed on startup.  Treat this as
+                    // a startup error rather than "segment work completed" to avoid an
+                    // infinite respawn loop.
+                    let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
+                    if forge_uptime < 30 && !self.reset.has_handoff() {
+                        self.rapid_exit_count += 1;
+                        if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            error!(
+                                consecutive_exits = self.rapid_exit_count,
+                                "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
+                            );
+                            return Ok(PairOutcome::Blocked {
+                                reason: format!(
+                                    "FORGE exited {} times within 30 seconds — likely a startup error. \
+                                     Check forge-stderr.log in the shared directory.",
+                                    self.rapid_exit_count
+                                ),
+                                blockers: vec![],
+                            });
+                        }
+                        warn!(
+                            elapsed_secs = forge_uptime,
+                            consecutive = self.rapid_exit_count,
+                            "FORGE exited quickly with stale progress files — likely startup error, not segment completion"
+                        );
+                        // Treat the same as "no progress" quick exit: retry with backoff
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        *forge = self.spawn_forge().await?;
+                    } else if self.sentinel_tracker.is_some() {
                         info!("FORGE exited but SENTINEL is active - waiting for completion");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } else {
+                        // FORGE ran for a healthy duration — reset rapid exit counter
+                        self.rapid_exit_count = 0;
+
                         // Check the lifecycle phase and spawn SENTINEL if needed
                         let plan_exists = self.config.shared.join("PLAN.md").exists();
                         let contract_exists = self.config.shared.join("CONTRACT.md").exists();
@@ -991,11 +1034,28 @@ impl ForgeSentinelPair {
                     // No progress files - check if FORGE just started and may not have had time
                     let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
                     if forge_uptime < 30 {
+                        self.rapid_exit_count += 1;
+                        if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            error!(
+                                consecutive_exits = self.rapid_exit_count,
+                                "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
+                            );
+                            return Ok(PairOutcome::Blocked {
+                                reason: format!(
+                                    "FORGE exited {} times within 30 seconds — likely a startup error. \
+                                     Check forge-stderr.log in the shared directory.",
+                                    self.rapid_exit_count
+                                ),
+                                blockers: vec![],
+                            });
+                        }
                         // Very quick exit - likely a startup error, retry
                         warn!(
-                            "FORGE exited quickly ({}s) without progress - retrying spawn",
-                            forge_uptime
+                            elapsed_secs = forge_uptime,
+                            consecutive = self.rapid_exit_count,
+                            "FORGE exited quickly without progress - retrying spawn"
                         );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
                     } else {
                         // Ran for a while but produced nothing - synthesize handoff and respawn
@@ -1056,6 +1116,7 @@ impl ForgeSentinelPair {
                 &self.config.shared,
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
+                self.config.cli_backend,
             )
             .await
     }
