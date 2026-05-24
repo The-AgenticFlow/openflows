@@ -197,7 +197,21 @@ impl LlmClient for AnthropicClient {
             .json(&body)
             .send()
             .await
-            .context("HTTP request to Anthropic API failed")?;
+            .map_err(|e| {
+                if e.is_connect() {
+                    anyhow::anyhow!(
+                        "Cannot connect to Anthropic API at {} — {}. Is the proxy running?",
+                        self.api_url,
+                        e
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "HTTP request to Anthropic API failed (url={}): {}",
+                        self.api_url,
+                        e
+                    )
+                }
+            })?;
 
         let status = resp.status();
         let raw_text = resp

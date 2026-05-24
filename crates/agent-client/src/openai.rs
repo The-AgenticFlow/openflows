@@ -212,7 +212,21 @@ impl LlmClient for OpenAiClient {
             .json(&body)
             .send()
             .await
-            .context("HTTP request to OpenAI API failed")?;
+            .map_err(|e| {
+                if e.is_connect() {
+                    anyhow::anyhow!(
+                        "Cannot connect to OpenAI API at {} — {}. Is the service running?",
+                        self.api_url,
+                        e
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "HTTP request to OpenAI API failed (url={}): {}",
+                        self.api_url,
+                        e
+                    )
+                }
+            })?;
 
         let status = resp.status();
         let raw_text = resp

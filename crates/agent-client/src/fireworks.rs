@@ -161,7 +161,21 @@ impl LlmClient for FireworksClient {
             .json(&body)
             .send()
             .await
-            .context("HTTP request to Fireworks API failed")?;
+            .map_err(|e| {
+                if e.is_connect() {
+                    anyhow::anyhow!(
+                        "Cannot connect to Fireworks API at {} — {}. Is the service running?",
+                        self.api_url,
+                        e
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "HTTP request to Fireworks API failed (url={}): {}",
+                        self.api_url,
+                        e
+                    )
+                }
+            })?;
 
         let status = resp.status();
         let raw_text = resp

@@ -202,59 +202,109 @@ impl BatchNode for ForgeNode {
             persona_content, worker_id, ticket_id, issue_context, branch_name
         );
 
-        // Use CLI flags to grant permissions
-        // Note: When using --allowedTools with comma-separated values, Claude Code
-        // doesn't properly recognize the prompt as a positional argument.
-        // We must pass the prompt via stdin instead.
-        let mut child = tokio::process::Command::new("claude")
-            .args(["--print", "--output-format", "json"])
-            .arg("--dangerously-skip-permissions")
-            .args(["--allowedTools", "Read,Write,Edit,Bash,WebFetch"])
-            .current_dir(&worktree_path)
-            .env(
-                "ANTHROPIC_API_KEY",
-                std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            )
-            .stdin(std::process::Stdio::piped())
-            .stdout(log_file)
-            .stderr(log_file_err)
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn Claude Code: {:#}", e))?;
+        // Resolve CLI backend from registry (respects DEFAULT_CLI env var)
+        let cli_backend = if let Some(registry_path) = &self.registry_path {
+            let registry = config::Registry::load(registry_path)?;
+            registry.resolve_cli_backend(&worker_id)
+        } else {
+            std::env::var(config::DEFAULT_CLI_ENV_VAR)
+                .ok()
+                .map(|s| config::CliBackend::parse(&s))
+                .unwrap_or_default()
+        };
 
-        // Write prompt to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
-        }
+        let cli_binary = match cli_backend.path_env_var() {
+            "CODEX_PATH" => std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+            _ => std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+        };
 
-        // MONITORING: Since we redirected stdout/stderr to a file, we can't easily
-        // monitor for "Dangerous command" strings in real-time within this process
-        // without tailing the file. For now, we'll let it run and check the STATUS.json
-        // or the log file afterwards.
+        match cli_backend {
+            config::CliBackend::Codex => {
+                let mut child = tokio::process::Command::new(&cli_binary)
+                    .args(["exec", "--full-auto"])
+                    .arg("-m")
+                    .arg(std::env::var("OPENAI_MODEL")
+                        .or_else(|_| std::env::var("FIREWORKS_MODEL"))
+                        .unwrap_or_else(|_| "gpt-4o-mini".to_string()))
+                    .current_dir(&worktree_path)
+                    .env("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").unwrap_or_default())
+                    .env("OPENAI_BASE_URL", std::env::var("OPENAI_BASE_URL").unwrap_or_default())
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(log_file)
+                    .stderr(log_file_err)
+                    .spawn()
+                    .map_err(|e| anyhow!("Failed to spawn Codex CLI: {:#}", e))?;
 
-        let timeout_dur = std::time::Duration::from_secs(1800); // 30 minutes
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    stdin
+                        .write_all(prompt.as_bytes())
+                        .await
+                        .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
+                }
 
-        // 2. Wait for process
-        let result = tokio::time::timeout(timeout_dur, child.wait()).await;
+                let timeout_dur = std::time::Duration::from_secs(1800);
+                let result = tokio::time::timeout(timeout_dur, child.wait()).await;
 
-        match result {
-            Err(_) => {
-                child.kill().await?;
-                warn!(worker = worker_id, "Claude Code timed out after 30m");
-                return Ok(json!({
-                    "worker_id": worker_id,
-                    "ticket_id": ticket_id,
-                    "outcome": "fuel_exhausted",
-                    "reason": "timeout"
-                }));
+                match result {
+                    Err(_) => {
+                        warn!(worker = worker_id, "Codex CLI timed out after 30m");
+                        return Ok(json!({
+                            "worker_id": worker_id,
+                            "ticket_id": ticket_id,
+                            "outcome": "fuel_exhausted",
+                            "reason": "timeout"
+                        }));
+                    }
+                    Ok(Ok(status)) if !status.success() => {
+                        warn!(worker = worker_id, exit = ?status.code(), "Codex CLI failed");
+                    }
+                    _ => {}
+                }
             }
-            Ok(Ok(status)) if !status.success() => {
-                warn!(worker = worker_id, exit = ?status.code(), "Claude Code failed");
+            config::CliBackend::Claude => {
+                let mut child = tokio::process::Command::new(&cli_binary)
+                    .args(["--print", "--output-format", "json"])
+                    .arg("--dangerously-skip-permissions")
+                    .args(["--allowedTools", "Read,Write,Edit,Bash,WebFetch"])
+                    .current_dir(&worktree_path)
+                    .env(
+                        "ANTHROPIC_API_KEY",
+                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+                    )
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(log_file)
+                    .stderr(log_file_err)
+                    .spawn()
+                    .map_err(|e| anyhow!("Failed to spawn Claude Code: {:#}", e))?;
+
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    stdin
+                        .write_all(prompt.as_bytes())
+                        .await
+                        .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
+                }
+
+                let timeout_dur = std::time::Duration::from_secs(1800);
+                let result = tokio::time::timeout(timeout_dur, child.wait()).await;
+
+                match result {
+                    Err(_) => {
+                        warn!(worker = worker_id, "Claude Code timed out after 30m");
+                        return Ok(json!({
+                            "worker_id": worker_id,
+                            "ticket_id": ticket_id,
+                            "outcome": "fuel_exhausted",
+                            "reason": "timeout"
+                        }));
+                    }
+                    Ok(Ok(status)) if !status.success() => {
+                        warn!(worker = worker_id, exit = ?status.code(), "Claude Code failed");
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
         }
 
         // 3. Read STATUS.json
@@ -1436,11 +1486,7 @@ impl BatchNode for ForgePairNode {
             let backend = registry.resolve_cli_backend(&worker_id);
             info!(worker_id, base_id, ?backend, "CLI backend resolved");
 
-            // Convert config::CliBackend to pair_harness::CliBackend
-            match backend {
-                config::CliBackend::Claude => pair_harness::types::CliBackend::Claude,
-                config::CliBackend::Codex => pair_harness::types::CliBackend::Codex,
-            }
+            backend
         } else {
             // No registry - check DEFAULT_CLI env var, then fallback to default
             let backend = std::env::var(config::DEFAULT_CLI_ENV_VAR)
@@ -1452,10 +1498,7 @@ impl BatchNode for ForgePairNode {
                 ?backend,
                 "No registry path, using CLI backend from env or default"
             );
-            match backend {
-                config::CliBackend::Claude => pair_harness::types::CliBackend::Claude,
-                config::CliBackend::Codex => pair_harness::types::CliBackend::Codex,
-            }
+            backend
         };
 
         let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)

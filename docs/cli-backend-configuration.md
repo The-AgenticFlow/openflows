@@ -107,15 +107,6 @@ This applies to all agents that don't have an explicit `cli` field.
 | `DEFAULT_CLI` | Override default CLI backend for all agents | (not set) |
 | `CLAUDE_PATH` | Path to Claude CLI binary | `"claude"` |
 | `CODEX_PATH` | Path to Codex CLI binary | `"codex"` |
-| `CODEX_APPROVAL_MODE` | Codex autonomy level | `"suggest"` |
-
-### Codex Approval Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `suggest` | Codex suggests changes, requires approval | Interactive development |
-| `auto-edit` | Codex can edit files automatically | Semi-autonomous agents |
-| `full-auto` | Codex can execute commands and edit files | Fully autonomous agents (recommended) |
 
 ## Example Configurations
 
@@ -125,8 +116,8 @@ This applies to all agents that don't have an explicit `cli` field.
 # .env
 DEFAULT_CLI=codex
 CODEX_PATH=codex
-CODEX_APPROVAL_MODE=full-auto
 OPENAI_API_KEY=your_openai_api_key
+OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1
 ```
 
 ```json
@@ -241,12 +232,44 @@ Check the priority chain:
 
 ### Codex Approval Issues
 
-If Codex is asking for approval when it shouldn't:
+Codex approval mode is hard-coded as `full-auto` in AgentFlow's process spawning logic. If you need to change this, modify `BackendConfig::codex()` in `crates/pair-harness/src/process.rs`.
+
+## Provider Compatibility
+
+### Codex CLI (OpenAI-Compatible — No Proxy Needed)
+
+| Provider | `OPENAI_BASE_URL` | Notes |
+|----------|-------------------|-------|
+| Fireworks | `https://api.fireworks.ai/inference/v1` | Set `OPENAI_API_KEY` to your Fireworks key |
+| OpenAI | (default) | Set `OPENAI_API_KEY` to your OpenAI key |
+| DeepSeek | `https://api.deepseek.com/v1` | Set `OPENAI_API_KEY` to your DeepSeek key |
+| Together | `https://api.together.xyz/v1` | Set `OPENAI_API_KEY` to your Together key |
+| Groq | `https://api.groq.com/openai/v1` | Set `OPENAI_API_KEY` to your Groq key |
+
+Codex uses the OpenAI Chat Completions format, which all these providers support natively.
+
+### Claude Code CLI (Anthropic Format — Proxy Required for Third-Party Providers)
+
+| Provider | Proxy Required? | How |
+|----------|----------------|-----|
+| Anthropic (direct key) | No | Just set `ANTHROPIC_API_KEY` |
+| Any OpenAI-compatible provider | **Yes** | Run `anthropic-mock` proxy to translate formats |
+
+Claude Code uses the Anthropic Messages format. Only Anthropic's own API supports this natively.
+For any other provider, you MUST run the `anthropic-mock` proxy:
 
 ```bash
-# Set approval mode to full-auto
-CODEX_APPROVAL_MODE=full-auto
+# Terminal 1: Start the proxy
+cargo run -p anthropic-mock
+
+# Terminal 2: Run orchestration
+cargo run --bin agentflow
 ```
+
+The proxy translates:
+- **Inbound**: Claude Code sends Anthropic `/v1/messages` requests to `localhost:8765`
+- **Outbound**: Proxy translates to OpenAI `/v1/chat/completions` and forwards to `GATEWAY_URL`
+- **Response**: Proxy translates OpenAI response back to Anthropic format
 
 ## Related Documentation
 

@@ -1,5 +1,7 @@
 # AgentFlow - Autonomous AI Development Team
 
+> Humans steer. Agents execute.
+>
 > 🌐 Official site: [openflows.dev](https://openflows.dev)
 
 An autonomous software development team composed of AI agents working in a unified Rust/Tokio flow. The team can take GitHub issues and turn them into working code with pull requests - all autonomously.
@@ -8,23 +10,100 @@ An autonomous software development team composed of AI agents working in a unifi
 
 ## Quick Start
 
+### Option A: Codex + Fireworks (Recommended — Simplest Setup)
+
+No proxy required! Codex CLI is OpenAI-compatible and connects directly to any OpenAI-compatible provider (Fireworks, OpenAI, DeepSeek, etc.).
+
+> **Tip:** You can also use Codex with a direct OpenAI API key — just set `OPENAI_API_KEY` and leave `OPENAI_BASE_URL` unset. No Fireworks key needed.
+
 ```bash
 # 1. Clone and setup
 git clone https://github.com/The-AgenticFlow/AgentFlow.git
 cd AgentFlow
 cp .env.example .env
-# Edit .env with your API keys
 
-# 2. Start the local proxy (required when gateway doesn't support Anthropic format)
-source .env && ./scripts/start_proxy.sh &
-# Or if your provider supports Anthropic directly, skip this step
+# 2. Install and authenticate Codex CLI
+npm install -g @openai/codex
+echo "your-fireworks-key" | codex login --with-api-key
+codex login status   # verify it worked
 
-# 3. Verify setup (optional but recommended)
-./scripts/check_setup.sh
+# 3. Edit .env — uncomment MODE A and set:
+#    DEFAULT_CLI=codex
+#    FIREWORKS_API_KEY=your-fireworks-key
+#    CODEX_PATH=codex     # or absolute path from: which codex
+#    OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1
+#    OPENAI_API_KEY=your-fireworks-key   # same as FIREWORKS_API_KEY
 
-# 4. Run the orchestration
-cargo run --bin real_test
+# 4. Run
+cargo run --bin agentflow
 ```
+
+### Option B: Claude Code + Direct Anthropic Key
+
+If you have a direct Anthropic API key, Claude Code connects natively — no proxy needed.
+
+```bash
+# 1. Clone and setup
+git clone https://github.com/The-AgenticFlow/AgentFlow.git
+cd AgentFlow
+cp .env.example .env
+
+# 2. Install and authenticate Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+claude login
+
+# 3. Edit .env — uncomment MODE B and set:
+#    DEFAULT_CLI=claude
+#    ANTHROPIC_API_KEY=sk-ant-...
+#    ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+
+# 4. Run
+cargo run --bin agentflow
+```
+
+### Option C: Claude Code + Third-Party Provider (Requires Proxy)
+
+Claude Code uses the Anthropic Messages API format, which is **NOT OpenAI-compatible**.
+If you want to route Claude Code through a third-party provider (Fireworks, etc.),
+you MUST run the local protocol translator proxy (`anthropic-mock`).
+
+```bash
+# 1. Clone and setup
+git clone https://github.com/The-AgenticFlow/AgentFlow.git
+cd AgentFlow
+cp .env.example .env
+
+# 2. Install Claude Code CLI (same as Option B)
+npm install -g @anthropic-ai/claude-code
+
+# 3. Edit .env — uncomment MODE C and set:
+#    DEFAULT_CLI=claude
+#    PROXY_URL=http://localhost:8765/v1
+#    PROXY_API_KEY=your-gateway-key
+#    MODEL_MAP=claude-haiku-4-5-20251001=your-gateway-model,...
+#    GATEWAY_URL=https://api.fireworks.ai/inference/v1/
+#    GATEWAY_API_KEY=your-gateway-key
+
+# 4. Start the proxy (MUST be running before orchestration)
+cargo run -p anthropic-mock &
+# Or: ./scripts/start_proxy.sh &
+
+# 5. Run orchestration (in another terminal)
+cargo run --bin agentflow
+```
+
+## Why Codex Doesn't Need a Proxy
+
+| | Codex CLI | Claude Code CLI |
+|---|---|---|
+| **API Format** | OpenAI Chat Completions | Anthropic Messages |
+| **Third-party providers** | Direct connection | Requires proxy |
+| **Env vars** | `OPENAI_API_KEY` + `OPENAI_BASE_URL` | `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` |
+| **Fireworks** | Set `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1` | Must run `anthropic-mock` proxy |
+
+**Codex CLI speaks the OpenAI Chat Completions format** (`/v1/chat/completions`), which is the industry-standard interchange format. Nearly every third-party provider (Fireworks, DeepSeek, Together, Groq, etc.) supports this format natively. This means Codex can connect directly to any of them with just `OPENAI_BASE_URL` and `OPENAI_API_KEY`.
+
+**Claude Code CLI speaks the Anthropic Messages format** (`/v1/messages`), which only Anthropic's own API supports natively. When you want to route Claude Code through a non-Anthropic provider, you need the `anthropic-mock` proxy running locally to translate Anthropic → OpenAI format in real-time.
 
 ## Getting Started
 
@@ -48,7 +127,7 @@ cargo run --bin real_test
 | Agent | Role | Description |
 |-------|------|-------------|
 | **NEXUS** | Orchestrator | Scrum Master & Tech Lead. Assigns tickets, approves dangerous commands. |
-| **FORGE** | Builder | Senior Engineer. Writes code, tests, opens PRs via Claude Code. |
+| **FORGE** | Builder | Senior Engineer. Writes code, tests, opens PRs via Claude Code or Codex CLI. |
 | **SENTINEL** | Reviewer | Security auditor. Reviews PRs, ensures all logic is tested. |
 | **VESSEL** | DevOps | Deployment expert. Manages CI/CD and rollbacks. |
 | **LORE** | Writer | Documenter. Writes ADRs, maintains project history. |
@@ -80,7 +159,7 @@ The registry at [`orchestration/agent/registry.json`](orchestration/agent/regist
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | Agent name. Used in logs, worktree names (`forge-1`, `forge-2`), and branch names. |
-| `cli` | string | CLI tool to spawn. Currently only `"claude"` (Claude Code) is supported. |
+| `cli` | string | CLI tool to spawn. `"claude"` (Claude Code) or `"codex"` (Codex CLI). |
 | `active` | bool | When `false`, the agent is excluded from orchestration entirely. |
 | `instances` | int | Number of parallel worker slots. FORGE uses this directly (`forge-1`, `forge-2`, ...). Other agents with `instances > 1` get numbered slots (`vessel-1`, `vessel-2`). Agents with `instances == 1` use their bare ID (`nexus`, `sentinel`). |
 | `model_backend` | string | Model identifier passed to the LLM client. Can be a direct provider path (`anthropic/claude-sonnet-4-5`) or a gateway path (`accounts/fireworks/models/glm-5`). |
@@ -150,7 +229,7 @@ AgentFlow/
 |-- orchestration/agent/agents/           # Agent personas (nexus.agent.md, forge.agent.md)
 |-- crates/
 |   |-- agent-nexus/         # Orchestrator node
-|   |-- agent-forge/         # Builder node (spawns Claude Code)
+|   |-- agent-forge/         # Builder node (spawns Claude Code or Codex CLI)
 |   |-- agent-client/        # LLM client + MCP integration
 |   |-- pair-harness/        # Worktree management, process spawning
 |   |-- pocketflow-core/     # Flow engine, shared store, routing
@@ -208,7 +287,7 @@ AgentFlow/
 ### The Orchestration Cycle
 
 1. **NEXUS** fetches open GitHub issues and assigns them to available FORGE workers
-2. **FORGE** creates an isolated worktree, writes PLAN.md, then implements code via Claude Code
+2. **FORGE** creates an isolated worktree, writes PLAN.md, then implements code via Claude Code or Codex CLI
 3. **SENTINEL** reviews the plan (CONTRACT.md), evaluates each code segment, and performs final review
 4. **FORGE** opens a PR once SENTINEL approves
 5. **VESSEL** polls CI status, detects merge conflicts, attempts resolution, and squash-merges green PRs
@@ -292,86 +371,126 @@ The `STATUS.json` structure:
 - **[TUTORIAL.md](TUTORIAL.md)** - Complete tutorial with logs, file structure, and troubleshooting
 - **[docs/demo.md](docs/demo.md)** - Live flow walkthrough: logs, file locations, and troubleshooting
 - **[docs/setup-claude-cli.md](docs/setup-claude-cli.md)** - Claude CLI setup and troubleshooting
+- **[docs/cli-backend-configuration.md](docs/cli-backend-configuration.md)** - CLI backend configuration (Claude & Codex)
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** - Development guidelines
 - **[docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md)** - Architecture details
 
-## Per-Agent LLM Routing (LiteLLM Proxy)
+## CLI Backend Configuration
 
-Each agent has different workload requirements. Instead of routing all agents through the same expensive model, AgentFlow supports per-agent model routing via a **LiteLLM proxy** — each agent uses the most cost-effective model for its task.
+AgentFlow supports two CLI backends for agent execution: **Claude Code** and **Codex CLI**.
 
-### Default Model Assignments
+### Supported Backends
 
-| Agent | Model | Why |
-|-------|-------|-----|
-| **FORGE** | `anthropic/claude-sonnet-4-5` | Primary coding agent, needs top-tier reasoning |
-| **NEXUS** | `anthropic/claude-sonnet-4-5` | Orchestrator, needs reliable decision-making |
-| **SENTINEL** | `gemini/gemini-2.5-pro` | Code review, strong reasoning at lower cost |
-| **VESSEL** | `groq/llama-3.3-70b-versatile` | CI/CD scripting, fast and cheap (free tier) |
-| **LORE** | `openai/gpt-4o-mini` | Documentation, lightweight task |
+| Backend | Description | Provider |
+|---------|-------------|----------|
+| `claude` | Claude Code CLI (default) | Anthropic |
+| `codex` | Codex CLI | OpenAI |
 
-### How It Works
+### Configuration Hierarchy
 
-1. Claude Code supports `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` env vars
-2. A LiteLLM proxy receives all requests and routes based on the API key (routing key)
-3. Each agent is spawned with its own routing key (e.g., `forge-key`, `sentinel-key`)
-4. The proxy maps each routing key to the correct backend model via `litellm_config.yaml`
-5. Fallback is configured — any provider failure falls back to `anthropic/claude-sonnet-4-5`
+The CLI backend is determined using a priority-based fallback chain:
+
+1. **Agent-specific `cli` field** in `registry.json` (highest priority)
+2. **`DEFAULT_CLI` environment variable**
+3. **`default_cli` field** in `registry.json`
+4. **Hardcoded `"claude"` fallback** (lowest priority)
+
+### Example: Mixed Backend Configuration
+
+```json
+{
+  "default_cli": "claude",
+  "team": [
+    { "id": "nexus", "cli": "claude", ... },
+    { "id": "forge", "cli": "codex", ... },
+    { "id": "sentinel", "cli": "claude", ... }
+  ]
+}
+```
+
+### Codex-Specific Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CODEX_PATH` | Path to Codex CLI binary | `"codex"` |
+| `OPENAI_API_KEY` | OpenAI API key for Codex | (required for Codex) |
+| `OPENAI_BASE_URL` | OpenAI-compatible API endpoint | (optional, for proxies) |
+| `CODEX_HOME` | Codex config directory per worktree | (auto-generated) |
+
+### Codex Harness Primitives
+
+When using Codex, AgentFlow maps these Codex concepts to its architecture:
+
+| Codex Primitive | AgentFlow Equivalent |
+|----------------|---------------------|
+| `codex exec --full-auto` | `spawn_forge_with_backend(Codex)` |
+| Hooks (SessionStart, PreToolUse, etc.) | `orchestration/plugin/hooks/` shell scripts |
+| Skills (SKILL.md) | `orchestration/plugin/skills/` (symlinked) |
+| Subagents (`.codex/agents/`) | `orchestration/agent/agents/*.agent.md` personas |
+| AGENTS.md | Generated from agent.md files at provision time |
+| Permission profiles | Generated in `.codex/config.toml` |
+| MCP servers | Configured in `.codex/config.toml` |
+
+For complete details, see **[docs/cli-backend-configuration.md](docs/cli-backend-configuration.md)**.
+
+## LLM Provider Routing
+
+AgentFlow routes LLM requests based on your `.env` configuration:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Registry model_backend (e.g. "accounts/fireworks/...") │
+│                         │                                │
+│                         v                                │
+│              ┌── Auto-detected? ──┐                      │
+│              │                    │                      │
+│         Yes (prefix)         No (use MODEL_PROVIDER_MAP)│
+│              │                    │                      │
+│              v                    v                      │
+│     FireworksClient        Resolved provider            │
+│     (direct, no proxy)     (direct, no proxy)           │
+└─────────────────────────────────────────────────────────┘
+
+Fallback chain (when no model_override):
+  PROXY_URL set? → AnthropicClient (proxy)
+  FIREWORKS_API_KEY? → FireworksClient (direct)
+  Otherwise → Direct API keys (ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY)
+```
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PROXY_URL` | Optional | LiteLLM proxy URL. When set, agents route through the proxy. When unset, agents use direct API access. |
-| `PROXY_API_KEY` | Optional | API key for a **hosted** LiteLLM proxy. When set, `ANTHROPIC_API_KEY` is set to this value for auth. When unset, the routing key is used as `ANTHROPIC_API_KEY` (for self-hosted LiteLLM). |
-| `ANTHROPIC_API_KEY` | Required* | Anthropic API key (used by FORGE, NEXUS, and as fallback) |
-| `GEMINI_API_KEY` | Optional | Google Gemini API key (used by SENTINEL via proxy) |
-| `OPENAI_API_KEY` | Optional | OpenAI API key (used by LORE via proxy) |
-| `GROQ_API_KEY` | Optional | Groq API key (used by VESSEL via proxy, free tier available) |
-| `GATEWAY_URL` | Optional | Remote OpenAI-compatible gateway URL. Used by the local Anthropic proxy to forward requests. Required only when the gateway doesn't support Anthropic protocol. |
-| `GATEWAY_API_KEY` | Optional | API key for the remote gateway. Falls back to `PROXY_API_KEY` if unset. |
+| `PROXY_URL` | Optional | Proxy URL. When set, agents route through the proxy. When unset, agents use direct API access. |
+| `PROXY_API_KEY` | Optional | API key for the proxy. Falls back to `ANTHROPIC_API_KEY`. |
+| `FIREWORKS_API_KEY` | Optional | Fireworks API key. When set, FireworksClient is used directly (no proxy needed). |
+| `OPENAI_BASE_URL` | Optional | OpenAI-compatible API endpoint. Critical for Codex+Fireworks. |
+| `OPENAI_API_KEY` | Optional | OpenAI API key. When using Fireworks, set to same as `FIREWORKS_API_KEY`. |
+| `ANTHROPIC_API_KEY` | Optional | Anthropic API key (used by FORGE, NEXUS, and as fallback) |
+| `GEMINI_API_KEY` | Optional | Google Gemini API key (used by SENTINEL via direct key) |
+| `GATEWAY_URL` | Optional | Remote OpenAI-compatible gateway URL. Used by anthropic-mock proxy. |
+| `GATEWAY_API_KEY` | Optional | API key for the remote gateway. Falls back to `PROXY_API_KEY`. |
 
-### Self-Hosted LiteLLM (Docker Compose)
-
-```bash
-# Start the proxy, Redis, and agent-team
-docker compose up
-
-# Or just the proxy for local dev
-docker compose up proxy redis
-```
-
-The proxy runs on port 4000 with a health check. See `docker-compose.yml` and `litellm_config.yaml` for configuration.
-
-### Hosted LiteLLM (e.g., LiteLLM Cloud)
-
-```bash
-# .env
-PROXY_URL=https://your-litellm-instance.example.com
-PROXY_API_KEY=sk-your-hosted-litellm-key
-```
-
-When using a hosted proxy, set `PROXY_API_KEY` to your proxy authentication key. The provider API keys (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc.) are configured on the proxy side, not in the AgentFlow `.env`.
-
-### OpenAI-Only Gateways (Local Anthropic Proxy)
+### OpenAI-Only Gateways (Local anthropic-mock Proxy)
 
 If your LLM gateway only supports the OpenAI Chat Completions format (`/v1/chat/completions`), Claude CLI will fail because it speaks Anthropic Messages API (`/v1/messages`). AgentFlow includes a local protocol translator:
 
 ```bash
 # Terminal 1: Start the proxy (reads .env automatically)
-./scripts/start_proxy.sh
+cargo run -p anthropic-mock
 
 # Terminal 2: Run orchestration
-cargo run --bin real_test
+cargo run --bin agentflow
 ```
 
 Configure `.env`:
 ```env
 # Claude CLI and Nexus send Anthropic requests to the LOCAL proxy
-PROXY_URL=http://localhost:8080/v1
+PROXY_URL=http://localhost:8765/v1
 PROXY_API_KEY=your-gateway-api-key
 
 # The LOCAL proxy forwards OpenAI-format requests to the REMOTE gateway
-GATEWAY_URL=https://api.ai.camer.digital/v1/
+GATEWAY_URL=https://api.fireworks.ai/inference/v1/
 GATEWAY_API_KEY=your-gateway-api-key
 ```
 
@@ -385,8 +504,17 @@ If `PROXY_URL` is not set, all agents use direct API access with `ANTHROPIC_API_
 
 - Rust 1.70+
 - Node.js 18+ (for GitHub MCP server)
-- **Claude Code CLI** - [Setup Guide](docs/setup-claude-cli.md)
-- API keys: `ANTHROPIC_API_KEY` (required), `GITHUB_PERSONAL_ACCESS_TOKEN` (required), plus optional provider keys for proxy routing (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`)
+- **Codex CLI** (`npm install -g @openai/codex`) or **Claude Code CLI** (`npm install -g @anthropic-ai/claude-code`)
+- API keys (choose one):
+  - **Codex + Fireworks**: `FIREWORKS_API_KEY` + `OPENAI_BASE_URL` (recommended — no proxy needed)
+  - **Codex + OpenAI**: `OPENAI_API_KEY` only (no `OPENAI_BASE_URL` needed — direct connection)
+  - **Claude direct**: `ANTHROPIC_API_KEY`
+  - **Claude + third-party gateway**: `PROXY_API_KEY` + `GATEWAY_API_KEY` (proxy required)
+- `GITHUB_PERSONAL_ACCESS_TOKEN` (required for all modes)
+
+Before first use, authenticate your CLI:
+  Codex:  echo "your-key" | codex login --with-api-key
+  Claude: claude login
 
 ## License
 

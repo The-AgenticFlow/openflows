@@ -99,8 +99,50 @@ impl FallbackClient {
 
         info!(
             proxy_active,
-            fireworks_active, model_override, "Building fallback client chain"
+            fireworks_active,
+            model_override,
+            "Building fallback client chain"
         );
+
+        if let Some(model) = model_override {
+            if let Some(provider) = resolve_provider_for_model(model) {
+                match provider.as_str() {
+                    "fireworks" if FireworksClient::is_configured() => {
+                        info!(
+                            model,
+                            provider = "fireworks",
+                            "Model-aware routing: using FireworksClient directly"
+                        );
+                        return Self::build_fireworks_chain(Some(model));
+                    }
+                    "openai" if has_api_key_for_provider("openai") => {
+                        info!(
+                            model,
+                            provider = "openai",
+                            "Model-aware routing: using OpenAiClient directly"
+                        );
+                        return Self::build_openai_direct_chain(model);
+                    }
+                    "anthropic" if has_api_key_for_provider("anthropic") && !proxy_is_configured() => {
+                        info!(
+                            model,
+                            provider = "anthropic",
+                            "Model-aware routing: using AnthropicClient directly"
+                        );
+                        return Self::build_anthropic_direct_chain(model);
+                    }
+                    _ => {}
+                }
+            }
+
+            if model.starts_with("accounts/fireworks/") && FireworksClient::is_configured() {
+                info!(
+                    model,
+                    "Auto-detected Fireworks model from prefix — using FireworksClient directly"
+                );
+                return Self::build_fireworks_chain(Some(model));
+            }
+        }
 
         if proxy_active {
             return Self::build_proxy_chain(model_override);
@@ -143,6 +185,38 @@ impl FallbackClient {
             .and_then(|s| s.parse().ok())
             .unwrap_or(120);
 
+        Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
+    }
+
+    fn build_openai_direct_chain(model: &str) -> Result<Self> {
+        let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
+        if let Ok(c) = OpenAiClient::from_env_with_model(model) {
+            info!(provider = "openai-direct", model = %c.model(), "Direct OpenAI client initialized");
+            clients.push(Box::new(c));
+        }
+        if clients.is_empty() {
+            bail!("OpenAI direct mode: OPENAI_API_KEY not set");
+        }
+        let timeout_secs = std::env::var("LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
+    }
+
+    fn build_anthropic_direct_chain(model: &str) -> Result<Self> {
+        let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
+        if let Ok(c) = AnthropicClient::from_env_with_model(model) {
+            info!(provider = "anthropic-direct", model = %c.model(), "Direct Anthropic client initialized");
+            clients.push(Box::new(c));
+        }
+        if clients.is_empty() {
+            bail!("Anthropic direct mode: ANTHROPIC_API_KEY not set");
+        }
+        let timeout_secs = std::env::var("LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
         Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
     }
 
@@ -469,7 +543,12 @@ impl LlmClient for FallbackClient {
         }
 
         match last_error {
-            Some(e) => bail!("All LLM providers failed. Last error: {}", e),
+            Some(e) => bail!(
+                "All {} LLM provider(s) failed. Providers: [{}]. Last error: {}",
+                self.clients.len(),
+                self.clients.iter().map(|c| c.model()).collect::<Vec<_>>().join(", "),
+                e
+            ),
             None => bail!("No LLM providers configured"),
         }
     }

@@ -1,4 +1,4 @@
-use agent_forge::ForgePairNode; // Use the event-driven pair node
+use agent_forge::ForgePairNode;
 use agent_lore::LoreNode;
 use agent_nexus::NexusNode;
 use agent_vessel::VesselNode;
@@ -11,7 +11,7 @@ use config::{
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,6 +21,44 @@ async fn main() -> Result<()> {
         Err(err) => return Err(err.into()),
     }
     tracing_subscriber::fmt::init();
+
+    // Startup diagnostics
+    let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| "claude".to_string());
+    let has_fireworks = std::env::var("FIREWORKS_API_KEY").is_ok();
+    let has_proxy = std::env::var("PROXY_URL").is_ok();
+    let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
+
+    info!("═══ AgentFlow Configuration ═══");
+    info!("  CLI Backend: {}", default_cli);
+    if default_cli == "codex" && has_fireworks {
+        info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
+    } else if default_cli == "claude" && has_anthropic && !has_proxy {
+        info!("  LLM Mode: Claude + Direct Anthropic Key");
+    } else if has_proxy {
+        info!(
+            "  LLM Mode: Claude + Proxy at {}",
+            std::env::var("PROXY_URL").unwrap_or_default()
+        );
+    } else {
+        warn!("  No valid LLM configuration detected!");
+        warn!("    For Codex: set FIREWORKS_API_KEY or OPENAI_API_KEY");
+        warn!("    For Claude: set ANTHROPIC_API_KEY or PROXY_URL");
+        anyhow::bail!("Invalid LLM configuration — see warnings above");
+    }
+
+    let cli_path = match default_cli.as_str() {
+        "codex" => std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+        _ => std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+    };
+    if which::which(&cli_path).is_err() {
+        anyhow::bail!(
+            "{} CLI not found at '{}' — install it or set {}_PATH in .env",
+            default_cli.to_uppercase(),
+            cli_path,
+            default_cli.to_uppercase()
+        );
+    }
+    info!("  CLI Binary: {} ({})", default_cli, cli_path);
 
     info!("Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)");
 
