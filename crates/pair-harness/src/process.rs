@@ -168,7 +168,11 @@ impl BackendConfig {
             uses_stdin_prompt: true,
             mcp_config_rel: PathBuf::from(".codex").join("config.toml"),
             needs_extras_provisioning: true,
-            forge_extra_args: vec![],
+            // Grant FORGE write access to the shared directory so it can
+            // write PLAN.md, WORKLOG.md, and other inter-agent files.
+            // Without this, Codex's workspace-write sandbox restricts
+            // writes to the worktree only, blocking shared-dir writes.
+            forge_extra_args: vec!["--add-dir".into(), shared.to_string_lossy().to_string()],
             sentinel_extra_args: vec!["-C".into(), shared.to_string_lossy().to_string()],
         }
     }

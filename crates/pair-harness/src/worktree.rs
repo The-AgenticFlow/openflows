@@ -169,6 +169,16 @@ impl WorktreeManager {
 
         info!(pair_id, ticket_id, branch = %branch_name, "Creating worktree");
 
+        // Ensure the repository is not shallow — worktree/branch ops need full history
+        self.unshallow_if_needed();
+
+        // Remove any stale index entries for worktrees/ that would block
+        // git worktree add (e.g., leftover submodule entries from previous runs)
+        self.clean_stale_worktrees_index();
+
+        // Ensure worktrees/ is in .gitignore so git doesn't track the worktree dirs
+        self.ensure_worktrees_gitignored();
+
         if let Err(e) = self.run_git_in_main(&["fetch", "origin", "main"]) {
             warn!(error = %e, "git fetch origin/main failed, continuing");
             warnings.push(SetupWarning {
@@ -188,8 +198,11 @@ impl WorktreeManager {
         }
 
         if worktree_path.exists() {
+            // Check if this is a proper git worktree (has .git file/link)
+            let is_proper_worktree = worktree_path.join(".git").exists();
+
             if let Ok(current) = self.get_current_branch(&worktree_path) {
-                if current == branch_name {
+                if current == branch_name && is_proper_worktree {
                     info!(
                         path = %worktree_path.display(),
                         branch = %branch_name,
@@ -200,17 +213,24 @@ impl WorktreeManager {
                         warnings,
                     });
                 }
-                info!(
-                    path = %worktree_path.display(),
-                    current = %current,
-                    new_branch = %branch_name,
-                    "Reusing existing worktree for new ticket"
-                );
-                return self
-                    .reuse_worktree(&worktree_path, &branch_name, github_token)
-                    .await;
+                if is_proper_worktree {
+                    info!(
+                        path = %worktree_path.display(),
+                        current = %current,
+                        new_branch = %branch_name,
+                        "Reusing existing worktree for new ticket"
+                    );
+                    return self
+                        .reuse_worktree(&worktree_path, &branch_name, github_token)
+                        .await;
+                }
             }
-            warn!(path = %worktree_path.display(), "Worktree exists but branch unknown, replacing");
+            // Not a proper worktree — remove and recreate from scratch
+            warn!(
+                path = %worktree_path.display(),
+                is_proper = is_proper_worktree,
+                "Worktree directory exists but is not a proper git worktree, replacing"
+            );
             self.remove_worktree_by_path(&worktree_path, "unknown")?;
         }
 
@@ -289,6 +309,121 @@ impl WorktreeManager {
             path: worktree_path,
             warnings,
         })
+    }
+
+    /// Unshallow the repository if it was cloned with --depth 1.
+    /// Worktree and branch operations require full commit history.
+    fn unshallow_if_needed(&self) {
+        let shallow_file = self.project_root.join(".git").join("shallow");
+        if !shallow_file.exists() {
+            return;
+        }
+
+        info!(path = %self.project_root.display(), "Unshallowing repository for worktree support");
+
+        let output = Command::new("git")
+            .args(["fetch", "--unshallow"])
+            .current_dir(&self.project_root)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!(path = %self.project_root.display(), "Repository unshallowed successfully");
+            }
+            Ok(o) => {
+                warn!(
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "git fetch --unshallow failed, worktree operations may not work"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to run git fetch --unshallow");
+            }
+        }
+    }
+
+    /// Remove stale `worktrees/` entries from the git index.
+    ///
+    /// Previous runs may have accidentally committed worktree directories
+    /// (as submodule entries with mode 160000), which blocks `git worktree add`.
+    /// This removes them from the index without affecting the working tree.
+    fn clean_stale_worktrees_index(&self) {
+        // Clean both worktrees/ and orchestration/pairs/ — these are runtime
+        // state that should not be tracked in the upstream repo
+        for prefix in &["worktrees/", "orchestration/pairs/"] {
+            let output = Command::new("git")
+                .args(["ls-files", "--stage", "--", prefix])
+                .current_dir(&self.project_root)
+                .output();
+
+            if let Ok(o) = output {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                if stdout.trim().is_empty() {
+                    continue; // Nothing to clean
+                }
+
+                // Remove entries from the index
+                info!(
+                    path = %self.project_root.display(),
+                    prefix,
+                    entries = stdout.lines().count(),
+                    "Removing stale index entries"
+                );
+
+                let rm_output = Command::new("git")
+                    .args(["rm", "--cached", "-r", "--", prefix])
+                    .current_dir(&self.project_root)
+                    .output();
+
+                match rm_output {
+                    Ok(o) if o.status.success() => {
+                        info!(prefix, "Stale index entries removed");
+                    }
+                    Ok(o) => {
+                        warn!(
+                            stderr = %String::from_utf8_lossy(&o.stderr),
+                            prefix,
+                            "Failed to remove stale index entries"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, prefix, "Failed to run git rm --cached");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure `worktrees/` is listed in `.gitignore` so that worktree
+    /// directories created inside the repo aren't tracked by git.
+    fn ensure_worktrees_gitignored(&self) {
+        let gitignore_path = self.project_root.join(".gitignore");
+
+        let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+
+        let entries = ["worktrees/", "orchestration/"];
+        let mut updated = existing.clone();
+
+        for entry in &entries {
+            if updated.lines().any(|l| l.trim() == *entry) {
+                continue; // Already present
+            }
+            if updated.is_empty() {
+                updated = format!("{}\n", entry);
+            } else if updated.ends_with('\n') {
+                updated = format!("{}{}\n", updated, entry);
+            } else {
+                updated = format!("{}\n{}\n", updated, entry);
+            }
+        }
+
+        if updated != existing {
+            if let Err(e) = std::fs::write(&gitignore_path, &updated) {
+                warn!(error = %e, "Failed to update .gitignore");
+            } else {
+                info!(path = %gitignore_path.display(), "Updated .gitignore with runtime directories");
+            }
+        }
     }
 
     /// Reuse an existing worktree by fetching origin/main and creating a new branch.

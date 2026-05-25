@@ -1,7 +1,7 @@
 ---
 id: forge
 role: builder
-cli: claude
+cli: auto
 active: true
 github: forge-openflows
 slack: "@forge"

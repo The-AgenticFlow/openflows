@@ -28,6 +28,20 @@ impl Provisioner {
         }
     }
 
+    /// Resolve the orchestrator source directory.
+    ///
+    /// The AgentFlow source repo (containing `orchestration/`) is NOT always
+    /// at `project_root` — when running against a target workspace, project_root
+    /// points to the cloned target repo. The `ORCHESTRATOR_DIR` env var (set
+    /// by the agentflow binary at startup) points to the AgentFlow source root.
+    fn orchestrator_dir(&self) -> PathBuf {
+        if let Ok(orch_dir) = std::env::var("ORCHESTRATOR_DIR") {
+            PathBuf::from(orch_dir)
+        } else {
+            self.project_root.clone()
+        }
+    }
+
     /// Provision all configuration for a pair using BackendConfig.
     pub async fn provision_pair(
         &self,
@@ -89,29 +103,39 @@ impl Provisioner {
         redis_url: Option<&str>,
     ) -> Result<()> {
         // 1. Generate .codex/config.toml for FORGE worktree
-        self.generate_codex_config_toml(worktree, github_token, redis_url, "workspace-write")?;
+        self.generate_codex_config_toml(worktree, shared, github_token, redis_url, "workspace-write")?;
 
         // 2. Generate .codex/config.toml for SENTINEL shared dir
-        self.generate_codex_config_toml(shared, github_token, redis_url, "read-only")?;
+        self.generate_codex_config_toml(shared, shared, github_token, redis_url, "read-only")?;
 
-        // 3. Generate .codex/agents/*.toml from existing agent.md files
+        // 3. Generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
         self.generate_codex_agent_tomls(worktree)?;
 
-        // 4. Generate .codex/hooks.json with absolute paths
+        // 4. Generate .codex/agents/sentinel.toml in shared dir (SENTINEL runs from shared)
+        self.generate_codex_agent_toml_for_role(shared, "sentinel")?;
+
+        // 5. Install hook scripts and generate .codex/hooks.json with relative paths
         self.generate_codex_hooks_json(worktree, shared)?;
 
-        // 5. Symlink skills to .agents/skills/ in worktree
+        // 6. Symlink skills to .agents/skills/ in worktree (all skills for FORGE)
         self.symlink_skills_to_agents(worktree)?;
 
-        // 6. Write AGENTS.md at worktree root from forge.agent.md
+        // 7. Symlink sentinel-relevant skills to .agents/skills/ in shared dir
+        self.symlink_skills_to_agents_for_role(shared, "sentinel")?;
+
+        // 8. Deploy .codex-plugin/ (Codex plugin directory) into both worktree and shared
+        self.deploy_codex_plugin(worktree)?;
+        self.deploy_codex_plugin(shared)?;
+
+        // 9. Write AGENTS.md at worktree root from forge.agent.md
         self.write_agents_md(worktree, "forge")?;
 
-        // 7. Write AGENTS.md at shared root from sentinel.agent.md
+        // 10. Write AGENTS.md at shared root from sentinel.agent.md
         self.write_agents_md(shared, "sentinel")?;
 
-        // 8. Generate Codex permission profiles
-        self.generate_codex_permissions(worktree, "workspace-write")?;
-        self.generate_codex_permissions(shared, "read-only")?;
+        // 11. Generate Codex permission profiles
+        self.generate_codex_permissions(worktree, shared, "workspace-write")?;
+        self.generate_codex_permissions(shared, shared, "read-only")?;
 
         Ok(())
     }
@@ -193,13 +217,7 @@ impl Provisioner {
 
     /// Symlink the Sprintless plugin to a .claude directory.
     pub fn symlink_plugin(&self, target_dir: &Path, role: &str) -> Result<()> {
-        // First check for ORCHESTRATOR_DIR env var (points to orchestrator source with plugin)
-        // Fall back to project_root for backwards compatibility
-        let plugin_source = if let Ok(orch_dir) = std::env::var("ORCHESTRATOR_DIR") {
-            PathBuf::from(orch_dir).join("orchestration").join("plugin")
-        } else {
-            self.project_root.join("orchestration").join("plugin")
-        };
+        let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
 
         // Check if plugin exists
         if !plugin_source.exists() {
@@ -292,6 +310,7 @@ impl Provisioner {
     fn generate_codex_config_toml(
         &self,
         target: &Path,
+        shared: &Path,
         github_token: &str,
         redis_url: Option<&str>,
         sandbox_mode: &str,
@@ -345,7 +364,7 @@ max_threads = 6
 max_depth = 1
 "#,
             worktree = target.display(),
-            shared = target.display(),
+            shared = shared.display(),
         );
 
         fs::write(&config_path, config).context("Failed to write .codex/config.toml")?;
@@ -355,46 +374,51 @@ max_depth = 1
 
     /// Generate .codex/agents/*.toml from existing agent.md files.
     fn generate_codex_agent_tomls(&self, worktree: &Path) -> Result<()> {
-        let agents_dir = worktree.join(".codex").join("agents");
-        fs::create_dir_all(&agents_dir).context("Failed to create .codex/agents directory")?;
-
         let agent_ids = ["forge", "sentinel"];
 
         for agent_id in &agent_ids {
-            let agent_md_path = self
-                .project_root
-                .join("orchestration")
-                .join("agent")
-                .join("agents")
-                .join(format!("{}.agent.md", agent_id));
+            self.generate_codex_agent_toml_for_role(worktree, agent_id)?;
+        }
 
-            if !agent_md_path.exists() {
-                debug!(
-                    path = %agent_md_path.display(),
-                    "Agent persona file not found, skipping TOML generation"
-                );
-                continue;
-            }
+        Ok(())
+    }
 
-            let persona = fs::read_to_string(&agent_md_path)
-                .context(format!("Failed to read {}", agent_md_path.display()))?;
+    /// Generate a single .codex/agents/{role}.toml in the target directory.
+    fn generate_codex_agent_toml_for_role(&self, target: &Path, agent_id: &str) -> Result<()> {
+        let agents_dir = target.join(".codex").join("agents");
+        fs::create_dir_all(&agents_dir).context("Failed to create .codex/agents directory")?;
 
-            let (role, model, sandbox_mode) = match *agent_id {
-                "forge" => (
-                    "builder",
-                    "gpt-5.4",
-                    "workspace-write",
-                ),
-                "sentinel" => (
-                    "reviewer",
-                    "gpt-5.4",
-                    "read-only",
-                ),
-                _ => ("unknown", "gpt-5.4", "workspace-write"),
-            };
+        let agent_md_path = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("agent")
+            .join("agents")
+            .join(format!("{}.agent.md", agent_id));
 
-            let toml_content = format!(
-                r#"# Auto-generated by AgentFlow Provisioner
+        if !agent_md_path.exists() {
+            debug!(
+                path = %agent_md_path.display(),
+                "Agent persona file not found, skipping TOML generation"
+            );
+            return Ok(());
+        }
+
+        let persona = fs::read_to_string(&agent_md_path)
+            .context(format!("Failed to read {}", agent_md_path.display()))?;
+
+        let (role, sandbox_mode) = match agent_id {
+            "forge" => ("builder", "workspace-write"),
+            "sentinel" => ("reviewer", "read-only"),
+            _ => ("unknown", "workspace-write"),
+        };
+
+        // Resolve model from env vars (same logic as BackendConfig::codex())
+        let model = std::env::var("FIREWORKS_MODEL")
+            .or_else(|_| std::env::var("OPENAI_MODEL"))
+            .unwrap_or_else(|_| "gpt-5.4".to_string());
+
+        let toml_content = format!(
+            r#"# Auto-generated by AgentFlow Provisioner
 # Source: {source}
 # DO NOT EDIT — changes will be overwritten on next provision
 
@@ -407,27 +431,25 @@ developer_instructions = """
 {persona}
 """
 "#,
-                id = agent_id,
-                role = role,
-                model = model,
-                sandbox = sandbox_mode,
-                persona = persona,
-                source = agent_md_path.display(),
-            );
+            id = agent_id,
+            role = role,
+            model = model,
+            sandbox = sandbox_mode,
+            persona = persona,
+            source = agent_md_path.display(),
+        );
 
-            let toml_path = agents_dir.join(format!("{}.toml", agent_id));
-            fs::write(&toml_path, toml_content)
-                .context(format!("Failed to write {}", toml_path.display()))?;
-            info!(path = %toml_path.display(), "Codex agent TOML generated");
-        }
-
+        let toml_path = agents_dir.join(format!("{}.toml", agent_id));
+        fs::write(&toml_path, toml_content)
+            .context(format!("Failed to write {}", toml_path.display()))?;
+        info!(path = %toml_path.display(), "Codex agent TOML generated for {} in {}", agent_id, target.display());
         Ok(())
     }
 
-    /// Generate .codex/hooks.json with absolute paths to hook scripts.
+    /// Generate .codex/hooks.json with relative paths to locally-installed hook scripts.
     fn generate_codex_hooks_json(&self, worktree: &Path, shared: &Path) -> Result<()> {
         let hooks_source = self
-            .project_root
+            .orchestrator_dir()
             .join("orchestration")
             .join("plugin")
             .join("hooks");
@@ -437,20 +459,95 @@ developer_instructions = """
             return Ok(());
         }
 
-        // Generate FORGE hooks
+        // Install hook scripts into FORGE worktree
+        self.install_hook_scripts(worktree, "forge", &hooks_source)?;
+
+        // Generate FORGE hooks.json (referencing local copies)
         let forge_hooks = self.build_codex_hooks_json("forge", &hooks_source)?;
         let forge_hooks_path = worktree.join(".codex").join("hooks.json");
         fs::create_dir_all(forge_hooks_path.parent().unwrap())?;
         self.write_json(&forge_hooks_path, &forge_hooks)?;
         info!(path = %forge_hooks_path.display(), "Codex hooks.json generated for FORGE");
 
-        // Generate SENTINEL hooks
+        // Install hook scripts into SENTINEL shared dir
+        self.install_hook_scripts(shared, "sentinel", &hooks_source)?;
+
+        // Generate SENTINEL hooks.json (referencing local copies)
         let sentinel_hooks = self.build_codex_hooks_json("sentinel", &hooks_source)?;
         let sentinel_hooks_path = shared.join(".codex").join("hooks.json");
         fs::create_dir_all(sentinel_hooks_path.parent().unwrap())?;
         self.write_json(&sentinel_hooks_path, &sentinel_hooks)?;
         info!(path = %sentinel_hooks_path.display(), "Codex hooks.json generated for SENTINEL");
 
+        Ok(())
+    }
+
+    /// Copy hook scripts from the source repo into .codex/hooks/{role}/ in the target directory.
+    ///
+    /// This makes the harness self-contained so it doesn't depend on the source
+    /// repo remaining at the same absolute path at runtime.
+    fn install_hook_scripts(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+        let hook_names: Vec<&str> = match role {
+            "forge" => vec![
+                "session_start",
+                "pre_bash_guard",
+                "pre_write_check",
+                "post_write_lint",
+                "pre_compact_handoff",
+                "stop_require_artifact",
+                "subagent_start",
+                "subagent_stop",
+            ],
+            "sentinel" => vec![
+                "session_start",
+                "pre_bash_readonly_guard",
+                "post_write_validate",
+                "stop_require_eval",
+                "subagent_start",
+                "subagent_stop",
+            ],
+            _ => vec![],
+        };
+
+        let hooks_dest = target.join(".codex").join("hooks").join(role);
+        fs::create_dir_all(&hooks_dest).context("Failed to create hooks directory")?;
+
+        for hook_name in &hook_names {
+            let src = hooks_source.join(role).join(format!("{}.sh", hook_name));
+            if !src.exists() {
+                debug!(
+                    path = %src.display(),
+                    "Hook script not found in source, skipping copy"
+                );
+                continue;
+            }
+            let dst = hooks_dest.join(format!("{}.sh", hook_name));
+            fs::copy(&src, &dst)
+                .context(format!("Failed to copy hook script {}", hook_name))?;
+
+            // Ensure the copied script is executable (fs::copy preserves
+            // permissions on Unix, but enforce +x in case the source lacked it)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&dst)?.permissions().mode();
+                if mode & 0o111 == 0 {
+                    fs::set_permissions(&dst, fs::Permissions::from_mode(mode | 0o755))?;
+                }
+            }
+
+            debug!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "Hook script copied"
+            );
+        }
+
+        info!(
+            path = %hooks_dest.display(),
+            role = role,
+            "Hook scripts installed"
+        );
         Ok(())
     }
 
@@ -492,7 +589,9 @@ developer_instructions = """
                 continue;
             }
 
-            let abs_path = hook_script.canonicalize().unwrap_or_else(|_| hook_script.clone());
+            // Reference the locally-installed copy via relative path from .codex/
+            // (where hooks.json lives), making the harness portable across systems.
+            let rel_path = format!("hooks/{}/{}.sh", agent_dir, hook_name);
 
             let hook_entry = json!({
                 "matcher": match *event {
@@ -514,7 +613,7 @@ developer_instructions = """
                 },
                 "hooks": [{
                     "type": "command",
-                    "command": abs_path.to_string_lossy().to_string(),
+                    "command": rel_path,
                     "statusMessage": status_msg,
                 }]
             });
@@ -532,7 +631,7 @@ developer_instructions = """
 
     /// Symlink skills to .agents/skills/ in worktree.
     fn symlink_skills_to_agents(&self, worktree: &Path) -> Result<()> {
-        let skills_source = self.project_root.join("orchestration").join("plugin").join("skills");
+        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
 
         if !skills_source.exists() {
             debug!("Skills source directory not found, skipping symlinks");
@@ -594,10 +693,119 @@ developer_instructions = """
         Ok(())
     }
 
+    /// Symlink role-relevant skills to .agents/skills/ in a target directory.
+    fn symlink_skills_to_agents_for_role(&self, target: &Path, role: &str) -> Result<()> {
+        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+
+        if !skills_source.exists() {
+            debug!("Skills source directory not found, skipping role symlinks");
+            return Ok(());
+        }
+
+        let agents_skills_dir = target.join(".agents").join("skills");
+        fs::create_dir_all(&agents_skills_dir).context("Failed to create .agents/skills directory")?;
+
+        let prefix = format!("{}-", role);
+        let shared_prefix = "shared-";
+
+        for entry in fs::read_dir(&skills_source)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            let skill_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if skill_name.is_empty() {
+                continue;
+            }
+
+            if !skill_name.starts_with(&prefix) && !skill_name.starts_with(shared_prefix) {
+                continue;
+            }
+
+            let symlink_path = agents_skills_dir.join(skill_name);
+
+            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(&symlink_path);
+            }
+
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {}", skill_name))?;
+            }
+
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {}", skill_name))?;
+            }
+
+            debug!(
+                source = %path.display(),
+                target = %symlink_path.display(),
+                role = role,
+                "Role skill symlinked"
+            );
+        }
+
+        info!(
+            target = %agents_skills_dir.display(),
+            role = role,
+            "Role-relevant skills symlinked to .agents/skills/"
+        );
+        Ok(())
+    }
+
+    /// Deploy the Codex plugin directory (.codex-plugin/) into the workspace.
+    fn deploy_codex_plugin(&self, target: &Path) -> Result<()> {
+        let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
+
+        let codex_plugin_source = plugin_source.join(".codex-plugin");
+
+        if !codex_plugin_source.exists() {
+            debug!(
+                path = %codex_plugin_source.display(),
+                "Codex plugin directory not found, skipping deployment"
+            );
+            return Ok(());
+        }
+
+        let plugins_dir = target.join(".agents").join("plugins");
+        fs::create_dir_all(&plugins_dir).context("Failed to create .agents/plugins directory")?;
+
+        let symlink_path = plugins_dir.join("orchestration");
+
+        if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+            let _ = fs::remove_file(&symlink_path);
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&plugin_source, &symlink_path)
+            .context("Failed to create Codex plugin symlink")?;
+
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&plugin_source, &symlink_path)
+            .context("Failed to create Codex plugin symlink")?;
+
+        info!(
+            source = %plugin_source.display(),
+            target = %symlink_path.display(),
+            "Codex plugin deployed to .agents/plugins/orchestration"
+        );
+        Ok(())
+    }
+
     /// Write AGENTS.md at worktree root from existing agent.md persona file.
     fn write_agents_md(&self, target: &Path, agent_id: &str) -> Result<()> {
         let agent_md_path = self
-            .project_root
+            .orchestrator_dir()
             .join("orchestration")
             .join("agent")
             .join("agents")
@@ -653,14 +861,15 @@ developer_instructions = """
     }
 
     /// Generate Codex permission profiles (.codex/permissions.toml).
-    fn generate_codex_permissions(&self, target: &Path, profile: &str) -> Result<()> {
+    fn generate_codex_permissions(&self, target: &Path, shared: &Path, profile: &str) -> Result<()> {
         let codex_dir = target.join(".codex");
         fs::create_dir_all(&codex_dir)?;
 
         let permissions_path = codex_dir.join("permissions.toml");
 
         let content = match profile {
-            "workspace-write" => r#"# Auto-generated by AgentFlow Provisioner
+            "workspace-write" => format!(
+                r#"# Auto-generated by AgentFlow Provisioner
 # FORGE permissions: workspace-write with network access
 
 default_permissions = "workspace-write"
@@ -670,6 +879,7 @@ default_permissions = "workspace-write"
 
 [permissions.workspace-write.filesystem.":workspace_roots"]
 "." = "write"
+"{shared}" = "write"
 "**/*.env" = "deny"
 
 [permissions.workspace-write.network]
@@ -679,6 +889,8 @@ enabled = true
 "api.github.com" = "allow"
 "*.github.com" = "allow"
 "#,
+                shared = shared.display(),
+            ),
             "read-only" => r#"# Auto-generated by AgentFlow Provisioner
 # SENTINEL permissions: read-only
 
@@ -692,8 +904,9 @@ default_permissions = "read-only"
 
 [permissions.read-only.network]
 enabled = false
-"#,
-            _ => "",
+"#
+            .to_string(),
+            _ => String::new(),
         };
 
         fs::write(&permissions_path, content)
@@ -792,5 +1005,70 @@ mod tests {
         assert!(shared.exists());
         assert!(!shared.join("sentinel").exists());
         assert!(shared.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn test_install_hook_scripts_copies_files() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        // Create fake source hooks directory with sentinel scripts
+        let hooks_source = dir.path().join("hooks");
+        let sentinel_src = hooks_source.join("sentinel");
+        fs::create_dir_all(&sentinel_src).unwrap();
+        fs::write(sentinel_src.join("session_start.sh"), "#!/bin/bash\necho sentinel-start").unwrap();
+
+        let provisioner = Provisioner::new(dir.path());
+        provisioner.install_hook_scripts(&target, "sentinel", &hooks_source).unwrap();
+
+        // Verify the script was copied to .codex/hooks/sentinel/
+        let copied = target.join(".codex").join("hooks").join("sentinel").join("session_start.sh");
+        assert!(copied.exists(), "Hook script should be copied to .codex/hooks/sentinel/");
+
+        let content = fs::read_to_string(&copied).unwrap();
+        assert_eq!(content, "#!/bin/bash\necho sentinel-start");
+    }
+
+    #[test]
+    fn test_build_codex_hooks_json_uses_relative_paths() {
+        let dir = tempdir().unwrap();
+
+        // Create fake source hooks directory with sentinel scripts
+        let hooks_source = dir.path().join("hooks");
+        let sentinel_src = hooks_source.join("sentinel");
+        fs::create_dir_all(&sentinel_src).unwrap();
+        fs::write(sentinel_src.join("session_start.sh"), "#!/bin/bash\necho sentinel").unwrap();
+        fs::write(sentinel_src.join("pre_bash_readonly_guard.sh"), "#!/bin/bash\necho guard").unwrap();
+        fs::write(sentinel_src.join("post_write_validate.sh"), "#!/bin/bash\necho validate").unwrap();
+        fs::write(sentinel_src.join("stop_require_eval.sh"), "#!/bin/bash\necho eval").unwrap();
+
+        let provisioner = Provisioner::new(dir.path());
+        let hooks_json = provisioner.build_codex_hooks_json("sentinel", &hooks_source).unwrap();
+
+        let hooks = hooks_json["hooks"].as_object().unwrap();
+
+        // Verify all commands use relative paths (no leading /)
+        for (_event, entries) in hooks {
+            for entry in entries.as_array().unwrap() {
+                for hook in entry["hooks"].as_array().unwrap() {
+                    let command = hook["command"].as_str().unwrap();
+                    assert!(
+                        !command.starts_with('/'),
+                        "Hook command should be relative, got absolute: {}",
+                        command
+                    );
+                    assert!(
+                        command.starts_with("hooks/"),
+                        "Hook command should start with 'hooks/', got: {}",
+                        command
+                    );
+                }
+            }
+        }
+
+        // Verify specific expected relative paths
+        let session_cmd = hooks["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert_eq!(session_cmd, "hooks/sentinel/session_start.sh");
     }
 }

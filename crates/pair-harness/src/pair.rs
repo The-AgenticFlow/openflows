@@ -296,6 +296,16 @@ struct SentinelTracker {
     timeout_secs: u64,
 }
 
+/// Tracks whether a SENTINEL process is actively running or its spawn was
+/// deferred due to the retry interval.  The deferred variant prevents the
+/// event loop from spinning when `check_sentinel_retry_interval()` returns
+/// false — the caller treats "deferred" the same as "active" for the purpose
+/// of deciding whether to wait rather than re-spawn.
+enum SentinelState {
+    Active(SentinelTracker),
+    Deferred { retry_after: Instant },
+}
+
 struct SentinelFailureInfo {
     mode: SentinelMode,
     reason: String,
@@ -360,7 +370,7 @@ pub struct ForgeSentinelPair {
     reset: ResetManager,
     watchdog: Watchdog,
     start_time: Instant,
-    sentinel_tracker: Option<SentinelTracker>,
+    sentinel_tracker: Option<SentinelState>,
     forge_spawn_time: Instant,
     sentinel_retries: SentinelRetryState,
     last_sentinel_spawn_time: Option<Instant>,
@@ -638,8 +648,16 @@ impl ForgeSentinelPair {
         watcher: &mut SharedDirWatcher,
     ) -> Result<PairOutcome> {
         loop {
+            // Check if a deferred SENTINEL spawn interval has elapsed.
+            if let Some(SentinelState::Deferred { retry_after }) = &self.sentinel_tracker {
+                if Instant::now() >= *retry_after {
+                    debug!("SENTINEL spawn defer interval elapsed — clearing deferred state");
+                    self.sentinel_tracker = None;
+                }
+            }
+
             // Check if SENTINEL has already exited.
-            if let Some(tracker) = &mut self.sentinel_tracker {
+            if let Some(SentinelState::Active(tracker)) = &mut self.sentinel_tracker {
                 match tracker.child.try_wait() {
                     Ok(Some(status)) => {
                         let mode = tracker.mode.clone();
@@ -656,7 +674,9 @@ impl ForgeSentinelPair {
                                 mode: mode.clone(),
                                 reason: format!("exit code {:?}", status.code()),
                             });
-                            self.sentinel_retries.reset(&mode);
+                            // Do NOT reset retry counter on failure — let it accumulate
+                            // so MAX_SENTINEL_RETRIES eventually triggers the synthetic
+                            // rejection fallback that breaks the loop.
                         }
                         self.sentinel_tracker = None;
                     }
@@ -669,7 +689,7 @@ impl ForgeSentinelPair {
             }
 
             // Check for SENTINEL timeout
-            if let Some(tracker) = &mut self.sentinel_tracker {
+            if let Some(SentinelState::Active(tracker)) = &mut self.sentinel_tracker {
                 if tracker.spawn_time.elapsed().as_secs() > tracker.timeout_secs {
                     warn!(
                         mode = ?tracker.mode,
@@ -692,7 +712,8 @@ impl ForgeSentinelPair {
                             stderr_excerpt.as_deref(),
                         )
                         .await;
-                    self.sentinel_retries.reset(&mode);
+                    // Do NOT reset retry counter on timeout — same as error exit,
+                    // let it accumulate so MAX_SENTINEL_RETRIES breaks the loop.
                     self.sentinel_tracker = None;
                 }
             }
@@ -1516,6 +1537,13 @@ impl ForgeSentinelPair {
     /// Spawn SENTINEL for plan review.
     async fn spawn_sentinel_for_plan(&mut self) -> Result<()> {
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning on the "FORGE exited" branch.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now()
+                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!("SENTINEL plan review spawn deferred — retry interval not yet elapsed");
             return Ok(());
         }
         let mode = SentinelMode::PlanReview;
@@ -1544,12 +1572,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::PlanReview,
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }
@@ -1557,6 +1585,16 @@ impl ForgeSentinelPair {
     /// Spawn SENTINEL for segment evaluation.
     async fn spawn_sentinel_for_segment(&mut self, segment: u32) -> Result<()> {
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now()
+                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!(
+                segment,
+                "SENTINEL segment eval spawn deferred — retry interval not yet elapsed"
+            );
             return Ok(());
         }
         let mode = SentinelMode::SegmentEval(segment);
@@ -1586,12 +1624,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::SegmentEval(segment),
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }
@@ -1605,6 +1643,13 @@ impl ForgeSentinelPair {
         }
 
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now()
+                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!("SENTINEL final review spawn deferred — retry interval not yet elapsed");
             return Ok(());
         }
         let mode = SentinelMode::FinalReview;
@@ -1634,12 +1679,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::FinalReview,
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }

@@ -6,13 +6,17 @@
       "pre_write_check": "./forge/pre_write_check.sh",
       "post_write_lint": "./forge/post_write_lint.sh",
       "pre_compact_handoff": "./forge/pre_compact_handoff.sh",
-      "stop_require_artifact": "./forge/stop_require_artifact.sh"
+      "stop_require_artifact": "./forge/stop_require_artifact.sh",
+      "subagent_start": "./forge/subagent_start.sh",
+      "subagent_stop": "./forge/subagent_stop.sh"
     },
     "sentinel": {
       "session_start": "./sentinel/session_start.sh",
       "pre_bash_readonly_guard": "./sentinel/pre_bash_readonly_guard.sh",
       "post_write_validate": "./sentinel/post_write_validate.sh",
-      "stop_require_eval": "./sentinel/stop_require_eval.sh"
+      "stop_require_eval": "./sentinel/stop_require_eval.sh",
+      "subagent_start": "./sentinel/subagent_start.sh",
+      "subagent_stop": "./sentinel/subagent_stop.sh"
     },
     "nexus": {
       "session_start": "./nexus/init-session.sh",

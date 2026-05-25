@@ -1,7 +1,7 @@
 ---
 id: sentinel
 role: reviewer
-cli: claude
+cli: auto
 active: true
 github: sentinel-bot
 slack: "@sentinel"

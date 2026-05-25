@@ -108,3 +108,4 @@ orchestration/pairs/
 
 # Worker worktrees (runtime only)
 worktrees/
+orchestration/

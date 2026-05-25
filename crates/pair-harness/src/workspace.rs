@@ -90,9 +90,13 @@ impl WorkspaceManager {
             github_token, self.repo_id
         );
 
-        // Run git clone
+        // Clone the full main branch history (not --depth 1).
+        // Shallow clones cannot create worktrees or new branches,
+        // which breaks the FORGE-SENTINEL pair isolation model.
+        // --single-branch --no-tags avoids fetching unrelated history
+        // while still providing enough commits for branching.
         let output = Command::new("git")
-            .args(["clone", "--depth", "1"])
+            .args(["clone", "--single-branch", "--no-tags"])
             .arg(&clone_url)
             .arg(&self.workspace_dir)
             .output()
@@ -109,6 +113,9 @@ impl WorkspaceManager {
 
     /// Update an existing workspace with git pull.
     fn update_workspace(&self) -> Result<()> {
+        // Unshallow if needed — worktree/branch operations require full history
+        self.unshallow_if_needed();
+
         // Fetch and pull latest changes
         let output = Command::new("git")
             .args(["fetch", "origin"])
@@ -141,6 +148,37 @@ impl WorkspaceManager {
 
         info!(workspace = %self.workspace_dir.display(), "Workspace updated");
         Ok(())
+    }
+
+    /// Unshallow the repository if it was cloned with --depth 1.
+    /// Worktree and branch operations require full history.
+    fn unshallow_if_needed(&self) {
+        let shallow_file = self.workspace_dir.join(".git").join("shallow");
+        if !shallow_file.exists() {
+            return;
+        }
+
+        info!(workspace = %self.workspace_dir.display(), "Unshallowing repository for worktree support");
+
+        let output = Command::new("git")
+            .args(["fetch", "--unshallow"])
+            .current_dir(&self.workspace_dir)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!(workspace = %self.workspace_dir.display(), "Repository unshallowed successfully");
+            }
+            Ok(o) => {
+                warn!(
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "git fetch --unshallow failed, worktree operations may not work"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to run git fetch --unshallow");
+            }
+        }
     }
 
     /// Remove the workspace directory.
