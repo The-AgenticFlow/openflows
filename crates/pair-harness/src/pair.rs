@@ -2584,7 +2584,7 @@ mod tests {
         assert!(config.worktree.starts_with("/project/worktrees/"));
         assert!(config
             .shared
-            .ends_with("orchestration/pairs/pair-1/T-1/shared"));
+            .ends_with("worktrees/pair-1/.pair-shared"));
         assert!(config.redis_url.is_none());
     }
 

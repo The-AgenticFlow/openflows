@@ -78,8 +78,9 @@ impl BackendConfig {
             settings_path.to_string_lossy().to_string(),
             "--plugin-dir".into(),
             plugin_dir.to_string_lossy().to_string(),
-            "--add-dir".into(),
-            shared.to_string_lossy().to_string(),
+            // --add-dir shared is no longer needed: the shared directory
+            // (.pair-shared/) now lives inside the worktree, so it is
+            // already accessible as part of the workspace.
         ];
         let sentinel_settings = shared.join(".claude").join("settings.json");
         let sentinel_plugin_dir = shared.join(".claude").join("plugins").join("orchestration");
@@ -88,8 +89,9 @@ impl BackendConfig {
             sentinel_settings.to_string_lossy().to_string(),
             "--plugin-dir".into(),
             sentinel_plugin_dir.to_string_lossy().to_string(),
-            "--add-dir".into(),
-            worktree.to_string_lossy().to_string(),
+            // --add-dir worktree is not needed: the shared directory
+            // (.pair-shared/) lives inside the worktree, so it is already
+            // accessible as part of the workspace.
         ];
         Self {
             binary_path: PathBuf::from(binary),
@@ -116,7 +118,7 @@ impl BackendConfig {
             settings_rel: PathBuf::from(".claude").join("settings.json"),
             uses_stdin_prompt: true,
             mcp_config_rel: PathBuf::from(".claude").join("mcp.json"),
-            needs_extras_provisioning: false,
+            needs_extras_provisioning: true,
             forge_extra_args: forge_extra,
             sentinel_extra_args: sentinel_extra,
         }
@@ -168,12 +170,27 @@ impl BackendConfig {
             uses_stdin_prompt: true,
             mcp_config_rel: PathBuf::from(".codex").join("config.toml"),
             needs_extras_provisioning: true,
-            // Grant FORGE write access to the shared directory so it can
-            // write PLAN.md, WORKLOG.md, and other inter-agent files.
-            // Without this, Codex's workspace-write sandbox restricts
-            // writes to the worktree only, blocking shared-dir writes.
-            forge_extra_args: vec!["--add-dir".into(), shared.to_string_lossy().to_string()],
-            sentinel_extra_args: vec!["-C".into(), shared.to_string_lossy().to_string()],
+            // The shared directory (.pair-shared/) now lives inside the
+            // worktree, so it is already writable under the workspace-write
+            // sandbox — no --add-dir needed.  (The --add-dir flag has a
+            // known bug in Codex v0.130.0 where it reports the path as
+            // writable but does not create the bind mount, causing
+            // EROFS errors at runtime.)
+            forge_extra_args: vec![],
+            // SENTINEL's CWD is the shared directory (.pair-shared/ inside
+            // the worktree) so it loads its own .codex/config.toml with
+            // read-only evaluation settings.  The workspace-write sandbox
+            // allows reads through the read-only root mount, so SENTINEL
+            // can evaluate source code in the worktree parent directory
+            // without needing --add-dir.  Writes go to the CWD (shared
+            // dir) which is inside the writable workspace.
+            // --skip-git-repo-check is needed because .pair-shared/ is
+            // not a git repository root.
+            sentinel_extra_args: vec![
+                "-C".into(),
+                shared.to_string_lossy().to_string(),
+                "--skip-git-repo-check".into(),
+            ],
         }
     }
 

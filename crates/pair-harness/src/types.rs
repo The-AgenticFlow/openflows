@@ -66,13 +66,23 @@ pub struct PairConfig {
 }
 
 impl PairConfig {
-    fn shared_path(project_root: &std::path::Path, pair_id: &str, ticket_id: &str) -> PathBuf {
+    /// Name of the shared orchestration directory inside each worktree.
+    ///
+    /// Placing the shared directory inside the worktree (rather than in
+    /// `orchestration/pairs/`) is required for the Codex `workspace-write`
+    /// sandbox: the sandbox only mounts the workspace root as writable, and
+    /// the `--add-dir` flag has a known bug (Codex v0.130.0) where it
+    /// reports the path as writable in the banner but does NOT create the
+    /// corresponding bind mount in the sandbox namespace.  By locating the
+    /// shared directory inside the worktree, it falls under the existing
+    /// writable bind mount and no `--add-dir` workaround is needed.
+    pub const SHARED_DIR_NAME: &'static str = ".pair-shared";
+
+    fn shared_path(project_root: &std::path::Path, pair_id: &str, _ticket_id: &str) -> PathBuf {
         project_root
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(ticket_id)
-            .join("shared")
+            .join(Self::SHARED_DIR_NAME)
     }
 
     /// Create a new pair configuration with filesystem-based state.

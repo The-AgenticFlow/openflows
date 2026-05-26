@@ -1245,7 +1245,7 @@ impl VesselNode {
         }
         let pair_id = parts[0];
 
-        let ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
+        let _ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
             if let Some(fb) = fallback_ticket_id {
                 info!(
                     branch,
@@ -1265,11 +1265,9 @@ impl VesselNode {
         });
 
         let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(&ticket_id)
-            .join("shared");
+            .join(".pair-shared");
 
         if !shared_dir.exists() {
             if let Err(e) = tokio::fs::create_dir_all(&shared_dir).await {
@@ -1755,14 +1753,12 @@ impl VesselNode {
         // Use ticket_id from PR info (extracted from title), not from branch name.
         // The branch name may be stale or mismatched with the actual ticket.
         // Fall back to branch-derived ticket_id if not available.
-        let ticket_id = pr_placeholder.ticket_id.as_deref().unwrap_or(parts[1]);
+        let _ticket_id = pr_placeholder.ticket_id.as_deref().unwrap_or(parts[1]);
 
         let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(ticket_id)
-            .join("shared");
+            .join(".pair-shared");
 
         // Ensure the shared directory exists before writing CI_FIX.md.
         // The directory may not exist yet if the pair hasn't been provisioned

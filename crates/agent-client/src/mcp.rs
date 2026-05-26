@@ -12,11 +12,12 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Command to spawn the local GitHub MCP server via Docker.
 pub const DOCKER_MCP_CMD: &[&str] = &[
@@ -29,17 +30,28 @@ pub const DOCKER_MCP_CMD: &[&str] = &[
     "ghcr.io/github/github-mcp-server",
 ];
 
+/// Default timeout for individual MCP JSON-RPC requests (seconds).
+/// The GitHub MCP server disconnects its session after ~10s of inactivity,
+/// so this must be shorter than that to catch unresponsive servers.
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 pub struct McpSession {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    request_timeout: Duration,
 }
 
 impl McpSession {
     /// Spawn the MCP server and perform the JSON-RPC initialization handshake.
     pub async fn connect(cmd: &[&str]) -> Result<Self> {
-        info!(cmd = ?cmd, "Spawning GitHub MCP server");
+        Self::connect_with_timeout(cmd, Self::default_timeout()).await
+    }
+
+    /// Spawn the MCP server with a custom request timeout.
+    pub async fn connect_with_timeout(cmd: &[&str], timeout: Duration) -> Result<Self> {
+        info!(cmd = ?cmd, timeout_secs = timeout.as_secs(), "Spawning GitHub MCP server");
 
         let mut child = Command::new(cmd[0])
             .args(&cmd[1..])
@@ -53,13 +65,24 @@ impl McpSession {
         let stdout = BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
 
         let mut session = Self {
-            _child: child,
+            child,
             stdin,
             stdout,
             next_id: 1,
+            request_timeout: timeout,
         };
         session.initialize().await?;
         Ok(session)
+    }
+
+    /// Resolve the request timeout from the `MCP_REQUEST_TIMEOUT_SECS` env var,
+    /// falling back to `DEFAULT_REQUEST_TIMEOUT_SECS`.
+    fn default_timeout() -> Duration {
+        let secs = std::env::var("MCP_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+        Duration::from_secs(secs)
     }
 
     /// Convenience: connects to either the 'hosted' or 'docker' MCP implementation.
@@ -134,10 +157,11 @@ impl McpSession {
                     BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
 
                 let mut session = Self {
-                    _child: child,
+                    child,
                     stdin,
                     stdout,
                     next_id: 1,
+                    request_timeout: Self::default_timeout(),
                 };
                 session.initialize().await?;
                 Ok(session)
@@ -164,32 +188,84 @@ impl McpSession {
 
         let mut line = serde_json::to_string(&req)?;
         line.push('\n');
-        debug!(method, "→ MCP request");
+        debug!(method, id, "→ MCP request");
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
 
-        // Read response lines until we find our id
-        loop {
-            let mut buf = String::new();
-            self.stdout.read_line(&mut buf).await?;
-            let buf = buf.trim();
-            if buf.is_empty() {
-                continue;
-            }
-
-            let resp: Value =
-                serde_json::from_str(buf).context("Failed to parse MCP JSON-RPC response")?;
-
-            // Match on id (notifications won't have id)
-            if resp["id"] == id {
-                debug!("← MCP response id={}", id);
-                if let Some(err) = resp.get("error") {
-                    bail!("MCP error: {}", err);
+        // Read response lines until we find our id, with a timeout.
+        // The GitHub MCP Docker server disconnects its session after ~10s of
+        // inactivity but the container stays alive — so read_line blocks
+        // forever unless we impose our own deadline.
+        let timeout = self.request_timeout;
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                let mut buf = String::new();
+                let bytes_read = self.stdout.read_line(&mut buf).await?;
+                if bytes_read == 0 {
+                    bail!(
+                        "MCP server exited unexpectedly while waiting for response to '{}' (id={}). \
+                         The subprocess may have crashed or timed out.",
+                        method, id
+                    );
                 }
-                return Ok(resp["result"].clone());
+                let buf = buf.trim();
+                if buf.is_empty() {
+                    continue;
+                }
+
+                let resp: Value =
+                    serde_json::from_str(buf).context("Failed to parse MCP JSON-RPC response")?;
+
+                // Match on id (notifications won't have id)
+                if resp["id"] == id {
+                    debug!("← MCP response id={}", id);
+                    if let Some(err) = resp.get("error") {
+                        bail!("MCP error: {}", err);
+                    }
+                    return Ok(resp["result"].clone());
+                }
+                // Otherwise it's a notification — ignore for now
+                debug!(notification = buf, "MCP notification (ignored)");
             }
-            // Otherwise it's a notification — ignore for now
-            debug!(notification = buf, "MCP notification (ignored)");
+        })
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                // Timeout — check if the child process is still alive
+                let status = self.child.try_wait();
+                match status {
+                    Ok(Some(exit_status)) => {
+                        bail!(
+                            "MCP request '{}' (id={}) timed out after {}s — server exited: {}",
+                            method, id, timeout.as_secs(), exit_status
+                        );
+                    }
+                    Ok(None) => {
+                        // Process alive but unresponsive — likely session timeout
+                        warn!(
+                            method, id, timeout_secs = timeout.as_secs(),
+                            "MCP server alive but unresponsive — killing subprocess"
+                        );
+                        let _ = self.child.kill().await;
+                        bail!(
+                            "MCP request '{}' (id={}) timed out after {}s — \
+                             server is alive but not responding (session likely timed out). \
+                             The GitHub MCP server disconnects after ~10s of inactivity; \
+                             consider shortening LLM calls or adding a keep-alive mechanism.",
+                            method, id, timeout.as_secs()
+                        );
+                    }
+                    Err(e) => {
+                        bail!(
+                            "MCP request '{}' (id={}) timed out after {}s — \
+                             could not check process status: {}",
+                            method, id, timeout.as_secs(), e
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -1,10 +1,10 @@
 {
   "default_cli": "codex",
   "team": [
-    { "id": "nexus",    "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/kimi-k2p5", "routing_key": "nexus-key",    "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN" },
-    { "id": "forge",    "cli": "codex", "active": true,  "instances": 2, "model_backend": "accounts/fireworks/models/kimi-k2p5", "routing_key": "forge-key",    "github_token_env": "AGENT_FORGE_GITHUB_TOKEN" },
-    { "id": "sentinel", "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/kimi-k2p5", "routing_key": "sentinel-key", "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN" },
-    { "id": "vessel",   "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/kimi-k2p5", "routing_key": "vessel-key",   "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN" },
-    { "id": "lore",     "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/kimi-k2p5", "routing_key": "lore-key",     "github_token_env": "AGENT_LORE_GITHUB_TOKEN" }
+    { "id": "nexus",    "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/glm-5p1", "routing_key": "nexus-key",    "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN" },
+    { "id": "forge",    "cli": "codex", "active": true,  "instances": 2, "model_backend": "accounts/fireworks/models/glm-5p1", "routing_key": "forge-key",    "github_token_env": "AGENT_FORGE_GITHUB_TOKEN" },
+    { "id": "sentinel", "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/glm-5p1", "routing_key": "sentinel-key", "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN" },
+    { "id": "vessel",   "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/glm-5p1", "routing_key": "vessel-key",   "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN" },
+    { "id": "lore",     "cli": "codex", "active": true,  "instances": 1, "model_backend": "accounts/fireworks/models/glm-5p1", "routing_key": "lore-key",     "github_token_env": "AGENT_LORE_GITHUB_TOKEN" }
   ]
 }
