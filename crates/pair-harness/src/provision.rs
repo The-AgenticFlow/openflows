@@ -322,7 +322,11 @@ impl Provisioner {
 
         let network_access = sandbox_mode == "workspace-write";
         let approval_policy = if sandbox_mode == "read-only" {
-            "always"
+            // SENTINEL runs in --ephemeral mode with no interactive terminal,
+            // so it must run autonomously. "never" allows the agent to proceed
+            // without approval prompts. Valid Codex values are:
+            // untrusted, on-failure, on-request, granular, never
+            "never"
         } else {
             "on-request"
         };

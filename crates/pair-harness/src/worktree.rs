@@ -12,16 +12,90 @@ pub struct WorktreeManager {
     project_root: PathBuf,
     /// Directory where worktrees are created
     worktrees_dir: PathBuf,
+    /// Detected default branch name (e.g., "main" or "master")
+    default_branch: String,
 }
 
 impl WorktreeManager {
     /// Create a new worktree manager.
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let project_root = project_root.into();
+        let default_branch = Self::detect_default_branch(&project_root);
+        info!(default_branch = %default_branch, "Detected repository default branch");
         Self {
             worktrees_dir: project_root.join("worktrees"),
             project_root,
+            default_branch,
         }
+    }
+
+    /// Returns the detected default branch name (e.g., "main" or "master").
+    pub fn default_branch(&self) -> &str {
+        &self.default_branch
+    }
+
+    /// Detect the repository's default branch from origin/HEAD.
+    ///
+    /// Uses `git symbolic-ref refs/remotes/origin/HEAD` to read the
+    /// remote HEAD symref, which GitHub sets to point at the default
+    /// branch (e.g., refs/remotes/origin/master). Falls back to
+    /// trying "main" then "master" via remote ref existence checks.
+    pub fn detect_default_branch(project_root: &Path) -> String {
+        // Method 1: Read origin/HEAD symref (most reliable)
+        let output = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(project_root)
+            .output();
+
+        if let Ok(o) = output {
+            if o.status.success() {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // Extract branch name from "refs/remotes/origin/{branch}"
+                if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        // Method 2: Check which remote branch ref exists
+        for candidate in ["main", "master"] {
+            let ref_path = format!("refs/remotes/origin/{candidate}");
+            let git_dir = project_root.join(".git");
+            // Check packed-refs or loose ref
+            if git_dir.join(&ref_path).exists() {
+                return candidate.to_string();
+            }
+            // Also check packed-refs file
+            if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+                if packed.contains(&ref_path) {
+                    return candidate.to_string();
+                }
+            }
+        }
+
+        // Method 3: Try git rev-parse for each candidate
+        for candidate in ["main", "master"] {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", &format!("origin/{candidate}")])
+                .current_dir(project_root)
+                .output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    return candidate.to_string();
+                }
+            }
+        }
+
+        // Final fallback
+        warn!("Could not detect default branch, falling back to 'main'");
+        "main".to_string()
+    }
+
+    /// Returns the origin-qualified default branch ref (e.g., "origin/main" or "origin/master").
+    fn origin_default_branch(&self) -> String {
+        format!("origin/{}", self.default_branch)
     }
 
     /// Configure git user identity in a worktree using the GitHub PAT.
@@ -179,19 +253,19 @@ impl WorktreeManager {
         // Ensure worktrees/ is in .gitignore so git doesn't track the worktree dirs
         self.ensure_worktrees_gitignored();
 
-        if let Err(e) = self.run_git_in_main(&["fetch", "origin", "main"]) {
-            warn!(error = %e, "git fetch origin/main failed, continuing");
+        if let Err(e) = self.run_git_in_main(&["fetch", "origin", &self.default_branch]) {
+            warn!(error = %e, default_branch = %self.default_branch, "git fetch origin/{} failed, continuing", self.default_branch);
             warnings.push(SetupWarning {
-                phase: "fetch_origin_main".to_string(),
+                phase: format!("fetch_origin_{}", self.default_branch),
                 error: e.to_string(),
                 affected_files: vec![],
             });
         }
-        if let Err(e) = self.run_git_in_main(&["merge", "origin/main"]) {
-            warn!(error = %e, "git merge origin/main failed, continuing");
+        if let Err(e) = self.run_git_in_main(&["merge", &self.origin_default_branch()]) {
+            warn!(error = %e, default_branch = %self.default_branch, "git merge origin/{} failed, continuing", self.default_branch);
             let affected_files = self.list_unmerged_files_in_main();
             warnings.push(SetupWarning {
-                phase: "merge_origin_main".to_string(),
+                phase: format!("merge_origin_{}", self.default_branch),
                 error: e.to_string(),
                 affected_files,
             });
@@ -460,20 +534,21 @@ impl WorktreeManager {
         })
     }
 
-    /// Fetch origin/main and reset the worktree to it.
+    /// Fetch origin/{default_branch} and reset the worktree to it.
     fn fetch_and_reset_to_main(&self, worktree_path: &Path) -> Result<()> {
-        info!(path = %worktree_path.display(), "Fetching origin/main and resetting");
+        info!(path = %worktree_path.display(), default_branch = %self.default_branch, "Fetching origin/{} and resetting", self.default_branch);
 
         let fetch = Command::new("git")
-            .args(["fetch", "origin", "main"])
+            .args(["fetch", "origin", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to fetch origin/main")?;
+            .context(format!("Failed to fetch origin/{}", self.default_branch))?;
 
         if !fetch.status.success() {
             warn!(
                 error = %String::from_utf8_lossy(&fetch.stderr),
-                "git fetch origin/main failed, continuing"
+                default_branch = %self.default_branch,
+                "git fetch origin/{} failed, continuing", self.default_branch
             );
         }
 
@@ -489,36 +564,39 @@ impl WorktreeManager {
         }
 
         let checkout = Command::new("git")
-            .args(["checkout", "main"])
+            .args(["checkout", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to checkout main")?;
+            .context(format!("Failed to checkout {}", self.default_branch))?;
 
         if !checkout.status.success() {
             let checkout = Command::new("git")
-                .args(["checkout", "origin/main"])
+                .args(["checkout", &self.origin_default_branch()])
                 .current_dir(worktree_path)
                 .output()
-                .context("Failed to checkout origin/main")?;
+                .context(format!("Failed to checkout {}", self.origin_default_branch()))?;
 
             if !checkout.status.success() {
                 return Err(anyhow!(
-                    "Failed to checkout main or origin/main: {}",
+                    "Failed to checkout {} or {}: {}",
+                    self.default_branch,
+                    self.origin_default_branch(),
                     String::from_utf8_lossy(&checkout.stderr)
                 ));
             }
         }
 
         let pull = Command::new("git")
-            .args(["pull", "origin", "main"])
+            .args(["pull", "origin", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to pull origin/main")?;
+            .context(format!("Failed to pull origin/{}", self.default_branch))?;
 
         if !pull.status.success() {
             warn!(
                 error = %String::from_utf8_lossy(&pull.stderr),
-                "git pull origin/main failed, continuing"
+                default_branch = %self.default_branch,
+                "git pull origin/{} failed, continuing", self.default_branch
             );
         }
 
@@ -619,7 +697,7 @@ impl WorktreeManager {
     pub fn create_idle_worktree(&self, pair_id: &str) -> Result<PathBuf> {
         let worktree_path = self.worktrees_dir.join(pair_id);
 
-        info!(pair_id, "Creating idle worktree on main");
+        info!(pair_id, default_branch = %self.default_branch, "Creating idle worktree on {}", self.default_branch);
 
         if worktree_path.exists() {
             let current = self.get_current_branch(&worktree_path).ok();
@@ -632,7 +710,7 @@ impl WorktreeManager {
         let output = Command::new("git")
             .args(["worktree", "add"])
             .arg(&worktree_path)
-            .arg("main")
+            .arg(&self.default_branch)
             .current_dir(&self.project_root)
             .output()
             .context("Failed to run git worktree add")?;
@@ -668,37 +746,38 @@ impl WorktreeManager {
         Ok(DivergenceStatus::UpToDate)
     }
 
-    /// Fetch origin/main and merge it into the worktree branch.
+    /// Fetch origin/{default_branch} and merge it into the worktree branch.
     ///
     /// This materializes conflicts locally so FORGE can see and resolve them.
     /// Used when VESSEL detects merge conflicts on GitHub but the worktree
-    /// doesn't have them locally because main was never merged in.
+    /// doesn't have them locally because the default branch was never merged in.
     pub fn merge_origin_main(&self, worktree_path: &Path) -> Result<MergeMainResult> {
-        info!(path = %worktree_path.display(), "Fetching origin/main into worktree");
+        info!(path = %worktree_path.display(), default_branch = %self.default_branch, "Fetching origin/{} into worktree", self.default_branch);
 
         let fetch = Command::new("git")
-            .args(["fetch", "origin", "main"])
+            .args(["fetch", "origin", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to fetch origin/main in worktree")?;
+            .context(format!("Failed to fetch origin/{} in worktree", self.default_branch))?;
 
         if !fetch.status.success() {
             return Err(anyhow!(
-                "git fetch origin/main failed in worktree: {}",
+                "git fetch origin/{} failed in worktree: {}",
+                self.default_branch,
                 String::from_utf8_lossy(&fetch.stderr)
             ));
         }
 
-        info!(path = %worktree_path.display(), "Merging origin/main into worktree branch");
+        info!(path = %worktree_path.display(), default_branch = %self.default_branch, "Merging origin/{} into worktree branch", self.default_branch);
 
         let merge = Command::new("git")
-            .args(["merge", "origin/main", "--no-edit"])
+            .args(["merge", &self.origin_default_branch(), "--no-edit"])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to merge origin/main in worktree")?;
+            .context(format!("Failed to merge {} in worktree", self.origin_default_branch()))?;
 
         if merge.status.success() {
-            info!(path = %worktree_path.display(), "origin/main merged cleanly — no conflicts");
+            info!(path = %worktree_path.display(), "origin/{} merged cleanly — no conflicts", self.default_branch);
             return Ok(MergeMainResult::Clean);
         }
 
@@ -707,21 +786,22 @@ impl WorktreeManager {
         if stderr.contains("refusing to merge unrelated histories") {
             warn!(
                 path = %worktree_path.display(),
-                "Branch and origin/main have unrelated histories — retrying with --allow-unrelated-histories"
+                default_branch = %self.default_branch,
+                "Branch and origin/{} have unrelated histories — retrying with --allow-unrelated-histories", self.default_branch
             );
             let retry = Command::new("git")
                 .args([
                     "merge",
-                    "origin/main",
+                    &self.origin_default_branch(),
                     "--no-edit",
                     "--allow-unrelated-histories",
                 ])
                 .current_dir(worktree_path)
                 .output()
-                .context("Failed to merge origin/main with --allow-unrelated-histories")?;
+                .context(format!("Failed to merge {} with --allow-unrelated-histories", self.origin_default_branch()))?;
 
             if retry.status.success() {
-                info!(path = %worktree_path.display(), "origin/main merged cleanly with --allow-unrelated-histories");
+                info!(path = %worktree_path.display(), "origin/{} merged cleanly with --allow-unrelated-histories", self.default_branch);
                 return Ok(MergeMainResult::Clean);
             }
 
@@ -737,7 +817,8 @@ impl WorktreeManager {
             }
 
             return Err(anyhow!(
-                "git merge origin/main --allow-unrelated-histories failed: {}",
+                "git merge {} --allow-unrelated-histories failed: {}",
+                self.origin_default_branch(),
                 retry_stderr
             ));
         }
@@ -752,7 +833,7 @@ impl WorktreeManager {
             return Ok(MergeMainResult::Conflict { conflicted_files });
         }
 
-        Err(anyhow!("git merge origin/main failed: {}", stderr))
+        Err(anyhow!("git merge {} failed: {}", self.origin_default_branch(), stderr))
     }
 
     /// List files with conflict markers in a worktree.
@@ -771,16 +852,16 @@ impl WorktreeManager {
         Ok(files)
     }
 
-    /// Rebase the worktree onto origin/main.
+    /// Rebase the worktree onto origin/{default_branch}.
     pub fn rebase_onto_main(&self, worktree_path: &Path) -> Result<RebaseResult> {
-        info!(path = %worktree_path.display(), "Rebasing onto origin/main");
+        info!(path = %worktree_path.display(), default_branch = %self.default_branch, "Rebasing onto origin/{}", self.default_branch);
 
         // Fetch latest
         let output = Command::new("git")
-            .args(["fetch", "origin", "main"])
+            .args(["fetch", "origin", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to fetch origin/main")?;
+            .context(format!("Failed to fetch origin/{}", self.default_branch))?;
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -791,7 +872,7 @@ impl WorktreeManager {
 
         // Rebase
         let output = Command::new("git")
-            .args(["rebase", "origin/main"])
+            .args(["rebase", &self.origin_default_branch()])
             .current_dir(worktree_path)
             .output()
             .context("Failed to rebase")?;
@@ -843,16 +924,17 @@ impl WorktreeManager {
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     }
 
-    /// Count commits behind origin/main.
+    /// Count commits behind origin/{default_branch}.
     fn count_commits_behind(&self, worktree_path: &Path) -> Result<u32> {
+        let origin_ref = self.origin_default_branch();
         let output = Command::new("git")
-            .args(["rev-list", "--count", "HEAD..origin/main"])
+            .args(["rev-list", "--count", &format!("HEAD..{}", origin_ref)])
             .current_dir(worktree_path)
             .output()
             .context("Failed to count commits behind")?;
 
         if !output.status.success() {
-            // If origin/main doesn't exist, return 0
+            // If origin/{default_branch} doesn't exist, return 0
             return Ok(0);
         }
 

@@ -797,6 +797,11 @@ impl ForgePairNode {
 
         Self::scan_and_scrub_secrets(&worktree_path)?;
 
+        // Detect the repository's default branch (e.g., "main" or "master")
+        // instead of hardcoding "main" — repos may use "master" as default.
+        let default_branch =
+            WorktreeManager::detect_default_branch(&self.workspace_root);
+
         let has_changes = StdCommand::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&worktree_path)
@@ -823,14 +828,18 @@ impl ForgePairNode {
         }
 
         let has_commits = StdCommand::new("git")
-            .args(["log", "main..HEAD", "--oneline"])
+            .args(["log", &format!("{}..HEAD", default_branch), "--oneline"])
             .current_dir(&worktree_path)
             .output()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
 
         if !has_commits {
-            return Err(anyhow!("No commits on branch {} beyond main", branch_name));
+            return Err(anyhow!(
+                "No commits on branch {} beyond {}",
+                branch_name,
+                default_branch
+            ));
         }
 
         info!(worker = worker_id, branch = %branch_name, "Pushing branch to origin");
@@ -995,7 +1004,7 @@ impl ForgePairNode {
             "title": pr_title,
             "body": pr_body,
             "head": branch_name,
-            "base": "main"
+            "base": default_branch
         });
 
         let resp = client

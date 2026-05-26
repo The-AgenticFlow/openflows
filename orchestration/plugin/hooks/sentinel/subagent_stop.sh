@@ -14,7 +14,7 @@
 PAIR_ID="${SPRINTLESS_PAIR_ID}"
 TICKET_ID="${SPRINTLESS_TICKET_ID}"
 SHARED="${SPRINTLESS_SHARED}"
-SEGMENT="${SPRINTLESS_SEGMENT:-unknown}"
+SEGMENT="${SPRINTLESS_SEGMENT}"
 SUBAGENT_ID="${CODEX_SUBAGENT_ID:-unknown}"
 EXIT_CODE="${CODEX_SUBAGENT_EXIT_CODE:-unknown}"
 STATUS="${CODEX_SUBAGENT_STATUS:-unknown}"
@@ -33,10 +33,13 @@ echo "Exit Code: ${EXIT_CODE}"
 echo "Status: ${STATUS}"
 echo ""
 
-# Validate subagent output
-EVAL_FILE="segment-${SEGMENT}-eval.md"
-if [ "${SEGMENT}" = "final" ]; then
+# Validate subagent output — determine expected artifact based on mode
+if [ -z "${SEGMENT}" ]; then
+  EVAL_FILE="CONTRACT.md"
+elif [ "${SEGMENT}" = "final" ]; then
   EVAL_FILE="final-review.md"
+else
+  EVAL_FILE="segment-${SEGMENT}-eval.md"
 fi
 
 if [ "${EXIT_CODE}" = "0" ] || [ "${STATUS}" = "success" ]; then

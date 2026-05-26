@@ -127,23 +127,18 @@ impl WorkspaceManager {
             warn!(stderr = %String::from_utf8_lossy(&output.stderr), "Git fetch failed, continuing anyway");
         }
 
+        // Detect the default branch instead of hardcoding "main"
+        let default_branch = crate::worktree::WorktreeManager::detect_default_branch(
+            &self.workspace_dir,
+        );
         let output = Command::new("git")
-            .args(["pull", "--rebase", "origin", "main"])
+            .args(["pull", "--rebase", "origin", &default_branch])
             .current_dir(&self.workspace_dir)
             .output()
             .context("Failed to execute git pull")?;
 
         if !output.status.success() {
-            // Try with master if main fails
-            let output = Command::new("git")
-                .args(["pull", "--rebase", "origin", "master"])
-                .current_dir(&self.workspace_dir)
-                .output()
-                .context("Failed to execute git pull")?;
-
-            if !output.status.success() {
-                warn!(stderr = %String::from_utf8_lossy(&output.stderr), "Git pull failed, continuing anyway");
-            }
+            warn!(stderr = %String::from_utf8_lossy(&output.stderr), default_branch = %default_branch, "Git pull from origin/{} failed, continuing anyway", default_branch);
         }
 
         info!(workspace = %self.workspace_dir.display(), "Workspace updated");
@@ -193,19 +188,9 @@ impl WorkspaceManager {
 
     /// Get the default branch name for the repository.
     pub fn get_default_branch(&self) -> Result<String> {
-        let output = Command::new("git")
-            .args(["symbolic-ref", "--short", "HEAD"])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .context("Failed to get default branch")?;
-
-        if output.status.success() {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(branch)
-        } else {
-            // Default to main if we can't determine
-            Ok("main".to_string())
-        }
+        Ok(crate::worktree::WorktreeManager::detect_default_branch(
+            &self.workspace_dir,
+        ))
     }
 }
 

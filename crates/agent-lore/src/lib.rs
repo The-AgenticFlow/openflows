@@ -21,7 +21,7 @@ use config::{KEY_PENDING_PRS, KEY_TICKETS};
 use github::GithubRestClient;
 use pocketflow_core::{Action, Node, SharedStore};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use tracing::{debug, info, warn};
 
@@ -480,6 +480,44 @@ impl LoreNode {
         }
     }
 
+    /// Detect the repository's default branch by reading origin/HEAD symref,
+    /// falling back to checking remote refs, then defaulting to "main".
+    fn detect_default_branch(project_root: &Path) -> String {
+        // Method 1: Read origin/HEAD symref (most reliable)
+        let output = StdCommand::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(project_root)
+            .output();
+
+        if let Ok(o) = output {
+            if o.status.success() {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        // Method 2: Try git rev-parse for each candidate
+        for candidate in ["main", "master"] {
+            let output = StdCommand::new("git")
+                .args(["rev-parse", "--verify", &format!("origin/{}", candidate)])
+                .current_dir(project_root)
+                .output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    return candidate.to_string();
+                }
+            }
+        }
+
+        // Final fallback
+        warn!("Could not detect default branch, falling back to 'main'");
+        "main".to_string()
+    }
+
     async fn commit_and_push_docs(&self, changed_files: &[PathBuf]) -> Result<()> {
         if changed_files.is_empty() {
             info!("LORE: No files to commit");
@@ -510,20 +548,22 @@ impl LoreNode {
         let stashed = stash_output.status.success()
             && !String::from_utf8_lossy(&stash_output.stdout).contains("No local changes");
 
-        // Fetch origin/main so the docs branch is based on the latest main,
+        // Fetch origin/{default_branch} so the docs branch is based on the latest default,
         // not on the forge branch that was previously checked out.
-        // This prevents merge conflicts when the PR is opened against main.
+        // This prevents merge conflicts when the PR is opened against the default branch.
+        let default_branch = Self::detect_default_branch(workspace);
         let fetch_output = StdCommand::new("git")
-            .args(["fetch", "origin", "main"])
+            .args(["fetch", "origin", &default_branch])
             .current_dir(workspace)
             .output()?;
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-            warn!(error = %stderr, "LORE: git fetch origin/main failed — will try creating branch from current HEAD");
+            warn!(error = %stderr, "LORE: git fetch origin/{} failed — will try creating branch from current HEAD", default_branch);
         }
 
+        let origin_default = format!("origin/{}", default_branch);
         let base_arg = if fetch_output.status.success() {
-            "origin/main"
+            origin_default.as_str()
         } else {
             ""
         };
@@ -609,15 +649,16 @@ impl LoreNode {
         }
         info!("LORE: Pushed branch {}", branch_name);
 
-        // Switch back to the original branch (or main) so the workspace
+        // Switch back to the original branch (or the default branch) so the workspace
         // is in a clean state for the next pipeline cycle.
+        let default_branch = Self::detect_default_branch(workspace);
         let restore_branch = if original_branch == branch_name {
-            "main"
+            default_branch.clone()
         } else {
-            &original_branch
+            original_branch.clone()
         };
         let _ = StdCommand::new("git")
-            .args(["checkout", restore_branch])
+            .args(["checkout", &restore_branch])
             .current_dir(workspace)
             .output();
 
@@ -653,6 +694,9 @@ impl LoreNode {
             }
         }
 
+        // Detect the default branch for PR base instead of hardcoding "main"
+        let default_branch = Self::detect_default_branch(&self.config.workspace_root);
+
         let title = format!(
             "docs: update documentation ({})",
             chrono::Utc::now().format("%Y-%m-%d %H:%M")
@@ -663,7 +707,7 @@ impl LoreNode {
                 repo_name,
                 &title,
                 branch_name,
-                "main",
+                &default_branch,
                 Some(&pr_body),
             )
             .await?;
@@ -674,7 +718,7 @@ impl LoreNode {
             "number": pr_number,
             "head_branch": branch_name,
             "head_sha": "",
-            "base_branch": "main",
+            "base_branch": default_branch,
             "ticket_id": "T-DOCS",
             "title": title,
             "worker_id": "lore",

@@ -1188,7 +1188,16 @@ impl ForgeSentinelPair {
         );
 
         let path = self.config.shared.join("ERROR_FEEDBACK.md");
-        tokio::fs::write(&path, &content).await?;
+        // Ensure the shared directory exists — write_error_feedback can be called
+        // early (e.g. from provision_worktree) before create_shared_structure runs.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create shared directory for ERROR_FEEDBACK.md")?;
+        }
+        tokio::fs::write(&path, &content)
+            .await
+            .context("Failed to write ERROR_FEEDBACK.md")?;
 
         info!(
             path = %path.display(),
@@ -1205,7 +1214,9 @@ impl ForgeSentinelPair {
     async fn clear_error_feedback(&self) -> Result<()> {
         let path = self.config.shared.join("ERROR_FEEDBACK.md");
         if path.exists() {
-            tokio::fs::remove_file(&path).await?;
+            tokio::fs::remove_file(&path)
+                .await
+                .context("Failed to remove ERROR_FEEDBACK.md")?;
             debug!("Removed ERROR_FEEDBACK.md — error resolved");
         }
         Ok(())
@@ -1296,7 +1307,9 @@ impl ForgeSentinelPair {
             return Ok(String::new());
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .context("Failed to read error_history.json")?;
         let history: ErrorHistory = match serde_json::from_str(&content) {
             Ok(h) => h,
             Err(_) => return Ok(String::new()),
@@ -1981,10 +1994,11 @@ impl ForgeSentinelPair {
             }
         };
 
-        let normalized = normalize_status(&status.status);
-        if normalized != status.status {
+        let effective = status.effective_status().to_string();
+        let normalized = normalize_status(&effective);
+        if normalized != effective {
             info!(
-                raw = %status.status,
+                raw = %effective,
                 normalized = %normalized,
                 "Normalized unrecognized STATUS.json status to canonical value"
             );
@@ -2045,7 +2059,7 @@ impl ForgeSentinelPair {
                 }
                 if status.pr_url.as_ref().is_some_and(|url| !url.is_empty()) {
                     warn!(
-                        status = %status.status,
+                        status = %status.effective_status(),
                         pr_url = status.pr_url.as_deref().unwrap_or_default(),
                         "Unrecognized STATUS.json status with PR metadata — treating as PR_OPENED"
                     );
@@ -2074,18 +2088,18 @@ impl ForgeSentinelPair {
                         | `SEGMENT_N_DONE` | Non-terminal | Segment N complete |\n\n\
                         The agent wrote an unrecognized status. Nexus should interpret the raw status\n\
                         intent and re-map it to the closest valid status above, then re-assign the worker.",
-                        status.status, normalized
+                        status.effective_status(), normalized
                     );
                     let _ = tokio::fs::write(&unrecognized_path, &remap_content).await;
 
                     warn!(
-                        status = %status.status,
+                        status = %status.effective_status(),
                         "Unrecognized STATUS.json status — treating as blocked (STATUS_UNRECOGNIZED.md written for Nexus fallback)"
                     );
                     PairOutcome::Blocked {
                         reason: format!(
                             "Unrecognized STATUS.json status: {} (normalized: {})",
-                            status.status, normalized
+                            status.effective_status(), normalized
                         ),
                         blockers: vec![],
                     }
