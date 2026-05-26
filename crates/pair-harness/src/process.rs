@@ -72,7 +72,10 @@ impl BackendConfig {
             cli_path
         };
         let settings_path = worktree.join(".claude").join("settings.json");
-        let plugin_dir = worktree.join(".claude").join("plugins").join("orchestration");
+        let plugin_dir = worktree
+            .join(".claude")
+            .join("plugins")
+            .join("orchestration");
         let forge_extra = vec![
             "--settings".into(),
             settings_path.to_string_lossy().to_string(),
@@ -114,7 +117,9 @@ impl BackendConfig {
             model_env: Some("ANTHROPIC_MODEL".into()),
             home_env_var: None,
             home_dir_suffix: String::new(),
-            plugin_dir_rel: PathBuf::from(".claude").join("plugins").join("orchestration"),
+            plugin_dir_rel: PathBuf::from(".claude")
+                .join("plugins")
+                .join("orchestration"),
             settings_rel: PathBuf::from(".claude").join("settings.json"),
             uses_stdin_prompt: true,
             mcp_config_rel: PathBuf::from(".claude").join("mcp.json"),
@@ -165,7 +170,9 @@ impl BackendConfig {
             model_env: Some(model_env.into()),
             home_env_var: Some("CODEX_HOME".into()),
             home_dir_suffix: ".codex-home".into(),
-            plugin_dir_rel: PathBuf::from(".agents").join("plugins").join("orchestration"),
+            plugin_dir_rel: PathBuf::from(".agents")
+                .join("plugins")
+                .join("orchestration"),
             settings_rel: PathBuf::from(".codex").join("config.toml"),
             uses_stdin_prompt: true,
             mcp_config_rel: PathBuf::from(".codex").join("config.toml"),
@@ -465,16 +472,22 @@ impl ProcessManager {
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
         let mut backends = HashMap::new();
-        backends.insert(CliBackend::Claude, BackendConfig::claude(
-            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
-            worktree,
-            shared,
-        ));
-        backends.insert(CliBackend::Codex, BackendConfig::codex(
-            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
-            worktree,
-            shared,
-        ));
+        backends.insert(
+            CliBackend::Claude,
+            BackendConfig::claude(
+                &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+                worktree,
+                shared,
+            ),
+        );
+        backends.insert(
+            CliBackend::Codex,
+            BackendConfig::codex(
+                &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+                worktree,
+                shared,
+            ),
+        );
 
         // Validate all registered backends
         for (backend, config) in &backends {
@@ -492,21 +505,32 @@ impl ProcessManager {
     }
 
     /// Create a ProcessManager with Redis backend.
-    pub fn with_redis(github_token: impl Into<String>, redis_url: impl Into<String>, worktree: &Path, shared: &Path) -> Self {
+    pub fn with_redis(
+        github_token: impl Into<String>,
+        redis_url: impl Into<String>,
+        worktree: &Path,
+        shared: &Path,
+    ) -> Self {
         let proxy_url = std::env::var("PROXY_URL").ok();
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
         let mut backends = HashMap::new();
-        backends.insert(CliBackend::Claude, BackendConfig::claude(
-            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
-            worktree,
-            shared,
-        ));
-        backends.insert(CliBackend::Codex, BackendConfig::codex(
-            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
-            worktree,
-            shared,
-        ));
+        backends.insert(
+            CliBackend::Claude,
+            BackendConfig::claude(
+                &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+                worktree,
+                shared,
+            ),
+        );
+        backends.insert(
+            CliBackend::Codex,
+            BackendConfig::codex(
+                &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+                worktree,
+                shared,
+            ),
+        );
 
         for (backend, config) in &backends {
             Self::validate_cli_binary(&config.binary_path, backend.binary_name());
@@ -533,16 +557,22 @@ impl ProcessManager {
         let proxy_api_key = std::env::var("PROXY_API_KEY").ok();
 
         let mut backends = HashMap::new();
-        backends.insert(CliBackend::Claude, BackendConfig::claude(
-            &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
-            worktree,
-            shared,
-        ));
-        backends.insert(CliBackend::Codex, BackendConfig::codex(
-            &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
-            worktree,
-            shared,
-        ));
+        backends.insert(
+            CliBackend::Claude,
+            BackendConfig::claude(
+                &std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+                worktree,
+                shared,
+            ),
+        );
+        backends.insert(
+            CliBackend::Codex,
+            BackendConfig::codex(
+                &std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+                worktree,
+                shared,
+            ),
+        );
 
         for (backend, config) in &backends {
             Self::validate_cli_binary(&config.binary_path, backend.binary_name());
@@ -756,12 +786,17 @@ trust_level = "trusted"
                     cmd.arg("-c").arg("model_provider=\"fireworks\"");
 
                     // Define the fireworks provider: Responses API over SSE, no WebSocket
-                    cmd.arg("-c").arg("model_providers.fireworks.name=\"Fireworks\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.name=\"Fireworks\"");
                     cmd.arg("-c").arg("model_providers.fireworks.base_url=\"https://api.fireworks.ai/inference/v1\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.wire_api=\"responses\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.supports_websockets=false");
-                    cmd.arg("-c").arg("model_providers.fireworks.requires_openai_auth=false");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.wire_api=\"responses\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.supports_websockets=false");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.requires_openai_auth=false");
 
                     info!("codex: using Fireworks provider (SSE, no WebSocket)");
                 }
@@ -802,7 +837,12 @@ trust_level = "trusted"
     }
 
     /// Build a command for SENTINEL mode.
-    fn build_sentinel_command(&self, backend: CliBackend, _worktree: &Path, _shared: &Path) -> Command {
+    fn build_sentinel_command(
+        &self,
+        backend: CliBackend,
+        _worktree: &Path,
+        _shared: &Path,
+    ) -> Command {
         let config = self.get_backend(backend);
         let mut cmd = Command::new(&config.binary_path);
 
@@ -826,12 +866,17 @@ trust_level = "trusted"
             match provider {
                 CodexProvider::Fireworks => {
                     cmd.arg("-c").arg("model_provider=\"fireworks\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.name=\"Fireworks\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.name=\"Fireworks\"");
                     cmd.arg("-c").arg("model_providers.fireworks.base_url=\"https://api.fireworks.ai/inference/v1\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.wire_api=\"responses\"");
-                    cmd.arg("-c").arg("model_providers.fireworks.supports_websockets=false");
-                    cmd.arg("-c").arg("model_providers.fireworks.requires_openai_auth=false");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.env_key=\"FIREWORKS_API_KEY\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.wire_api=\"responses\"");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.supports_websockets=false");
+                    cmd.arg("-c")
+                        .arg("model_providers.fireworks.requires_openai_auth=false");
                 }
                 CodexProvider::OpenAI => {
                     cmd.arg("-c").arg("model_provider=\"openai\"");
@@ -1228,11 +1273,20 @@ trust_level = "trusted"
         shared: &Path,
         timeout_secs: u64,
     ) -> Result<Child> {
-        self.spawn_sentinel_with_backend(pair_id, ticket_id, mode, worktree, shared, timeout_secs, self.default_backend)
-            .await
+        self.spawn_sentinel_with_backend(
+            pair_id,
+            ticket_id,
+            mode,
+            worktree,
+            shared,
+            timeout_secs,
+            self.default_backend,
+        )
+        .await
     }
 
     /// Spawn a SENTINEL process with an explicit backend.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_sentinel_with_backend(
         &self,
         pair_id: &str,
@@ -1904,13 +1958,26 @@ impl ForgeProcessBuilder {
     /// Build and spawn the FORGE process.
     pub async fn spawn(self) -> Result<Child> {
         let manager = match (&self.redis_url, &self.proxy_url) {
-            (Some(redis_url), Some(proxy_url)) => {
-                ProcessManager::with_proxy(self.github_token, Some(redis_url.clone()), proxy_url, &self.worktree, &self.shared)
-            }
-            (Some(redis_url), None) => ProcessManager::with_redis(self.github_token, redis_url, &self.worktree, &self.shared),
-            (None, Some(proxy_url)) => {
-                ProcessManager::with_proxy(self.github_token, None, proxy_url, &self.worktree, &self.shared)
-            }
+            (Some(redis_url), Some(proxy_url)) => ProcessManager::with_proxy(
+                self.github_token,
+                Some(redis_url.clone()),
+                proxy_url,
+                &self.worktree,
+                &self.shared,
+            ),
+            (Some(redis_url), None) => ProcessManager::with_redis(
+                self.github_token,
+                redis_url,
+                &self.worktree,
+                &self.shared,
+            ),
+            (None, Some(proxy_url)) => ProcessManager::with_proxy(
+                self.github_token,
+                None,
+                proxy_url,
+                &self.worktree,
+                &self.shared,
+            ),
             (None, None) => ProcessManager::new(self.github_token, &self.worktree, &self.shared),
         };
 
@@ -1946,8 +2013,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(&shared).unwrap();
         let manager = ProcessManager::new("ghp_test", &worktree, &shared);
-        let prompt =
-            manager.build_sentinel_prompt(&shared, &SentinelMode::PlanReview);
+        let prompt = manager.build_sentinel_prompt(&shared, &SentinelMode::PlanReview);
 
         assert!(prompt.contains("--- TICKET.md ---"));
         assert!(prompt.contains("Write ONLY to"));
@@ -1965,7 +2031,11 @@ mod tests {
 
     #[test]
     fn test_new_session_prompt_discourages_verification_only_segments() {
-        let manager = ProcessManager::new("ghp_test", Path::new("/tmp/worktree"), Path::new("/tmp/shared"));
+        let manager = ProcessManager::new(
+            "ghp_test",
+            Path::new("/tmp/worktree"),
+            Path::new("/tmp/shared"),
+        );
         let dir = tempfile::tempdir().unwrap();
         let ticket_path = dir.path().join("TICKET.md");
         let task_path = dir.path().join("TASK.md");
@@ -1985,8 +2055,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(&shared).unwrap();
         let manager = ProcessManager::new("ghp_test", &worktree, &shared);
-        let prompt =
-            manager.build_sentinel_prompt(&shared, &SentinelMode::SegmentEval(3));
+        let prompt = manager.build_sentinel_prompt(&shared, &SentinelMode::SegmentEval(3));
 
         assert!(prompt.contains("SHARED:"));
         assert!(prompt.contains("--- CONTRACT.md ---"));
@@ -2001,8 +2070,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::create_dir_all(&shared).unwrap();
         let manager = ProcessManager::new("ghp_test", &worktree, &shared);
-        let prompt =
-            manager.build_sentinel_prompt(&shared, &SentinelMode::FinalReview);
+        let prompt = manager.build_sentinel_prompt(&shared, &SentinelMode::FinalReview);
 
         assert!(prompt.contains("SHARED:"));
         assert!(prompt.contains("--- CONTRACT.md ---"));
@@ -2029,7 +2097,10 @@ mod tests {
         let result = parse_codex_exec_output(json).unwrap();
         assert!(result.success);
         assert_eq!(result.turns.len(), 2);
-        assert_eq!(result.result_text.as_deref(), Some("APPROVED - All tests passed"));
+        assert_eq!(
+            result.result_text.as_deref(),
+            Some("APPROVED - All tests passed")
+        );
     }
 
     #[test]
@@ -2056,7 +2127,10 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.thread_id.as_deref(), Some("thread_abc123"));
         assert_eq!(result.turns.len(), 2);
-        assert_eq!(result.result_text.as_deref(), Some("NEEDS_WORK - Fix required in src/main.rs"));
+        assert_eq!(
+            result.result_text.as_deref(),
+            Some("NEEDS_WORK - Fix required in src/main.rs")
+        );
     }
 
     #[test]

@@ -574,7 +574,10 @@ impl WorktreeManager {
                 .args(["checkout", &self.origin_default_branch()])
                 .current_dir(worktree_path)
                 .output()
-                .context(format!("Failed to checkout {}", self.origin_default_branch()))?;
+                .context(format!(
+                    "Failed to checkout {}",
+                    self.origin_default_branch()
+                ))?;
 
             if !checkout.status.success() {
                 return Err(anyhow!(
@@ -758,7 +761,10 @@ impl WorktreeManager {
             .args(["fetch", "origin", &self.default_branch])
             .current_dir(worktree_path)
             .output()
-            .context(format!("Failed to fetch origin/{} in worktree", self.default_branch))?;
+            .context(format!(
+                "Failed to fetch origin/{} in worktree",
+                self.default_branch
+            ))?;
 
         if !fetch.status.success() {
             return Err(anyhow!(
@@ -774,7 +780,10 @@ impl WorktreeManager {
             .args(["merge", &self.origin_default_branch(), "--no-edit"])
             .current_dir(worktree_path)
             .output()
-            .context(format!("Failed to merge {} in worktree", self.origin_default_branch()))?;
+            .context(format!(
+                "Failed to merge {} in worktree",
+                self.origin_default_branch()
+            ))?;
 
         if merge.status.success() {
             info!(path = %worktree_path.display(), "origin/{} merged cleanly — no conflicts", self.default_branch);
@@ -798,7 +807,10 @@ impl WorktreeManager {
                 ])
                 .current_dir(worktree_path)
                 .output()
-                .context(format!("Failed to merge {} with --allow-unrelated-histories", self.origin_default_branch()))?;
+                .context(format!(
+                    "Failed to merge {} with --allow-unrelated-histories",
+                    self.origin_default_branch()
+                ))?;
 
             if retry.status.success() {
                 info!(path = %worktree_path.display(), "origin/{} merged cleanly with --allow-unrelated-histories", self.default_branch);
@@ -833,7 +845,11 @@ impl WorktreeManager {
             return Ok(MergeMainResult::Conflict { conflicted_files });
         }
 
-        Err(anyhow!("git merge {} failed: {}", self.origin_default_branch(), stderr))
+        Err(anyhow!(
+            "git merge {} failed: {}",
+            self.origin_default_branch(),
+            stderr
+        ))
     }
 
     /// List files with conflict markers in a worktree.

@@ -99,9 +99,7 @@ impl FallbackClient {
 
         info!(
             proxy_active,
-            fireworks_active,
-            model_override,
-            "Building fallback client chain"
+            fireworks_active, model_override, "Building fallback client chain"
         );
 
         if let Some(model) = model_override {
@@ -123,7 +121,9 @@ impl FallbackClient {
                         );
                         return Self::build_openai_direct_chain(model);
                     }
-                    "anthropic" if has_api_key_for_provider("anthropic") && !proxy_is_configured() => {
+                    "anthropic"
+                        if has_api_key_for_provider("anthropic") && !proxy_is_configured() =>
+                    {
                         info!(
                             model,
                             provider = "anthropic",
@@ -546,7 +546,11 @@ impl LlmClient for FallbackClient {
             Some(e) => bail!(
                 "All {} LLM provider(s) failed. Providers: [{}]. Last error: {}",
                 self.clients.len(),
-                self.clients.iter().map(|c| c.model()).collect::<Vec<_>>().join(", "),
+                self.clients
+                    .iter()
+                    .map(|c| c.model())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 e
             ),
             None => bail!("No LLM providers configured"),

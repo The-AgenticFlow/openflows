@@ -87,7 +87,13 @@ impl Provisioner {
 
         // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
-            self.provision_backend_extras(&backend_config, worktree, shared, github_token, redis_url)?;
+            self.provision_backend_extras(
+                &backend_config,
+                worktree,
+                shared,
+                github_token,
+                redis_url,
+            )?;
         }
 
         info!(pair = pair_id, backend = ?cli_backend, "Pair provisioning complete");
@@ -110,10 +116,24 @@ impl Provisioner {
 
         if is_codex {
             // Codex: generate .codex/config.toml for FORGE worktree
-            self.generate_codex_config_toml(worktree, worktree, shared, github_token, redis_url, "workspace-write")?;
+            self.generate_codex_config_toml(
+                worktree,
+                worktree,
+                shared,
+                github_token,
+                redis_url,
+                "workspace-write",
+            )?;
 
             // Codex: generate .codex/config.toml for SENTINEL shared dir
-            self.generate_codex_config_toml(shared, worktree, shared, github_token, redis_url, "read-only")?;
+            self.generate_codex_config_toml(
+                shared,
+                worktree,
+                shared,
+                github_token,
+                redis_url,
+                "read-only",
+            )?;
 
             // Codex: generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
             self.generate_codex_agent_tomls(worktree)?;
@@ -160,7 +180,8 @@ impl Provisioner {
 
     /// Create FORGE's settings.json with auto-mode permissions.
     pub fn create_forge_settings(&self, worktree: &Path, config: &BackendConfig) -> Result<()> {
-        let settings_dir = worktree.join(&config.settings_rel.parent().unwrap_or(&config.settings_rel));
+        let settings_dir =
+            worktree.join(config.settings_rel.parent().unwrap_or(&config.settings_rel));
         fs::create_dir_all(&settings_dir).context("Failed to create settings directory")?;
 
         let settings_path = config.settings_path(worktree);
@@ -181,7 +202,9 @@ impl Provisioner {
 
     fn ensure_worktree_gitignore(&self, worktree: &Path, config: &BackendConfig) -> Result<()> {
         let gitignore_path = worktree.join(".gitignore");
-        let settings_dir_name = config.settings_rel.parent()
+        let settings_dir_name = config
+            .settings_rel
+            .parent()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| ".claude/".to_string());
@@ -240,8 +263,10 @@ impl Provisioner {
                 .context("Failed to remove legacy sentinel directory")?;
         }
 
-        let settings_dir = shared.join(&config.settings_rel.parent().unwrap_or(&config.settings_rel));
-        fs::create_dir_all(&settings_dir).context("Failed to create sentinel settings directory")?;
+        let settings_dir =
+            shared.join(config.settings_rel.parent().unwrap_or(&config.settings_rel));
+        fs::create_dir_all(&settings_dir)
+            .context("Failed to create sentinel settings directory")?;
 
         let settings_path = config.settings_path(shared);
 
@@ -258,7 +283,12 @@ impl Provisioner {
     }
 
     /// Symlink the orchestration plugin to the backend-specific plugin directory.
-    pub fn symlink_plugin(&self, target_dir: &Path, role: &str, backend_config: &BackendConfig) -> Result<()> {
+    pub fn symlink_plugin(
+        &self,
+        target_dir: &Path,
+        role: &str,
+        backend_config: &BackendConfig,
+    ) -> Result<()> {
         let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
 
         // Check if plugin exists
@@ -271,13 +301,12 @@ impl Provisioner {
             return Ok(());
         }
 
-        let plugins_dir = target_dir.join(
-            backend_config.plugin_dir_rel.parent().unwrap_or_else(|| {
+        let plugins_dir =
+            target_dir.join(backend_config.plugin_dir_rel.parent().unwrap_or_else(|| {
                 // plugin_dir_rel is e.g. ".claude/plugins/orchestration" or ".agents/plugins/orchestration"
                 // We need the parent: ".claude/plugins" or ".agents/plugins"
                 std::path::Path::new(".claude/plugins")
-            })
-        );
+            }));
 
         fs::create_dir_all(&plugins_dir).context("Failed to create plugins directory")?;
 
@@ -589,8 +618,7 @@ developer_instructions = """
                 continue;
             }
             let dst = hooks_dest.join(format!("{}.sh", hook_name));
-            fs::copy(&src, &dst)
-                .context(format!("Failed to copy hook script {}", hook_name))?;
+            fs::copy(&src, &dst).context(format!("Failed to copy hook script {}", hook_name))?;
 
             // Ensure the copied script is executable (fs::copy preserves
             // permissions on Unix, but enforce +x in case the source lacked it)
@@ -622,22 +650,92 @@ developer_instructions = """
     fn build_codex_hooks_json(&self, role: &str, hooks_source: &Path) -> Result<Value> {
         let hook_mapping: Vec<(&str, &str, &str, &str)> = match role {
             "forge" => vec![
-                ("SessionStart", "session_start", "Loading FORGE session context", "forge"),
-                ("PreToolUse", "pre_bash_guard", "Checking Bash command", "forge"),
-                ("PreToolUse", "pre_write_check", "Validating file write", "forge"),
-                ("PostToolUse", "post_write_lint", "Linting after changes", "forge"),
-                ("PreCompact", "pre_compact_handoff", "Preparing context reset", "forge"),
-                ("Stop", "stop_require_artifact", "Checking for required artifacts", "forge"),
-                ("SubagentStart", "subagent_start", "Initializing subagent", "forge"),
-                ("SubagentStop", "subagent_stop", "Validating subagent output", "forge"),
+                (
+                    "SessionStart",
+                    "session_start",
+                    "Loading FORGE session context",
+                    "forge",
+                ),
+                (
+                    "PreToolUse",
+                    "pre_bash_guard",
+                    "Checking Bash command",
+                    "forge",
+                ),
+                (
+                    "PreToolUse",
+                    "pre_write_check",
+                    "Validating file write",
+                    "forge",
+                ),
+                (
+                    "PostToolUse",
+                    "post_write_lint",
+                    "Linting after changes",
+                    "forge",
+                ),
+                (
+                    "PreCompact",
+                    "pre_compact_handoff",
+                    "Preparing context reset",
+                    "forge",
+                ),
+                (
+                    "Stop",
+                    "stop_require_artifact",
+                    "Checking for required artifacts",
+                    "forge",
+                ),
+                (
+                    "SubagentStart",
+                    "subagent_start",
+                    "Initializing subagent",
+                    "forge",
+                ),
+                (
+                    "SubagentStop",
+                    "subagent_stop",
+                    "Validating subagent output",
+                    "forge",
+                ),
             ],
             "sentinel" => vec![
-                ("SessionStart", "session_start", "Loading SENTINEL session context", "sentinel"),
-                ("PreToolUse", "pre_bash_readonly_guard", "Enforcing read-only mode", "sentinel"),
-                ("PostToolUse", "post_write_validate", "Validating evaluation output", "sentinel"),
-                ("Stop", "stop_require_eval", "Checking for required evaluation", "sentinel"),
-                ("SubagentStart", "subagent_start", "Initializing subagent", "sentinel"),
-                ("SubagentStop", "subagent_stop", "Validating subagent evaluation", "sentinel"),
+                (
+                    "SessionStart",
+                    "session_start",
+                    "Loading SENTINEL session context",
+                    "sentinel",
+                ),
+                (
+                    "PreToolUse",
+                    "pre_bash_readonly_guard",
+                    "Enforcing read-only mode",
+                    "sentinel",
+                ),
+                (
+                    "PostToolUse",
+                    "post_write_validate",
+                    "Validating evaluation output",
+                    "sentinel",
+                ),
+                (
+                    "Stop",
+                    "stop_require_eval",
+                    "Checking for required evaluation",
+                    "sentinel",
+                ),
+                (
+                    "SubagentStart",
+                    "subagent_start",
+                    "Initializing subagent",
+                    "sentinel",
+                ),
+                (
+                    "SubagentStop",
+                    "subagent_stop",
+                    "Validating subagent evaluation",
+                    "sentinel",
+                ),
             ],
             _ => vec![],
         };
@@ -645,7 +743,9 @@ developer_instructions = """
         let mut hooks_map = serde_json::Map::new();
 
         for (event, hook_name, status_msg, agent_dir) in &hook_mapping {
-            let hook_script = hooks_source.join(agent_dir).join(format!("{}.sh", hook_name));
+            let hook_script = hooks_source
+                .join(agent_dir)
+                .join(format!("{}.sh", hook_name));
 
             // Skip hooks that don't exist yet (e.g., subagent hooks)
             if !hook_script.exists() {
@@ -722,7 +822,12 @@ developer_instructions = """
     }
 
     /// Copy hook scripts from source repo into .claude/hooks/{role}/ in the target directory.
-    fn install_claude_hook_scripts(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+    fn install_claude_hook_scripts(
+        &self,
+        target: &Path,
+        role: &str,
+        hooks_source: &Path,
+    ) -> Result<()> {
         let hook_names: Vec<&str> = match role {
             "forge" => vec![
                 "session_start",
@@ -758,8 +863,7 @@ developer_instructions = """
                 continue;
             }
             let dst = hooks_dest.join(format!("{}.sh", hook_name));
-            fs::copy(&src, &dst)
-                .context(format!("Failed to copy hook script {}", hook_name))?;
+            fs::copy(&src, &dst).context(format!("Failed to copy hook script {}", hook_name))?;
 
             #[cfg(unix)]
             {
@@ -786,7 +890,12 @@ developer_instructions = """
     }
 
     /// Add hooks configuration to existing .claude/settings.json.
-    fn add_hooks_to_claude_settings(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+    fn add_hooks_to_claude_settings(
+        &self,
+        target: &Path,
+        role: &str,
+        hooks_source: &Path,
+    ) -> Result<()> {
         let settings_path = target.join(".claude").join("settings.json");
 
         // Read existing settings
@@ -800,22 +909,58 @@ developer_instructions = """
 
         let hook_mapping: Vec<(&str, &str, &str)> = match role {
             "forge" => vec![
-                ("SessionStart", "session_start", "Loading FORGE session context"),
+                (
+                    "SessionStart",
+                    "session_start",
+                    "Loading FORGE session context",
+                ),
                 ("PreToolUse", "pre_bash_guard", "Checking Bash command"),
                 ("PreToolUse", "pre_write_check", "Validating file write"),
                 ("PostToolUse", "post_write_lint", "Linting after changes"),
-                ("PreCompact", "pre_compact_handoff", "Preparing context reset"),
-                ("Stop", "stop_require_artifact", "Checking for required artifacts"),
+                (
+                    "PreCompact",
+                    "pre_compact_handoff",
+                    "Preparing context reset",
+                ),
+                (
+                    "Stop",
+                    "stop_require_artifact",
+                    "Checking for required artifacts",
+                ),
                 ("SubagentStart", "subagent_start", "Initializing subagent"),
-                ("SubagentStop", "subagent_stop", "Validating subagent output"),
+                (
+                    "SubagentStop",
+                    "subagent_stop",
+                    "Validating subagent output",
+                ),
             ],
             "sentinel" => vec![
-                ("SessionStart", "session_start", "Loading SENTINEL session context"),
-                ("PreToolUse", "pre_bash_readonly_guard", "Enforcing read-only mode"),
-                ("PostToolUse", "post_write_validate", "Validating evaluation output"),
-                ("Stop", "stop_require_eval", "Checking for required evaluation"),
+                (
+                    "SessionStart",
+                    "session_start",
+                    "Loading SENTINEL session context",
+                ),
+                (
+                    "PreToolUse",
+                    "pre_bash_readonly_guard",
+                    "Enforcing read-only mode",
+                ),
+                (
+                    "PostToolUse",
+                    "post_write_validate",
+                    "Validating evaluation output",
+                ),
+                (
+                    "Stop",
+                    "stop_require_eval",
+                    "Checking for required evaluation",
+                ),
                 ("SubagentStart", "subagent_start", "Initializing subagent"),
-                ("SubagentStop", "subagent_stop", "Validating subagent evaluation"),
+                (
+                    "SubagentStop",
+                    "subagent_stop",
+                    "Validating subagent evaluation",
+                ),
             ],
             _ => vec![],
         };
@@ -878,7 +1023,11 @@ developer_instructions = """
 
     /// Symlink skills to .claude/skills/ in worktree.
     fn symlink_skills_to_claude(&self, worktree: &Path) -> Result<()> {
-        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+        let skills_source = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("plugin")
+            .join("skills");
 
         if !skills_source.exists() {
             debug!("Skills source directory not found, skipping Claude skill symlinks");
@@ -886,7 +1035,8 @@ developer_instructions = """
         }
 
         let claude_skills_dir = worktree.join(".claude").join("skills");
-        fs::create_dir_all(&claude_skills_dir).context("Failed to create .claude/skills directory")?;
+        fs::create_dir_all(&claude_skills_dir)
+            .context("Failed to create .claude/skills directory")?;
 
         for entry in fs::read_dir(&skills_source)? {
             let entry = entry?;
@@ -896,10 +1046,7 @@ developer_instructions = """
                 continue;
             }
 
-            let skill_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let skill_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if skill_name.is_empty() {
                 continue;
@@ -913,14 +1060,18 @@ developer_instructions = """
 
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+                std::os::unix::fs::symlink(&path, &symlink_path).context(format!(
+                    "Failed to symlink skill {} to .claude/skills/",
+                    skill_name
+                ))?;
             }
 
             #[cfg(windows)]
             {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+                std::os::windows::fs::symlink_dir(&path, &symlink_path).context(format!(
+                    "Failed to symlink skill {} to .claude/skills/",
+                    skill_name
+                ))?;
             }
 
             debug!(
@@ -939,7 +1090,11 @@ developer_instructions = """
 
     /// Symlink role-relevant skills to .claude/skills/ in a target directory.
     fn symlink_skills_to_claude_for_role(&self, target: &Path, role: &str) -> Result<()> {
-        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+        let skills_source = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("plugin")
+            .join("skills");
 
         if !skills_source.exists() {
             debug!("Skills source directory not found, skipping Claude role symlinks");
@@ -947,7 +1102,8 @@ developer_instructions = """
         }
 
         let claude_skills_dir = target.join(".claude").join("skills");
-        fs::create_dir_all(&claude_skills_dir).context("Failed to create .claude/skills directory")?;
+        fs::create_dir_all(&claude_skills_dir)
+            .context("Failed to create .claude/skills directory")?;
 
         let prefix = format!("{}-", role);
         let shared_prefix = "shared-";
@@ -960,10 +1116,7 @@ developer_instructions = """
                 continue;
             }
 
-            let skill_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let skill_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if skill_name.is_empty() {
                 continue;
@@ -981,14 +1134,18 @@ developer_instructions = """
 
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+                std::os::unix::fs::symlink(&path, &symlink_path).context(format!(
+                    "Failed to symlink skill {} to .claude/skills/",
+                    skill_name
+                ))?;
             }
 
             #[cfg(windows)]
             {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+                std::os::windows::fs::symlink_dir(&path, &symlink_path).context(format!(
+                    "Failed to symlink skill {} to .claude/skills/",
+                    skill_name
+                ))?;
             }
 
             debug!(
@@ -1068,7 +1225,11 @@ developer_instructions = """
 
     /// Symlink skills to .agents/skills/ in worktree.
     fn symlink_skills_to_agents(&self, worktree: &Path) -> Result<()> {
-        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+        let skills_source = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("plugin")
+            .join("skills");
 
         if !skills_source.exists() {
             debug!("Skills source directory not found, skipping symlinks");
@@ -1076,7 +1237,8 @@ developer_instructions = """
         }
 
         let agents_skills_dir = worktree.join(".agents").join("skills");
-        fs::create_dir_all(&agents_skills_dir).context("Failed to create .agents/skills directory")?;
+        fs::create_dir_all(&agents_skills_dir)
+            .context("Failed to create .agents/skills directory")?;
 
         // Find all SKILL.md directories and symlink them
         for entry in fs::read_dir(&skills_source)? {
@@ -1087,10 +1249,7 @@ developer_instructions = """
                 continue;
             }
 
-            let skill_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let skill_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if skill_name.is_empty() {
                 continue;
@@ -1132,7 +1291,11 @@ developer_instructions = """
 
     /// Symlink role-relevant skills to .agents/skills/ in a target directory.
     fn symlink_skills_to_agents_for_role(&self, target: &Path, role: &str) -> Result<()> {
-        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+        let skills_source = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("plugin")
+            .join("skills");
 
         if !skills_source.exists() {
             debug!("Skills source directory not found, skipping role symlinks");
@@ -1140,7 +1303,8 @@ developer_instructions = """
         }
 
         let agents_skills_dir = target.join(".agents").join("skills");
-        fs::create_dir_all(&agents_skills_dir).context("Failed to create .agents/skills directory")?;
+        fs::create_dir_all(&agents_skills_dir)
+            .context("Failed to create .agents/skills directory")?;
 
         let prefix = format!("{}-", role);
         let shared_prefix = "shared-";
@@ -1153,10 +1317,7 @@ developer_instructions = """
                 continue;
             }
 
-            let skill_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let skill_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if skill_name.is_empty() {
                 continue;
@@ -1298,7 +1459,12 @@ developer_instructions = """
     }
 
     /// Generate Codex permission profiles (.codex/permissions.toml).
-    fn generate_codex_permissions(&self, target: &Path, shared: &Path, profile: &str) -> Result<()> {
+    fn generate_codex_permissions(
+        &self,
+        target: &Path,
+        shared: &Path,
+        profile: &str,
+    ) -> Result<()> {
         let codex_dir = target.join(".codex");
         fs::create_dir_all(&codex_dir)?;
 
@@ -1346,8 +1512,7 @@ enabled = false
             _ => String::new(),
         };
 
-        fs::write(&permissions_path, content)
-            .context("Failed to write permissions.toml")?;
+        fs::write(&permissions_path, content).context("Failed to write permissions.toml")?;
         info!(path = %permissions_path.display(), "Codex permissions profile generated");
         Ok(())
     }
@@ -1400,7 +1565,9 @@ mod tests {
         let backend_config = BackendConfig::claude("", worktree, &shared);
 
         let provisioner = Provisioner::new(dir.path());
-        provisioner.create_forge_settings(worktree, &backend_config).unwrap();
+        provisioner
+            .create_forge_settings(worktree, &backend_config)
+            .unwrap();
 
         let settings_path = worktree.join(".claude").join("settings.json");
         assert!(settings_path.exists());
@@ -1419,7 +1586,9 @@ mod tests {
         let backend_config = BackendConfig::claude("", &worktree, shared);
 
         let provisioner = Provisioner::new(dir.path());
-        provisioner.create_sentinel_settings(shared, &backend_config).unwrap();
+        provisioner
+            .create_sentinel_settings(shared, &backend_config)
+            .unwrap();
 
         let settings_path = shared.join(".claude").join("settings.json");
         assert!(settings_path.exists());
@@ -1454,14 +1623,27 @@ mod tests {
         let hooks_source = dir.path().join("hooks");
         let sentinel_src = hooks_source.join("sentinel");
         fs::create_dir_all(&sentinel_src).unwrap();
-        fs::write(sentinel_src.join("session_start.sh"), "#!/bin/bash\necho sentinel-start").unwrap();
+        fs::write(
+            sentinel_src.join("session_start.sh"),
+            "#!/bin/bash\necho sentinel-start",
+        )
+        .unwrap();
 
         let provisioner = Provisioner::new(dir.path());
-        provisioner.install_hook_scripts(&target, "sentinel", &hooks_source).unwrap();
+        provisioner
+            .install_hook_scripts(&target, "sentinel", &hooks_source)
+            .unwrap();
 
         // Verify the script was copied to .codex/hooks/sentinel/
-        let copied = target.join(".codex").join("hooks").join("sentinel").join("session_start.sh");
-        assert!(copied.exists(), "Hook script should be copied to .codex/hooks/sentinel/");
+        let copied = target
+            .join(".codex")
+            .join("hooks")
+            .join("sentinel")
+            .join("session_start.sh");
+        assert!(
+            copied.exists(),
+            "Hook script should be copied to .codex/hooks/sentinel/"
+        );
 
         let content = fs::read_to_string(&copied).unwrap();
         assert_eq!(content, "#!/bin/bash\necho sentinel-start");
@@ -1475,13 +1657,31 @@ mod tests {
         let hooks_source = dir.path().join("hooks");
         let sentinel_src = hooks_source.join("sentinel");
         fs::create_dir_all(&sentinel_src).unwrap();
-        fs::write(sentinel_src.join("session_start.sh"), "#!/bin/bash\necho sentinel").unwrap();
-        fs::write(sentinel_src.join("pre_bash_readonly_guard.sh"), "#!/bin/bash\necho guard").unwrap();
-        fs::write(sentinel_src.join("post_write_validate.sh"), "#!/bin/bash\necho validate").unwrap();
-        fs::write(sentinel_src.join("stop_require_eval.sh"), "#!/bin/bash\necho eval").unwrap();
+        fs::write(
+            sentinel_src.join("session_start.sh"),
+            "#!/bin/bash\necho sentinel",
+        )
+        .unwrap();
+        fs::write(
+            sentinel_src.join("pre_bash_readonly_guard.sh"),
+            "#!/bin/bash\necho guard",
+        )
+        .unwrap();
+        fs::write(
+            sentinel_src.join("post_write_validate.sh"),
+            "#!/bin/bash\necho validate",
+        )
+        .unwrap();
+        fs::write(
+            sentinel_src.join("stop_require_eval.sh"),
+            "#!/bin/bash\necho eval",
+        )
+        .unwrap();
 
         let provisioner = Provisioner::new(dir.path());
-        let hooks_json = provisioner.build_codex_hooks_json("sentinel", &hooks_source).unwrap();
+        let hooks_json = provisioner
+            .build_codex_hooks_json("sentinel", &hooks_source)
+            .unwrap();
 
         let hooks = hooks_json["hooks"].as_object().unwrap();
 
@@ -1505,7 +1705,9 @@ mod tests {
         }
 
         // Verify specific expected relative paths
-        let session_cmd = hooks["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        let session_cmd = hooks["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         assert_eq!(session_cmd, "hooks/sentinel/session_start.sh");
     }
 }

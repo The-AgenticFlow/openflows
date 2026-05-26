@@ -408,16 +408,24 @@ impl ForgeSentinelPair {
                     &config.shared,
                 )
                 .with_default_backend(cli_backend),
-                (Some(redis_url), None) => {
-                    ProcessManager::with_redis(&config.github_token, redis_url, &config.worktree, &config.shared)
-                        .with_default_backend(cli_backend)
-                }
-                (None, Some(proxy_url)) => {
-                    ProcessManager::with_proxy(&config.github_token, None, proxy_url, &config.worktree, &config.shared)
-                        .with_default_backend(cli_backend)
-                }
+                (Some(redis_url), None) => ProcessManager::with_redis(
+                    &config.github_token,
+                    redis_url,
+                    &config.worktree,
+                    &config.shared,
+                )
+                .with_default_backend(cli_backend),
+                (None, Some(proxy_url)) => ProcessManager::with_proxy(
+                    &config.github_token,
+                    None,
+                    proxy_url,
+                    &config.worktree,
+                    &config.shared,
+                )
+                .with_default_backend(cli_backend),
                 (None, None) => {
-                    ProcessManager::new(&config.github_token, &config.worktree, &config.shared).with_default_backend(cli_backend)
+                    ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
+                        .with_default_backend(cli_backend)
                 }
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
@@ -1553,8 +1561,7 @@ impl ForgeSentinelPair {
             // Spawning is deferred — record this so the event loop knows to
             // wait rather than spinning on the "FORGE exited" branch.
             self.sentinel_tracker = Some(SentinelState::Deferred {
-                retry_after: Instant::now()
-                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
             });
             debug!("SENTINEL plan review spawn deferred — retry interval not yet elapsed");
             return Ok(());
@@ -1601,8 +1608,7 @@ impl ForgeSentinelPair {
             // Spawning is deferred — record this so the event loop knows to
             // wait rather than spinning.
             self.sentinel_tracker = Some(SentinelState::Deferred {
-                retry_after: Instant::now()
-                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
             });
             debug!(
                 segment,
@@ -1659,8 +1665,7 @@ impl ForgeSentinelPair {
             // Spawning is deferred — record this so the event loop knows to
             // wait rather than spinning.
             self.sentinel_tracker = Some(SentinelState::Deferred {
-                retry_after: Instant::now()
-                    + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
             });
             debug!("SENTINEL final review spawn deferred — retry interval not yet elapsed");
             return Ok(());
@@ -2099,7 +2104,8 @@ impl ForgeSentinelPair {
                     PairOutcome::Blocked {
                         reason: format!(
                             "Unrecognized STATUS.json status: {} (normalized: {})",
-                            status.effective_status(), normalized
+                            status.effective_status(),
+                            normalized
                         ),
                         blockers: vec![],
                     }
@@ -2582,9 +2588,7 @@ mod tests {
 
         assert_eq!(config.pair_id, "pair-1");
         assert!(config.worktree.starts_with("/project/worktrees/"));
-        assert!(config
-            .shared
-            .ends_with("worktrees/pair-1/.pair-shared"));
+        assert!(config.shared.ends_with("worktrees/pair-1/.pair-shared"));
         assert!(config.redis_url.is_none());
     }
 

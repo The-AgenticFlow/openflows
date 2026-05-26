@@ -44,7 +44,7 @@ impl Flow {
 
     /// Register a node with its outgoing route table.
     ///
-    /// ```no_run
+    /// ```text
     /// // Example (agent crates wired in binary/main.rs):
     /// // flow.add_node("nexus", Arc::new(NexusNode),
     /// //     vec![

@@ -128,9 +128,8 @@ impl WorkspaceManager {
         }
 
         // Detect the default branch instead of hardcoding "main"
-        let default_branch = crate::worktree::WorktreeManager::detect_default_branch(
-            &self.workspace_dir,
-        );
+        let default_branch =
+            crate::worktree::WorktreeManager::detect_default_branch(&self.workspace_dir);
         let output = Command::new("git")
             .args(["pull", "--rebase", "origin", &default_branch])
             .current_dir(&self.workspace_dir)

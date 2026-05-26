@@ -135,7 +135,10 @@ async fn main() -> Result<()> {
         .join("registry.json");
 
     let nexus = Arc::new(NexusNode::new(persona_path, registry_path.clone()));
-    let forge_pair = Arc::new(ForgePairNode::new_with_registry(&workspace_dir, registry_path.clone()));
+    let forge_pair = Arc::new(ForgePairNode::new_with_registry(
+        &workspace_dir,
+        registry_path.clone(),
+    ));
     let vessel = Arc::new(VesselNode::from_env());
     let lore = Arc::new(LoreNode::new_with_registry(
         &workspace_dir,

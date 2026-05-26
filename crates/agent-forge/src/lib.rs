@@ -223,12 +223,20 @@ impl BatchNode for ForgeNode {
                 let mut child = tokio::process::Command::new(&cli_binary)
                     .args(["exec", "--full-auto"])
                     .arg("-m")
-                    .arg(std::env::var("OPENAI_MODEL")
-                        .or_else(|_| std::env::var("FIREWORKS_MODEL"))
-                        .unwrap_or_else(|_| "gpt-4o-mini".to_string()))
+                    .arg(
+                        std::env::var("OPENAI_MODEL")
+                            .or_else(|_| std::env::var("FIREWORKS_MODEL"))
+                            .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+                    )
                     .current_dir(&worktree_path)
-                    .env("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").unwrap_or_default())
-                    .env("OPENAI_BASE_URL", std::env::var("OPENAI_BASE_URL").unwrap_or_default())
+                    .env(
+                        "OPENAI_API_KEY",
+                        std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+                    )
+                    .env(
+                        "OPENAI_BASE_URL",
+                        std::env::var("OPENAI_BASE_URL").unwrap_or_default(),
+                    )
                     .stdin(std::process::Stdio::piped())
                     .stdout(log_file)
                     .stderr(log_file_err)
@@ -843,10 +851,7 @@ impl ForgePairNode {
         // Check for commits beyond the default branch.
         // First try the local branch name, then fall back to the remote-tracking
         // ref (origin/{default_branch}) which is more reliable after fetches.
-        let has_commits = Self::has_commits_beyond_branch(
-            &worktree_path,
-            default_branch,
-        );
+        let has_commits = Self::has_commits_beyond_branch(&worktree_path, default_branch);
 
         if !has_commits {
             return Err(anyhow!(
@@ -939,7 +944,9 @@ impl ForgePairNode {
                                 bare_stderr
                             ));
                         }
-                    } else if retry_stderr.contains("stale info") || retry_stderr.contains("rejected") {
+                    } else if retry_stderr.contains("stale info")
+                        || retry_stderr.contains("rejected")
+                    {
                         // force-with-lease rejected due to remote changes — fall back to bare --force
                         warn!(worker = worker_id, branch = %branch_name, "force-with-lease rejected — falling back to --force");
                         let bare_force = StdCommand::new("git")
@@ -1334,10 +1341,7 @@ impl ForgePairNode {
     /// handles command failures (exit code != 0) instead of treating
     /// them as "no commits" — a failed `git log` produces empty stdout
     /// but the error is on stderr, which the old code silently ignored.
-    fn has_commits_beyond_branch(
-        worktree_path: &std::path::Path,
-        default_branch: &str,
-    ) -> bool {
+    fn has_commits_beyond_branch(worktree_path: &std::path::Path, default_branch: &str) -> bool {
         use std::process::Command as StdCommand;
 
         // Try local branch first
@@ -1751,7 +1755,9 @@ impl ForgePairNode {
                 .ok()
                 .and_then(|o| {
                     if o.status.success() {
-                        String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                        String::from_utf8(o.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
                     } else {
                         None
                     }
@@ -1779,7 +1785,10 @@ impl ForgePairNode {
 
             match remove_output {
                 Ok(o) if o.status.success() => {
-                    info!(worker = worker_id, "Contaminated worktree removed successfully");
+                    info!(
+                        worker = worker_id,
+                        "Contaminated worktree removed successfully"
+                    );
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
@@ -1978,8 +1987,8 @@ impl BatchNode for ForgePairNode {
                         }
                         Err(e) => {
                             let error_detail = format!("{:#}", e);
-                            let is_secret_rejection = error_detail.contains("GH013")
-                                || error_detail.contains("secret");
+                            let is_secret_rejection =
+                                error_detail.contains("GH013") || error_detail.contains("secret");
 
                             // If the push was rejected due to secrets in git
                             // history, destroy the contaminated worktree and
@@ -2029,7 +2038,8 @@ impl BatchNode for ForgePairNode {
                                 "Push failed — writing ERROR_FEEDBACK.md for FORGE self-repair"
                             );
 
-                            let shared_path = self.workspace_root
+                            let shared_path = self
+                                .workspace_root
                                 .join("worktrees")
                                 .join(&worker_id)
                                 .join(".pair-shared");

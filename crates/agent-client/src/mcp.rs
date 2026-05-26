@@ -239,13 +239,18 @@ impl McpSession {
                     Ok(Some(exit_status)) => {
                         bail!(
                             "MCP request '{}' (id={}) timed out after {}s — server exited: {}",
-                            method, id, timeout.as_secs(), exit_status
+                            method,
+                            id,
+                            timeout.as_secs(),
+                            exit_status
                         );
                     }
                     Ok(None) => {
                         // Process alive but unresponsive — likely session timeout
                         warn!(
-                            method, id, timeout_secs = timeout.as_secs(),
+                            method,
+                            id,
+                            timeout_secs = timeout.as_secs(),
                             "MCP server alive but unresponsive — killing subprocess"
                         );
                         let _ = self.child.kill().await;
@@ -254,14 +259,19 @@ impl McpSession {
                              server is alive but not responding (session likely timed out). \
                              The GitHub MCP server disconnects after ~10s of inactivity; \
                              consider shortening LLM calls or adding a keep-alive mechanism.",
-                            method, id, timeout.as_secs()
+                            method,
+                            id,
+                            timeout.as_secs()
                         );
                     }
                     Err(e) => {
                         bail!(
                             "MCP request '{}' (id={}) timed out after {}s — \
                              could not check process status: {}",
-                            method, id, timeout.as_secs(), e
+                            method,
+                            id,
+                            timeout.as_secs(),
+                            e
                         );
                     }
                 }

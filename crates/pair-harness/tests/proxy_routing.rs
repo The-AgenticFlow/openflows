@@ -89,8 +89,13 @@ fn test_proxy_api_key_from_env() {
     let shared = dir.path().join("shared");
     std::fs::create_dir_all(&worktree).unwrap();
     std::fs::create_dir_all(&shared).unwrap();
-    let manager =
-        pair_harness::process::ProcessManager::with_proxy("ghp_test", None, "http://proxy:4000", &worktree, &shared);
+    let manager = pair_harness::process::ProcessManager::with_proxy(
+        "ghp_test",
+        None,
+        "http://proxy:4000",
+        &worktree,
+        &shared,
+    );
     assert_eq!(manager.proxy_url(), Some("http://proxy:4000"));
     assert!(manager.proxy_api_key().is_none());
 }
