@@ -384,10 +384,21 @@ pub struct ForgeSentinelPair {
     /// Counts consecutive rapid FORGE exits (<30s). Used to break infinite
     /// respawn loops when progress files are stale from a previous lifecycle.
     rapid_exit_count: u32,
+    /// Counts consecutive PR-mode FORGE spawns that exit without writing
+    /// STATUS.json.  Codex's sandbox restricts git push / network access,
+    /// so FORGE may be unable to create a PR directly.  After
+    /// MAX_PR_SPAWN_ATTEMPTS failures, return Blocked so the external
+    /// push_and_create_pr() fallback can handle it.
+    pr_spawn_count: u32,
 }
 
 /// Maximum consecutive rapid FORGE exits before giving up.
 const MAX_RAPID_EXITS: u32 = 5;
+
+/// Maximum consecutive PR-mode FORGE spawns before giving up and delegating
+/// to the external push_and_create_pr() fallback.  Codex's sandbox restricts
+/// git push and network access, so FORGE may be unable to create a PR directly.
+const MAX_PR_SPAWN_ATTEMPTS: u32 = 3;
 
 impl ForgeSentinelPair {
     /// Create a new ForgeSentinelPair.
@@ -444,6 +455,7 @@ impl ForgeSentinelPair {
             contract_timeout: None,
             error_feedback_attempts: 0,
             rapid_exit_count: 0,
+            pr_spawn_count: 0,
         }
     }
 
@@ -813,7 +825,10 @@ impl ForgeSentinelPair {
                             self.final_approved = true;
                             info!("Final review APPROVED - respawning FORGE to create PR");
                             self.process.kill(forge).await?;
-                            *forge = self.spawn_forge_for_pr().await?;
+                            match self.spawn_forge_for_pr_or_blocked().await? {
+                                Ok(child) => *forge = child,
+                                Err(outcome) => return Ok(outcome),
+                            }
                         } else {
                             info!("Final review REJECTED - FORGE must fix issues");
                         }
@@ -925,7 +940,10 @@ impl ForgeSentinelPair {
                             if verdict == "APPROVED" {
                                 self.final_approved = true;
                                 info!("Final review APPROVED (drained) - respawning FORGE to create PR");
-                                *forge = self.spawn_forge_for_pr().await?;
+                                match self.spawn_forge_for_pr_or_blocked().await? {
+                                    Ok(child) => *forge = child,
+                                    Err(outcome) => return Ok(outcome),
+                                }
                             }
                         }
                         FsEvent::StatusJsonWritten => {
@@ -986,8 +1004,24 @@ impl ForgeSentinelPair {
                     // Determine whether this is a genuine startup error or a
                     // legitimate one-shot `codex exec` completion.
                     // Genuine startup error = quick exit + stale progress + no sentinel active
+                    // + NOT resuming with an approved plan or final approval.
+                    // When plan_approved or final_approved is true, stale progress files
+                    // are expected (they're from a legitimate previous lifecycle), so a
+                    // quick FORGE exit should fall through to lifecycle logic rather than
+                    // being treated as a startup error.
                     let is_genuine_startup_error =
-                        forge_uptime < 30 && !self.reset.has_handoff() && !sentinel_active && !fresh_progress;
+                        forge_uptime < 30 && !self.reset.has_handoff() && !sentinel_active && !fresh_progress && !self.plan_approved && !self.final_approved;
+
+                    debug!(
+                        forge_uptime,
+                        has_handoff = self.reset.has_handoff(),
+                        sentinel_active,
+                        fresh_progress,
+                        plan_approved = self.plan_approved,
+                        final_approved = self.final_approved,
+                        is_genuine_startup_error,
+                        "FORGE exit diagnostic: startup error decision factors"
+                    );
 
                     if is_genuine_startup_error {
                         // Stale progress files from a previous lifecycle + quick exit.
@@ -1053,15 +1087,35 @@ impl ForgeSentinelPair {
                         } else if worklog_exists {
                             // Implementation in progress - check segment status
                             if self.all_segments_approved().await? {
-                                if !final_review_exists && !self.final_approved {
+                                if self.final_approved {
+                                    // Final review was APPROVED (via FsEvent or resume) —
+                                    // FORGE should create the PR, not continue implementation.
+                                    info!("FORGE exited with final approval — respawning for PR creation");
+                                    match self.spawn_forge_for_pr_or_blocked().await? {
+                                        Ok(child) => *forge = child,
+                                        Err(outcome) => return Ok(outcome),
+                                    }
+                                } else if !final_review_exists {
+                                    // No final review yet — spawn SENTINEL for final review
                                     info!("FORGE exited, all segments approved - spawning SENTINEL for final review");
                                     self.spawn_sentinel_for_final().await?;
                                 } else {
-                                    // Final review already approved (CI fix / conflict rework)
-                                    // or already exists — respawn FORGE to continue rework
-                                    info!("FORGE exited with final approval already granted — respawning to continue rework");
-                                    self.sentinel_retries.reset_all();
-                                    *forge = self.spawn_forge_resume().await?;
+                                    // final-review.md exists — check the verdict to determine
+                                    // next action.  Do NOT assume approval just because the file
+                                    // exists — it may contain REJECTED.
+                                    let verdict = self.read_final_review_verdict().await?;
+                                    if verdict == "APPROVED" {
+                                        self.final_approved = true;
+                                        info!("FORGE exited, final review APPROVED (discovered at exit) — respawning for PR creation");
+                                        match self.spawn_forge_for_pr_or_blocked().await? {
+                                            Ok(child) => *forge = child,
+                                            Err(outcome) => return Ok(outcome),
+                                        }
+                                    } else {
+                                        info!(verdict = %verdict, "FORGE exited, final review not approved — respawning to fix issues");
+                                        self.sentinel_retries.reset_all();
+                                        *forge = self.spawn_forge_resume().await?;
+                                    }
                                 }
                             } else if let Some(segment_n) = self.next_segment_to_eval().await? {
                                 info!(
@@ -1102,7 +1156,12 @@ impl ForgeSentinelPair {
                         );
                         self.rapid_exit_count = 0;
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                    } else if forge_uptime < 30 {
+                    } else if forge_uptime < 30 && !self.plan_approved && !self.final_approved {
+                        // Quick exit with no progress AND not resuming from an approved
+                        // plan or final approval — likely a genuine startup error.
+                        // When plan_approved/final_approved is true, the pair is resuming
+                        // and the lack of fresh progress files is expected; fall through
+                        // to the lifecycle logic below instead of treating as startup error.
                         self.rapid_exit_count += 1;
                         if self.rapid_exit_count >= MAX_RAPID_EXITS {
                             error!(
@@ -1126,6 +1185,18 @@ impl ForgeSentinelPair {
                         );
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
+                    } else if forge_uptime < 30 && (self.plan_approved || self.final_approved) {
+                        // Quick exit but pair is resuming with approved plan or final approval.
+                        // No fresh progress files, but this is expected on resume — fall through
+                        // to lifecycle logic to determine next action (spawn sentinel, respawn, etc.)
+                        info!(
+                            elapsed_secs = forge_uptime,
+                            plan_approved = self.plan_approved,
+                            final_approved = self.final_approved,
+                            "FORGE exited quickly on resume with approved plan/approval — proceeding with lifecycle logic"
+                        );
+                        self.rapid_exit_count = 0;
+                        // Fall through to lifecycle logic below
                     } else {
                         // Ran for a while but produced nothing - synthesize handoff and respawn
                         warn!("FORGE exited unexpectedly after {}s without progress - synthesizing handoff", forge_uptime);
@@ -1552,16 +1623,43 @@ impl ForgeSentinelPair {
     }
 
     /// Spawn FORGE process for PR creation after final approval.
-    async fn spawn_forge_for_pr(&mut self) -> Result<Child> {
+    ///
+    /// Tracks consecutive PR-mode spawns.  After MAX_PR_SPAWN_ATTEMPTS failures
+    /// (FORGE exits without writing STATUS.json), returns a Blocked outcome so
+    /// the external `push_and_create_pr()` fallback in ForgeNode can handle it.
+    /// This is necessary because codex's sandbox restricts git push and network
+    /// access, making FORGE unable to create a PR directly.
+    async fn spawn_forge_for_pr_or_blocked(&mut self) -> Result<Result<Child, PairOutcome>> {
+        self.pr_spawn_count += 1;
+        if self.pr_spawn_count > MAX_PR_SPAWN_ATTEMPTS {
+            warn!(
+                attempts = self.pr_spawn_count,
+                "FORGE failed to create PR after {} attempts — delegating to external push_and_create_pr()",
+                self.pr_spawn_count
+            );
+            return Ok(Err(PairOutcome::Blocked {
+                reason: "Work complete but PR not created - needs push/PR creation".to_string(),
+                blockers: vec![],
+            }));
+        }
+        info!(
+            attempt = self.pr_spawn_count,
+            max = MAX_PR_SPAWN_ATTEMPTS,
+            "Spawning FORGE for PR creation (attempt {}/{})",
+            self.pr_spawn_count,
+            MAX_PR_SPAWN_ATTEMPTS,
+        );
         self.forge_spawn_time = Instant::now();
-        self.process
+        let child = self
+            .process
             .spawn_forge_for_pr(
                 &self.config.pair_id,
                 &self.ticket_id,
                 &self.config.worktree,
                 &self.config.shared,
             )
-            .await
+            .await?;
+        Ok(Ok(child))
     }
 
     /// Resolve the effective timeout for a SENTINEL evaluation based on mode and contract.
