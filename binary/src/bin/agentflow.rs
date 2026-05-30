@@ -31,25 +31,34 @@ async fn main() -> Result<()> {
     // Startup diagnostics
     let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| "claude".to_string());
     let has_fireworks = std::env::var("FIREWORKS_API_KEY").is_ok();
+    let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
     let has_proxy = std::env::var("PROXY_URL").is_ok();
     let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
 
     info!("═══ AgentFlow Configuration ═══");
     info!("  CLI Backend: {}", default_cli);
-    if default_cli == "codex" && has_fireworks {
-        info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
-    } else if default_cli == "claude" && has_anthropic && !has_proxy {
-        info!("  LLM Mode: Claude + Direct Anthropic Key");
-    } else if has_proxy {
-        info!(
-            "  LLM Mode: Claude + Proxy at {}",
-            std::env::var("PROXY_URL").unwrap_or_default()
-        );
-    } else {
-        warn!("  No valid LLM configuration detected!");
-        warn!("    For Codex: set FIREWORKS_API_KEY or OPENAI_API_KEY");
-        warn!("    For Claude: set ANTHROPIC_API_KEY or PROXY_URL");
-        anyhow::bail!("Invalid LLM configuration — see warnings above");
+    match default_cli.as_str() {
+        "codex" if has_fireworks => {
+            info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
+        }
+        "codex" if has_openai => {
+            info!("  LLM Mode: Codex + OpenAI (direct — no proxy needed)");
+        }
+        "claude" if has_anthropic && !has_proxy => {
+            info!("  LLM Mode: Claude + Direct Anthropic Key");
+        }
+        "claude" if has_proxy => {
+            info!(
+                "  LLM Mode: Claude + Proxy at {}",
+                std::env::var("PROXY_URL").unwrap_or_default()
+            );
+        }
+        _ => {
+            warn!("  No valid LLM configuration detected!");
+            warn!("    For Codex: set FIREWORKS_API_KEY or OPENAI_API_KEY");
+            warn!("    For Claude: set ANTHROPIC_API_KEY or PROXY_URL");
+            anyhow::bail!("Invalid LLM configuration — see warnings above");
+        }
     }
 
     let cli_path = match default_cli.as_str() {
