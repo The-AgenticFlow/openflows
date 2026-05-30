@@ -1,3 +1,8 @@
+---
+name: sentinel-criteria
+description: Evaluation criteria for SENTINEL — the five criteria (correctness, test coverage, standards, quality, no regressions) and severity levels
+---
+
 # SENTINEL Evaluation Criteria
 
 ## The five criteria - all must pass for any approval

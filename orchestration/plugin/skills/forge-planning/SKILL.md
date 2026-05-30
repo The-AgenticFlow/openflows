@@ -1,3 +1,8 @@
+---
+name: forge-planning
+description: Planning skill for FORGE — writing PLAN.md, segment sizing, and contract negotiation
+---
+
 # FORGE Planning Skill
 
 ## Writing PLAN.md

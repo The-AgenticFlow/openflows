@@ -1,3 +1,8 @@
+---
+name: forge-coding
+description: Coding skill for FORGE — implementation workflow, testing discipline, segment submission, and PR creation
+---
+
 # FORGE Coding Skill
 
 ## Your role

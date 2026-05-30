@@ -1,3 +1,8 @@
+---
+name: sentinel-review
+description: Review skill for SENTINEL — plan review, segment evaluation, and final review workflow
+---
+
 # SENTINEL Review Skill
 
 ## Your role

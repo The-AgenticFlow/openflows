@@ -970,12 +970,28 @@ impl ForgeSentinelPair {
                     // FORGE made progress - determine what SENTINEL action is needed
                     //
                     // IMPORTANT: progress files may be stale from a previous lifecycle.
-                    // If FORGE ran for less than 30 seconds, it almost certainly didn't
-                    // complete a segment — it likely crashed on startup.  Treat this as
-                    // a startup error rather than "segment work completed" to avoid an
-                    // infinite respawn loop.
+                    // If FORGE ran for less than 30 seconds, it *might* be a startup
+                    // error — but it could also be a legitimate `codex exec` completion
+                    // (one-shot execution that writes PLAN.md and exits normally).
+                    //
+                    // We now check three things to distinguish real startup errors from
+                    // normal one-shot exits:
+                    // 1. Is SENTINEL currently active? (FORGE wrote PLAN.md, SENTINEL is reviewing)
+                    // 2. Are progress files FRESH? (modified after this FORGE was spawned)
+                    // 3. Only then fall through to the "stale / startup error" path
                     let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
-                    if forge_uptime < 30 && !self.reset.has_handoff() {
+                    let sentinel_active = self.sentinel_tracker.is_some();
+                    let fresh_progress = self.has_fresh_progress_files();
+
+                    // Determine whether this is a genuine startup error or a
+                    // legitimate one-shot `codex exec` completion.
+                    // Genuine startup error = quick exit + stale progress + no sentinel active
+                    let is_genuine_startup_error =
+                        forge_uptime < 30 && !self.reset.has_handoff() && !sentinel_active && !fresh_progress;
+
+                    if is_genuine_startup_error {
+                        // Stale progress files from a previous lifecycle + quick exit.
+                        // This is likely a real startup error.
                         self.rapid_exit_count += 1;
                         if self.rapid_exit_count >= MAX_RAPID_EXITS {
                             error!(
@@ -999,11 +1015,24 @@ impl ForgeSentinelPair {
                         // Treat the same as "no progress" quick exit: retry with backoff
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
-                    } else if self.sentinel_tracker.is_some() {
-                        info!("FORGE exited but SENTINEL is active - waiting for completion");
+                    } else if sentinel_active {
+                        // SENTINEL is actively reviewing FORGE's output (e.g. PLAN.md).
+                        // FORGE's quick exit is expected with `codex exec` — it wrote
+                        // PLAN.md, and now SENTINEL is processing the plan review.
+                        info!(
+                            elapsed_secs = forge_uptime,
+                            fresh = fresh_progress,
+                            "FORGE exited but SENTINEL is active — waiting for SENTINEL to complete"
+                        );
+                        self.rapid_exit_count = 0;
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } else {
-                        // FORGE ran for a healthy duration — reset rapid exit counter
+                        // Either:
+                        // - FORGE ran for a healthy duration (>= 30s), OR
+                        // - FORGE exited quickly with FRESH progress files (normal codex exec
+                        //   one-shot completion — e.g. wrote PLAN.md and exited), OR
+                        // - FORGE had a handoff (context reset)
+                        // In all cases, reset rapid exit counter and proceed with lifecycle logic.
                         self.rapid_exit_count = 0;
 
                         // Check the lifecycle phase and spawn SENTINEL if needed
@@ -1062,7 +1091,18 @@ impl ForgeSentinelPair {
                 } else {
                     // No progress files - check if FORGE just started and may not have had time
                     let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
-                    if forge_uptime < 30 {
+
+                    // If SENTINEL is active, FORGE may have been respawned while
+                    // waiting for SENTINEL review. A quick exit without progress
+                    // is expected in this case — don't count as rapid exit.
+                    if self.sentinel_tracker.is_some() {
+                        info!(
+                            elapsed_secs = forge_uptime,
+                            "FORGE exited without progress but SENTINEL is active — waiting for SENTINEL"
+                        );
+                        self.rapid_exit_count = 0;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else if forge_uptime < 30 {
                         self.rapid_exit_count += 1;
                         if self.rapid_exit_count >= MAX_RAPID_EXITS {
                             error!(
@@ -2179,6 +2219,47 @@ impl ForgeSentinelPair {
         let worklog_path = self.config.shared.join("WORKLOG.md");
 
         plan_path.exists() || worklog_path.exists()
+    }
+
+    /// Check if progress files were modified AFTER the current FORGE session
+    /// was spawned. This distinguishes fresh progress (FORGE wrote them just
+    /// now) from stale progress (left over from a previous lifecycle).
+    ///
+    /// When `codex exec` processes a prompt, writes PLAN.md, and exits
+    /// normally in ~14 seconds, the progress files ARE fresh — the rapid
+    /// exit detector should NOT treat this as a startup error.
+    fn has_fresh_progress_files(&self) -> bool {
+        let plan_path = self.config.shared.join("PLAN.md");
+        let worklog_path = self.config.shared.join("WORKLOG.md");
+
+        // How long has this FORGE session been alive?
+        let uptime = self.forge_spawn_time.elapsed();
+
+        let is_fresh = |path: &std::path::Path| {
+            if !path.exists() {
+                return false;
+            }
+            // Check if the file was modified within the FORGE uptime window.
+            // A file modified after FORGE was spawned is fresh progress.
+            // Allow a small tolerance (2s) for filesystem timestamp granularity.
+            match std::fs::metadata(path).and_then(|m| m.modified()) {
+                Ok(mtime) => {
+                    match mtime.elapsed() {
+                        Ok(file_age) => {
+                            // File age should be <= uptime + tolerance
+                            file_age <= uptime + std::time::Duration::from_secs(2)
+                        }
+                        Err(_) => {
+                            // mtime is in the future (clock skew) — treat as fresh
+                            true
+                        }
+                    }
+                }
+                Err(_) => false,
+            }
+        };
+
+        is_fresh(&plan_path) || is_fresh(&worklog_path)
     }
 
     /// Check if we're waiting for SENTINEL output (plan reviewed but no contract).
