@@ -9,6 +9,7 @@ use std::io;
 use crate::util::env_check;
 use crate::util::theme::Theme;
 use crate::widgets::check::{CheckList, CheckState};
+use config::CliBackend;
 
 #[derive(Default)]
 pub struct EnvStep {
@@ -18,6 +19,7 @@ pub struct EnvStep {
 impl EnvStep {
     pub fn new() -> Self {
         let mut checks = Vec::new();
+        let selected_backend = env_check::selected_cli_backend();
 
         if let Some(version) = env_check::check_rustc() {
             checks.push((format!("Rust {}", version), CheckState::Pass));
@@ -40,13 +42,27 @@ impl EnvStep {
             ));
         }
 
-        if let Some(version) = env_check::check_claude() {
-            checks.push((format!("Claude Code CLI {}", version), CheckState::Pass));
-        } else {
-            checks.push((
-                "Claude Code CLI not found (required)".to_string(),
-                CheckState::Fail,
-            ));
+        match selected_backend {
+            CliBackend::Claude => {
+                if let Some(version) = env_check::check_claude() {
+                    checks.push((format!("Claude Code CLI {}", version), CheckState::Pass));
+                } else {
+                    checks.push((
+                        "Claude Code CLI not found (required)".to_string(),
+                        CheckState::Fail,
+                    ));
+                }
+            }
+            CliBackend::Codex => {
+                if let Some(version) = env_check::check_codex() {
+                    checks.push((format!("Codex CLI {}", version), CheckState::Pass));
+                } else {
+                    checks.push((
+                        "Codex CLI not found (required)".to_string(),
+                        CheckState::Fail,
+                    ));
+                }
+            }
         }
 
         Self { checks }

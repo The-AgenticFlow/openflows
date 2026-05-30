@@ -52,32 +52,6 @@ else
     error "Node.js is not installed. Install from: https://nodejs.org/"
 fi
 
-# Check Claude Code CLI
-# First check CLAUDE_PATH from .env, then fallback to system PATH
-CLAUDE_PATH=""
-if [ -f ".env" ] && grep -q "^CLAUDE_PATH=" .env; then
-    CLAUDE_PATH=$(grep "^CLAUDE_PATH=" .env | cut -d'=' -f2-)
-fi
-
-if [ -n "$CLAUDE_PATH" ] && [ "$CLAUDE_PATH" != "claude" ]; then
-    # CLAUDE_PATH is set to a specific path
-    if [ -x "$CLAUDE_PATH" ]; then
-        CLAUDE_VERSION=$("$CLAUDE_PATH" --version 2>&1 || echo "unknown")
-        success "Claude Code CLI is installed at $CLAUDE_PATH ($CLAUDE_VERSION)"
-    else
-        error "CLAUDE_PATH is set to '$CLAUDE_PATH' but the file doesn't exist or isn't executable"
-        echo "    See docs/setup-claude-cli.md for setup instructions"
-    fi
-elif command -v claude &> /dev/null; then
-    # Claude is in system PATH
-    CLAUDE_VERSION=$(claude --version 2>&1 || echo "unknown")
-    success "Claude Code CLI is installed in PATH ($CLAUDE_VERSION)"
-else
-    error "Claude Code CLI is not installed. Install from: https://claude.ai/download"
-    echo "    Or set CLAUDE_PATH in .env to the full path of the claude binary"
-    echo "    See docs/setup-claude-cli.md for setup instructions"
-fi
-
 # Check Git
 if command -v git &> /dev/null; then
     GIT_VERSION=$(git --version | awk '{print $3}')
@@ -101,12 +75,70 @@ echo "----------------------------------------"
 # Check if .env exists
 if [ -f ".env" ]; then
     success ".env file exists"
+
+    DEFAULT_CLI="claude"
+    if grep -q "^DEFAULT_CLI=" .env; then
+        DEFAULT_CLI=$(grep "^DEFAULT_CLI=" .env | cut -d'=' -f2-)
+    fi
+    success "DEFAULT_CLI is set to: $DEFAULT_CLI"
     
-    # Check each required variable
-    if grep -q "^ANTHROPIC_API_KEY=" .env && ! grep -q "^ANTHROPIC_API_KEY=$" .env && ! grep -q "^ANTHROPIC_API_KEY=sk-ant-xxx" .env; then
-        success "ANTHROPIC_API_KEY is set"
+    # Check the selected CLI backend and its required auth key
+    if [ "$DEFAULT_CLI" = "codex" ]; then
+        CODEX_PATH=""
+        if grep -q "^CODEX_PATH=" .env; then
+            CODEX_PATH=$(grep "^CODEX_PATH=" .env | cut -d'=' -f2-)
+        fi
+
+        if [ -n "$CODEX_PATH" ] && [ "$CODEX_PATH" != "codex" ]; then
+            if [ -x "$CODEX_PATH" ]; then
+                CODEX_VERSION=$("$CODEX_PATH" --version 2>&1 || echo "unknown")
+                success "Codex CLI is installed at $CODEX_PATH ($CODEX_VERSION)"
+            else
+                error "CODEX_PATH is set to '$CODEX_PATH' but the file doesn't exist or isn't executable"
+                echo "    Set CODEX_PATH to the full path of the codex binary"
+            fi
+        elif command -v codex &> /dev/null; then
+            CODEX_VERSION=$(codex --version 2>&1 || echo "unknown")
+            success "Codex CLI is installed in PATH ($CODEX_VERSION)"
+        else
+            error "Codex CLI is not installed. Install it or set CODEX_PATH in .env"
+        fi
+
+        if grep -q "^OPENAI_API_KEY=" .env && ! grep -q "^OPENAI_API_KEY=$" .env && ! grep -q "^OPENAI_API_KEY=sk-xxx" .env; then
+            success "OPENAI_API_KEY is set for Codex"
+        elif grep -q "^FIREWORKS_API_KEY=" .env && ! grep -q "^FIREWORKS_API_KEY=$" .env && ! grep -q "^FIREWORKS_API_KEY=your_fireworks_api_key_here" .env; then
+            success "FIREWORKS_API_KEY is set for Codex"
+        else
+            error "OPENAI_API_KEY or FIREWORKS_API_KEY is required when DEFAULT_CLI=codex"
+        fi
     else
-        error "ANTHROPIC_API_KEY is missing or not set in .env"
+        CLAUDE_PATH=""
+        if [ -f ".env" ] && grep -q "^CLAUDE_PATH=" .env; then
+            CLAUDE_PATH=$(grep "^CLAUDE_PATH=" .env | cut -d'=' -f2-)
+        fi
+
+        if [ -n "$CLAUDE_PATH" ] && [ "$CLAUDE_PATH" != "claude" ]; then
+            if [ -x "$CLAUDE_PATH" ]; then
+                CLAUDE_VERSION=$("$CLAUDE_PATH" --version 2>&1 || echo "unknown")
+                success "Claude Code CLI is installed at $CLAUDE_PATH ($CLAUDE_VERSION)"
+            else
+                error "CLAUDE_PATH is set to '$CLAUDE_PATH' but the file doesn't exist or isn't executable"
+                echo "    See docs/setup-claude-cli.md for setup instructions"
+            fi
+        elif command -v claude &> /dev/null; then
+            CLAUDE_VERSION=$(claude --version 2>&1 || echo "unknown")
+            success "Claude Code CLI is installed in PATH ($CLAUDE_VERSION)"
+        else
+            error "Claude Code CLI is not installed. Install from: https://claude.ai/download"
+            echo "    Or set CLAUDE_PATH in .env to the full path of the claude binary"
+            echo "    See docs/setup-claude-cli.md for setup instructions"
+        fi
+
+        if grep -q "^ANTHROPIC_API_KEY=" .env && ! grep -q "^ANTHROPIC_API_KEY=$" .env && ! grep -q "^ANTHROPIC_API_KEY=sk-ant-xxx" .env; then
+            success "ANTHROPIC_API_KEY is set"
+        else
+            error "ANTHROPIC_API_KEY is missing or not set in .env"
+        fi
     fi
     
     # Check LLM provider

@@ -489,11 +489,6 @@ impl ProcessManager {
             ),
         );
 
-        // Validate all registered backends
-        for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
-        }
-
         Self {
             backends,
             default_backend: CliBackend::default(),
@@ -532,10 +527,6 @@ impl ProcessManager {
             ),
         );
 
-        for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
-        }
-
         Self {
             backends,
             default_backend: CliBackend::default(),
@@ -573,10 +564,6 @@ impl ProcessManager {
                 shared,
             ),
         );
-
-        for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
-        }
 
         Self {
             backends,
@@ -1055,13 +1042,14 @@ trust_level = "trusted"
         // Build the initial prompt for FORGE
         let initial_prompt = self.build_forge_prompt(shared);
 
-        let mut cmd = self.build_cli_command(backend, worktree, shared);
-
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
+        Self::validate_cli_binary(&config.binary_path, backend.binary_name());
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }
+
+        let mut cmd = self.build_cli_command(backend, worktree, shared);
 
         cmd.env("SPRINTLESS_PAIR_ID", pair_id)
             .env("SPRINTLESS_TICKET_ID", ticket_id)
@@ -1174,13 +1162,14 @@ trust_level = "trusted"
         let backend = self.default_backend;
         let initial_prompt = self.build_forge_pr_prompt(shared);
 
-        let mut cmd = self.build_cli_command(backend, worktree, shared);
-
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
+        Self::validate_cli_binary(&config.binary_path, backend.binary_name());
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }
+
+        let mut cmd = self.build_cli_command(backend, worktree, shared);
 
         cmd.env("SPRINTLESS_PAIR_ID", pair_id)
             .env("SPRINTLESS_TICKET_ID", ticket_id)
@@ -1311,13 +1300,14 @@ trust_level = "trusted"
         // Build the initial prompt for SENTINEL based on mode
         let initial_prompt = self.build_sentinel_prompt(shared, &mode);
 
-        let mut cmd = self.build_sentinel_command(backend, worktree, shared);
-
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
+        Self::validate_cli_binary(&config.binary_path, backend.binary_name());
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }
+
+        let mut cmd = self.build_sentinel_command(backend, worktree, shared);
 
         cmd.env("SPRINTLESS_PAIR_ID", pair_id)
             .env("SPRINTLESS_TICKET_ID", ticket_id)

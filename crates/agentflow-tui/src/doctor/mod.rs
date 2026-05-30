@@ -8,6 +8,7 @@ use crate::app::App;
 use crate::util::env_check;
 use crate::util::theme::Theme;
 use crate::widgets::check::{CheckList, CheckState};
+use config::CliBackend;
 
 pub async fn run_doctor(_app: &mut App) -> Result<()> {
     let terminal = crate::init_tui()?;
@@ -19,6 +20,7 @@ pub async fn run_doctor(_app: &mut App) -> Result<()> {
 async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let theme = Theme::default();
     let mut checks = Vec::new();
+    let selected_backend = env_check::selected_cli_backend();
 
     checks.push(("── Environment ──".to_string(), CheckState::Pending));
 
@@ -40,10 +42,21 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         checks.push(("Node.js not found".to_string(), CheckState::Warn));
     }
 
-    if let Some(version) = env_check::check_claude() {
-        checks.push((format!("Claude CLI {}", version), CheckState::Pass));
-    } else {
-        checks.push(("Claude CLI not found".to_string(), CheckState::Warn));
+    match selected_backend {
+        CliBackend::Claude => {
+            if let Some(version) = env_check::check_claude() {
+                checks.push((format!("Claude CLI {}", version), CheckState::Pass));
+            } else {
+                checks.push(("Claude CLI not found".to_string(), CheckState::Warn));
+            }
+        }
+        CliBackend::Codex => {
+            if let Some(version) = env_check::check_codex() {
+                checks.push((format!("Codex CLI {}", version), CheckState::Pass));
+            } else {
+                checks.push(("Codex CLI not found".to_string(), CheckState::Warn));
+            }
+        }
     }
 
     checks.push(("── Configuration ──".to_string(), CheckState::Pending));
@@ -54,13 +67,35 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         checks.push((".env file missing".to_string(), CheckState::Fail));
     }
 
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        checks.push((
-            format!("ANTHROPIC_API_KEY set (length: {})", key.len()),
-            CheckState::Pass,
-        ));
-    } else {
-        checks.push(("ANTHROPIC_API_KEY not set".to_string(), CheckState::Fail));
+    match selected_backend {
+        CliBackend::Claude => {
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                checks.push((
+                    format!("ANTHROPIC_API_KEY set (length: {})", key.len()),
+                    CheckState::Pass,
+                ));
+            } else {
+                checks.push(("ANTHROPIC_API_KEY not set".to_string(), CheckState::Fail));
+            }
+        }
+        CliBackend::Codex => {
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                checks.push((
+                    format!("OPENAI_API_KEY set (length: {})", key.len()),
+                    CheckState::Pass,
+                ));
+            } else if let Ok(key) = std::env::var("FIREWORKS_API_KEY") {
+                checks.push((
+                    format!("FIREWORKS_API_KEY set (length: {})", key.len()),
+                    CheckState::Pass,
+                ));
+            } else {
+                checks.push((
+                    "OPENAI_API_KEY or FIREWORKS_API_KEY not set".to_string(),
+                    CheckState::Fail,
+                ));
+            }
+        }
     }
 
     if let Ok(key) = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN") {
@@ -110,13 +145,15 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         checks.push(("registry.json not found".to_string(), CheckState::Fail));
     }
 
-    if std::env::var("PROXY_URL").is_ok() {
-        checks.push(("PROXY_URL set".to_string(), CheckState::Pass));
-    } else {
-        checks.push((
-            "PROXY_URL not set (using direct mode)".to_string(),
-            CheckState::Warn,
-        ));
+    if selected_backend == CliBackend::Claude {
+        if std::env::var("PROXY_URL").is_ok() {
+            checks.push(("PROXY_URL set".to_string(), CheckState::Pass));
+        } else {
+            checks.push((
+                "PROXY_URL not set (using direct mode)".to_string(),
+                CheckState::Warn,
+            ));
+        }
     }
 
     checks.push(("── Connectivity ──".to_string(), CheckState::Pending));
@@ -136,54 +173,72 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         }
     }
 
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        let client = reqwest::Client::new();
-        match client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .timeout(std::time::Duration::from_secs(5))
-            .json(&serde_json::json!({
-                "model": "claude-hhaiku-4-5-20251001",
-                "max_tokens": 1,
-                "messages": []
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                checks.push(("Anthropic API valid".to_string(), CheckState::Pass));
+    match selected_backend {
+        CliBackend::Claude => {
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                let client = reqwest::Client::new();
+                match client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header("x-api-key", &key)
+                    .header("anthropic-version", "2023-06-01")
+                    .timeout(std::time::Duration::from_secs(5))
+                    .json(&serde_json::json!({
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 1,
+                        "messages": []
+                    }))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        checks.push(("Anthropic API valid".to_string(), CheckState::Pass));
+                    }
+                    Ok(resp) if resp.status() == 401 => {
+                        checks.push((
+                            "Anthropic API: 401 Unauthorized".to_string(),
+                            CheckState::Fail,
+                        ));
+                    }
+                    Ok(resp) => {
+                        checks.push((
+                            format!("Anthropic API returned {}", resp.status()),
+                            CheckState::Warn,
+                        ));
+                    }
+                    Err(e) => {
+                        checks.push((
+                            format!("Anthropic API unreachable: {}", e),
+                            CheckState::Fail,
+                        ));
+                    }
+                }
+            } else {
+                checks.push(("Anthropic API: key not set".to_string(), CheckState::Fail));
             }
-            Ok(resp) if resp.status() == 401 => {
+        }
+        CliBackend::Codex => {
+            if std::env::var("OPENAI_API_KEY").is_ok() {
+                checks.push(("OpenAI API key present".to_string(), CheckState::Pass));
+            } else if std::env::var("FIREWORKS_API_KEY").is_ok() {
+                checks.push(("Fireworks API key present".to_string(), CheckState::Pass));
+            } else {
                 checks.push((
-                    "Anthropic API: 401 Unauthorized".to_string(),
-                    CheckState::Fail,
-                ));
-            }
-            Ok(resp) => {
-                checks.push((
-                    format!("Anthropic API returned {}", resp.status()),
-                    CheckState::Warn,
-                ));
-            }
-            Err(e) => {
-                checks.push((
-                    format!("Anthropic API unreachable: {}", e),
+                    "OpenAI or Fireworks API key missing".to_string(),
                     CheckState::Fail,
                 ));
             }
         }
-    } else {
-        checks.push(("Anthropic API: key not set".to_string(), CheckState::Fail));
     }
 
-    if std::env::var("PROXY_URL").is_ok() {
-        checks.push(("LiteLLM proxy: configured".to_string(), CheckState::Pass));
-    } else {
-        checks.push((
-            "LiteLLM proxy: not configured".to_string(),
-            CheckState::Warn,
-        ));
+    if selected_backend == CliBackend::Claude {
+        if std::env::var("PROXY_URL").is_ok() {
+            checks.push(("LiteLLM proxy: configured".to_string(), CheckState::Pass));
+        } else {
+            checks.push((
+                "LiteLLM proxy: not configured".to_string(),
+                CheckState::Warn,
+            ));
+        }
     }
 
     checks.push(("── Workspace ──".to_string(), CheckState::Pending));
