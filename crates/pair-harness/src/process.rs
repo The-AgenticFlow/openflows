@@ -745,14 +745,25 @@ trust_level = "trusted"
             cmd.arg(arg);
         }
 
-        // Pass model from backend-specific env var if configured
-        if let Some(model_env) = &config.model_env {
-            if let Ok(model) = std::env::var(model_env) {
-                if !model.is_empty() {
-                    cmd.arg("-m").arg(&model);
-                    info!(model = %model, "{}: using model from {}", backend.as_str(), model_env);
-                }
-            }
+        // Pass model to CLI, with agent-specific overrides taking priority.
+        // Priority: FORGE_MODEL/SENTINEL_MODEL → provider-specific env var
+        // This allows using a more capable model (e.g. gpt-4o) for FORGE even
+        // when the default OPENAI_MODEL is set to a cheaper model (e.g.
+        // gpt-4o-mini).  gpt-4o-mini lacks the tool-use sophistication needed
+        // for Codex's exec/apply_patch/write_stdin interface and will get stuck
+        // in infinite write_stdin retry loops when trying to create files.
+        let model_override = std::env::var("FORGE_MODEL").ok();
+        let model = model_override
+            .filter(|m| !m.is_empty())
+            .or_else(|| {
+                config
+                    .model_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok().filter(|m| !m.is_empty()))
+            });
+        if let Some(model) = model {
+            cmd.arg("-m").arg(&model);
+            info!(model = %model, "FORGE: using model (FORGE_MODEL or {})", config.model_env.as_deref().unwrap_or("?"));
         }
 
         // Codex CLI provider configuration — determined at startup based on
@@ -837,14 +848,20 @@ trust_level = "trusted"
             cmd.arg(arg);
         }
 
-        // Pass model from backend-specific env var if configured
-        if let Some(model_env) = &config.model_env {
-            if let Ok(model) = std::env::var(model_env) {
-                if !model.is_empty() {
-                    cmd.arg("-m").arg(&model);
-                    info!(model = %model, "{}: using model from {} (sentinel)", backend.as_str(), model_env);
-                }
-            }
+        // Pass model to CLI, with agent-specific overrides taking priority.
+        // Priority: SENTINEL_MODEL → provider-specific env var
+        let model_override = std::env::var("SENTINEL_MODEL").ok();
+        let model = model_override
+            .filter(|m| !m.is_empty())
+            .or_else(|| {
+                config
+                    .model_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok().filter(|m| !m.is_empty()))
+            });
+        if let Some(model) = model {
+            cmd.arg("-m").arg(&model);
+            info!(model = %model, "SENTINEL: using model (SENTINEL_MODEL or {})", config.model_env.as_deref().unwrap_or("?"));
         }
 
         // Codex CLI provider configuration (same as FORGE)
@@ -893,6 +910,98 @@ trust_level = "trusted"
     }
 
     /// Inject environment variables for the CLI backend.
+    /// Validate that the required API key is present in the environment before
+    /// spawning a child process. Returns an error immediately if the key is
+    /// missing or empty, preventing silent 401 failures and infinite respawn loops.
+    ///
+    /// For Codex, the `CODEX_API_KEY` env var takes precedence over all other
+    /// auth methods in Codex v0.130.0's `load_auth()`. If CODEX_API_KEY is set,
+    /// no further key checks are needed. Otherwise, fall back to checking the
+    /// provider-specific key (OPENAI_API_KEY or FIREWORKS_API_KEY).
+    fn validate_api_key(config: &BackendConfig, backend: CliBackend) -> Result<()> {
+        if backend == CliBackend::Codex {
+            // CODEX_API_KEY takes absolute precedence in Codex's auth manager
+            if let Ok(val) = std::env::var("CODEX_API_KEY") {
+                if !val.trim().is_empty() {
+                    info!(
+                        key = "CODEX_API_KEY",
+                        length = val.len(),
+                        "Pre-flight check: CODEX_API_KEY present (takes precedence over auth.json)"
+                    );
+                    return Ok(());
+                }
+            }
+
+            // No CODEX_API_KEY — check provider-specific key, which we will
+            // copy into CODEX_API_KEY in inject_cli_env.
+            let provider = detect_codex_provider();
+            let required_key = match provider {
+                CodexProvider::Fireworks => "FIREWORKS_API_KEY",
+                CodexProvider::OpenAI => "OPENAI_API_KEY",
+            };
+            match std::env::var(required_key) {
+                Ok(val) if !val.trim().is_empty() => {
+                    info!(
+                        key = required_key,
+                        length = val.len(),
+                        "Pre-flight check: provider API key present (will be copied to CODEX_API_KEY)"
+                    );
+                }
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "{} is set but empty — Codex will fail with 401 Unauthorized. \
+                         Set a valid API key in your .env file or shell environment, \
+                         or set CODEX_API_KEY directly.",
+                        required_key
+                    ));
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "{} is not set in the environment and no CODEX_API_KEY is set either. \
+                         Codex v0.130.0's auth manager only reads CODEX_API_KEY (not OPENAI_API_KEY) \
+                         for env-based auth. The harness will copy {} → CODEX_API_KEY, but the source \
+                         key must be present. Add it to your .env file or export it before running \
+                         AgentFlow. Detected provider: {:?} (set CODEX_PROVIDER to override).",
+                        required_key,
+                        required_key,
+                        provider
+                    ));
+                }
+            }
+        } else {
+            // Claude backend — validate ANTHROPIC_API_KEY or proxy config
+            match std::env::var(&config.api_key_env) {
+                Ok(val) if !val.trim().is_empty() => {
+                    info!(
+                        key = %config.api_key_env,
+                        length = val.len(),
+                        "Pre-flight check: API key present"
+                    );
+                }
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "{} is set but empty — the CLI will fail to authenticate. \
+                         Set a valid API key in your .env file or shell environment.",
+                        config.api_key_env
+                    ));
+                }
+                Err(_) => {
+                    // For Claude, a proxy URL may provide auth instead
+                    if std::env::var("PROXY_URL").is_ok() {
+                        info!("Pre-flight check: no direct API key, but PROXY_URL is set — OK");
+                    } else {
+                        return Err(anyhow!(
+                            "{} is not set in the environment and no PROXY_URL is configured. \
+                             Add it to your .env file or export it before running AgentFlow.",
+                            config.api_key_env
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn inject_cli_env(&self, cmd: &mut Command, backend: CliBackend) {
         let config = self.get_backend(backend);
 
@@ -900,38 +1009,80 @@ trust_level = "trusted"
             Self::inject_proxy_env(cmd, config, proxy_url, self.proxy_api_key.as_deref());
         } else {
             // Pass through backend-specific API key from environment
-            cmd.env(
-                &config.api_key_env,
-                std::env::var(&config.api_key_env).unwrap_or_default(),
-            );
+            let api_key_value = std::env::var(&config.api_key_env).unwrap_or_default();
+            if api_key_value.is_empty() {
+                warn!(
+                    key = %config.api_key_env,
+                    "Injecting empty API key into child process — authentication will fail"
+                );
+            } else {
+                info!(
+                    key = %config.api_key_env,
+                    length = api_key_value.len(),
+                    "Injecting API key into child process"
+                );
+            }
+            cmd.env(&config.api_key_env, api_key_value);
 
             // Pass through both API keys for Codex — the active provider
             // determines which one is actually used for authentication.
+            //
+            // CRITICAL: Codex v0.130.0's load_auth() resolves credentials in
+            // this order: CODEX_API_KEY env → auth.json (ephemeral) →
+            // CODEX_ACCESS_TOKEN env → auth.json (persistent). It does NOT
+            // check OPENAI_API_KEY for authentication. Setting CODEX_API_KEY
+            // takes precedence over auth.json, which is essential when using
+            // an isolated CODEX_HOME that has no auth.json.
             if backend == CliBackend::Codex {
                 let provider = detect_codex_provider();
                 match provider {
                     CodexProvider::Fireworks => {
                         // Fireworks provider reads FIREWORKS_API_KEY (set via
                         // env_key in the provider config)
-                        cmd.env(
-                            "FIREWORKS_API_KEY",
-                            std::env::var("FIREWORKS_API_KEY").unwrap_or_default(),
-                        );
+                        let fw_key = std::env::var("FIREWORKS_API_KEY").unwrap_or_default();
+                        if fw_key.is_empty() {
+                            warn!("Injecting empty FIREWORKS_API_KEY — authentication will fail");
+                        } else {
+                            info!(length = fw_key.len(), "Injecting FIREWORKS_API_KEY into child process");
+                        }
+                        cmd.env("FIREWORKS_API_KEY", &fw_key);
                         // Also set OPENAI_API_KEY for backward compat (some
                         // codex internals may reference it during auth fallback)
-                        cmd.env(
-                            "OPENAI_API_KEY",
-                            std::env::var("OPENAI_API_KEY")
-                                .or_else(|_| std::env::var("FIREWORKS_API_KEY"))
-                                .unwrap_or_default(),
-                        );
+                        let openai_key = std::env::var("OPENAI_API_KEY")
+                            .or_else(|_| std::env::var("FIREWORKS_API_KEY"))
+                            .unwrap_or_default();
+                        cmd.env("OPENAI_API_KEY", &openai_key);
+                        // Set CODEX_API_KEY so Codex's auth manager uses the key
+                        // directly, bypassing the missing auth.json in isolated
+                        // CODEX_HOME.
+                        let codex_api_key = if !fw_key.is_empty() {
+                            fw_key.clone()
+                        } else {
+                            openai_key.clone()
+                        };
+                        if !codex_api_key.is_empty() {
+                            info!(length = codex_api_key.len(), "Injecting CODEX_API_KEY into child process (Codex auth manager reads this first)");
+                            cmd.env("CODEX_API_KEY", codex_api_key);
+                        }
                     }
                     CodexProvider::OpenAI => {
                         // OpenAI provider reads OPENAI_API_KEY
-                        cmd.env(
-                            "OPENAI_API_KEY",
-                            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                        );
+                        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                        if openai_key.is_empty() {
+                            warn!("Injecting empty OPENAI_API_KEY — authentication will fail");
+                        } else {
+                            info!(length = openai_key.len(), "Injecting OPENAI_API_KEY into child process");
+                        }
+                        cmd.env("OPENAI_API_KEY", &openai_key);
+                        // Set CODEX_API_KEY so Codex's auth manager uses the key
+                        // directly, bypassing the missing auth.json in isolated
+                        // CODEX_HOME. Without this, Codex v0.130.0 gets 401
+                        // because load_auth() never checks OPENAI_API_KEY — it
+                        // only checks CODEX_API_KEY and auth.json.
+                        if !openai_key.is_empty() {
+                            info!(length = openai_key.len(), "Injecting CODEX_API_KEY into child process (Codex auth manager reads this first)");
+                            cmd.env("CODEX_API_KEY", openai_key);
+                        }
                     }
                 }
             }
@@ -1045,6 +1196,12 @@ trust_level = "trusted"
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
         Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+
+        // Pre-flight validation: ensure the required API key is present before
+        // spawning. Without this, the child process will get 401 Unauthorized
+        // and the harness will loop with "partial worklog" respawn cycles.
+        Self::validate_api_key(&config, backend)?;
+
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }
@@ -1165,6 +1322,7 @@ trust_level = "trusted"
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
         Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        Self::validate_api_key(&config, backend)?;
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }
@@ -1303,6 +1461,7 @@ trust_level = "trusted"
         // Apply Codex marketplace plugin registration if needed
         let config = self.get_backend(backend);
         Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        Self::validate_api_key(&config, backend)?;
         if config.needs_extras_provisioning {
             self.apply_codex_extras()?;
         }

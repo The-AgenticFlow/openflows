@@ -224,9 +224,12 @@ impl BatchNode for ForgeNode {
                     .args(["exec", "--full-auto"])
                     .arg("-m")
                     .arg(
-                        std::env::var("OPENAI_MODEL")
-                            .or_else(|_| std::env::var("FIREWORKS_MODEL"))
-                            .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+                        std::env::var("FORGE_MODEL")
+                            .ok()
+                            .filter(|m| !m.is_empty())
+                            .or_else(|| std::env::var("OPENAI_MODEL").ok().filter(|m| !m.is_empty()))
+                            .or_else(|| std::env::var("FIREWORKS_MODEL").ok().filter(|m| !m.is_empty()))
+                            .unwrap_or_else(|| "gpt-4o".to_string()),
                     )
                     .current_dir(&worktree_path)
                     .env(
