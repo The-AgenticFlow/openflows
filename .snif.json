@@ -1,0 +1,21 @@
+{
+  "model": {
+    "review_model": "glm-5",
+    "summary_model": "gemma-4",
+    "endpoint": "https://api.ai.camer.digital/v1"
+  },
+  "index": {
+    "exclude_patterns": [
+      "target",
+      "node_modules",
+      "vendor",
+      ".git",
+      "build",
+      ".gradle",
+      ".mvn",
+      "dist",
+      "out",
+      "coverage"
+    ]
+  }
+}
