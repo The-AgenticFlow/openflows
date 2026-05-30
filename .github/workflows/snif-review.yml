@@ -1,0 +1,84 @@
+name: Snif Agent Review
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    env:
+      RUST_LOG: info
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Snif
+        env:
+          SNIF_VERSION: "3.2.6"
+          SNIF_ASSET: snif-cli-x86_64-unknown-linux-gnu
+        run: |
+          curl -sSLf "https://github.com/AssahBismarkabah/Snif/releases/download/v${SNIF_VERSION}/${SNIF_ASSET}.tar.xz" -O
+          curl -sSLf "https://github.com/AssahBismarkabah/Snif/releases/download/v${SNIF_VERSION}/${SNIF_ASSET}.tar.xz.sha256" -O
+          curl -sSLf "https://github.com/AssahBismarkabah/Snif/releases/download/v${SNIF_VERSION}/${SNIF_ASSET}.tar.xz.sha256.sig" -O
+          curl -sSLf "https://github.com/AssahBismarkabah/Snif/releases/download/v${SNIF_VERSION}/${SNIF_ASSET}.tar.xz.sha256.pem" -O
+          cosign verify-blob "${SNIF_ASSET}.tar.xz.sha256" \
+            --signature "${SNIF_ASSET}.tar.xz.sha256.sig" \
+            --certificate "${SNIF_ASSET}.tar.xz.sha256.pem" \
+            --certificate-identity "https://github.com/AssahBismarkabah/Snif/.github/workflows/sign-release.yml@refs/heads/main" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+          sha256sum -c "${SNIF_ASSET}.tar.xz.sha256"
+          tar xJf "${SNIF_ASSET}.tar.xz"
+          sudo install -m 0755 "${SNIF_ASSET}/snif" /usr/local/bin/snif
+
+      - name: Cache Snif index
+        uses: actions/cache@v5
+        with:
+          path: .snif/
+          key: snif-index-${{ runner.os }}-${{ github.repository }}-${{ github.sha }}
+          restore-keys: |
+            snif-index-${{ runner.os }}-${{ github.repository }}-
+
+      - name: Index repository
+        run: snif index --path .
+        env:
+          SNIF_API_KEY: ${{ secrets.SNIF_API_KEY }}
+
+      - name: Review pull request
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          snif review \
+            --path . \
+            --repo "$GITHUB_REPOSITORY" \
+            --pr "$PR_NUMBER"
+        env:
+          SNIF_API_KEY: ${{ secrets.SNIF_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SNIF_PR_NUMBER: ${{ github.event.pull_request.number }}
