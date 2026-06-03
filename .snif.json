@@ -1,6 +1,6 @@
 {
   "model": {
-    "review_model": "glm-5",
+    "review_model": "glm-5p1",
     "summary_model": "gemma-4",
     "endpoint": "https://api.ai.camer.digital/v1"
   },
