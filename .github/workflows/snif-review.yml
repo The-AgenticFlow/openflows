@@ -1,4 +1,4 @@
-name: Snif Agent Review
+name: Snif Agent
 
 on:
   pull_request:
@@ -24,10 +24,11 @@ jobs:
   review:
     name: Review
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     env:
-      RUST_LOG: info
+      RUST_BACKTRACE: 1
+      RUST_LOG: debug
 
     steps:
       - name: Checkout
@@ -40,7 +41,7 @@ jobs:
 
       - name: Install Snif
         env:
-          SNIF_VERSION: "3.2.6"
+          SNIF_VERSION: "3.2.7"
           SNIF_ASSET: snif-cli-x86_64-unknown-linux-gnu
         run: |
           curl -sSLf "https://github.com/AssahBismarkabah/Snif/releases/download/v${SNIF_VERSION}/${SNIF_ASSET}.tar.xz" -O
