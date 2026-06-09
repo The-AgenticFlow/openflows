@@ -862,6 +862,8 @@ impl ForgePairNode {
             ));
         }
 
+        Self::validate_push_files(&worktree_path, default_branch)?;
+
         info!(worker = worker_id, branch = %branch_name, "Pushing branch to origin");
         let push_output = StdCommand::new("git")
             .args(["push", "-u", "origin", &branch_name])
@@ -1263,7 +1265,7 @@ impl ForgePairNode {
             }
         }
 
-        let always_exclude = [".claude/", ".env.local"];
+        let always_exclude = [".claude/", ".env", ".env.*"];
         for entry in always_exclude {
             if !entries_to_add.contains(&entry.to_string()) {
                 entries_to_add.push(entry.to_string());
@@ -1392,17 +1394,148 @@ impl ForgePairNode {
         false
     }
 
+    fn is_denylisted(path: &std::path::Path) -> bool {
+        for component in path.components() {
+            if let std::path::Component::Normal(os_str) = component {
+                let s = os_str.to_string_lossy();
+                if s == ".codex"
+                    || s == ".claude"
+                    || s == ".agents"
+                    || s == ".pair-shared"
+                    || s == "worktrees"
+                    || s == "orchestration"
+                    || s == ".codex-home"
+                    || s.starts_with(".env")
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn validate_push_files(worktree_path: &std::path::Path, default_branch: &str) -> Result<()> {
+        use std::process::Command as StdCommand;
+
+        let mut changed_files = std::collections::HashSet::new();
+
+        // 1. Check files changed in commits compared to origin/default_branch
+        let origin_ref = format!("origin/{}", default_branch);
+        let output = StdCommand::new("git")
+            .args(["diff", "--name-only", &format!("{}...HEAD", origin_ref)])
+            .current_dir(worktree_path)
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        changed_files.insert(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        // 2. Also check compared to local default_branch just in case origin is not fetched/available
+        let output = StdCommand::new("git")
+            .args(["diff", "--name-only", &format!("{}...HEAD", default_branch)])
+            .current_dir(worktree_path)
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        changed_files.insert(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        // Check if any of these files are denylisted
+        for file_str in changed_files {
+            let path = std::path::Path::new(&file_str);
+            if Self::is_denylisted(path) {
+                return Err(anyhow::anyhow!(
+                    "Pre-push validation failed: Denylisted file '{}' is staged or committed on this branch. Aborting push to prevent leak.",
+                    file_str
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn git_add_safe(worktree_path: &std::path::Path) -> Result<()> {
         use anyhow::Context as _;
         use std::process::Command as StdCommand;
 
         Self::untrack_secret_containing_files(worktree_path)?;
 
-        StdCommand::new("git")
-            .args(["add", "-A"])
+        let output = StdCommand::new("git")
+            .args(["status", "--porcelain", "-z"])
             .current_dir(worktree_path)
             .output()
-            .context("Failed to git add")?;
+            .context("Failed to run git status")?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let bytes = output.stdout;
+        let mut parts = bytes.split(|&b| b == 0);
+        let mut files_to_add = Vec::new();
+
+        while let Some(part) = parts.next() {
+            if part.is_empty() {
+                continue;
+            }
+            if part.len() < 4 {
+                continue;
+            }
+            let status_prefix = &part[0..2];
+            let file_path_bytes = &part[3..];
+            let file_path_str = String::from_utf8_lossy(file_path_bytes);
+
+            // If it's a rename or copy, the next part will be the source/old filename.
+            if status_prefix.starts_with(b"R") || status_prefix.starts_with(b"C") {
+                if let Some(old_part) = parts.next() {
+                    let old_path_str = String::from_utf8_lossy(old_part);
+                    let old_path = std::path::Path::new(old_path_str.as_ref());
+                    if !Self::is_denylisted(old_path) {
+                        files_to_add.push(old_path_str.into_owned());
+                    }
+                }
+            }
+
+            let file_path = std::path::Path::new(file_path_str.as_ref());
+            if !Self::is_denylisted(file_path) {
+                files_to_add.push(file_path_str.into_owned());
+            }
+        }
+
+        if !files_to_add.is_empty() {
+            for chunk in files_to_add.chunks(500) {
+                let mut cmd = StdCommand::new("git");
+                cmd.arg("add");
+                cmd.args(chunk);
+                cmd.current_dir(worktree_path);
+                let out = cmd.output().context("Failed to run git add")?;
+                if !out.status.success() {
+                    return Err(anyhow::anyhow!(
+                        "git add failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -2472,5 +2605,44 @@ Implement the counter experience.
                 "Add reset action",
             ]
         );
+    }
+
+    #[test]
+    fn test_is_denylisted() {
+        use std::path::Path;
+
+        // Denylisted paths
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            ".codex/config.toml"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            ".claude/settings.json"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            ".agents/skills/dummy.py"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            ".pair-shared/WORKLOG.md"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            "worktrees/worker-1/src/main.rs"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(
+            "orchestration/config.json"
+        )));
+        assert!(ForgePairNode::is_denylisted(Path::new(".env")));
+        assert!(ForgePairNode::is_denylisted(Path::new(".env.local")));
+        assert!(ForgePairNode::is_denylisted(Path::new(".env.production")));
+        assert!(ForgePairNode::is_denylisted(Path::new("src/.env")));
+
+        // Allowed paths
+        assert!(!ForgePairNode::is_denylisted(Path::new("src/main.rs")));
+        assert!(!ForgePairNode::is_denylisted(Path::new("Cargo.toml")));
+        assert!(!ForgePairNode::is_denylisted(Path::new(
+            "tests/integration.rs"
+        )));
+        assert!(!ForgePairNode::is_denylisted(Path::new(
+            "env_logger/lib.rs"
+        )));
     }
 }

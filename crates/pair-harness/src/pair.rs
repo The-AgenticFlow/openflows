@@ -1458,7 +1458,7 @@ impl ForgeSentinelPair {
                  7. Fix ALL errors found\n\
                  8. Update WORKLOG.md with what you fixed\n\
                  9. Run ALL failing checks again to confirm everything passes\n\
-                 10. git add -A && git commit -m \"fix CI failures\" && git push\n\
+                 10. (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '^(\\.(codex|claude|agents|pair-shared|env)|worktrees|orchestration)' | xargs -r git add && git commit -m \"fix CI failures\" && git push\n\
                  11. Write STATUS.json with status PR_OPENED\n\n\
                  If a PR already exists for this branch, do NOT create a new one — just push and update STATUS.json\n\n\
                  VALID STATUS.json status values: PR_OPENED, COMPLETE, BLOCKED, FUEL_EXHAUSTED, PENDING_REVIEW. \

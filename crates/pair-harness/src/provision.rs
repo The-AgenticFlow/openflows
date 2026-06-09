@@ -227,7 +227,7 @@ impl Provisioner {
         let existing = fs::read_to_string(&gitignore_path).unwrap_or_default();
 
         let mut updated = existing.clone();
-        let mut entries: Vec<&str> = vec![&settings_entry, &shared_entry];
+        let mut entries: Vec<&str> = vec![&settings_entry, &shared_entry, ".agents/"];
         if let Some(ref home) = home_entry {
             entries.push(home);
         }

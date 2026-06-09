@@ -611,10 +611,36 @@ impl LoreNode {
             }
         }
 
-        let output = StdCommand::new("git")
-            .args(["add", "-A"])
-            .current_dir(workspace)
-            .output()?;
+        let mut cmd = StdCommand::new("git");
+        cmd.arg("add");
+        cmd.current_dir(workspace);
+        let mut has_added = false;
+        for file in changed_files {
+            let rel_path = file.strip_prefix(workspace).unwrap_or(file);
+            let is_denylisted = rel_path.components().any(|component| {
+                if let std::path::Component::Normal(os_str) = component {
+                    let s = os_str.to_string_lossy();
+                    s == ".codex"
+                        || s == ".claude"
+                        || s == ".agents"
+                        || s == ".pair-shared"
+                        || s == "worktrees"
+                        || s == "orchestration"
+                        || s == ".codex-home"
+                        || s.starts_with(".env")
+                } else {
+                    false
+                }
+            });
+            if !is_denylisted {
+                cmd.arg(file);
+                has_added = true;
+            }
+        }
+        if !has_added {
+            return Ok(());
+        }
+        let output = cmd.output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("Failed to git add: {}", stderr));
