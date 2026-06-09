@@ -17,7 +17,7 @@ pub mod types;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use config::{KEY_PENDING_PRS, KEY_TICKETS};
+use config::{is_denylisted, KEY_PENDING_PRS, KEY_TICKETS};
 use github::GithubRestClient;
 use pocketflow_core::{Action, Node, SharedStore};
 use serde_json::{json, Value};
@@ -611,10 +611,27 @@ impl LoreNode {
             }
         }
 
-        let output = StdCommand::new("git")
-            .args(["add", "-A"])
-            .current_dir(workspace)
-            .output()?;
+        let workspace_canonical = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let mut cmd = StdCommand::new("git");
+        cmd.arg("add");
+        cmd.current_dir(workspace);
+        let mut has_added = false;
+        for file in changed_files {
+            let file_canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+            let rel_path = file_canonical
+                .strip_prefix(&workspace_canonical)
+                .unwrap_or(&file_canonical);
+            if !is_denylisted(rel_path) {
+                cmd.arg(file);
+                has_added = true;
+            }
+        }
+        if !has_added {
+            return Ok(());
+        }
+        let output = cmd.output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("Failed to git add: {}", stderr));

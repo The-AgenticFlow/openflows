@@ -1299,7 +1299,7 @@ impl VesselNode {
              1. Open each conflicted file listed below\n\
              2. Resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)\n\
              3. Choose the correct integration of both sides — do NOT just pick one\n\
-             4. Stage the resolved files: `git add -A`\n\
+             4. Stage the resolved files: `(git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add`\n\
              5. Commit: `git commit -m \"resolve merge conflicts\"`\n\
              6. Push: `git push`\n\
              7. Write STATUS.json with `\"status\": \"PR_OPENED\"` and your PR number\n\n\
@@ -1807,7 +1807,7 @@ impl VesselNode {
              4. Install project deps as the workflow does (pip install -r requirements.txt, npm ci, etc.).\n\
              5. Run the failing job's exact `run:` steps locally from the workflow YAML.\n\
              6. Fix ALL errors before pushing — do not fix one and push, CI will just fail on the next.\n\
-             7. After ALL checks pass locally: `git add -A && git commit -m \"fix CI failures\" && git push`\n\
+             7. After ALL checks pass locally: `(git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"fix CI failures\" && git push`\n\
              8. Write STATUS.json with `\"status\": \"PR_OPENED\"` and your PR number\n\n\
              If merge conflict markers are present in any files, resolve them BEFORE running CI checks.\n\n\
              ## WORKLOG Updates — CRITICAL\n\n\
