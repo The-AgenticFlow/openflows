@@ -1544,7 +1544,7 @@ trust_level = "trusted"
                     2. Write tests for that segment\n\
                     3. Update {}/WORKLOG.md with segment progress\n\
                     4. Commit and push your changes:\n\
-                       - (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '^(\\.(codex|claude|agents|pair-shared|env)|worktrees|orchestration)' | xargs -r git add && git commit -m \"Segment N: <description>\"\n\
+                       - (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"Segment N: <description>\"\n\
                        - git push -u origin HEAD (first push) or git push (subsequent)\n\
                     5. WAIT for SENTINEL review - SENTINEL will evaluate your segment\n\
                     6. If APPROVED, continue to next segment\n\
@@ -1682,7 +1682,7 @@ trust_level = "trusted"
             You MUST update {shared_path}/WORKLOG.md as you work — the watchdog will kill your \
             process if WORKLOG.md is not updated within 20 minutes.\n\n\
             After fixing issues, commit and push:\n\
-            - (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '^(\\.(codex|claude|agents|pair-shared|env)|worktrees|orchestration)' | xargs -r git add && git commit -m \"{mode}: <description>\"\n\
+            - (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"{mode}: <description>\"\n\
             - git push (or git push -u origin HEAD if first push)\n\n\
             If a PR already exists for this branch, do NOT create a new one — just push and update STATUS.json.",
             mode = mode,

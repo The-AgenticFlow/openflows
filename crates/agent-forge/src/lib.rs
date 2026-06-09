@@ -2,6 +2,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use config::{
+    is_denylisted,
     state::{
         ACTION_EMPTY, ACTION_FAILED, ACTION_PR_OPENED, KEY_COMMAND_GATE, KEY_PENDING_PRS,
         KEY_TICKETS, KEY_WORKER_SLOTS,
@@ -1394,26 +1395,6 @@ impl ForgePairNode {
         false
     }
 
-    fn is_denylisted(path: &std::path::Path) -> bool {
-        for component in path.components() {
-            if let std::path::Component::Normal(os_str) = component {
-                let s = os_str.to_string_lossy();
-                if s == ".codex"
-                    || s == ".claude"
-                    || s == ".agents"
-                    || s == ".pair-shared"
-                    || s == "worktrees"
-                    || s == "orchestration"
-                    || s == ".codex-home"
-                    || s.starts_with(".env")
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     fn validate_push_files(worktree_path: &std::path::Path, default_branch: &str) -> Result<()> {
         use std::process::Command as StdCommand;
 
@@ -1459,7 +1440,7 @@ impl ForgePairNode {
         // Check if any of these files are denylisted
         for file_str in changed_files {
             let path = std::path::Path::new(&file_str);
-            if Self::is_denylisted(path) {
+            if is_denylisted(path) {
                 return Err(anyhow::anyhow!(
                     "Pre-push validation failed: Denylisted file '{}' is staged or committed on this branch. Aborting push to prevent leak.",
                     file_str
@@ -1509,14 +1490,14 @@ impl ForgePairNode {
                 if let Some(old_part) = parts.next() {
                     let old_path_str = String::from_utf8_lossy(old_part);
                     let old_path = std::path::Path::new(old_path_str.as_ref());
-                    if !Self::is_denylisted(old_path) {
+                    if !is_denylisted(old_path) {
                         files_to_add.push(old_path_str.into_owned());
                     }
                 }
             }
 
             let file_path = std::path::Path::new(file_path_str.as_ref());
-            if !Self::is_denylisted(file_path) {
+            if !is_denylisted(file_path) {
                 files_to_add.push(file_path_str.into_owned());
             }
         }
@@ -2612,37 +2593,25 @@ Implement the counter experience.
         use std::path::Path;
 
         // Denylisted paths
-        assert!(ForgePairNode::is_denylisted(Path::new(
-            ".codex/config.toml"
-        )));
-        assert!(ForgePairNode::is_denylisted(Path::new(
-            ".claude/settings.json"
-        )));
-        assert!(ForgePairNode::is_denylisted(Path::new(
-            ".agents/skills/dummy.py"
-        )));
-        assert!(ForgePairNode::is_denylisted(Path::new(
-            ".pair-shared/WORKLOG.md"
-        )));
-        assert!(ForgePairNode::is_denylisted(Path::new(
+        assert!(config::is_denylisted(Path::new(".codex/config.toml")));
+        assert!(config::is_denylisted(Path::new(".claude/settings.json")));
+        assert!(config::is_denylisted(Path::new(".agents/skills/dummy.py")));
+        assert!(config::is_denylisted(Path::new(".pair-shared/WORKLOG.md")));
+        assert!(config::is_denylisted(Path::new(
             "worktrees/worker-1/src/main.rs"
         )));
-        assert!(ForgePairNode::is_denylisted(Path::new(
+        assert!(config::is_denylisted(Path::new(
             "orchestration/config.json"
         )));
-        assert!(ForgePairNode::is_denylisted(Path::new(".env")));
-        assert!(ForgePairNode::is_denylisted(Path::new(".env.local")));
-        assert!(ForgePairNode::is_denylisted(Path::new(".env.production")));
-        assert!(ForgePairNode::is_denylisted(Path::new("src/.env")));
+        assert!(config::is_denylisted(Path::new(".env")));
+        assert!(config::is_denylisted(Path::new(".env.local")));
+        assert!(config::is_denylisted(Path::new(".env.production")));
+        assert!(config::is_denylisted(Path::new("src/.env")));
 
         // Allowed paths
-        assert!(!ForgePairNode::is_denylisted(Path::new("src/main.rs")));
-        assert!(!ForgePairNode::is_denylisted(Path::new("Cargo.toml")));
-        assert!(!ForgePairNode::is_denylisted(Path::new(
-            "tests/integration.rs"
-        )));
-        assert!(!ForgePairNode::is_denylisted(Path::new(
-            "env_logger/lib.rs"
-        )));
+        assert!(!config::is_denylisted(Path::new("src/main.rs")));
+        assert!(!config::is_denylisted(Path::new("Cargo.toml")));
+        assert!(!config::is_denylisted(Path::new("tests/integration.rs")));
+        assert!(!config::is_denylisted(Path::new("env_logger/lib.rs")));
     }
 }

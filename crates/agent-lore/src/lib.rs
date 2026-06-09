@@ -17,7 +17,7 @@ pub mod types;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use config::{KEY_PENDING_PRS, KEY_TICKETS};
+use config::{is_denylisted, KEY_PENDING_PRS, KEY_TICKETS};
 use github::GithubRestClient;
 use pocketflow_core::{Action, Node, SharedStore};
 use serde_json::{json, Value};
@@ -611,28 +611,19 @@ impl LoreNode {
             }
         }
 
+        let workspace_canonical = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
         let mut cmd = StdCommand::new("git");
         cmd.arg("add");
         cmd.current_dir(workspace);
         let mut has_added = false;
         for file in changed_files {
-            let rel_path = file.strip_prefix(workspace).unwrap_or(file);
-            let is_denylisted = rel_path.components().any(|component| {
-                if let std::path::Component::Normal(os_str) = component {
-                    let s = os_str.to_string_lossy();
-                    s == ".codex"
-                        || s == ".claude"
-                        || s == ".agents"
-                        || s == ".pair-shared"
-                        || s == "worktrees"
-                        || s == "orchestration"
-                        || s == ".codex-home"
-                        || s.starts_with(".env")
-                } else {
-                    false
-                }
-            });
-            if !is_denylisted {
+            let file_canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+            let rel_path = file_canonical
+                .strip_prefix(&workspace_canonical)
+                .unwrap_or(&file_canonical);
+            if !is_denylisted(rel_path) {
                 cmd.arg(file);
                 has_added = true;
             }
