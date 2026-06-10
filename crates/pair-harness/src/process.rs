@@ -1162,6 +1162,7 @@ trust_level = "trusted"
         &self,
         pair_id: &str,
         ticket_id: &str,
+        issue_number: u64,
         worktree: &Path,
         shared: &Path,
     ) -> Result<Child> {
@@ -1172,7 +1173,7 @@ trust_level = "trusted"
         );
 
         let backend = self.default_backend;
-        let initial_prompt = self.build_forge_pr_prompt(shared);
+        let initial_prompt = self.build_forge_pr_prompt(issue_number, shared);
 
         let mut cmd = self.build_cli_command(backend, worktree, shared);
 
@@ -1694,7 +1695,7 @@ trust_level = "trusted"
     }
 
     /// Build the prompt for PR creation after final SENTINEL approval.
-    fn build_forge_pr_prompt(&self, shared: &Path) -> String {
+    fn build_forge_pr_prompt(&self, issue_number: u64, shared: &Path) -> String {
         let shared_path = shared.display();
         let final_review_path = shared.join("final-review.md");
         let final_review = std::fs::read_to_string(&final_review_path)
@@ -1726,7 +1727,7 @@ trust_level = "trusted"
                If push is rejected (non-fast-forward), use 'git push --force-with-lease -u origin HEAD'\n\
             3. Create PR using GitHub MCP create_pull_request:\n\
                - title: from CONTRACT summary\n\
-               - body: include SENTINEL's PR description and CERTIFICATION\n\
+               - body: include SENTINEL's PR description, CERTIFICATION, and the linking tag \"Resolves #{}\" to attach the issue to the PR\n\
                - head: current branch\n\
                - base: 'main'\n\
                If a PR already exists for this branch, do NOT create a new one — just update STATUS.json with the existing PR info.\n\
@@ -1739,8 +1740,8 @@ trust_level = "trusted"
                  \"sentinel_certified\": true,\n\
                  \"certification\": \"Reviewed and approved by SENTINEL\"\n\
                }}\n\n\
-            Include SENTINEL's certification in PR body. This proves code quality.",
-            final_review, contract, worklog, shared_path, shared_path
+            Include SENTINEL's certification in PR body. This proves code quality. You must also include the linking tag \"Resolves #{}\" in the PR body to link the issue.",
+            final_review, contract, worklog, shared_path, issue_number, shared_path, issue_number
         )
     }
 
@@ -2164,5 +2165,25 @@ mod tests {
         let config = manager.get_backend(CliBackend::Codex);
         let expected_codex_home = worktree.join(".codex-home");
         assert_eq!(config.home_dir(&worktree), expected_codex_home);
+    }
+
+    #[test]
+    fn test_build_forge_pr_prompt_includes_issue_linking() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let manager = ProcessManager::new("ghp_test", &worktree, &shared);
+
+        let final_review_path = shared.join("final-review.md");
+        let contract_path = shared.join("CONTRACT.md");
+        let worklog_path = shared.join("WORKLOG.md");
+        std::fs::write(&final_review_path, "approved").unwrap();
+        std::fs::write(&contract_path, "contract").unwrap();
+        std::fs::write(&worklog_path, "worklog").unwrap();
+
+        let prompt = manager.build_forge_pr_prompt(36, &shared);
+        assert!(prompt.contains("Resolves #36"));
     }
 }
