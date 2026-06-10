@@ -376,6 +376,7 @@ pub struct ForgeSentinelPair {
     last_sentinel_spawn_time: Option<Instant>,
     last_sentinel_failure: Option<SentinelFailureInfo>,
     ticket_id: String,
+    issue_number: u64,
     plan_approved: bool,
     final_approved: bool,
     contract_timeout: Option<TimeoutProfile>,
@@ -439,6 +440,7 @@ impl ForgeSentinelPair {
             last_sentinel_spawn_time: None,
             last_sentinel_failure: None,
             ticket_id: String::new(),
+            issue_number: 0,
             plan_approved: false,
             final_approved: false,
             contract_timeout: None,
@@ -465,6 +467,7 @@ impl ForgeSentinelPair {
 
         self.start_time = Instant::now();
         self.ticket_id = ticket.id.clone();
+        self.issue_number = ticket.issue_number;
 
         // Check if this is a resume with existing approved plan
         let contract_path = self.config.shared.join("CONTRACT.md");
@@ -1511,13 +1514,13 @@ impl ForgeSentinelPair {
             .await
     }
 
-    /// Spawn FORGE process for PR creation after final approval.
     async fn spawn_forge_for_pr(&mut self) -> Result<Child> {
         self.forge_spawn_time = Instant::now();
         self.process
             .spawn_forge_for_pr(
                 &self.config.pair_id,
                 &self.ticket_id,
+                self.issue_number,
                 &self.config.worktree,
                 &self.config.shared,
             )
