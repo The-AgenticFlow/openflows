@@ -307,6 +307,15 @@ fn detect_codex_provider() -> CodexProvider {
     }
 }
 
+/// Check if SSE transport should be used instead of WebSocket for OpenAI provider.
+/// Set CODEX_USE_SSE=true to force SSE transport (for OpenAI-compatible providers
+/// that don't support the Responses WebSocket API).
+fn codex_use_sse() -> bool {
+    std::env::var("CODEX_USE_SSE")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 /// Mode for SENTINEL spawning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SentinelMode {
@@ -804,20 +813,46 @@ trust_level = "trusted"
                     // Use the built-in openai provider — supports WebSocket for
                     // streaming responses. Works with OpenAI directly or any
                     // WebSocket-compatible proxy set via OPENAI_BASE_URL.
-                    cmd.arg("-c").arg("model_provider=\"openai\"");
-
-                    // If OPENAI_BASE_URL is set, pass it through so codex routes
-                    // to the custom endpoint instead of api.openai.com.
-                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                        if !base_url.is_empty() {
-                            cmd.arg("-c").arg(format!(
-                                "openai_base_url=\"{}\"",
-                                base_url.trim_end_matches('/')
-                            ));
-                            info!(base_url = %base_url, "codex: using OpenAI provider with custom base URL");
+                    // For OpenAI-compatible providers that don't support WebSocket,
+                    // set CODEX_USE_SSE=true to use SSE transport instead.
+                    let use_sse = codex_use_sse();
+                    if use_sse {
+                        // Use chat completions API for OpenAI-compatible providers
+                        // that don't support the Responses API tool types.
+                        // wire_api="chat" uses /v1/chat/completions instead of /v1/responses
+                        cmd.arg("-c").arg("model_provider=\"custom\"");
+                        cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
+                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                            if !base_url.is_empty() {
+                                cmd.arg("-c").arg(format!(
+                                    "model_providers.custom.base_url=\"{}\"",
+                                    base_url.trim_end_matches('/')
+                                ));
+                            }
                         }
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.wire_api=\"chat\"");
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.supports_websockets=false");
+                        info!("codex: using Custom provider with Chat Completions API (CODEX_USE_SSE=true)");
                     } else {
-                        info!("codex: using OpenAI provider with default endpoint");
+                        cmd.arg("-c").arg("model_provider=\"openai\"");
+
+                        // If OPENAI_BASE_URL is set, pass it through so codex routes
+                        // to the custom endpoint instead of api.openai.com.
+                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                            if !base_url.is_empty() {
+                                cmd.arg("-c").arg(format!(
+                                    "openai_base_url=\"{}\"",
+                                    base_url.trim_end_matches('/')
+                                ));
+                                info!(base_url = %base_url, "codex: using OpenAI provider with custom base URL");
+                            }
+                        } else {
+                            info!("codex: using OpenAI provider with default endpoint");
+                        }
                     }
                 }
             }
@@ -879,13 +914,33 @@ trust_level = "trusted"
                         .arg("model_providers.fireworks.requires_openai_auth=false");
                 }
                 CodexProvider::OpenAI => {
-                    cmd.arg("-c").arg("model_provider=\"openai\"");
-                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                        if !base_url.is_empty() {
-                            cmd.arg("-c").arg(format!(
-                                "openai_base_url=\"{}\"",
-                                base_url.trim_end_matches('/')
-                            ));
+                    let use_sse = codex_use_sse();
+                    if use_sse {
+                        cmd.arg("-c").arg("model_provider=\"custom\"");
+                        cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
+                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                            if !base_url.is_empty() {
+                                cmd.arg("-c").arg(format!(
+                                    "model_providers.custom.base_url=\"{}\"",
+                                    base_url.trim_end_matches('/')
+                                ));
+                            }
+                        }
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.wire_api=\"chat\"");
+                        cmd.arg("-c")
+                            .arg("model_providers.custom.supports_websockets=false");
+                    } else {
+                        cmd.arg("-c").arg("model_provider=\"openai\"");
+                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                            if !base_url.is_empty() {
+                                cmd.arg("-c").arg(format!(
+                                    "openai_base_url=\"{}\"",
+                                    base_url.trim_end_matches('/')
+                                ));
+                            }
                         }
                     }
                 }
@@ -940,11 +995,16 @@ trust_level = "trusted"
                         );
                     }
                     CodexProvider::OpenAI => {
-                        // OpenAI provider reads OPENAI_API_KEY
-                        cmd.env(
-                            "OPENAI_API_KEY",
-                            std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                        );
+                        // OpenAI provider reads OPENAI_API_KEY, but Codex v0.133.0
+                        // uses "managed" auth which requires CODEX_API_KEY for the
+                        // Authorization header. Without CODEX_API_KEY, Codex detects
+                        // OPENAI_API_KEY but doesn't attach it to requests, resulting
+                        // in 401 Unauthorized errors.
+                        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                        cmd.env("OPENAI_API_KEY", &openai_key);
+                        if !openai_key.is_empty() {
+                            cmd.env("CODEX_API_KEY", &openai_key);
+                        }
                     }
                 }
             }
