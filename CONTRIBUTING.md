@@ -91,6 +91,8 @@ Look for issues labeled:
 
 ## 📋 Contribution Workflow
 
+> Before you start, read the [Contribution Guidelines](docs/contribution_guidelines.md) for the full standards on branch naming, commit messages, and PR conventions.
+
 ### 1. Find or Create an Issue
 - Check [existing issues](https://github.com/The-AgenticFlow/OpenFlows/issues)
 - Comment on an issue to express interest
@@ -269,6 +271,7 @@ Contributors will be:
 ## 📚 Additional Resources
 
 - [Official Website](https://openflows.dev)
+- [Contribution Guidelines](docs/contribution_guidelines.md)
 - [Tutorial](TUTORIAL.md)
 - [Demo Walkthrough](DEMO.md)
 - [Packaging Guide](PACKAGING.md)
