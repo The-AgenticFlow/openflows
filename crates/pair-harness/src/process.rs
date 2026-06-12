@@ -310,10 +310,50 @@ fn detect_codex_provider() -> CodexProvider {
 /// Check if SSE transport should be used instead of WebSocket for OpenAI provider.
 /// Set CODEX_USE_SSE=true to force SSE transport (for OpenAI-compatible providers
 /// that don't support the Responses WebSocket API).
-fn codex_use_sse() -> bool {
+pub fn codex_use_sse() -> bool {
     std::env::var("CODEX_USE_SSE")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+/// Append `--disable` flags for Codex features that register non-function tool
+/// types in the Responses API.
+///
+/// Non-OpenAI providers (proxies, custom endpoints) typically only support the
+/// `"function"` tool type in the OpenAI Responses API.  Codex features like
+/// computer_use, MCP, browser_use, etc. register tools with other type values
+/// (`"computer_preview"`, `"mcp"`, etc.) which cause a 400 "unknown tool type"
+/// error from these providers.
+///
+/// This function disables all known Codex features that produce non-function
+/// tool types, leaving only `"function"` tools (shell, file ops, etc.) which
+/// are universally supported.
+///
+/// Must be called **in addition** to removing MCP server entries from config.toml
+/// when using a custom SSE provider, because MCP tools also use the `"mcp"` type.
+fn append_sse_disable_flags(cmd: &mut Command) {
+    // Original set — always needed for SSE custom providers:
+    cmd.arg("--disable").arg("computer_use");
+    cmd.arg("--disable").arg("browser_use");
+    cmd.arg("--disable").arg("browser_use_external");
+    cmd.arg("--disable").arg("image_generation");
+    cmd.arg("--disable").arg("tool_call_mcp_elicitation");
+    cmd.arg("--disable").arg("in_app_browser");
+    cmd.arg("--disable").arg("tool_suggest");
+
+    // Extended set — additional features that register non-function tool types
+    // in the Responses API request.  These caused 400 "unknown tool type" errors
+    // on OpenAI-compatible proxies (e.g. api.ai.camer.digital) that only
+    // accept type="function".
+    cmd.arg("--disable").arg("apps");
+    cmd.arg("--disable").arg("multi_agent");
+    cmd.arg("--disable").arg("plugins");
+    cmd.arg("--disable").arg("plugin_hooks");
+    cmd.arg("--disable").arg("plugin_sharing");
+    cmd.arg("--disable").arg("skill_mcp_dependency_install");
+    cmd.arg("--disable").arg("goals");
+    cmd.arg("--disable").arg("guardian_approval");
+    cmd.arg("--disable").arg("workspace_dependencies");
 }
 
 /// Mode for SENTINEL spawning.
@@ -846,13 +886,18 @@ trust_level = "trusted"
                         // don't support. Without these, Codex only sends "function"
                         // type tools which are universally compatible.
                         // See: https://github.com/openai/codex/discussions/7782
-                        cmd.arg("--disable").arg("computer_use");
-                        cmd.arg("--disable").arg("browser_use");
-                        cmd.arg("--disable").arg("browser_use_external");
-                        cmd.arg("--disable").arg("image_generation");
-                        cmd.arg("--disable").arg("tool_call_mcp_elicitation");
-                        cmd.arg("--disable").arg("in_app_browser");
-                        cmd.arg("--disable").arg("tool_suggest");
+                        //
+                        // The Responses API defines several tool types beyond "function":
+                        //   - computer_preview, mcp, web_search, etc.
+                        // Non-OpenAI providers typically only support type="function".
+                        // Any tool sent with a non-function type causes a 400
+                        // "unknown tool type" error from the provider.
+                        //
+                        // The flags below disable Codex features that register
+                        // non-function tool types in the Responses API request.
+                        // Core functionality like shell_tool (Bash) uses type="function"
+                        // and is preserved.
+                        append_sse_disable_flags(&mut cmd);
                         info!("codex: using Custom provider with Responses API over SSE (CODEX_USE_SSE=true)");
                     } else {
                         cmd.arg("-c").arg("model_provider=\"openai\"");
@@ -950,16 +995,8 @@ trust_level = "trusted"
                         cmd.arg("-c")
                             .arg("model_providers.custom.supports_websockets=false");
                         // Disable Responses API tool types that non-OpenAI providers
-                        // don't support. Without these, Codex only sends "function"
-                        // type tools which are universally compatible.
-                        // See: https://github.com/openai/codex/discussions/7782
-                        cmd.arg("--disable").arg("computer_use");
-                        cmd.arg("--disable").arg("browser_use");
-                        cmd.arg("--disable").arg("browser_use_external");
-                        cmd.arg("--disable").arg("image_generation");
-                        cmd.arg("--disable").arg("tool_call_mcp_elicitation");
-                        cmd.arg("--disable").arg("in_app_browser");
-                        cmd.arg("--disable").arg("tool_suggest");
+                        // don't support. See build_cli_command for rationale.
+                        append_sse_disable_flags(&mut cmd);
                     } else {
                         cmd.arg("-c").arg("model_provider=\"openai\"");
                         if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
