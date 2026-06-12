@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod mcp;
 pub mod openai;
 pub mod runner;
+pub mod truncate;
 pub mod types;
 
 pub use anthropic::AnthropicClient;

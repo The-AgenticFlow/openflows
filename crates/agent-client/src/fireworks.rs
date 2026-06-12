@@ -187,7 +187,7 @@ impl LlmClient for FireworksClient {
         let raw: Value = serde_json::from_str(&raw_text).context(format!(
             "Failed to parse Fireworks response (status={}, body={})",
             status,
-            &raw_text[..raw_text.len().min(500)]
+            crate::truncate::truncate_str(&raw_text, 500)
         ))?;
 
         if !status.is_success() {

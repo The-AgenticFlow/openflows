@@ -817,9 +817,15 @@ trust_level = "trusted"
                     // set CODEX_USE_SSE=true to use SSE transport instead.
                     let use_sse = codex_use_sse();
                     if use_sse {
-                        // Use chat completions API for OpenAI-compatible providers
-                        // that don't support the Responses API tool types.
-                        // wire_api="chat" uses /v1/chat/completions instead of /v1/responses
+                        // Use Responses API over SSE for OpenAI-compatible providers.
+                        // Codex v0.133.0+ removed wire_api="chat"; all providers
+                        // must use wire_api="responses". SSE transport is controlled
+                        // separately via supports_websockets=false.
+                        //
+                        // Non-OpenAI providers typically only support the "function"
+                        // tool type in the Responses API. Disable Codex features
+                        // that add unsupported tool types (computer_preview, MCP,
+                        // browser) to avoid 400 "unknown tool type" errors.
                         cmd.arg("-c").arg("model_provider=\"custom\"");
                         cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
                         if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
@@ -833,10 +839,21 @@ trust_level = "trusted"
                         cmd.arg("-c")
                             .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
                         cmd.arg("-c")
-                            .arg("model_providers.custom.wire_api=\"chat\"");
+                            .arg("model_providers.custom.wire_api=\"responses\"");
                         cmd.arg("-c")
                             .arg("model_providers.custom.supports_websockets=false");
-                        info!("codex: using Custom provider with Chat Completions API (CODEX_USE_SSE=true)");
+                        // Disable Responses API tool types that non-OpenAI providers
+                        // don't support. Without these, Codex only sends "function"
+                        // type tools which are universally compatible.
+                        // See: https://github.com/openai/codex/discussions/7782
+                        cmd.arg("--disable").arg("computer_use");
+                        cmd.arg("--disable").arg("browser_use");
+                        cmd.arg("--disable").arg("browser_use_external");
+                        cmd.arg("--disable").arg("image_generation");
+                        cmd.arg("--disable").arg("tool_call_mcp_elicitation");
+                        cmd.arg("--disable").arg("in_app_browser");
+                        cmd.arg("--disable").arg("tool_suggest");
+                        info!("codex: using Custom provider with Responses API over SSE (CODEX_USE_SSE=true)");
                     } else {
                         cmd.arg("-c").arg("model_provider=\"openai\"");
 
@@ -929,9 +946,20 @@ trust_level = "trusted"
                         cmd.arg("-c")
                             .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
                         cmd.arg("-c")
-                            .arg("model_providers.custom.wire_api=\"chat\"");
+                            .arg("model_providers.custom.wire_api=\"responses\"");
                         cmd.arg("-c")
                             .arg("model_providers.custom.supports_websockets=false");
+                        // Disable Responses API tool types that non-OpenAI providers
+                        // don't support. Without these, Codex only sends "function"
+                        // type tools which are universally compatible.
+                        // See: https://github.com/openai/codex/discussions/7782
+                        cmd.arg("--disable").arg("computer_use");
+                        cmd.arg("--disable").arg("browser_use");
+                        cmd.arg("--disable").arg("browser_use_external");
+                        cmd.arg("--disable").arg("image_generation");
+                        cmd.arg("--disable").arg("tool_call_mcp_elicitation");
+                        cmd.arg("--disable").arg("in_app_browser");
+                        cmd.arg("--disable").arg("tool_suggest");
                     } else {
                         cmd.arg("-c").arg("model_provider=\"openai\"");
                         if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
