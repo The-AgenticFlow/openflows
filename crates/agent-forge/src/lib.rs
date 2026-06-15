@@ -1928,8 +1928,32 @@ impl BatchNode for ForgePairNode {
             backend
         };
 
+        // Resolve model_backend from registry for this worker.
+        // This overrides the OPENAI_MODEL / ANTHROPIC_MODEL env vars
+        // passed to the spawned CLI process, ensuring each agent uses
+        // the model specified in registry.json's model_backend field.
+        let model_backend = if let Some(registry_path) = &self.registry_path {
+            let registry = config::Registry::load(registry_path)?;
+            let base_id = worker_id
+                .rfind('-')
+                .map(|i| &worker_id[..i])
+                .unwrap_or(&worker_id);
+            let model = registry
+                .get(base_id)
+                .and_then(|entry| entry.model_backend.clone());
+            if let Some(ref m) = model {
+                info!(worker_id, base_id, model = %m, "Model backend resolved from registry");
+            } else {
+                info!(worker_id, base_id, "No model_backend in registry, using env var default");
+            }
+            model
+        } else {
+            None
+        };
+
         let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)
-            .with_cli_backend(cli_backend);
+            .with_cli_backend(cli_backend)
+            .with_model_backend(model_backend);
 
         let mut pair = ForgeSentinelPair::new(config);
         let outcome = pair

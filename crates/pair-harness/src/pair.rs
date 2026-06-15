@@ -407,14 +407,16 @@ impl ForgeSentinelPair {
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (Some(redis_url), None) => ProcessManager::with_redis(
                     &config.github_token,
                     redis_url,
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (None, Some(proxy_url)) => ProcessManager::with_proxy(
                     &config.github_token,
                     None,
@@ -422,10 +424,12 @@ impl ForgeSentinelPair {
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (None, None) => {
                     ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
                         .with_default_backend(cli_backend)
+                        .with_model_backend(config.model_backend.clone())
                 }
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
@@ -1146,6 +1150,7 @@ impl ForgeSentinelPair {
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
                 self.config.cli_backend,
+                self.config.model_backend.as_deref(),
             )
             .await
     }

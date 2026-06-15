@@ -11,6 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
 notify = "6.1"
 sha2 = "0.10"
 hex = "0.4"
@@ -19,7 +20,10 @@ libc = "0.2"
 which = "7"
 regex = "1"
 config = { path = "../config" }
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "stream"] }
+axum = { version = "0.8", features = ["http2"] }
+uuid = { version = "1", features = ["v4"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

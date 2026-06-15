@@ -61,6 +61,10 @@ pub struct PairConfig {
     pub watchdog_timeout_secs: u64,
     /// CLI backend to use for this pair (claude or codex)
     pub cli_backend: CliBackend,
+    /// Model to use for this pair's CLI backend (e.g., "deepseek-v4-flash", "gpt-5.5").
+    /// Read from registry.json's `model_backend` field. When set, this overrides
+    /// the OPENAI_MODEL / ANTHROPIC_MODEL environment variables for the spawned process.
+    pub model_backend: Option<String>,
     pub verify_command: Option<String>,
     pub max_verify_attempts: u32,
 }
@@ -106,6 +110,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -133,6 +138,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -160,6 +166,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -168,6 +175,13 @@ impl PairConfig {
     /// Set the CLI backend for this pair.
     pub fn with_cli_backend(mut self, backend: CliBackend) -> Self {
         self.cli_backend = backend;
+        self
+    }
+
+    /// Set the model backend for this pair (e.g., "deepseek-v4-flash" from registry.json).
+    /// This overrides the model passed to the CLI process via environment variable.
+    pub fn with_model_backend(mut self, model: Option<String>) -> Self {
+        self.model_backend = model.filter(|m| !m.is_empty());
         self
     }
 }

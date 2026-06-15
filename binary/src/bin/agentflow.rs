@@ -46,9 +46,6 @@ async fn main() -> Result<()> {
     let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
     let has_proxy = std::env::var("PROXY_URL").is_ok();
     let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
-    let use_sse = std::env::var("CODEX_USE_SSE")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
 
     info!("═══ AgentFlow Configuration ═══");
     info!("  CLI Backend: {}", default_cli);
@@ -56,18 +53,14 @@ async fn main() -> Result<()> {
         info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
     } else if default_cli == "codex" && has_openai {
         let base_url = std::env::var("OPENAI_BASE_URL").ok();
-        if use_sse {
-            if let Some(url) = base_url {
-                info!("  LLM Mode: Codex + OpenAI-compatible provider at {} (Chat Completions API)", url);
-            } else {
-                info!("  LLM Mode: Codex + OpenAI (Chat Completions API)");
-            }
+        // The endpoint mode (ResponsesApi vs ChatCompletions) is determined at
+        // runtime by probing /v1/responses — see process.rs::probe_endpoint_supports_responses().
+        // If the endpoint doesn't support /v1/responses, a local proxy is started
+        // to translate between the two formats.
+        if let Some(url) = base_url {
+            info!("  LLM Mode: Codex + OpenAI-compatible provider at {} (endpoint mode probed at startup)", url);
         } else {
-            if let Some(url) = base_url {
-                info!("  LLM Mode: Codex + OpenAI-compatible provider at {} (WebSocket)", url);
-            } else {
-                info!("  LLM Mode: Codex + OpenAI (direct — no proxy needed)");
-            }
+            info!("  LLM Mode: Codex + OpenAI (direct — no proxy needed)");
         }
     } else if default_cli == "claude" && has_anthropic && !has_proxy {
         info!("  LLM Mode: Claude + Direct Anthropic Key");

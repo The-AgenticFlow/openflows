@@ -245,13 +245,28 @@ pub fn get_backend_config(backend: CliBackend, worktree: &Path, shared: &Path) -
 ///
 /// Determines how codex CLI routes API requests:
 /// - `Fireworks`: Custom provider with SSE transport (no WebSocket), for Fireworks AI.
-/// - `OpenAI`: Built-in provider with WebSocket support, for direct OpenAI usage.
+/// - `OpenAI`: Provider mode determined by endpoint probing — Responses API if
+///   the endpoint supports `/v1/responses`, otherwise Chat Completions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexProvider {
     /// Fireworks AI — Responses API over SSE (no WebSocket support).
     Fireworks,
-    /// OpenAI — Responses API with WebSocket transport.
+    /// OpenAI — mode determined by endpoint capability probing.
     OpenAI,
+}
+
+/// Whether an OpenAI-compatible endpoint supports the Responses API (`/v1/responses`).
+///
+/// Determined at runtime by probing the endpoint. Cached for the process lifetime
+/// so we only probe once per startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointMode {
+    /// Endpoint supports `/v1/responses` — use the Responses API with custom provider config.
+    ResponsesApi,
+    /// Endpoint only supports `/v1/chat/completions` — start a local Responses→ChatCompletions
+    /// proxy since Codex CLI v0.133.0+ requires `wire_api="responses"`. The proxy translates
+    /// `/v1/responses` requests to `/v1/chat/completions` requests.
+    ChatCompletions,
 }
 
 impl CodexProvider {
@@ -269,7 +284,7 @@ impl CodexProvider {
 /// Selection priority:
 /// 1. `CODEX_PROVIDER` env var (explicit: `"fireworks"` or `"openai"`)
 /// 2. `FIREWORKS_API_KEY` present → Fireworks (SSE transport, no WebSocket)
-/// 3. Otherwise → OpenAI (built-in provider with WebSocket support)
+/// 3. Otherwise → OpenAI (mode determined by endpoint probing)
 fn detect_codex_provider() -> CodexProvider {
     // Explicit override takes priority
     if let Ok(provider) = std::env::var("CODEX_PROVIDER") {
@@ -302,18 +317,149 @@ fn detect_codex_provider() -> CodexProvider {
         info!("codex: auto-detected Fireworks provider (FIREWORKS_API_KEY present)");
         CodexProvider::Fireworks
     } else {
-        info!("codex: using built-in OpenAI provider");
+        info!("codex: using OpenAI-compatible provider");
         CodexProvider::OpenAI
     }
 }
 
-/// Check if SSE transport should be used instead of WebSocket for OpenAI provider.
-/// Set CODEX_USE_SSE=true to force SSE transport (for OpenAI-compatible providers
-/// that don't support the Responses WebSocket API).
+/// Probe whether the OpenAI-compatible endpoint (OPENAI_BASE_URL) supports the
+/// Responses API (`/v1/responses`).
+///
+/// Sends a lightweight POST request to `{base_url}/responses` with a minimal payload.
+/// If the endpoint returns 2xx or a 4xx that indicates the route exists (e.g., 401,
+/// 422), we consider it Responses API–capable. If it returns 404, the route doesn't
+/// exist and we fall back to Chat Completions mode.
+///
+/// Results are cached for the process lifetime via a `OnceLock`.
+///
+/// NOTE: The HTTP probe runs in a dedicated OS thread to avoid Tokio runtime
+/// conflicts — `reqwest::blocking` creates its own Tokio runtime internally,
+/// which panics if called from within an existing async runtime context.
+fn probe_endpoint_supports_responses() -> EndpointMode {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<EndpointMode> = OnceLock::new();
+
+    *CACHE.get_or_init(|| {
+        let base_url = match std::env::var("OPENAI_BASE_URL") {
+            Ok(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
+            _ => {
+                info!("codex: no OPENAI_BASE_URL set; assuming Responses API capable");
+                return EndpointMode::ResponsesApi;
+            }
+        };
+
+        let probe_url = format!("{}/responses", base_url);
+
+        // Build a minimal request body that is valid for Responses API probes.
+        let body = r#"{"model":"probe","input":"ping"}"#.to_string();
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+
+        // Run the HTTP probe in a dedicated OS thread. This is necessary because:
+        // - reqwest::blocking creates its own Tokio runtime internally
+        // - This function is called from within an async Tokio context
+        //   (during ForgeSentinelPair::new → ProcessManager construction →
+        //    build_cli_command), and creating a nested runtime panics.
+        // - std::thread::spawn creates a new OS thread where the blocking
+        //   client can safely create its own runtime.
+        let handle = std::thread::spawn(move || {
+            // Use a short timeout — this runs during process spawn so must be fast.
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "codex: failed to build HTTP client for endpoint probe; assuming Responses API");
+                    return EndpointMode::ResponsesApi;
+                }
+            };
+
+            let result = client
+                .post(&probe_url)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .body(body)
+                .send();
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status == 404 {
+                        // 404 = the /v1/responses route does not exist
+                        info!(
+                            base_url = %base_url,
+                            status,
+                            "codex: endpoint does NOT support /v1/responses (404); using Chat Completions mode"
+                        );
+                        EndpointMode::ChatCompletions
+                    } else if status >= 200 && status < 300 {
+                        // 2xx = the route exists and processed the request (possibly with
+                        // an error in the body, but the route is there)
+                        info!(
+                            base_url = %base_url,
+                            status,
+                            "codex: endpoint supports /v1/responses (2xx); using Responses API mode"
+                        );
+                        EndpointMode::ResponsesApi
+                    } else if status == 401 || status == 422 || status == 429 {
+                        // 401 Unauthorized, 422 Unprocessable, 429 Rate Limited
+                        // These all indicate the route EXISTS but the request was invalid
+                        // (bad auth, bad payload, rate limit). Safer to try ResponsesApi.
+                        info!(
+                            base_url = %base_url,
+                            status,
+                            "codex: endpoint appears to support /v1/responses (auth/validation error); using Responses API mode"
+                        );
+                        EndpointMode::ResponsesApi
+                    } else {
+                        // 403 Forbidden, 5xx errors, and anything else — these indicate
+                        // the gateway may NOT support /v1/responses (e.g., 403 from
+                        // gateways that reject WebSocket upgrades, or 500 from misconfigured
+                        // gateways). Default to ChatCompletions mode which uses the proxy,
+                        // since it's the safer fallback (the proxy can always translate).
+                        warn!(
+                            base_url = %base_url,
+                            status,
+                            "codex: endpoint returned {}; defaulting to Chat Completions mode (proxy will be started)",
+                            status
+                        );
+                        EndpointMode::ChatCompletions
+                    }
+                }
+                Err(e) => {
+                    // Network errors (DNS, timeout, connection refused) — default to
+                    // ChatCompletions mode since we can't confirm ResponsesApi support.
+                    // The local proxy can translate if needed.
+                    warn!(
+                        error = %e,
+                        "codex: endpoint probe failed; defaulting to Chat Completions mode (proxy will be started)"
+                    );
+                    EndpointMode::ChatCompletions
+                }
+            }
+        });
+
+        match handle.join() {
+            Ok(mode) => mode,
+            Err(_) => {
+                warn!("codex: endpoint probe thread panicked; assuming Responses API capable");
+                EndpointMode::ResponsesApi
+            }
+        }
+    })
+}
+
+/// Determine whether to use SSE (custom provider) mode for OpenAI-compatible endpoints.
+///
+/// Instead of relying on a manual env var toggle, we probe the endpoint at runtime:
+/// - If the endpoint supports `/v1/responses` → use Responses API (custom provider + SSE)
+/// - If the endpoint returns 404 for `/v1/responses` → start a local proxy that translates
+///   Responses API requests to Chat Completions format (since Codex CLI only supports
+///   `wire_api="responses"`)
 pub fn codex_use_sse() -> bool {
-    std::env::var("CODEX_USE_SSE")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
+    // NOTE: The former CODEX_USE_SSE env var has been removed. This function
+    // now probes the endpoint capability instead of reading a static flag.
+    probe_endpoint_supports_responses() == EndpointMode::ChatCompletions
 }
 
 /// Append `--disable` flags for Codex features that register non-function tool
@@ -354,6 +500,38 @@ fn append_sse_disable_flags(cmd: &mut Command) {
     cmd.arg("--disable").arg("goals");
     cmd.arg("--disable").arg("guardian_approval");
     cmd.arg("--disable").arg("workspace_dependencies");
+}
+
+/// Configure Codex CLI to use the local Responses→ChatCompletions proxy.
+///
+/// This is only needed when the upstream gateway supports `/v1/chat/completions`
+/// but NOT `/v1/responses`. Since Codex CLI v0.133.0+ only supports
+/// `wire_api="responses"`, we start a local proxy that:
+///
+/// 1. Receives Responses API `POST /v1/responses` requests from Codex
+/// 2. Translates them to Chat Completions `POST /v1/chat/completions` requests
+/// 3. Forwards to the upstream gateway
+/// 4. Translates responses back to Responses API format
+///
+/// This is a **special-case adapter** — it is NOT used when the gateway
+/// natively supports `/v1/responses` (e.g., api.openai.com, Fireworks).
+fn configure_responses_proxy(cmd: &mut Command, proxy_url: &str) {
+    cmd.arg("-c").arg("model_provider=\"responses_proxy\"");
+    cmd.arg("-c").arg(format!(
+        "model_providers.responses_proxy.name=\"ResponsesProxy\""
+    ));
+    cmd.arg("-c").arg(format!(
+        "model_providers.responses_proxy.base_url=\"{}\"",
+        proxy_url.trim_end_matches('/')
+    ));
+    cmd.arg("-c")
+        .arg("model_providers.responses_proxy.env_key=\"OPENAI_API_KEY\"");
+    cmd.arg("-c")
+        .arg("model_providers.responses_proxy.wire_api=\"responses\"");
+    cmd.arg("-c")
+        .arg("model_providers.responses_proxy.supports_websockets=false");
+    // Disable Responses API tool types that non-OpenAI providers don't support.
+    append_sse_disable_flags(cmd);
 }
 
 /// Mode for SENTINEL spawning.
@@ -500,18 +678,66 @@ fn extract_result_from_turns_with_thread(
     }
 }
 
+/// Wraps a Tokio runtime so it can be dropped safely from an async context.
+///
+/// Dropping a multi-thread runtime blocks the current thread by joining worker
+/// threads, which panics inside an async task. This wrapper offloads the drop
+/// to a dedicated OS thread.
+pub struct ThreadSafeRuntime(Option<tokio::runtime::Runtime>);
+
+impl ThreadSafeRuntime {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self(Some(rt))
+    }
+}
+
+impl Drop for ThreadSafeRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            std::thread::spawn(move || {
+                drop(rt);
+            });
+        }
+    }
+}
+
+/// Holds the initialized state for the responses proxy. The address and runtime
+/// are always set atomically together, preventing a race where the cached address
+/// points to a proxy whose runtime has been dropped.
+struct ResponsesProxyState {
+    /// The proxy base URL (e.g., "http://127.0.0.1:35173").
+    addr: String,
+    /// The Tokio runtime that drives the proxy server. Kept alive for the
+    /// lifetime of ProcessManager so the proxy continues serving requests.
+    runtime: ThreadSafeRuntime,
+    /// Shutdown sender for graceful proxy termination. When dropped, the
+    /// server stops accepting new connections and drains in-flight requests.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
 /// Manages FORGE and SENTINEL processes.
-/// Supports multiple CLI backends via `BackendConfig` — adding a new backend
+/// Supports multiple CLI backends via the `BackendConfig` abstraction — adding a new backend
 /// only requires creating a new `BackendConfig` and registering it.
 pub struct ProcessManager {
     /// Registry of backend configs, keyed by CliBackend
     backends: HashMap<CliBackend, BackendConfig>,
     /// Default CLI backend to use
     default_backend: CliBackend,
+    /// Model backend override from registry.json (e.g., "deepseek-v4-flash").
+    /// When set, this overrides the OPENAI_MODEL / ANTHROPIC_MODEL env var
+    /// for the spawned CLI process.
+    model_backend: Option<String>,
     github_token: String,
     redis_url: Option<String>,
     proxy_url: Option<String>,
     proxy_api_key: Option<String>,
+    /// Local Responses API proxy state (started when endpoint doesn't
+    /// support /v1/responses). When set, Codex CLI is configured to point
+    /// at this proxy instead of the upstream directly.
+    /// Uses a single Mutex to ensure atomic initialization — the address
+    /// and runtime are always set together, preventing a race where the
+    /// address points to a killed proxy.
+    responses_proxy: std::sync::Mutex<Option<ResponsesProxyState>>,
 }
 
 impl ProcessManager {
@@ -546,10 +772,12 @@ impl ProcessManager {
         Self {
             backends,
             default_backend: CliBackend::default(),
+            model_backend: None,
             github_token: github_token.into(),
             redis_url: None,
             proxy_url,
             proxy_api_key,
+            responses_proxy: std::sync::Mutex::new(None),
         }
     }
 
@@ -588,10 +816,12 @@ impl ProcessManager {
         Self {
             backends,
             default_backend: CliBackend::default(),
+            model_backend: None,
             github_token: github_token.into(),
             redis_url: Some(redis_url.into()),
             proxy_url,
             proxy_api_key,
+            responses_proxy: std::sync::Mutex::new(None),
         }
     }
 
@@ -630,10 +860,12 @@ impl ProcessManager {
         Self {
             backends,
             default_backend: CliBackend::default(),
+            model_backend: None,
             github_token: github_token.into(),
             redis_url,
             proxy_url: Some(proxy_url.into()),
             proxy_api_key,
+            responses_proxy: std::sync::Mutex::new(None),
         }
     }
 
@@ -641,6 +873,103 @@ impl ProcessManager {
     pub fn with_default_backend(mut self, backend: CliBackend) -> Self {
         self.default_backend = backend;
         self
+    }
+
+    /// Set the model backend override (from registry.json's model_backend field).
+    /// When set, this overrides the OPENAI_MODEL / ANTHROPIC_MODEL env var
+    /// for the spawned CLI process.
+    pub fn with_model_backend(mut self, model: Option<String>) -> Self {
+        self.model_backend = model.filter(|m| !m.is_empty());
+        self
+    }
+
+    /// Ensure the local Responses API proxy is running. Starts it if not yet
+    /// started, and returns the proxy base URL (e.g., "http://127.0.0.1:PORT").
+    ///
+    /// The proxy translates `/v1/responses` (Responses API) requests into
+    /// `/v1/chat/completions` (Chat Completions API) requests and forwards
+    /// them to the upstream gateway. This is needed because Codex CLI v0.133.0+
+    /// only supports `wire_api="responses"` but many OpenAI-compatible gateways
+    /// only implement `/v1/chat/completions`.
+    pub fn ensure_responses_proxy(&self) -> Result<String> {
+        // Check if already started under the lock to prevent races.
+        // If two threads race here, only one will start the proxy; the other
+        // will find it already initialized and return the cached address.
+        {
+            let guard = self.responses_proxy.lock().expect("responses_proxy mutex poisoned");
+            if let Some(ref state) = *guard {
+                return Ok(state.addr.clone());
+            }
+        }
+
+        let upstream_base_url = std::env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+
+        if api_key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "OPENAI_API_KEY is required for the responses proxy (endpoint does not support /v1/responses)"
+            ));
+        }
+
+        info!(
+            upstream = %upstream_base_url,
+            "responses_proxy: starting Responses→ChatCompletions proxy for Codex CLI"
+        );
+
+        let upstream_clone = upstream_base_url.clone();
+        let api_key_clone = api_key.clone();
+
+        // Run the proxy startup in a dedicated OS thread. This is necessary because:
+        // - Creating a new multi-thread Tokio runtime panics if called from within
+        //   an existing Tokio runtime (which happens when build_cli_command or
+        //   build_sentinel_command is invoked from async spawn functions).
+        // - We also need block_on on the new runtime to start the proxy.
+        // - std::thread::spawn creates a new OS thread where the runtime can be
+        //   safely created and kept alive.
+        let handle = std::thread::spawn(move || -> Result<(String, ThreadSafeRuntime, tokio::sync::watch::Sender<bool>)> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("Failed to create Tokio runtime for responses proxy")?;
+
+            let (addr, shutdown_tx) = rt.block_on(async {
+                crate::responses_proxy::start_responses_proxy(upstream_clone, api_key_clone).await
+            })?;
+
+            let proxy_url = format!("http://{}:{}", addr.ip(), addr.port());
+            Ok((proxy_url, ThreadSafeRuntime::new(rt), shutdown_tx))
+        });
+
+        let (proxy_url, rt, shutdown_tx) = match handle.join() {
+            Ok(result) => result.context("responses_proxy: failed to start")?,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "responses_proxy: dedicated thread panicked: {:?}",
+                    e
+                ));
+            }
+        };
+
+        info!(proxy_url = %proxy_url, "responses_proxy: proxy started");
+
+        // Store both the address and runtime atomically under the same lock.
+        // This prevents a race where the address is cached but the runtime
+        // is from a different (killed) proxy instance.
+        let mut guard = self.responses_proxy.lock().expect("responses_proxy mutex poisoned");
+        // Another thread may have initialized the proxy while we were starting ours.
+        // If so, return the cached address and drop our duplicate runtime.
+        if let Some(ref state) = *guard {
+            return Ok(state.addr.clone());
+        }
+        *guard = Some(ResponsesProxyState {
+            addr: proxy_url.clone(),
+            runtime: rt,
+            shutdown_tx,
+        });
+
+        Ok(proxy_url)
     }
 
     /// Register a custom backend config (for testing or third-party backends).
@@ -807,8 +1136,14 @@ trust_level = "trusted"
             cmd.arg(arg);
         }
 
-        // Pass model from backend-specific env var if configured
-        if let Some(model_env) = &config.model_env {
+        // Pass model from ProcessManager's model_backend override (from registry.json)
+        // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
+        if let Some(model) = &self.model_backend {
+            if !model.is_empty() {
+                cmd.arg("-m").arg(model);
+                info!(model = %model, "{}: using model from registry model_backend", backend.as_str());
+            }
+        } else if let Some(model_env) = &config.model_env {
             if let Ok(model) = std::env::var(model_env) {
                 if !model.is_empty() {
                     cmd.arg("-m").arg(&model);
@@ -820,9 +1155,15 @@ trust_level = "trusted"
         // Codex CLI provider configuration — determined at startup based on
         // CODEX_PROVIDER env var or auto-detected from available API keys.
         //
-        // Two modes:
-        //   * Fireworks: custom provider with supports_websockets=false (SSE only)
-        //   * OpenAI:    built-in provider with WebSocket support enabled
+        // Three modes:
+        //   * Fireworks:          custom provider with supports_websockets=false (SSE only)
+        //   * OpenAI + Responses: custom provider using wire_api="responses" + SSE
+        //   * OpenAI + Chat:      built-in provider with openai_base_url (Chat Completions fallback)
+        //
+        // For OpenAI-compatible endpoints that are NOT api.openai.com, we probe the
+        // endpoint at startup to determine if it supports the Responses API (/v1/responses).
+        // If it does, we use custom SSE provider mode. If it returns 404 for /v1/responses,
+        // we fall back to the built-in OpenAI provider which uses Chat Completions.
         //
         // Provider is defined via `-c` runtime flags because `model_providers`
         // is on the project-local config denylist and cannot be set in
@@ -850,70 +1191,73 @@ trust_level = "trusted"
                     info!("codex: using Fireworks provider (SSE, no WebSocket)");
                 }
                 CodexProvider::OpenAI => {
-                    // Use the built-in openai provider — supports WebSocket for
-                    // streaming responses. Works with OpenAI directly or any
-                    // WebSocket-compatible proxy set via OPENAI_BASE_URL.
-                    // For OpenAI-compatible providers that don't support WebSocket,
-                    // set CODEX_USE_SSE=true to use SSE transport instead.
-                    let use_sse = codex_use_sse();
-                    if use_sse {
-                        // Use Responses API over SSE for OpenAI-compatible providers.
-                        // Codex v0.133.0+ removed wire_api="chat"; all providers
-                        // must use wire_api="responses". SSE transport is controlled
-                        // separately via supports_websockets=false.
-                        //
-                        // Non-OpenAI providers typically only support the "function"
-                        // tool type in the Responses API. Disable Codex features
-                        // that add unsupported tool types (computer_preview, MCP,
-                        // browser) to avoid 400 "unknown tool type" errors.
-                        cmd.arg("-c").arg("model_provider=\"custom\"");
-                        cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
-                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                            if !base_url.is_empty() {
-                                cmd.arg("-c").arg(format!(
-                                    "model_providers.custom.base_url=\"{}\"",
-                                    base_url.trim_end_matches('/')
-                                ));
+                    // Probe the endpoint to determine if it supports the Responses API.
+                    // Endpoints that support /v1/responses get the custom SSE provider;
+                    // endpoints that return 404 (like OpenAI-compatible proxies) fall back
+                    // to the built-in openai provider with Chat Completions.
+                    let endpoint_mode = probe_endpoint_supports_responses();
+                    match endpoint_mode {
+                        EndpointMode::ResponsesApi => {
+                            // Endpoint supports /v1/responses — use custom provider
+                            // with SSE transport and disable non-function tool types
+                            // that cause errors on non-OpenAI proxies.
+                            cmd.arg("-c").arg("model_provider=\"custom\"");
+                            cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
+                            if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                                if !base_url.is_empty() {
+                                    cmd.arg("-c").arg(format!(
+                                        "model_providers.custom.base_url=\"{}\"",
+                                        base_url.trim_end_matches('/')
+                                    ));
+                                }
                             }
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.wire_api=\"responses\"");
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.supports_websockets=false");
+                            // Disable Responses API tool types that non-OpenAI providers
+                            // don't support. Without these, Codex only sends "function"
+                            // type tools which are universally compatible.
+                            // See: https://github.com/openai/codex/discussions/7782
+                            append_sse_disable_flags(&mut cmd);
+                            info!("codex: using Custom provider with Responses API over SSE (endpoint supports /v1/responses)");
                         }
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.wire_api=\"responses\"");
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.supports_websockets=false");
-                        // Disable Responses API tool types that non-OpenAI providers
-                        // don't support. Without these, Codex only sends "function"
-                        // type tools which are universally compatible.
-                        // See: https://github.com/openai/codex/discussions/7782
-                        //
-                        // The Responses API defines several tool types beyond "function":
-                        //   - computer_preview, mcp, web_search, etc.
-                        // Non-OpenAI providers typically only support type="function".
-                        // Any tool sent with a non-function type causes a 400
-                        // "unknown tool type" error from the provider.
-                        //
-                        // The flags below disable Codex features that register
-                        // non-function tool types in the Responses API request.
-                        // Core functionality like shell_tool (Bash) uses type="function"
-                        // and is preserved.
-                        append_sse_disable_flags(&mut cmd);
-                        info!("codex: using Custom provider with Responses API over SSE (CODEX_USE_SSE=true)");
-                    } else {
-                        cmd.arg("-c").arg("model_provider=\"openai\"");
-
-                        // If OPENAI_BASE_URL is set, pass it through so codex routes
-                        // to the custom endpoint instead of api.openai.com.
-                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                            if !base_url.is_empty() {
-                                cmd.arg("-c").arg(format!(
-                                    "openai_base_url=\"{}\"",
-                                    base_url.trim_end_matches('/')
-                                ));
-                                info!(base_url = %base_url, "codex: using OpenAI provider with custom base URL");
+                        EndpointMode::ChatCompletions => {
+                            // SPECIAL CASE: Endpoint does NOT support /v1/responses.
+                            //
+                            // Codex CLI v0.133.0+ only supports wire_api="responses"
+                            // (the Responses API). The built-in `openai` provider always
+                            // uses /v1/responses via WebSocket, which fails with 403 on
+                            // gateways that don't implement that endpoint.
+                            //
+                            // This is the format-discrepancy case: the gateway only
+                            // speaks Chat Completions but Codex only speaks Responses
+                            // API. We bridge this gap with a local proxy that translates
+                            // between the two formats.
+                            match self.ensure_responses_proxy() {
+                                Ok(proxy_url) => {
+                                    configure_responses_proxy(&mut cmd, &proxy_url);
+                                    info!(proxy_url = %proxy_url, "codex: using local Responses→ChatCompletions proxy (format discrepancy: endpoint lacks /v1/responses)");
+                                }
+                                Err(e) => {
+                                    error!("codex: FAILED to start responses proxy: {}. This endpoint does NOT support /v1/responses and the proxy could not be started. The spawned process will not be able to communicate with the LLM.", e);
+                                    // NOTE: We still build the command to avoid changing the
+                                    // return type, but it will fail immediately because the
+                                    // endpoint doesn't support /v1/responses. The pair watchdog
+                                    // will detect the quick exit and mark the pair as blocked.
+                                    cmd.arg("-c").arg("model_provider=\"openai\"");
+                                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                                        if !base_url.is_empty() {
+                                            cmd.arg("-c").arg(format!(
+                                                "openai_base_url=\"{}\"",
+                                                base_url.trim_end_matches('/')
+                                            ));
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            info!("codex: using OpenAI provider with default endpoint");
                         }
                     }
                 }
@@ -947,8 +1291,14 @@ trust_level = "trusted"
             cmd.arg(arg);
         }
 
-        // Pass model from backend-specific env var if configured
-        if let Some(model_env) = &config.model_env {
+        // Pass model from ProcessManager's model_backend override (from registry.json)
+        // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
+        if let Some(model) = &self.model_backend {
+            if !model.is_empty() {
+                cmd.arg("-m").arg(model);
+                info!(model = %model, "{}: using model from registry model_backend (sentinel)", backend.as_str());
+            }
+        } else if let Some(model_env) = &config.model_env {
             if let Ok(model) = std::env::var(model_env) {
                 if !model.is_empty() {
                     cmd.arg("-m").arg(&model);
@@ -957,7 +1307,7 @@ trust_level = "trusted"
             }
         }
 
-        // Codex CLI provider configuration (same as FORGE)
+        // Codex CLI provider configuration (same probe-based logic as FORGE)
         if backend == CliBackend::Codex {
             let provider = detect_codex_provider();
             match provider {
@@ -976,35 +1326,51 @@ trust_level = "trusted"
                         .arg("model_providers.fireworks.requires_openai_auth=false");
                 }
                 CodexProvider::OpenAI => {
-                    let use_sse = codex_use_sse();
-                    if use_sse {
-                        cmd.arg("-c").arg("model_provider=\"custom\"");
-                        cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
-                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                            if !base_url.is_empty() {
-                                cmd.arg("-c").arg(format!(
-                                    "model_providers.custom.base_url=\"{}\"",
-                                    base_url.trim_end_matches('/')
-                                ));
+                    let endpoint_mode = probe_endpoint_supports_responses();
+                    match endpoint_mode {
+                        EndpointMode::ResponsesApi => {
+                            cmd.arg("-c").arg("model_provider=\"custom\"");
+                            cmd.arg("-c").arg("model_providers.custom.name=\"Custom\"");
+                            if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                                if !base_url.is_empty() {
+                                    cmd.arg("-c").arg(format!(
+                                        "model_providers.custom.base_url=\"{}\"",
+                                        base_url.trim_end_matches('/')
+                                    ));
+                                }
                             }
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.wire_api=\"responses\"");
+                            cmd.arg("-c")
+                                .arg("model_providers.custom.supports_websockets=false");
+                            // Disable Responses API tool types that non-OpenAI providers
+                            // don't support. See build_cli_command for rationale.
+                            append_sse_disable_flags(&mut cmd);
+                            info!("codex: sentinel using Custom provider with Responses API over SSE (endpoint supports /v1/responses)");
                         }
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.env_key=\"OPENAI_API_KEY\"");
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.wire_api=\"responses\"");
-                        cmd.arg("-c")
-                            .arg("model_providers.custom.supports_websockets=false");
-                        // Disable Responses API tool types that non-OpenAI providers
-                        // don't support. See build_cli_command for rationale.
-                        append_sse_disable_flags(&mut cmd);
-                    } else {
-                        cmd.arg("-c").arg("model_provider=\"openai\"");
-                        if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
-                            if !base_url.is_empty() {
-                                cmd.arg("-c").arg(format!(
-                                    "openai_base_url=\"{}\"",
-                                    base_url.trim_end_matches('/')
-                                ));
+                        EndpointMode::ChatCompletions => {
+                            // SPECIAL CASE: Same format discrepancy as FORGE.
+                            // Endpoint only supports /v1/chat/completions but Codex
+                            // requires /v1/responses. Use the local translation proxy.
+                            match self.ensure_responses_proxy() {
+                                Ok(proxy_url) => {
+                                    configure_responses_proxy(&mut cmd, &proxy_url);
+                                    info!(proxy_url = %proxy_url, "codex: sentinel using local Responses→ChatCompletions proxy (format discrepancy)");
+                                }
+                                Err(e) => {
+                                    error!("codex: sentinel FAILED to start responses proxy: {}. This endpoint does NOT support /v1/responses and the proxy could not be started. The spawned process will not be able to communicate with the LLM.", e);
+                                    cmd.arg("-c").arg("model_provider=\"openai\"");
+                                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                                        if !base_url.is_empty() {
+                                            cmd.arg("-c").arg(format!(
+                                                "openai_base_url=\"{}\"",
+                                                base_url.trim_end_matches('/')
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1074,18 +1440,23 @@ trust_level = "trusted"
                 }
             }
 
-            // For OpenAI-compatible backends, also pass through base URL
-            if let Some(base_url_env) = &config.base_url_env {
-                if let Ok(base_url) = std::env::var(base_url_env) {
-                    cmd.env(base_url_env, base_url);
-                } else if base_url_env == "OPENAI_BASE_URL" {
-                    // Also support OPENAI_API_URL for backwards compatibility
-                    if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
-                        let base_url = api_url
-                            .trim_end_matches("/chat/completions")
-                            .trim_end_matches("/completions")
-                            .trim_end_matches('/');
-                        cmd.env("OPENAI_BASE_URL", base_url);
+            // For OpenAI-compatible backends, also pass through base URL.
+            // When the responses proxy is active, we skip this because Codex
+            // points at the local proxy via model_providers.responses_proxy.base_url
+            // instead of using OPENAI_BASE_URL directly.
+            if self.responses_proxy.lock().expect("responses_proxy mutex poisoned").is_none() {
+                if let Some(base_url_env) = &config.base_url_env {
+                    if let Ok(base_url) = std::env::var(base_url_env) {
+                        cmd.env(base_url_env, base_url);
+                    } else if base_url_env == "OPENAI_BASE_URL" {
+                        // Also support OPENAI_API_URL for backwards compatibility
+                        if let Ok(api_url) = std::env::var("OPENAI_API_URL") {
+                            let base_url = api_url
+                                .trim_end_matches("/chat/completions")
+                                .trim_end_matches("/completions")
+                                .trim_end_matches('/');
+                            cmd.env("OPENAI_BASE_URL", base_url);
+                        }
                     }
                 }
             }

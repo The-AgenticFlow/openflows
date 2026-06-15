@@ -6,14 +6,24 @@
 
 Imagine having a complete engineering team — Scrum Master, Senior Developer, Security Auditor, DevOps Engineer, and Technical Writer — that works 24/7 to turn your GitHub issues into production-ready code and pull requests. All without you writing a single line of code.
 
-## Installation
+## Table of Contents
 
-See **[INSTALL.md](INSTALL.md)** for complete installation and configuration instructions.
+- [Quick Start](#quick-start)
+- [For Contributors](#for-contributors)
+- [The Big Idea](#the-big-idea-you-stay-the-product-owner)
+- [The Team](#the-team)
+- [Architecture](#architecture)
+- [How It Works](#how-it-works)
+- [Key Files](#key-files)
+- [Documentation](#documentation)
+- [License](#license)
 
-Quick start:
+## Quick Start
+
+**For end users:**
 
 ```bash
-# One-line install (recommended)
+# One-line install
 curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
 
 # Or via cargo
@@ -21,6 +31,33 @@ cargo install openflows
 openflows-setup
 openflows
 ```
+
+See [INSTALL.md](INSTALL.md) for complete installation options (Homebrew, Docker, npm, and source build).
+
+## For Contributors
+
+Want to hack on OpenFlows? Build from source in under 5 minutes:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/The-AgenticFlow/AgentFlow.git
+cd AgentFlow
+
+# 2. Build the project
+make build
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your API keys (see .env.example comments for setup modes)
+
+# 4. Run a quick smoke test (no API keys needed)
+cargo run --bin demo
+
+# 5. Run the full test suite
+cargo test --workspace
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow, code standards, and development tips.
 
 ## The Big Idea: You Stay the Product Owner
 
@@ -34,7 +71,7 @@ openflows
 
 **Otherwise, the team runs autonomously.** You wake up to completed features, reviewed PRs, and updated documentation.
 
-![AgentFlow Architecture](image.png)
+![OpenFlows Architecture](image.png)
 
 ## The Team
 
@@ -133,15 +170,18 @@ All agents communicate through a **SharedStore** (in-memory or Redis):
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [INSTALL.md](INSTALL.md) | Complete installation and configuration guide |
-| [TUTORIAL.md](TUTORIAL.md) | Step-by-step tutorial with logs and troubleshooting |
-| [RUN.md](RUN.md) | Running and configuration reference |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Development guidelines |
-| [docs/demo.md](docs/demo.md) | Live flow walkthrough |
-| [docs/setup-claude-cli.md](docs/setup-claude-cli.md) | Claude CLI setup |
-| [docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md) | Architecture deep dive |
+| Document | Audience | Description |
+|----------|----------|-------------|
+| [INSTALL.md](INSTALL.md) | End users & contributors | Complete installation and configuration guide |
+| [BUILD.md](BUILD.md) | Contributors | Building from source |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contributors | Development guidelines and workflow |
+| [RUN.md](RUN.md) | End users & contributors | Running and configuration reference |
+| [TUTORIAL.md](TUTORIAL.md) | End users | Step-by-step tutorial with logs and troubleshooting |
+| [docs/getting-started.md](docs/getting-started.md) | End users | Getting started overview |
+| [docs/configuration.md](docs/configuration.md) | End users | Configuration deep dive |
+| [docs/setup-claude-cli.md](docs/setup-claude-cli.md) | End users | Claude CLI setup |
+| [docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md) | Contributors | Architecture deep dive |
+| [DEMO.md](DEMO.md) | End users | Quick demo guide |
 
 ## License
 
