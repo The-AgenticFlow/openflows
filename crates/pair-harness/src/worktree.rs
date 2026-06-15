@@ -18,8 +18,48 @@ pub struct WorktreeManager {
 
 impl WorktreeManager {
     /// Create a new worktree manager.
+    ///
+    /// If `project_root` is a git worktree (i.e., `.git` is a file, not a
+    /// directory), resolves to the actual repository root by reading the
+    /// `gitdir` pointer.  This prevents nested `worktrees/` directories
+    /// when a worktree path is accidentally passed instead of the main repo.
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        let project_root = project_root.into();
+        let mut project_root: PathBuf = project_root.into();
+
+        // Guard: if .git is a file (not a directory), we're inside a git
+        // worktree, not the main repo.  Resolve to the real repo root to
+        // prevent creating nested worktrees/ directories.
+        let git_path = project_root.join(".git");
+        if git_path.exists() && !git_path.is_dir() {
+            // .git is a file — this is a worktree.  Read the gitdir pointer.
+            if let Ok(content) = std::fs::read_to_string(&git_path) {
+                // Format: "gitdir: /path/to/main/repo/.git/worktrees/<name>"
+                if let Some(gitdir) = content.strip_prefix("gitdir: ") {
+                    let gitdir = gitdir.trim();
+                    // The gitdir points into the main repo's .git/worktrees/<name>.
+                    // Resolve the main repo root from it.
+                    // e.g. /repo/.git/worktrees/forge-1 -> /repo
+                    let gitdir_path = PathBuf::from(gitdir);
+                    // Walk up from .git/worktrees/<name> to find the repo root
+                    // .git/worktrees/<name> -> .git/worktrees -> .git -> repo_root
+                    if let Some(repo_git_dir) = gitdir_path
+                        .parent()  // .git/worktrees
+                        .and_then(|p| p.parent())  // .git
+                    {
+                        let repo_root = repo_git_dir.parent().unwrap_or(repo_git_dir).to_path_buf();
+                        if repo_root.join(".git").is_dir() || repo_root.join("HEAD").exists() {
+                            warn!(
+                                provided = %project_root.display(),
+                                resolved = %repo_root.display(),
+                                "WorktreeManager::new called with a worktree path — resolving to actual repo root"
+                            );
+                            project_root = repo_root;
+                        }
+                    }
+                }
+            }
+        }
+
         let default_branch = Self::detect_default_branch(&project_root);
         info!(default_branch = %default_branch, "Detected repository default branch");
         Self {

@@ -4,18 +4,19 @@
 // communicates via JSON-RPC 2.0.
 //
 // Protocol flow:
-//   1. Spawn process (docker or npx)
-//   2. Send `initialize` request
-//   3. Receive `initialize` response
-//   4. Send `initialized` notification
-//   5. Ready: call list_tools / call_tool freely
+//   1. Spawn process (docker, npx, or direct node)
+//   2. Wait for readiness signal on stderr (e.g. "running on stdio")
+//   3. Send `initialize` request
+//   4. Receive `initialize` response
+//   5. Send `initialized` notification
+//   6. Ready: call list_tools / call_tool freely
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 use tracing::{debug, info, warn};
 
@@ -35,10 +36,25 @@ pub const DOCKER_MCP_CMD: &[&str] = &[
 /// so this must be shorter than that to catch unresponsive servers.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Default timeout for MCP server startup readiness (seconds).
+/// When launching via `npx`, the server can take significant time to resolve
+/// the package, download it (first run), and start. This timeout controls how
+/// long we wait for the server's readiness signal on stderr before proceeding.
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 60;
+
+/// Substrings that indicate an MCP server has finished starting up and is
+/// ready to receive JSON-RPC requests on stdin.
+const READY_PATTERNS: &[&str] = &["running on stdio", "server started", "mcp server ready"];
+
 pub struct McpSession {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Stderr reader kept alive so the server's stderr pipe doesn't fill up
+    /// and block the process.  Not actively read after startup readiness
+    /// detection completes.
+    #[allow(dead_code)]
+    stderr: Option<BufReader<ChildStderr>>,
     next_id: u64,
     request_timeout: Duration,
 }
@@ -57,20 +73,30 @@ impl McpSession {
             .args(&cmd[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit()) // surface errors in our logs
+            .stderr(std::process::Stdio::piped()) // capture stderr for readiness detection
             .spawn()
             .context("Failed to spawn GitHub MCP server")?;
 
         let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
+        let stderr = BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
 
         let mut session = Self {
             child,
             stdin,
             stdout,
+            stderr: Some(stderr),
             next_id: 1,
             request_timeout: timeout,
         };
+
+        // Wait for the server to signal readiness on stderr before sending
+        // any JSON-RPC messages.  This is critical when launching via `npx`,
+        // which has significant startup overhead (package resolution, download,
+        // Node.js bootstrap) and does not reliably forward stdio until the
+        // actual server process is running.
+        session.wait_for_ready().await?;
+
         session.initialize().await?;
         Ok(session)
     }
@@ -148,23 +174,131 @@ impl McpSession {
                     .arg("stream")
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::piped())
                     .spawn()
                     .context("Failed to spawn hosted MCP npx bridge")?;
 
                 let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
                 let stdout =
                     BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
+                let stderr =
+                    BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
 
                 let mut session = Self {
                     child,
                     stdin,
                     stdout,
+                    stderr: Some(stderr),
                     next_id: 1,
                     request_timeout: Self::default_timeout(),
                 };
+
+                // Wait for mcp-proxy to signal readiness before initializing.
+                session.wait_for_ready().await?;
+
                 session.initialize().await?;
                 Ok(session)
+            }
+        }
+    }
+
+    // ── Private: Startup readiness ──────────────────────────────────────────
+
+    /// Wait for the MCP server to signal readiness on stderr.
+    ///
+    /// When launched via `npx`, the MCP server process does not accept
+    /// JSON-RPC input until the Node.js process has finished resolving and
+    /// downloading the package.  The `@modelcontextprotocol/server-github`
+    /// package prints "GitHub MCP Server running on stdio" to stderr once it
+    /// is ready to receive requests.
+    ///
+    /// This method reads stderr lines until one of the `READY_PATTERNS` is
+    /// detected.  If no pattern is found within the startup timeout, the
+    /// method logs a warning and proceeds anyway — the server may not print
+    /// a readiness signal, or this may be a mock/test server.
+    async fn wait_for_ready(&mut self) -> Result<()> {
+        let startup_timeout = Duration::from_secs(
+            std::env::var("MCP_STARTUP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS),
+        );
+
+        let stderr = match &mut self.stderr {
+            Some(s) => s,
+            None => {
+                info!("No stderr reader — assuming MCP server is ready");
+                return Ok(());
+            }
+        };
+
+        let start = std::time::Instant::now();
+        let mut line = String::new();
+
+        info!("Waiting for MCP server readiness signal on stderr...");
+
+        loop {
+            if start.elapsed() > startup_timeout {
+                warn!(
+                    elapsed_secs = start.elapsed().as_secs(),
+                    timeout_secs = startup_timeout.as_secs(),
+                    "MCP server startup timeout exceeded — proceeding without readiness signal"
+                );
+                return Ok(());
+            }
+
+            line.clear();
+            match tokio::time::timeout(Duration::from_secs(5), stderr.read_line(&mut line)).await {
+                Ok(Ok(0)) => {
+                    // EOF — server closed stderr
+                    let status = self.child.try_wait();
+                    match status {
+                        Ok(Some(exit)) => {
+                            bail!(
+                                "MCP server exited during startup: {} — \
+                                 the server may have crashed or the command is invalid.",
+                                exit
+                            );
+                        }
+                        Ok(None) => {
+                            // Process still alive but closed stderr — some servers
+                            // close stderr after startup.  Proceed with initialization.
+                            info!("MCP server closed stderr during startup — proceeding with initialization");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Could not check MCP server status after stderr EOF — proceeding");
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(Ok(_bytes)) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        info!(line = trimmed, "MCP server stderr");
+                        let lower = trimmed.to_lowercase();
+                        if READY_PATTERNS.iter().any(|p| lower.contains(p)) {
+                            info!("MCP server ready (detected readiness signal on stderr)");
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "Error reading MCP server stderr — proceeding with initialization");
+                    return Ok(());
+                }
+                Err(_) => {
+                    // 5-second timeout on this individual read.
+                    // Check if the server is still alive before continuing to wait.
+                    if let Ok(Some(status)) = self.child.try_wait() {
+                        bail!(
+                            "MCP server exited during startup: {} — \
+                             the server may have crashed or the startup command is invalid.",
+                            status
+                        );
+                    }
+                    // Server still alive but no stderr output yet — keep waiting
+                }
             }
         }
     }
@@ -246,7 +380,8 @@ impl McpSession {
                         );
                     }
                     Ok(None) => {
-                        // Process alive but unresponsive — likely session timeout
+                        // Process alive but unresponsive — likely npx startup
+                        // delay or session timeout
                         warn!(
                             method,
                             id,
@@ -256,9 +391,12 @@ impl McpSession {
                         let _ = self.child.kill().await;
                         bail!(
                             "MCP request '{}' (id={}) timed out after {}s — \
-                             server is alive but not responding (session likely timed out). \
-                             The GitHub MCP server disconnects after ~10s of inactivity; \
-                             consider shortening LLM calls or adding a keep-alive mechanism.",
+                             server is alive but not responding. \
+                             Common causes: (1) MCP server not fully started yet \
+                             (npx can take >30s to resolve the package); \
+                             (2) session timeout after inactivity. \
+                             Consider setting MCP_STARTUP_TIMEOUT_SECS to a higher \
+                             value or using a direct 'node' command instead of 'npx'.",
                             method,
                             id,
                             timeout.as_secs()
