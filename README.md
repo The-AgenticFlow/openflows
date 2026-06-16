@@ -4,184 +4,87 @@
 
 **OpenFlows is an autonomous software development team that runs itself.**
 
-Imagine having a complete engineering team — Scrum Master, Senior Developer, Security Auditor, DevOps Engineer, and Technical Writer — that works 24/7 to turn your GitHub issues into production-ready code and pull requests. All without you writing a single line of code.
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [For Contributors](#for-contributors)
-- [The Big Idea](#the-big-idea-you-stay-the-product-owner)
-- [The Team](#the-team)
-- [Architecture](#architecture)
-- [How It Works](#how-it-works)
-- [Key Files](#key-files)
-- [Documentation](#documentation)
-- [License](#license)
+Give it a GitHub repo and some issues, and OpenFlows handles everything — writing code, opening PRs, reviewing changes, merging, and documenting — without you writing a single line of code.
 
 ## Quick Start
 
-**For end users:**
-
 ```bash
-# One-line install
+# Install
 curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
 
-# Or via cargo
-cargo install openflows
+# Set up your environment (interactive wizard)
 openflows-setup
+
+# Run
 openflows
 ```
 
-See [INSTALL.md](INSTALL.md) for complete installation options (Homebrew, Docker, npm, and source build).
+That's it. The setup wizard walks you through configuring your GitHub repo, API keys, and CLI backend.
 
-## For Contributors
+<details>
+<summary>Other install options</summary>
 
-Want to hack on OpenFlows? Build from source in under 5 minutes:
+- **Homebrew (macOS):** `brew tap The-AgenticFlow/openflows && brew install openflows`
+- **Cargo:** `cargo install openflows`
+- **Docker:** See [INSTALL.md](INSTALL.md#option-3-docker)
+- **npm:** `npm install -g @the-agenticflow/openflows`
+- **From source:** See [BUILD.md](BUILD.md)
 
-```bash
-# 1. Clone the repository
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+</details>
 
-# 2. Build the project
-make build
+## How It Works
 
-# 3. Configure environment
-cp .env.example .env
-# Edit .env with your API keys (see .env.example comments for setup modes)
+OpenFlows runs a team of AI agents that collaborate just like a real engineering team:
 
-# 4. Run a quick smoke test (no API keys needed)
-cargo run --bin demo
-
-# 5. Run the full test suite
-cargo test --workspace
+```
+You create a GitHub issue → The team picks it up → Code is written, reviewed, and merged → You get a PR
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow, code standards, and development tips.
-
-## The Big Idea: You Stay the Product Owner
-
-**Each AI agent gets their own account and identity.** They create branches, open PRs, review code, run CI/CD, and deploy — just like human developers.
-
-**You stay as the client/product owner.** NEXUS (the orchestrator) notifies you via your preferred communication channel (WhatsApp, Discord, Email, etc.) only when necessary:
-- Specification discrepancies need clarification
-- Credits/API limits are exhausted
-- Security concerns require human approval
-- Final approval for major architectural decisions
-
-**Otherwise, the team runs autonomously.** You wake up to completed features, reviewed PRs, and updated documentation.
+You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously.
 
 ![OpenFlows Architecture](image.png)
 
 ## The Team
 
-| Agent | Role | Description |
+| Agent | Role | What it does |
 |-------|------|-------------|
-| **NEXUS** | Orchestrator | Scrum Master & Tech Lead. Assigns tickets, approves dangerous commands. |
-| **FORGE** | Builder | Senior Engineer. Writes code, tests, opens PRs via Claude Code. |
-| **SENTINEL** | Reviewer | Security auditor. Reviews PRs, ensures all logic is tested. |
-| **VESSEL** | DevOps | Deployment expert. Manages CI/CD and rollbacks. |
-| **LORE** | Writer | Documenter. Writes ADRs, maintains project history. |
+| **NEXUS** | Orchestrator | Assigns issues, coordinates the team, notifies you when needed |
+| **FORGE** | Builder | Writes code, creates branches, opens PRs |
+| **SENTINEL** | Reviewer | Reviews code for security, quality, and test coverage |
+| **VESSEL** | DevOps | Monitors CI, handles merge conflicts, squash-merges green PRs |
+| **LORE** | Writer | Documents decisions, updates changelogs, maintains project history |
 
-### Human-in-the-Loop (Only When Needed)
+## What You Need
 
-NEXUS reaches out to you via your configured channels when:
-- **Security concerns** — SENTINEL flags potential vulnerabilities
-- **Resource limits** — API credits exhausted, need approval to continue
-- **Spec ambiguity** — Issue description unclear, needs clarification
-- **Architecture decisions** — Major design choices need product owner input
-- **CI failures** — Tests failing repeatedly, needs human debugging
+- **A GitHub repository** — the repo OpenFlows will work on
+- **A GitHub Personal Access Token** — with `repo` scope
+- **An AI backend** — either Claude Code CLI or Codex CLI with an API key
+- **Node.js 18+** — for the GitHub MCP server
 
-**Default mode:** Autonomous execution. You only hear from the team when they need you.
-
-## Architecture
-
-```
-openflows/
-├── orchestration/agent/
-│   ├── agents/              # Agent personas (nexus.agent.md, forge.agent.md)
-│   ├── registry.json        # Agent definitions and model routing
-│   └── standards/           # Coding standards
-├── crates/
-│   ├── agent-nexus/         # Orchestrator node
-│   ├── agent-forge/         # Builder node (spawns Claude Code)
-│   ├── agent-client/        # LLM client + MCP integration
-│   ├── pair-harness/        # Worktree management, process spawning
-│   └── pocketflow-core/     # Flow engine, shared store, routing
-└── binary/src/bin/
-    ├── agentflow.rs         # Main entry point
-    └── demo.rs              # Mocked demonstration
-```
-
-## How It Works
-
-```
-GitHub Issue → NEXUS assigns → FORGE codes → SENTINEL reviews → VESSEL merges → You get notified
-```
-
-### The Lifecycle of an Issue
-
-1. **Discovery** — NEXUS polls GitHub and discovers new issues
-2. **Assignment** — NEXUS assigns tickets to available FORGE workers
-3. **Implementation** — FORGE spawns Claude Code, writes code, opens PRs
-4. **Review** — SENTINEL reviews PRs for security, quality, and test coverage
-5. **Iteration** — If issues found, FORGE fixes them; loop continues
-6. **Merge** — VESSEL merges approved PRs, handles CI/CD
-7. **Documentation** — LORE writes ADRs and updates docs
-8. **Notification** — NEXUS notifies you only when human input needed
-
-### The Orchestration Cycle
-
-1. **NEXUS** fetches open GitHub issues and assigns them to available FORGE workers
-2. **FORGE** creates an isolated worktree, writes PLAN.md, then implements code via Claude Code
-3. **SENTINEL** reviews the plan (CONTRACT.md), evaluates each code segment, and performs final review
-4. **FORGE** opens a PR once SENTINEL approves
-5. **VESSEL** polls CI status, detects merge conflicts, attempts resolution, and squash-merges green PRs
-6. **LORE** generates documentation: ADRs, changelogs, and project history updates
-7. **NEXUS** loops back to assign the next ticket or halts when no work remains
-
-### Agent Accounts & Identity
-
-Each agent operates with their own identity:
-- **Separate GitHub tokens** — Each agent can have their own PAT
-- **Named branches** — `forge-1/feature-xyz`, `sentinel/review-123`
-- **Attribution in commits** — Know which agent made changes
-- **Individual worktrees** — Agents work in isolated directories
-
-### Shared State
-
-All agents communicate through a **SharedStore** (in-memory or Redis):
-
-| Key | Purpose |
-|-----|---------|
-| `tickets` | GitHub issues converted to internal work items |
-| `worker_slots` | Available FORGE workers and their status |
-| `pending_prs` | PRs awaiting CI completion |
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| [`orchestration/agent/agents/nexus.agent.md`](orchestration/agent/agents/nexus.agent.md) | Orchestrator persona and workflow |
-| [`orchestration/agent/agents/forge.agent.md`](orchestration/agent/agents/forge.agent.md) | Builder persona and instructions |
-| [`orchestration/agent/registry.json`](orchestration/agent/registry.json) | Worker slot definitions |
-| [`binary/src/bin/agentflow.rs`](binary/src/bin/agentflow.rs) | Main entry point |
-| [`crates/agent-forge/src/lib.rs`](crates/agent-forge/src/lib.rs) | Forge node implementation |
+The `openflows-setup` wizard handles configuration. See [.env.example](.env.example) for all available options.
 
 ## Documentation
 
-| Document | Audience | Description |
-|----------|----------|-------------|
-| [INSTALL.md](INSTALL.md) | End users & contributors | Complete installation and configuration guide |
-| [BUILD.md](BUILD.md) | Contributors | Building from source |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Contributors | Development guidelines and workflow |
-| [RUN.md](RUN.md) | End users & contributors | Running and configuration reference |
-| [TUTORIAL.md](TUTORIAL.md) | End users | Step-by-step tutorial with logs and troubleshooting |
-| [docs/getting-started.md](docs/getting-started.md) | End users | Getting started overview |
-| [docs/configuration.md](docs/configuration.md) | End users | Configuration deep dive |
-| [docs/setup-claude-cli.md](docs/setup-claude-cli.md) | End users | Claude CLI setup |
-| [docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md) | Contributors | Architecture deep dive |
-| [DEMO.md](DEMO.md) | End users | Quick demo guide |
+| Guide | What it covers |
+|-------|---------------|
+| [INSTALL.md](INSTALL.md) | Full installation options and configuration |
+| [RUN.md](RUN.md) | Running and configuration reference |
+| [TUTORIAL.md](TUTORIAL.md) | Step-by-step walkthrough with logs |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute to OpenFlows |
+| [BUILD.md](BUILD.md) | Building from source |
+| [DEMO.md](DEMO.md) | Quick demo (no API keys needed) |
+
+## For Contributors
+
+```bash
+git clone https://github.com/The-AgenticFlow/AgentFlow.git
+cd AgentFlow
+make install   # build release binaries & install to ~/.local/bin
+openflows-setup
+openflows
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow and [BUILD.md](BUILD.md) for build details.
 
 ## License
 
