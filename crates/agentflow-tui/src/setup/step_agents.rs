@@ -47,22 +47,6 @@ impl AgentsStep {
             .join("agent")
             .join("registry.json");
 
-        if registry_path.exists() {
-            if let Ok(registry) = config::Registry::load(&registry_path) {
-                for entry in registry.team {
-                    agents.push(AgentConfig {
-                        id: entry.id,
-                        cli: entry.cli,
-                        active: entry.active,
-                        instances: entry.instances,
-                        model_backend: entry.model_backend,
-                        routing_key: entry.routing_key,
-                        github_token_env: entry.github_token_env,
-                    });
-                }
-            }
-        }
-
         // Discover models dynamically from the selected provider
         let discovered_models = match discover_models(config).await {
             Ok(models) => models,
@@ -89,6 +73,22 @@ impl AgentsStep {
             Some(p) if p.contains("Anthropic") => "claude",
             _ => "codex",
         };
+
+        if registry_path.exists() {
+            if let Ok(registry) = config::Registry::load(&registry_path) {
+                for entry in registry.team {
+                    agents.push(AgentConfig {
+                        id: entry.id,
+                        cli: cli_backend.to_string(),
+                        active: entry.active,
+                        instances: entry.instances,
+                        model_backend: Some(default_model.to_string()),
+                        routing_key: entry.routing_key,
+                        github_token_env: entry.github_token_env,
+                    });
+                }
+            }
+        }
 
         // Nexus always has exactly 1 instance (immutable)
         if agents.is_empty() {
