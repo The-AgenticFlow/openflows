@@ -456,6 +456,20 @@ fn probe_endpoint_supports_responses() -> EndpointMode {
 /// - If the endpoint returns 404 for `/v1/responses` → start a local proxy that translates
 ///   Responses API requests to Chat Completions format (since Codex CLI only supports
 ///   `wire_api="responses"`)
+/// Strip a provider prefix (e.g. "anthropic/", "openai/", "fireworks/") from a
+/// model identifier.  CLI backends like `claude` and `codex` expect bare model
+/// names (e.g. "claude-haiku-4-5-20251001"), but the registry may store them
+/// with a routing prefix (e.g. "anthropic/claude-haiku-4-5-20251001").
+pub(crate) fn strip_provider_prefix(model: &str) -> &str {
+    model
+        .strip_prefix("anthropic/")
+        .or_else(|| model.strip_prefix("openai/"))
+        .or_else(|| model.strip_prefix("fireworks/"))
+        .or_else(|| model.strip_prefix("gemini/"))
+        .or_else(|| model.strip_prefix("groq/"))
+        .unwrap_or(model)
+}
+
 pub fn codex_use_sse() -> bool {
     // NOTE: The former CODEX_USE_SSE env var has been removed. This function
     // now probes the endpoint capability instead of reading a static flag.
@@ -1138,16 +1152,20 @@ trust_level = "trusted"
 
         // Pass model from ProcessManager's model_backend override (from registry.json)
         // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
+        // Provider prefixes (e.g. "anthropic/") are stripped because CLI backends
+        // expect bare model names.
         if let Some(model) = &self.model_backend {
             if !model.is_empty() {
-                cmd.arg("-m").arg(model);
-                info!(model = %model, "{}: using model from registry model_backend", backend.as_str());
+                let clean = strip_provider_prefix(model);
+                cmd.arg("--model").arg(clean);
+                info!(model = %model, clean_model = %clean, "{}: using model from registry model_backend", backend.as_str());
             }
         } else if let Some(model_env) = &config.model_env {
             if let Ok(model) = std::env::var(model_env) {
                 if !model.is_empty() {
-                    cmd.arg("-m").arg(&model);
-                    info!(model = %model, "{}: using model from {}", backend.as_str(), model_env);
+                    let clean = strip_provider_prefix(&model);
+                    cmd.arg("--model").arg(clean);
+                    info!(model = %model, clean_model = %clean, "{}: using model from {}", backend.as_str(), model_env);
                 }
             }
         }
@@ -1293,16 +1311,20 @@ trust_level = "trusted"
 
         // Pass model from ProcessManager's model_backend override (from registry.json)
         // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
+        // Provider prefixes (e.g. "anthropic/") are stripped because CLI backends
+        // expect bare model names.
         if let Some(model) = &self.model_backend {
             if !model.is_empty() {
-                cmd.arg("-m").arg(model);
-                info!(model = %model, "{}: using model from registry model_backend (sentinel)", backend.as_str());
+                let clean = strip_provider_prefix(model);
+                cmd.arg("--model").arg(clean);
+                info!(model = %model, clean_model = %clean, "{}: using model from registry model_backend (sentinel)", backend.as_str());
             }
         } else if let Some(model_env) = &config.model_env {
             if let Ok(model) = std::env::var(model_env) {
                 if !model.is_empty() {
-                    cmd.arg("-m").arg(&model);
-                    info!(model = %model, "{}: using model from {} (sentinel)", backend.as_str(), model_env);
+                    let clean = strip_provider_prefix(&model);
+                    cmd.arg("--model").arg(clean);
+                    info!(model = %model, clean_model = %clean, "{}: using model from {} (sentinel)", backend.as_str(), model_env);
                 }
             }
         }
@@ -2493,6 +2515,18 @@ impl ForgeProcessBuilder {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn test_strip_provider_prefix() {
+        assert_eq!(strip_provider_prefix("anthropic/claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+        assert_eq!(strip_provider_prefix("openai/gpt-4o"), "gpt-4o");
+        assert_eq!(strip_provider_prefix("fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"), "accounts/fireworks/models/llama-v3p1-8b-instruct");
+        assert_eq!(strip_provider_prefix("gemini/gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(strip_provider_prefix("groq/llama-3.3-70b-versatile"), "llama-3.3-70b-versatile");
+        assert_eq!(strip_provider_prefix("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+        assert_eq!(strip_provider_prefix("gpt-4o"), "gpt-4o");
+        assert_eq!(strip_provider_prefix(""), "");
+    }
 
     #[test]
     fn test_sentinel_mode_segment_value() {

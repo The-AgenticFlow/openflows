@@ -102,8 +102,8 @@ impl AnthropicClient {
 
     pub fn from_env_with_model(model_override: &str) -> Result<Self> {
         let mut client = Self::from_env()?;
-        client.model = model_override.to_string();
-        tracing::info!(model = %model_override, "AnthropicClient model overridden from registry");
+        client.model = crate::strip_provider_prefix(model_override).to_string();
+        tracing::info!(model = %client.model, "AnthropicClient model overridden from registry");
         Ok(client)
     }
 

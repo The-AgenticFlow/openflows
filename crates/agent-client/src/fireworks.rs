@@ -45,8 +45,8 @@ impl FireworksClient {
 
     pub fn from_env_with_model(model_override: &str) -> Result<Self> {
         let mut client = Self::from_env()?;
-        client.model = model_override.to_string();
-        tracing::info!(model = %model_override, "FireworksClient model overridden");
+        client.model = crate::strip_provider_prefix(model_override).to_string();
+        tracing::info!(model = %client.model, "FireworksClient model overridden");
         Ok(client)
     }
 

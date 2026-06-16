@@ -554,8 +554,10 @@ max_depth = 1
         };
 
         // Resolve model: registry model_backend (highest priority) > FIREWORKS_MODEL > OPENAI_MODEL > default
+        // Provider prefixes (e.g. "anthropic/", "openai/") must be stripped
+        // because Codex CLI expects bare model names.
         let model = model_backend
-            .map(|m| m.to_string())
+            .map(|m| crate::process::strip_provider_prefix(m).to_string())
             .or_else(|| std::env::var("FIREWORKS_MODEL").ok())
             .or_else(|| std::env::var("OPENAI_MODEL").ok())
             .unwrap_or_else(|| "gpt-5.4".to_string());
