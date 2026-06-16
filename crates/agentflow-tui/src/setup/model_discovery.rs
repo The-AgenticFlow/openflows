@@ -11,11 +11,19 @@ pub struct ModelInfo {
 }
 
 /// Discover available models from the selected provider.
-/// Fetches models dynamically from Anthropic, OpenAI, or Fireworks based on the selected provider.
+/// Fetches models dynamically from Anthropic, OpenAI, or Fireworks API using user's key.
 pub async fn discover_models(config: &SetupConfig) -> Result<Vec<ModelInfo>> {
     match config.selected_provider.as_deref() {
         Some(p) if p.contains("Anthropic") => {
-            // For Anthropic, use the Claude CLI to discover models
+            // Try Anthropic API first with user's key, then CLI
+            if !config.anthropic_key.is_empty() {
+                if let Ok(models) = discover_anthropic_models(&config.anthropic_key).await {
+                    if !models.is_empty() {
+                        return Ok(models);
+                    }
+                }
+            }
+            // Fallback to CLI discovery
             discover_claude_models()
         }
         Some(p) if p.contains("OpenAI") || p.contains("Codex") => {
@@ -162,6 +170,75 @@ fn discover_codex_models() -> Result<Vec<ModelInfo>> {
     }
 
     Ok(models)
+}
+
+/// Fetch available models from Anthropic API using user's API key.
+/// This dynamically discovers models available for the specific account.
+async fn discover_anthropic_models(api_key: &str) -> Result<Vec<ModelInfo>> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://api.anthropic.com/v1/models")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Anthropic API returned status {} when listing models",
+            response.status()
+        ));
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    let mut models = Vec::new();
+
+    if let Some(model_array) = json.get("data").and_then(|v| v.as_array()) {
+        for m in model_array {
+            let raw_id = m
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Skip non-chat models (if any)
+            if !is_anthropic_chat_model(&raw_id) {
+                continue;
+            }
+
+            let display_name = m
+                .get("display_name")
+                .or_else(|| m.get("id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let description = m
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            models.push(ModelInfo {
+                slug: format!("anthropic/{}", raw_id),
+                display_name,
+                description,
+            });
+        }
+    }
+
+    if models.is_empty() {
+        return Err(anyhow::anyhow!("No models found in Anthropic account"));
+    }
+
+    Ok(models)
+}
+
+/// Check if an Anthropic model ID is a chat model
+fn is_anthropic_chat_model(model_id: &str) -> bool {
+    // Anthropic chat models start with "claude-"
+    // Exclude any non-chat models if they exist
+    model_id.starts_with("claude-")
+        && !model_id.contains("-rlhf-")  // Exclude RLHF training models
+        && !model_id.contains("-eval-") // Exclude evaluation models
 }
 
 /// Fetch models from claude CLI
@@ -425,6 +502,14 @@ mod tests {
         assert_eq!(map_claude_model_alias("claude-3-5-haiku-latest"), "claude-3-5-haiku-20241022");
         assert_eq!(map_claude_model_alias("claude-3-opus-latest"), "claude-3-opus-20240229");
         assert_eq!(map_claude_model_alias("claude-3-5-sonnet-20241022"), "claude-3-5-sonnet-20241022"); // already dated
+    }
+
+    #[test]
+    fn test_is_anthropic_chat_model() {
+        assert!(is_anthropic_chat_model("claude-3-5-sonnet-20241022"));
+        assert!(is_anthropic_chat_model("claude-3-opus-20240229"));
+        assert!(!is_anthropic_chat_model("claude-3-5-sonnet-rlhf-20241022"));
+        assert!(!is_anthropic_chat_model("claude-3-5-sonnet-eval-20241022"));
     }
 
     #[test]
