@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::anthropic::AnthropicClient;
 use crate::fireworks::FireworksClient;
-use crate::gemini::GeminiClient;
+
 use crate::openai::OpenAiClient;
 use crate::types::{LlmClient, LlmResponse, Message, ToolSchema};
 
@@ -52,7 +52,6 @@ fn has_api_key_for_provider(provider: &str) -> bool {
     match provider {
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
         "openai" => std::env::var("OPENAI_API_KEY").is_ok(),
-        "gemini" => std::env::var("GEMINI_API_KEY").is_ok(),
         "fireworks" => std::env::var("FIREWORKS_API_KEY").is_ok(),
         _ => false,
     }
@@ -245,9 +244,6 @@ impl FallbackClient {
                     warn!(provider = "openai-proxy", error = %e, "Failed to init proxy client")
                 }
             },
-            Some("gemini") => {
-                warn!("Gemini proxy format not yet supported, falling back to Anthropic format");
-            }
             _ => match AnthropicClient::from_env_with_model(model) {
                 Ok(c) => {
                     info!(provider = "anthropic-proxy", model = %c.model(), "Proxy client initialized");
@@ -271,13 +267,6 @@ impl FallbackClient {
             if !skip_anthropic_direct {
                 if let Ok(c) = AnthropicClient::from_env_with_model(model) {
                     info!(provider = "anthropic-direct", model = %c.model(), "Direct fallback initialized");
-                    clients.push(Box::new(c));
-                }
-            }
-
-            if std::env::var("GEMINI_API_KEY").is_ok() {
-                if let Ok(c) = GeminiClient::from_env() {
-                    info!(provider = "gemini-direct", model = %c.model(), "Direct fallback initialized");
                     clients.push(Box::new(c));
                 }
             }
@@ -313,7 +302,7 @@ impl FallbackClient {
     /// Requires individual API keys for each provider.
     fn build_direct_chain(model_override: Option<&str>) -> Result<Self> {
         let fallback_order =
-            std::env::var("LLM_FALLBACK").unwrap_or_else(|_| "anthropic,gemini,openai".to_string());
+            std::env::var("LLM_FALLBACK").unwrap_or_else(|_| "anthropic,openai,fireworks".to_string());
 
         let provider_names: Vec<&str> = fallback_order.split(',').map(|s| s.trim()).collect();
 
@@ -403,12 +392,6 @@ impl FallbackClient {
                         })
                         .ok()
                 }
-                "gemini" => GeminiClient::from_env()
-                    .map(|c| {
-                        info!(provider = name, model = %c.model(), "Client initialized");
-                        Box::new(c) as Box<dyn LlmClient>
-                    })
-                    .ok(),
                 "openai" => {
                     let client = match model_override {
                         Some(m) => OpenAiClient::from_env_with_model(m),
