@@ -273,6 +273,9 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
     ));
     content.push_str("RUST_LOG=info,agent_team=debug,pocketflow_core=debug\n");
 
+    // GitHub MCP server command
+    content.push_str("GITHUB_MCP_CMD=\"npx -y @modelcontextprotocol/server-github\"\n");
+
     std::fs::write(project_dir.join(".env"), content)?;
     Ok(())
 }
