@@ -84,11 +84,17 @@ impl AgentsStep {
             .map(|m| m.slug.as_str())
             .unwrap_or("openai/gpt-4o");
 
+        // Determine CLI backend based on selected provider
+        let cli_backend = match config.selected_provider.as_deref() {
+            Some(p) if p.contains("Anthropic") => "claude",
+            _ => "codex",
+        };
+
         // Nexus always has exactly 1 instance (immutable)
         if agents.is_empty() {
             agents.push(AgentConfig {
                 id: "nexus".to_string(),
-                cli: "codex".to_string(),
+                cli: cli_backend.to_string(),
                 active: true,
                 instances: 1, // Nexus is always 1 instance (orchestrator singleton)
                 model_backend: Some(default_model.to_string()),
@@ -97,7 +103,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "forge".to_string(),
-                cli: "codex".to_string(),
+                cli: cli_backend.to_string(),
                 active: true,
                 instances: 2,
                 model_backend: Some(default_model.to_string()),
@@ -106,7 +112,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "sentinel".to_string(),
-                cli: "codex".to_string(),
+                cli: cli_backend.to_string(),
                 active: true,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),
@@ -115,7 +121,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "vessel".to_string(),
-                cli: "codex".to_string(),
+                cli: cli_backend.to_string(),
                 active: true,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),
@@ -124,7 +130,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "lore".to_string(),
-                cli: "codex".to_string(),
+                cli: cli_backend.to_string(),
                 active: false,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),

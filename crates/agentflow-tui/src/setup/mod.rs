@@ -369,7 +369,8 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     });
                     config::RegistryEntry {
                         id: agent.id.clone(),
-                        cli: agent.cli.clone(),
+                        // Update CLI to match selected provider's CLI backend
+                        cli: default_cli.clone(),
                         active: agent.active,
                         instances: agent.instances,
                         model_backend: agent.model_backend.clone(),

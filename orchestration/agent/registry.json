@@ -6,7 +6,7 @@
       "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-3-haiku-20240307",
+      "model_backend": "anthropic/claude-3-7-sonnet-latest",
       "routing_key": "nexus-key",
       "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
     },
@@ -15,7 +15,7 @@
       "cli": "codex",
       "active": true,
       "instances": 2,
-      "model_backend": "anthropic/claude-3-haiku-20240307",
+      "model_backend": "anthropic/claude-3-7-sonnet-latest",
       "routing_key": "forge-key",
       "github_token_env": "AGENT_FORGE_GITHUB_TOKEN"
     },
@@ -24,7 +24,7 @@
       "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-3-haiku-20240307",
+      "model_backend": "anthropic/claude-3-7-sonnet-latest",
       "routing_key": "sentinel-key",
       "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN"
     },
@@ -33,7 +33,7 @@
       "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-3-haiku-20240307",
+      "model_backend": "anthropic/claude-3-7-sonnet-latest",
       "routing_key": "vessel-key",
       "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN"
     },
@@ -42,7 +42,7 @@
       "cli": "codex",
       "active": false,
       "instances": 1,
-      "model_backend": "anthropic/claude-3-haiku-20240307",
+      "model_backend": "anthropic/claude-3-7-sonnet-latest",
       "routing_key": "lore-key",
       "github_token_env": "AGENT_LORE_GITHUB_TOKEN"
     }
