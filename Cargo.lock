@@ -95,6 +95,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde_json",
+ "tracing",
  "tui-input",
 ]
 

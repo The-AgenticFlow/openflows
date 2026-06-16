@@ -19,8 +19,8 @@ pub struct Provider {
 fn get_providers() -> Vec<Provider> {
     vec![
         Provider {
-            name: "Anthropic (Claude)".into(),
-            env_key: "ANTHROPIC_API_KEY".into(),
+            name: "Codex (OpenAI CLI)".into(),
+            env_key: "OPENAI_API_KEY".into(),
             requires_key: true,
         },
         Provider {
@@ -29,24 +29,9 @@ fn get_providers() -> Vec<Provider> {
             requires_key: true,
         },
         Provider {
-            name: "Google Gemini".into(),
-            env_key: "GEMINI_API_KEY".into(),
-            requires_key: true,
-        },
-        Provider {
             name: "Fireworks AI".into(),
             env_key: "FIREWORKS_API_KEY".into(),
             requires_key: true,
-        },
-        Provider {
-            name: "LiteLLM Proxy".into(),
-            env_key: "LITELLM_URL".into(),
-            requires_key: false,
-        },
-        Provider {
-            name: "Ollama (Local)".into(),
-            env_key: "OLLAMA_HOST".into(),
-            requires_key: false,
         },
         Provider {
             name: "Skip for now".into(),
@@ -145,16 +130,7 @@ impl ProviderStep {
                                 config.selected_provider = Some(provider.name.clone());
 
                                 match provider.name.as_str() {
-                                    "Anthropic (Claude)" if config.anthropic_key.is_empty() => {
-                                        config.anthropic_key =
-                                            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-                                    }
-                                    "Google Gemini" if config.gemini_key.is_none() => {
-                                        config.gemini_key = Some(
-                                            std::env::var("GEMINI_API_KEY").unwrap_or_default(),
-                                        );
-                                    }
-                                    "OpenAI" if config.openai_key.is_none() => {
+                                    "Codex (OpenAI CLI)" | "OpenAI" if config.openai_key.is_none() => {
                                         config.openai_key = Some(
                                             std::env::var("OPENAI_API_KEY").unwrap_or_default(),
                                         );

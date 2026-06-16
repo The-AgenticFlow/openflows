@@ -56,19 +56,14 @@ impl ExistingConfigStep {
             }
             if let Some((key, value)) = line.split_once('=') {
                 match key.trim() {
-                    "ANTHROPIC_API_KEY" => {
-                        config.anthropic_key = value.to_string();
-                        config.selected_provider = Some("Anthropic (Claude)".to_string());
-                    }
                     "GITHUB_PERSONAL_ACCESS_TOKEN" => config.github_pat = value.to_string(),
                     "GITHUB_REPOSITORY" => config.repo = value.to_string(),
-                    "GEMINI_API_KEY" => {
-                        config.gemini_key = Some(value.to_string());
-                        config.selected_provider = Some("Google Gemini".to_string());
-                    }
                     "OPENAI_API_KEY" => {
                         config.openai_key = Some(value.to_string());
-                        config.selected_provider = Some("OpenAI".to_string());
+                        // Only set provider if not already set by Fireworks
+                        if config.selected_provider.is_none() {
+                            config.selected_provider = Some("OpenAI".to_string());
+                        }
                     }
                     "FIREWORKS_API_KEY" => {
                         config.fireworks_key = Some(value.to_string());

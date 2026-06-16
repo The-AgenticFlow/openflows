@@ -7,61 +7,22 @@ use ratatui::Terminal;
 use std::io;
 
 use crate::setup::{AgentConfig, SetupConfig};
+use crate::setup::model_discovery::{discover_models, ModelInfo, default_model_for_provider};
 use crate::util::theme::Theme;
 use crate::widgets::select::SelectableListState;
-
-const MODELS_ANTHROPIC: &[&str] = &[
-    "anthropic/claude-sonnet-4-5",
-    "anthropic/claude-3-5-sonnet",
-    "anthropic/claude-3-haiku-20240307",
-];
-
-const MODELS_GEMINI: &[&str] = &[
-    "gemini/gemini-2.5-pro",
-    "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.0-flash-exp",
-];
-
-const MODELS_OPENAI: &[&str] = &["openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4-turbo"];
-
-const MODELS_GROQ: &[&str] = &["groq/llama-3.3-70b-versatile", "groq/llama-3.1-8b-instant"];
-
-const MODELS_FIREWORKS: &[&str] = &[
-    "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct",
-    "fireworks/accounts/fireworks/models/glm-5",
-];
-
-const MODELS_ALL: &[&str] = &[
-    "anthropic/claude-sonnet-4-5",
-    "anthropic/claude-3-5-sonnet",
-    "gemini/gemini-2.5-pro",
-    "openai/gpt-4o",
-    "groq/llama-3.3-70b-versatile",
-];
-
-fn get_models_for_provider(provider: Option<&str>) -> Vec<&'static str> {
-    match provider {
-        Some(p) if p.contains("Anthropic") => MODELS_ANTHROPIC.to_vec(),
-        Some(p) if p.contains("Gemini") || p.contains("Google") => MODELS_GEMINI.to_vec(),
-        Some(p) if p.contains("OpenAI") => MODELS_OPENAI.to_vec(),
-        Some(p) if p.contains("Groq") => MODELS_GROQ.to_vec(),
-        Some(p) if p.contains("Fireworks") => MODELS_FIREWORKS.to_vec(),
-        _ => MODELS_ALL.to_vec(),
-    }
-}
 
 enum AgentConfigState {
     MainList {
         agents: Vec<AgentConfig>,
         selected: usize,
         focused_field: usize,
-        available_models: Vec<&'static str>,
+        available_models: Vec<ModelInfo>,
     },
     ModelPicker {
         agents: Vec<AgentConfig>,
         agent_idx: usize,
         selected: usize,
-        available_models: Vec<&'static str>,
+        available_models: Vec<ModelInfo>,
     },
 }
 
@@ -102,18 +63,32 @@ impl AgentsStep {
             }
         }
 
-        // Default agents if registry doesn't exist
-        // Get provider-specific models or default models
-        let available_models = get_models_for_provider(config.selected_provider.as_deref());
-        let default_model = available_models
+        // Discover models dynamically from the selected provider
+        let discovered_models = match discover_models(config).await {
+            Ok(models) => models,
+            Err(e) => {
+                // Fall back to default models if discovery fails
+                tracing::warn!("Failed to discover models: {}, using defaults", e);
+                vec![ModelInfo {
+                    slug: default_model_for_provider(
+                        config.selected_provider.as_deref().unwrap_or("OpenAI")
+                    ).to_string(),
+                    display_name: Some("Default Model".to_string()),
+                    description: None,
+                }]
+            }
+        };
+
+        let default_model = discovered_models
             .first()
-            .unwrap_or(&"anthropic/claude-sonnet-4-5");
+            .map(|m| m.slug.as_str())
+            .unwrap_or("openai/gpt-4o");
 
         // Nexus always has exactly 1 instance (immutable)
         if agents.is_empty() {
             agents.push(AgentConfig {
                 id: "nexus".to_string(),
-                cli: "claude".to_string(),
+                cli: "codex".to_string(),
                 active: true,
                 instances: 1, // Nexus is always 1 instance (orchestrator singleton)
                 model_backend: Some(default_model.to_string()),
@@ -122,7 +97,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "forge".to_string(),
-                cli: "claude".to_string(),
+                cli: "codex".to_string(),
                 active: true,
                 instances: 2,
                 model_backend: Some(default_model.to_string()),
@@ -131,7 +106,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "sentinel".to_string(),
-                cli: "claude".to_string(),
+                cli: "codex".to_string(),
                 active: true,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),
@@ -140,7 +115,7 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "vessel".to_string(),
-                cli: "claude".to_string(),
+                cli: "codex".to_string(),
                 active: true,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),
@@ -149,8 +124,8 @@ impl AgentsStep {
             });
             agents.push(AgentConfig {
                 id: "lore".to_string(),
-                cli: "claude".to_string(),
-                active: true,
+                cli: "codex".to_string(),
+                active: false,
                 instances: 1,
                 model_backend: Some(default_model.to_string()),
                 routing_key: Some("lore-key".to_string()),
@@ -162,7 +137,7 @@ impl AgentsStep {
             agents,
             selected: 0,
             focused_field: 0,
-            available_models,
+            available_models: discovered_models,
         };
 
         loop {
@@ -245,7 +220,7 @@ impl AgentsStep {
 
                                 // Active field
                                 if is_selected && *focused_field == 0 {
-                                    row_text.push_str(&format!("[{}]", active_str));
+                                    row_text.push_str(&format!("[{:<8}]", active_str));
                                 } else {
                                     row_text.push_str(&format!(" {:<10}", active_str));
                                 }
@@ -352,7 +327,7 @@ impl AgentsStep {
                                             .unwrap_or("");
                                         let initial_idx = available_models
                                             .iter()
-                                            .position(|m| *m == current_model)
+                                            .position(|m| m.slug == current_model)
                                             .unwrap_or(0);
                                         state = AgentConfigState::ModelPicker {
                                             agents: agents.clone(),
@@ -378,9 +353,16 @@ impl AgentsStep {
                     available_models,
                 } => {
                     let agent_idx_val = *agent_idx;
-                    let mut list_state = SelectableListState::new(
-                        available_models.iter().map(|s| s.to_string()).collect(),
-                    );
+                    let model_items: Vec<String> = available_models
+                        .iter()
+                        .map(|m| {
+                            m.display_name
+                                .as_ref()
+                                .map(|n| format!("{} ({})", n, m.slug))
+                                .unwrap_or_else(|| m.slug.clone())
+                        })
+                        .collect();
+                    let mut list_state = SelectableListState::new(model_items);
                     list_state.selected = *selected;
 
                     loop {
@@ -439,7 +421,7 @@ impl AgentsStep {
                                     KeyCode::Down => list_state.move_down(),
                                     KeyCode::Enter => {
                                         agents[agent_idx_val].model_backend =
-                                            Some(available_models[list_state.selected].to_string());
+                                            Some(available_models[list_state.selected].slug.clone());
                                         state = AgentConfigState::MainList {
                                             agents: agents.clone(),
                                             selected: agent_idx_val,
