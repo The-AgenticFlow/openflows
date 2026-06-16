@@ -123,7 +123,7 @@ Then start the proxy before running the orchestration:
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 When your provider adds native Anthropic support, just change `PROXY_URL` to point directly to the gateway and remove `GATEWAY_*`.
@@ -179,7 +179,7 @@ Run the setup checker to ensure everything is configured correctly:
 ✓ All checks passed!
 
 You're ready to run OpenFlows:
-  cargo run --bin agentflow
+  cargo run --bin openflows
 ```
 
 If any checks fail, follow the error messages to fix the issues.
@@ -249,18 +249,18 @@ GITHUB_REPOSITORY=your-username/test-calculator
 cd /path/to/OpenFlows
 
 # Build the project (first time only)
-cargo build --release --bin agentflow
+cargo build --release --bin openflows
 
 # Run the orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 **Expected output on startup:**
 
 ```
-2026-03-31T00:00:01.234Z  INFO agentflow: Starting REAL End-to-End Orchestration (No Mocks)
-2026-03-31T00:00:02.456Z  INFO agentflow: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-test-calculator
-2026-03-31T00:00:02.789Z  INFO agentflow: Running orchestration loop for repository: your-username/test-calculator
+2026-03-31T00:00:01.234Z  INFO openflows: Starting REAL End-to-End Orchestration (No Mocks)
+2026-03-31T00:00:02.456Z  INFO openflows: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-test-calculator
+2026-03-31T00:00:02.789Z  INFO openflows: Running orchestration loop for repository: your-username/test-calculator
 ```
 
 ### 2. Understanding the Workspace
@@ -417,7 +417,7 @@ The cycle repeats for each issue!
 ```
 2026-03-31T00:30:12.123Z  INFO agent_nexus: No more open issues
 2026-03-31T00:30:12.234Z  INFO agent_nexus: All workers idle
-2026-03-31T00:30:12.345Z  INFO agentflow: Orchestration flow halted with action: no_work
+2026-03-31T00:30:12.345Z  INFO openflows: Orchestration flow halted with action: no_work
 ```
 
 ---
@@ -712,7 +712,7 @@ chmod -R u+w ~/.agentflow/workspaces/
 ./scripts/start_proxy.sh
 
 # Terminal 2
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 Ensure `.env` has `GATEWAY_URL` and `GATEWAY_API_KEY` set. See the [OpenAI-only gateways](#if-your-gateway-only-supports-openai-format) section above.
@@ -748,7 +748,7 @@ OpenFlows/                                    # Orchestrator project
 │   │   └── forge.agent.md                   # Builder persona
 │   └── registry.json                         # Worker slot definitions
 ├── binary/src/bin/
-│   └── agentflow.rs                          # Main entry point
+│   └── openflows.rs                          # Main entry point
 └── crates/                                   # Implementation crates
 
 ~/.agentflow/                                 # OpenFlows runtime directory

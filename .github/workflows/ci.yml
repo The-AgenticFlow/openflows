@@ -103,12 +103,12 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - name: Build binaries
-        run: cargo build --release --target ${{ matrix.target }} --bin agentflow --bin agentflow-setup --bin agentflow-dashboard --bin agentflow-doctor
+        run: cargo build --release --target ${{ matrix.target }} --bin openflows --bin openflows-setup --bin openflows-dashboard --bin openflows-doctor
       - name: Upload binaries
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            target/${{ matrix.target }}/release/agentflow
-            target/${{ matrix.target }}/release/agentflow-setup
-            target/${{ matrix.target }}/release/agentflow-dashboard
-            target/${{ matrix.target }}/release/agentflow-doctor
+            target/${{ matrix.target }}/release/openflows
+            target/${{ matrix.target }}/release/openflows-setup
+            target/${{ matrix.target }}/release/openflows-dashboard
+            target/${{ matrix.target }}/release/openflows-doctor

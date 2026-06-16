@@ -263,7 +263,7 @@ For any other provider, you MUST run the `anthropic-mock` proxy:
 cargo run -p anthropic-mock
 
 # Terminal 2: Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 The proxy translates:

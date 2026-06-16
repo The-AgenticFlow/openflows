@@ -209,16 +209,16 @@ Total: 75 tests, all passing. Zero backend-specific conditional logic in tests. 
 
 ## Try It
 
-The full implementation is at [github.com/christ/agentflow](https://github.com/christ/agentflow). The pair harness is in `crates/pair-harness/`, with the `BackendConfig` abstraction in `src/process.rs` and the provisioning pipeline in `src/provision.rs`.
+The full implementation is at [github.com/The-AgenticFlow/AgentFlow](https://github.com/The-AgenticFlow/AgentFlow). The pair harness is in `crates/pair-harness/`, with the `BackendConfig` abstraction in `src/process.rs` and the provisioning pipeline in `src/provision.rs`.
 
 Claude:
 ```
-ANTHROPIC_API_KEY=... cargo run --bin agentflow
+ANTHROPIC_API_KEY=... cargo run --bin openflows
 ```
 
 Codex:
 ```
-DEFAULT_CLI=codex FIREWORKS_API_KEY=... cargo run --bin agentflow
+DEFAULT_CLI=codex FIREWORKS_API_KEY=... cargo run --bin openflows
 ```
 
 Mixed pair (FORGE=Codex for coding speed, SENTINEL=Claude for review quality):
@@ -226,7 +226,7 @@ Mixed pair (FORGE=Codex for coding speed, SENTINEL=Claude for review quality):
 # Edit orchestration/agent/registry.json:
 # { "id": "forge", "cli": "codex", ... }
 # { "id": "sentinel", "cli": "claude", ... }
-ANTHROPIC_API_KEY=... FIREWORKS_API_KEY=... cargo run --bin agentflow
+ANTHROPIC_API_KEY=... FIREWORKS_API_KEY=... cargo run --bin openflows
 ```
 
 The orchestration layer doesn't care which backend you choose. It just works.

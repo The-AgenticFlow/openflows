@@ -107,19 +107,19 @@ Release builds are significantly faster at runtime but take longer to compile.
 
 ```bash
 # Main orchestration binary
-cargo build --bin agentflow
+cargo build --bin openflows
 
 # Mocked demonstration (no API keys needed)
 cargo build --bin demo
 
 # Interactive setup wizard
-cargo build --bin agentflow-setup
+cargo build --bin openflows-setup
 
 # Live dashboard monitor
-cargo build --bin agentflow-dashboard
+cargo build --bin openflows-dashboard
 
 # Environment diagnostic tool
-cargo build --bin agentflow-doctor
+cargo build --bin openflows-doctor
 ```
 
 ### Makefile Targets
@@ -151,15 +151,15 @@ make check
 
 | Binary | Purpose | When to Use |
 |--------|---------|-------------|
-| `agentflow` | Main entrypoint — production orchestration with real GitHub API and CLI backend | Running the autonomous team against real repos |
+| `openflows` | Main entrypoint — production orchestration with real GitHub API and CLI backend | Running the autonomous team against real repos |
 | `demo` | Mocked demonstration with fake data | Quick smoke test without API keys |
-| `agentflow-setup` | Interactive TUI setup wizard | First-time configuration |
-| `agentflow-dashboard` | Live worker status monitor | Watching agents work in real time |
-| `agentflow-doctor` | Environment diagnostic tool | Troubleshooting setup problems |
+| `openflows-setup` | Interactive TUI setup wizard | First-time configuration |
+| `openflows-dashboard` | Live worker status monitor | Watching agents work in real time |
+| `openflows-doctor` | Environment diagnostic tool | Troubleshooting setup problems |
 
 ## Install Globally
 
-Install `agentflow` and companion binaries to `~/.local/bin/`:
+Install `openflows` and companion binaries to `~/.local/bin/`:
 
 ```bash
 make install
@@ -173,8 +173,8 @@ cargo install --path binary
 
 After installation, run from anywhere:
 ```bash
-agentflow
-agentflow-doctor
+openflows
+openflows-doctor
 ```
 
 Make sure `~/.local/bin` (or `~/.cargo/bin` if using `cargo install`) is in your `PATH`.
@@ -232,17 +232,17 @@ After a successful build:
 ```
 target/
 ├── debug/
-│   ├── agentflow             # Development binary
+│   ├── openflows             # Development binary
 │   ├── demo                  # Mocked demo
-│   ├── agentflow-setup       # Setup wizard
-│   ├── agentflow-dashboard   # Dashboard
-│   └── agentflow-doctor    # Diagnostics
+│   ├── openflows-setup       # Setup wizard
+│   ├── openflows-dashboard   # Dashboard
+│   └── openflows-doctor      # Diagnostics
 └── release/
-    ├── agentflow             # Production binary (optimized)
+    ├── openflows             # Production binary (optimized)
     ├── demo                  # Mocked demo
-    ├── agentflow-setup       # Setup wizard
-    ├── agentflow-dashboard   # Dashboard
-    └── agentflow-doctor    # Diagnostics
+    ├── openflows-setup       # Setup wizard
+    ├── openflows-dashboard   # Dashboard
+    └── openflows-doctor      # Diagnostics
 ```
 
 ## Next Steps

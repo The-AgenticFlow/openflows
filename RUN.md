@@ -26,7 +26,7 @@ cp .env.example .env
 cargo run --bin demo
 
 # 3. Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 ## Environment Configuration
@@ -78,10 +78,10 @@ Run the full orchestration with real GitHub API and CLI backend:
 
 ```bash
 # Via cargo
-cargo run --bin agentflow
+cargo run --bin openflows
 
 # Or directly after build
-./target/release/agentflow
+./target/release/openflows
 ```
 
 This mode:
@@ -105,7 +105,7 @@ Uses in-memory implementations without external API calls.
 Live worker status monitor:
 
 ```bash
-cargo run --bin agentflow-dashboard
+cargo run --bin openflows-dashboard
 ```
 
 ### Setup Wizard
@@ -113,7 +113,7 @@ cargo run --bin agentflow-dashboard
 Interactive TUI configuration:
 
 ```bash
-cargo run --bin agentflow-setup
+cargo run --bin openflows-setup
 ```
 
 ### Diagnostics
@@ -121,7 +121,7 @@ cargo run --bin agentflow-setup
 Check your environment for common issues:
 
 ```bash
-cargo run --bin agentflow-doctor
+cargo run --bin openflows-doctor
 ```
 
 ## Configuration Options
@@ -189,7 +189,7 @@ OpenFlows creates workspaces in `~/.agentflow/`:
 
 ```bash
 # Ensure .env is configured
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 Expected output:
@@ -212,7 +212,7 @@ AGENTFLOW_WORKSPACE_ROOT=/custom/path/workspaces
 docker run -d -p 6379:6379 redis
 
 # Run with Redis backend
-REDIS_URL=redis://localhost:6379 cargo run --bin agentflow
+REDIS_URL=redis://localhost:6379 cargo run --bin openflows
 ```
 
 ## Troubleshooting

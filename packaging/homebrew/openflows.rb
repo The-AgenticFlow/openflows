@@ -14,6 +14,6 @@ class Openflows < Formula
   end
 
   test do
-    assert_match "OpenFlows", shell_output("#{bin}/agentflow --version")
+    assert_match "OpenFlows", shell_output("#{bin}/openflows --version")
   end
 end

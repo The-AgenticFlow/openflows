@@ -109,7 +109,7 @@ cargo run --bin demo
 
 ```bash
 # Ensure .env is configured, then run
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 ---
@@ -126,7 +126,7 @@ openflows/
 ├── Makefile                # Common build tasks
 ├── binary/                 # CLI entry points
 │   └── src/bin/
-│       ├── agentflow.rs    # Main orchestration
+│       ├── openflows.rs    # Main orchestration
 │       ├── demo.rs         # Mocked demo
 │       ├── setup.rs        # TUI setup wizard
 │       ├── dashboard.rs    # Live monitoring dashboard
@@ -301,17 +301,16 @@ cargo run --bin demo
 **Real Mode** (connects to live LLMs and GitHub):
 ```bash
 # Ensure .env is configured
-cargo run --bin agentflow
-```
+cargo run --bin openflows
 
 **Dashboard** (monitor workers):
 ```bash
-cargo run --bin agentflow-dashboard
+cargo run --bin openflows-dashboard
 ```
 
 **Doctor** (check environment):
 ```bash
-cargo run --bin agentflow-doctor
+cargo run --bin openflows-doctor
 ```
 
 ---

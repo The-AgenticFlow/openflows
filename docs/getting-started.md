@@ -12,14 +12,14 @@ It is not a separate hosted service. Your machine or server runs the runtime, an
 
 If you want the least confusing path, use the default local setup directly from the repository:
 
-1. Run `cargo run --bin agentflow-setup`.
-2. Run `cargo run --bin agentflow-doctor`.
-3. Start `cargo run --bin agentflow`.
+1. Run `cargo run --bin openflows-setup`.
+2. Run `cargo run --bin openflows-doctor`.
+3. Start `cargo run --bin openflows`.
 
 ```bash
-cargo run --bin agentflow-setup
-cargo run --bin agentflow-doctor
-cargo run --bin agentflow
+cargo run --bin openflows-setup
+cargo run --bin openflows-doctor
+cargo run --bin openflows
 ```
 
 ## Prerequisites
@@ -61,19 +61,19 @@ cp .env.example .env
 3. Start the guided setup:
 
 ```bash
-cargo run --bin agentflow-setup
+cargo run --bin openflows-setup
 ```
 
 4. Run the doctor:
 
 ```bash
-cargo run --bin agentflow-doctor
+cargo run --bin openflows-doctor
 ```
 
 5. Start the orchestrator:
 
 ```bash
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 ## What Happens Next

@@ -608,7 +608,7 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
 
-  agentflow:
+  openflows:
     build: .
     environment:
       - REDIS_URL=redis://redis:6379/

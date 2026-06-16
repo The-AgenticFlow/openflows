@@ -7,7 +7,7 @@ set -euo pipefail
 
 REPO="The-AgenticFlow/AgentFlow"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
-BINARIES=("agentflow" "agentflow-setup" "agentflow-dashboard" "agentflow-doctor")
+BINARIES=("openflows" "openflows-setup" "openflows-dashboard" "openflows-doctor")
 
 # Colors
 RED='\033[0;31m'
@@ -198,10 +198,10 @@ run_setup() {
     echo "Would you like to run the setup wizard now? (Y/n)"
     read -r response
     if [[ "$response" =~ ^[Yy]$ ]] || [[ -z "$response" ]]; then
-        if has_cmd agentflow-setup; then
-            agentflow-setup
+        if has_cmd openflows-setup; then
+            openflows-setup
         else
-            warn "agentflow-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
+            warn "openflows-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
         fi
     fi
 }
@@ -267,14 +267,14 @@ main() {
     echo "╚══════════════════════════════════════════════╝"
     echo ""
     echo "  Available commands:"
-    echo "    agentflow         - Start orchestration"
-    echo "    agentflow-setup   - Guided setup wizard"
-    echo "    agentflow-dashboard - Live monitoring TUI"
-    echo "    agentflow-doctor  - Diagnostic checks"
+    echo "    openflows         - Start orchestration"
+    echo "    openflows-setup   - Guided setup wizard"
+    echo "    openflows-dashboard - Live monitoring TUI"
+    echo "    openflows-doctor  - Diagnostic checks"
     echo ""
     echo "  Next steps:"
-    echo "    1. Run 'agentflow-setup' to configure API keys"
-    echo "    2. Run 'agentflow' to start the autonomous team"
+    echo "    1. Run 'openflows-setup' to configure API keys"
+    echo "    2. Run 'openflows' to start the autonomous team"
     echo ""
     echo "  Docs: https://openflows.dev"
     echo ""

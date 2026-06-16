@@ -142,11 +142,11 @@ cargo build --release -p openflows
 
 | Binary | Purpose |
 |--------|---------|
-| `agentflow` | Main orchestration — connects to GitHub, spawns AI agents, creates real PRs |
+| `openflows` | Main orchestration — connects to GitHub, spawns AI agents, creates real PRs |
 | `demo` | Mocked demonstration with fake data (no API keys required) |
-| `agentflow-setup` | Interactive TUI setup wizard |
-| `agentflow-dashboard` | Live worker status monitor |
-| `agentflow-doctor` | Environment diagnostic tool |
+| `openflows-setup` | Interactive TUI setup wizard |
+| `openflows-dashboard` | Live worker status monitor |
+| `openflows-doctor` | Environment diagnostic tool |
 
 After a successful build, binaries are located in `target/debug/` or `target/release/`.
 
@@ -175,7 +175,7 @@ At minimum you must set:
 
 ```bash
 # Run diagnostics
-./target/debug/agentflow-doctor
+./target/debug/openflows-doctor
 
 # Run the mocked demo (no API keys needed)
 cargo run --bin demo
@@ -190,10 +190,10 @@ cargo test --workspace
 
 ### Standard Commands (All Install Methods)
 
-1. **Configure** — `openflows-setup` (or `agentflow-setup`) runs the interactive TUI wizard
-2. **Verify** — `openflows-doctor` (or `agentflow-doctor`) checks your environment
-3. **Run** — `openflows` (or `agentflow`) starts the autonomous team
-4. **Monitor** — `openflows-dashboard` (or `agentflow-dashboard`) shows live worker status
+1. **Configure** — `openflows-setup` runs the interactive TUI wizard
+2. **Verify** — `openflows-doctor` checks your environment
+3. **Run** — `openflows` starts the autonomous team
+4. **Monitor** — `openflows-dashboard` shows live worker status
 
 ### npm-Specific Workflow
 
@@ -308,7 +308,7 @@ If your LLM gateway only supports the OpenAI Chat Completions format (`/v1/chat/
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 Configure `.env`:
@@ -431,10 +431,10 @@ Run the full orchestration with real GitHub API and Claude CLI:
 
 ```bash
 # Via cargo
-cargo run --bin agentflow
+cargo run --bin openflows
 
 # Or directly after build
-./target/release/agentflow
+./target/release/openflows
 ```
 
 This mode:
@@ -458,7 +458,7 @@ Uses in-memory implementations without external API calls.
 Monitor worker status in real time:
 
 ```bash
-cargo run --bin agentflow-dashboard
+cargo run --bin openflows-dashboard
 ```
 
 ---
