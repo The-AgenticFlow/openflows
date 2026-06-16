@@ -10,12 +10,16 @@ use crate::util::theme::Theme;
 use crate::widgets::select::SelectableListState;
 
 const ALL_CLI_BACKENDS: &[(&str, &str, &str)] = &[
+    ("claude", "Claude Code", "Anthropic's CLI agent"),
     ("codex", "Codex CLI", "OpenAI's CLI agent"),
 ];
 
 fn get_cli_backends(config: &SetupConfig) -> Vec<(&'static str, &'static str, &'static str)> {
     match config.selected_provider.as_deref() {
-        Some(p) if p.contains("Codex") || p.contains("OpenAI") || p.contains("Fireworks") => {
+        Some(p) if p.contains("Anthropic") => {
+            vec![("claude", "Claude Code", "Anthropic's CLI agent")]
+        }
+        Some(p) if p.contains("OpenAI") || p.contains("Fireworks") => {
             // Codex works with OpenAI directly and Fireworks (OpenAI-compatible)
             vec![("codex", "Codex CLI", "OpenAI-compatible CLI agent")]
         }

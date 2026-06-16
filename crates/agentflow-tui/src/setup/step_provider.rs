@@ -19,12 +19,12 @@ pub struct Provider {
 fn get_providers() -> Vec<Provider> {
     vec![
         Provider {
-            name: "Codex (OpenAI CLI)".into(),
-            env_key: "OPENAI_API_KEY".into(),
+            name: "Anthropic (Claude)".into(),
+            env_key: "ANTHROPIC_API_KEY".into(),
             requires_key: true,
         },
         Provider {
-            name: "OpenAI".into(),
+            name: "OpenAI (Codex)".into(),
             env_key: "OPENAI_API_KEY".into(),
             requires_key: true,
         },
@@ -130,7 +130,10 @@ impl ProviderStep {
                                 config.selected_provider = Some(provider.name.clone());
 
                                 match provider.name.as_str() {
-                                    "Codex (OpenAI CLI)" | "OpenAI" if config.openai_key.is_none() => {
+                                    "Anthropic (Claude)" => {
+                                        // Anthropic key is loaded into anthropic_key field
+                                    }
+                                    "OpenAI (Codex)" if config.openai_key.is_none() => {
                                         config.openai_key = Some(
                                             std::env::var("OPENAI_API_KEY").unwrap_or_default(),
                                         );

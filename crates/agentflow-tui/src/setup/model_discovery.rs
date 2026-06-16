@@ -11,9 +11,13 @@ pub struct ModelInfo {
 }
 
 /// Discover available models from the selected provider.
-/// Fetches models dynamically from OpenAI, Fireworks, or Codex based on the selected provider.
+/// Fetches models dynamically from Anthropic, OpenAI, or Fireworks based on the selected provider.
 pub async fn discover_models(config: &SetupConfig) -> Result<Vec<ModelInfo>> {
     match config.selected_provider.as_deref() {
+        Some(p) if p.contains("Anthropic") => {
+            // For Anthropic, use the Claude CLI to discover models
+            discover_claude_models()
+        }
         Some(p) if p.contains("OpenAI") || p.contains("Codex") => {
             // For OpenAI/Codex, try Codex CLI first, then fall back to OpenAI API
             if let Ok(models) = discover_codex_models() {
@@ -362,7 +366,9 @@ pub fn default_model_for_backend(cli_backend: &str) -> &'static str {
 
 /// Get default model for a provider.
 pub fn default_model_for_provider(provider: &str) -> &'static str {
-    if provider.contains("OpenAI") || provider.contains("Codex") {
+    if provider.contains("Anthropic") {
+        "anthropic/claude-sonnet-4-5"
+    } else if provider.contains("OpenAI") || provider.contains("Codex") {
         "openai/gpt-4o"
     } else if provider.contains("Fireworks") {
         "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"

@@ -44,6 +44,7 @@ pub struct AgentConfig {
 #[derive(Debug, Clone)]
 pub struct SetupConfig {
     pub github_pat: String,
+    pub anthropic_key: String,
     pub openai_key: Option<String>,
     pub fireworks_key: Option<String>,
     pub repo: String,
@@ -67,6 +68,7 @@ impl Default for SetupConfig {
 
         Self {
             github_pat: String::new(),
+            anthropic_key: String::new(),
             openai_key: None,
             fireworks_key: None,
             repo: "owner/repo".to_string(),
@@ -202,6 +204,12 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
 
     // Only write the API key for the selected provider
     match config.selected_provider.as_deref() {
+        Some(p) if p.contains("Anthropic") => {
+            if !config.anthropic_key.is_empty() {
+                content.push_str(&format!("ANTHROPIC_API_KEY={}\n", config.anthropic_key));
+                content.push_str("DEFAULT_CLI=claude\n");
+            }
+        }
         Some(p) if p.contains("OpenAI") || p.contains("Codex") => {
             if let Some(ref key) = config.openai_key {
                 content.push_str(&format!("OPENAI_API_KEY={}\n", key));
@@ -249,17 +257,23 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
     std::fs::create_dir_all(&registry_dir)?;
 
     // Determine default CLI based on selected provider
-    let default_cli = if config.selected_provider.as_ref().map_or(false, |p| {
-        p.contains("OpenAI") || p.contains("Codex") || p.contains("Fireworks")
-    }) {
-        "codex".to_string()
-    } else {
-        config.selected_cli_backend.clone()
+    let default_cli = match config.selected_provider.as_deref() {
+        Some(p) if p.contains("Anthropic") => "claude".to_string(),
+        Some(p) if p.contains("OpenAI") || p.contains("Codex") || p.contains("Fireworks") => {
+            "codex".to_string()
+        }
+        _ => config.selected_cli_backend.clone(),
     };
 
     let default_model = config.agents.first()
         .and_then(|a| a.model_backend.clone())
-        .unwrap_or_else(|| "openai/gpt-4o".to_string());
+        .unwrap_or_else(|| {
+            match config.selected_provider.as_deref() {
+                Some(p) if p.contains("Anthropic") => "anthropic/claude-sonnet-4-5".to_string(),
+                Some(p) if p.contains("Fireworks") => "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct".to_string(),
+                _ => "openai/gpt-4o".to_string(),
+            }
+        });
 
     let registry = config::Registry {
         default_cli: default_cli.clone(),

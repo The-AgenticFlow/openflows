@@ -43,7 +43,13 @@ impl ApiStep {
         let mut fields: Vec<ApiField> = Vec::new();
 
         let provider_field = match provider_name.as_str() {
-            "Codex (OpenAI CLI)" | "OpenAI" => Some(ApiField {
+            "Anthropic (Claude)" => Some(ApiField {
+                label: "Anthropic API Key".to_string(),
+                env_key: "ANTHROPIC_API_KEY".to_string(),
+                input: Input::new(config.anthropic_key.clone()),
+                required: true,
+            }),
+            "OpenAI (Codex)" => Some(ApiField {
                 label: "OpenAI API Key".to_string(),
                 env_key: "OPENAI_API_KEY".to_string(),
                 input: Input::new(config.openai_key.clone().unwrap_or_default()),
@@ -168,6 +174,7 @@ impl ApiStep {
                                 for field in &fields {
                                     let value = field.input.value().to_string();
                                     match field.env_key.as_str() {
+                                        "ANTHROPIC_API_KEY" => config.anthropic_key = value,
                                         "OPENAI_API_KEY" => {
                                             config.openai_key =
                                                 if value.is_empty() { None } else { Some(value) };
