@@ -297,7 +297,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
         .and_then(|a| a.model_backend.clone())
         .unwrap_or_else(|| {
             match config.selected_provider.as_deref() {
-                Some(p) if p.contains("Anthropic") => "anthropic/claude-sonnet-4-5".to_string(),
+                Some(p) if p.contains("Anthropic") => "anthropic/claude-3-7-sonnet-20250219".to_string(),
                 Some(p) if p.contains("Fireworks") => "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct".to_string(),
                 _ => "openai/gpt-4o".to_string(),
             }

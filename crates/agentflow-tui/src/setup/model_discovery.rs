@@ -173,12 +173,13 @@ fn discover_claude_models() -> Result<Vec<ModelInfo>> {
         }
     }
 
-    // Fallback to known-valid model IDs (using -latest aliases where possible)
+    // Fallback to known-valid Anthropic API model IDs
+    // Note: -latest aliases don't work with the API, must use dated versions
     let known_models = vec![
-        ("claude-sonnet-4-5", "Claude Sonnet 4.5", "Latest Claude Sonnet model"),
-        ("claude-opus-4-5", "Claude Opus 4.5", "Latest Claude Opus model"),
-        ("claude-3-7-sonnet-latest", "Claude 3.7 Sonnet", "Claude 3.7 Sonnet model"),
-        ("claude-3-5-sonnet-latest", "Claude 3.5 Sonnet", "Previous generation Sonnet"),
+        ("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet", "Latest Claude 3.7 Sonnet"),
+        ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", "Claude 3.5 Sonnet"),
+        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku", "Fast, cost-effective"),
+        ("claude-3-opus-20240229", "Claude 3 Opus", "Powerful model for complex tasks"),
     ];
 
     Ok(known_models
@@ -192,6 +193,7 @@ fn discover_claude_models() -> Result<Vec<ModelInfo>> {
 }
 
 /// Query claude CLI for available models
+/// Maps CLI -latest aliases to actual API model IDs
 fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
     let output = Command::new("claude")
         .args(["models"])
@@ -209,8 +211,12 @@ fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        
+        // Map CLI -latest aliases to actual API model IDs
+        let api_model_id = map_claude_model_alias(line);
+        
         models.push(ModelInfo {
-            slug: format!("anthropic/{}", line),
+            slug: format!("anthropic/{}", api_model_id),
             display_name: Some(line.replace('-', " ").to_string()),
             description: None,
         });
@@ -221,6 +227,19 @@ fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
     }
 
     Ok(models)
+}
+
+/// Map Claude CLI model aliases to actual API model IDs
+/// The -latest aliases don't work with the API
+fn map_claude_model_alias(alias: &str) -> &str {
+    match alias {
+        "claude-3-7-sonnet-latest" => "claude-3-7-sonnet-20250219",
+        "claude-3-5-sonnet-latest" => "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-latest" => "claude-3-5-haiku-20241022",
+        "claude-3-opus-latest" => "claude-3-opus-20240229",
+        // If it's already a dated version or unknown, return as-is
+        _ => alias,
+    }
 }
 
 /// Fetch available models from OpenAI API.
@@ -367,7 +386,7 @@ pub fn default_model_for_backend(cli_backend: &str) -> &'static str {
 /// Get default model for a provider.
 pub fn default_model_for_provider(provider: &str) -> &'static str {
     if provider.contains("Anthropic") {
-        "anthropic/claude-sonnet-4-5"
+        "anthropic/claude-3-7-sonnet-20250219"
     } else if provider.contains("OpenAI") || provider.contains("Codex") {
         "openai/gpt-4o"
     } else if provider.contains("Fireworks") {
@@ -389,10 +408,20 @@ mod tests {
 
     #[test]
     fn test_default_model_for_provider() {
+        assert_eq!(default_model_for_provider("Anthropic"), "anthropic/claude-3-7-sonnet-20250219");
         assert_eq!(default_model_for_provider("OpenAI"), "openai/gpt-4o");
         assert_eq!(default_model_for_provider("Codex"), "openai/gpt-4o");
         assert_eq!(default_model_for_provider("Fireworks"), "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct");
         assert_eq!(default_model_for_provider("Unknown"), "openai/gpt-4o");
+    }
+
+    #[test]
+    fn test_map_claude_model_alias() {
+        assert_eq!(map_claude_model_alias("claude-3-7-sonnet-latest"), "claude-3-7-sonnet-20250219");
+        assert_eq!(map_claude_model_alias("claude-3-5-sonnet-latest"), "claude-3-5-sonnet-20241022");
+        assert_eq!(map_claude_model_alias("claude-3-5-haiku-latest"), "claude-3-5-haiku-20241022");
+        assert_eq!(map_claude_model_alias("claude-3-opus-latest"), "claude-3-opus-20240229");
+        assert_eq!(map_claude_model_alias("claude-3-7-sonnet-20250219"), "claude-3-7-sonnet-20250219"); // already dated
     }
 
     #[test]
