@@ -95,15 +95,40 @@ ensure_node() {
     success "Node.js $(node --version)"
 }
 
-# Install Claude Code CLI
-ensure_claude() {
+# Check for AI CLI backend (Claude Code or Codex)
+ensure_ai_cli() {
+    local has_claude=false
+    local has_codex=false
+
     if has_cmd claude; then
         success "Claude Code CLI $(claude --version 2>/dev/null || echo 'installed')"
-        return
+        has_claude=true
     fi
-    info "Installing Claude Code CLI..."
-    npm install -g @anthropic-ai/claude-code
-    success "Claude Code CLI installed"
+
+    if has_cmd codex; then
+        success "Codex CLI $(codex --version 2>/dev/null || echo 'installed')"
+        has_codex=true
+    fi
+
+    if [ "$has_claude" = false ] && [ "$has_codex" = false ]; then
+        warn "No AI CLI backend found."
+        echo ""
+        echo "  OpenFlows requires either Claude Code (Anthropic) or Codex (OpenAI)."
+        echo ""
+        echo "  To install Claude Code:"
+        echo "    npm install -g @anthropic-ai/claude-code"
+        echo "    claude login"
+        echo ""
+        echo "  To install Codex:"
+        echo "    npm install -g @openai/codex"
+        echo "    codex login"
+        echo ""
+        echo "  You can also use npx without installing globally:"
+        echo "    npx @anthropic-ai/claude-code"
+        echo "    npx @openai/codex"
+        echo ""
+        info "Continuing without AI CLI - you'll need to install one before running OpenFlows"
+    fi
 }
 
 # Download pre-built binary from GitHub Releases
@@ -226,7 +251,7 @@ main() {
     ensure_rust
     ensure_git
     ensure_node
-    ensure_claude
+    ensure_ai_cli
     echo ""
 
     # Try to download pre-built binary
