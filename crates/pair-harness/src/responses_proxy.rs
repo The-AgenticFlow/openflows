@@ -115,10 +115,7 @@ fn translate_content(content: Value) -> Value {
 
         // Array of content parts — translate each part's type.
         Value::Array(parts) => {
-            let translated: Vec<Value> = parts
-                .into_iter()
-                .map(|part| translate_content_part(part))
-                .collect();
+            let translated: Vec<Value> = parts.into_iter().map(translate_content_part).collect();
             Value::Array(translated)
         }
 
@@ -286,14 +283,8 @@ fn translate_request(responses_req: &ResponsesApiRequest) -> ChatCompletionsRequ
                     match item_type {
                         // Responses API function_call → Chat Completions assistant message with tool_calls
                         "function_call" => {
-                            let call_id = obj
-                                .get("call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let fn_name = obj
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let call_id = obj.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let fn_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let fn_args = obj
                                 .get("arguments")
                                 .and_then(|v| v.as_str())
@@ -315,14 +306,8 @@ fn translate_request(responses_req: &ResponsesApiRequest) -> ChatCompletionsRequ
                         }
                         // Responses API function_call_output → Chat Completions tool message
                         "function_call_output" => {
-                            let call_id = obj
-                                .get("call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let output = obj
-                                .get("output")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let call_id = obj.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let output = obj.get("output").and_then(|v| v.as_str()).unwrap_or("");
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Value::String(output.to_string()),
@@ -335,10 +320,8 @@ fn translate_request(responses_req: &ResponsesApiRequest) -> ChatCompletionsRequ
                         // over tool_call_id, tool_calls, and name which may be
                         // present on tool-response and assistant messages.
                         _ => {
-                            let raw_role = obj
-                                .get("role")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("user");
+                            let raw_role =
+                                obj.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                             // Map Responses API roles to Chat Completions roles.
                             // The Responses API uses "developer" for system-level
                             // instructions (equivalent to "system" in Chat Completions).
@@ -365,9 +348,7 @@ fn translate_request(responses_req: &ResponsesApiRequest) -> ChatCompletionsRequ
                             // Responses API assistant messages may include
                             // tool_calls directly (type "message" with role
                             // "assistant" and a tool_calls array).
-                            let tool_calls = obj
-                                .get("tool_calls")
-                                .cloned();
+                            let tool_calls = obj.get("tool_calls").cloned();
 
                             // The `name` field on a tool message identifies which
                             // function was called (optional in Chat Completions).
@@ -426,14 +407,15 @@ fn translate_request(responses_req: &ResponsesApiRequest) -> ChatCompletionsRequ
         Value::Array(tool_arr) => {
             let translated: Vec<Value> = tool_arr
                 .iter()
-                .filter(|tool| {
-                    tool.get("type").and_then(|v| v.as_str()) == Some("function")
-                })
+                .filter(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("function"))
                 .map(|tool| {
                     // Reshape from flat Responses API format to nested Chat Completions format
                     let name = tool.get("name").cloned().unwrap_or(Value::Null);
                     let description = tool.get("description").cloned().unwrap_or(Value::Null);
-                    let parameters = tool.get("parameters").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                    let parameters = tool
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or(Value::Object(serde_json::Map::new()));
                     serde_json::json!({
                         "type": "function",
                         "function": {
@@ -719,20 +701,27 @@ async fn handle_responses_post(
             "responses_proxy: upstream returned {}: {}",
             upstream_status, body
         );
-// Diagnostic: on 422 errors, log the translated messages for debugging
+        // Diagnostic: on 422 errors, log the translated messages for debugging
         if upstream_status.as_u16() == 422 {
-            let msg_summary: Vec<String> = chat_req.messages.iter().enumerate().map(|(i, m)| {
-                let has_tool_calls = m.tool_calls.is_some();
-                let has_tool_call_id = m.tool_call_id.is_some();
-                let content_preview = match &m.content {
-                    Value::String(s) => format!("{} chars", s.len()),
-                    Value::Array(arr) => format!("{} items", arr.len()),
-                    Value::Null => "null".to_string(),
-                    other => format!("{:?}", other),
-                };
-                format!("[{}] role={} content={} tool_calls={} tool_call_id={}",
-                    i, m.role, content_preview, has_tool_calls, has_tool_call_id)
-            }).collect();
+            let msg_summary: Vec<String> = chat_req
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let has_tool_calls = m.tool_calls.is_some();
+                    let has_tool_call_id = m.tool_call_id.is_some();
+                    let content_preview = match &m.content {
+                        Value::String(s) => format!("{} chars", s.len()),
+                        Value::Array(arr) => format!("{} items", arr.len()),
+                        Value::Null => "null".to_string(),
+                        other => format!("{:?}", other),
+                    };
+                    format!(
+                        "[{}] role={} content={} tool_calls={} tool_call_id={}",
+                        i, m.role, content_preview, has_tool_calls, has_tool_call_id
+                    )
+                })
+                .collect();
             debug!(
                 "responses_proxy: 422 — translated messages that caused the error: [{}]",
                 msg_summary.join(" | ")
@@ -789,10 +778,12 @@ async fn handle_responses_post(
             }
         });
 
-        if tx.try_send(Ok(format!(
-            "event: response.created\ndata: {}\n\n",
-            created_event
-        ))).is_err()
+        if tx
+            .try_send(Ok(format!(
+                "event: response.created\ndata: {}\n\n",
+                created_event
+            )))
+            .is_err()
         {
             // Receiver already dropped — client disconnected
             return StatusCode::OK.into_response();
@@ -850,10 +841,13 @@ async fn handle_responses_post(
                                             "content_index": 0,
                                             "text": full_text
                                         });
-                                        if tx.try_send(Ok(format!(
-                                            "event: response.output_text.done\ndata: {}\n\n",
-                                            text_done
-                                        ))).is_err() {
+                                        if tx
+                                            .try_send(Ok(format!(
+                                                "event: response.output_text.done\ndata: {}\n\n",
+                                                text_done
+                                            )))
+                                            .is_err()
+                                        {
                                             return;
                                         }
 
@@ -867,10 +861,13 @@ async fn handle_responses_post(
                                                 "text": full_text
                                             }
                                         });
-                                        if tx.try_send(Ok(format!(
-                                            "event: response.content_part.done\ndata: {}\n\n",
-                                            content_done
-                                        ))).is_err() {
+                                        if tx
+                                            .try_send(Ok(format!(
+                                                "event: response.content_part.done\ndata: {}\n\n",
+                                                content_done
+                                            )))
+                                            .is_err()
+                                        {
                                             return;
                                         }
 
@@ -889,10 +886,13 @@ async fn handle_responses_post(
                                                 "status": "completed"
                                             }
                                         });
-                                        if tx.try_send(Ok(format!(
-                                            "event: response.output_item.done\ndata: {}\n\n",
-                                            msg_done
-                                        ))).is_err() {
+                                        if tx
+                                            .try_send(Ok(format!(
+                                                "event: response.output_item.done\ndata: {}\n\n",
+                                                msg_done
+                                            )))
+                                            .is_err()
+                                        {
                                             return;
                                         }
                                     }
@@ -926,10 +926,13 @@ async fn handle_responses_post(
                                                 "status": "completed"
                                             }
                                         });
-                                        if tx.try_send(Ok(format!(
-                                            "event: response.output_item.done\ndata: {}\n\n",
-                                            item_done
-                                        ))).is_err() {
+                                        if tx
+                                            .try_send(Ok(format!(
+                                                "event: response.output_item.done\ndata: {}\n\n",
+                                                item_done
+                                            )))
+                                            .is_err()
+                                        {
                                             return;
                                         }
                                         output_index += 1;
@@ -1078,7 +1081,8 @@ async fn handle_responses_post(
                                             // response.output_item.added so the client
                                             // knows a function call is starting.
                                             if !call_id.is_empty() {
-                                                let is_new = !pending_fn_calls.contains_key(call_id);
+                                                let is_new =
+                                                    !pending_fn_calls.contains_key(call_id);
                                                 if is_new {
                                                     // Emit response.output_item.added event
                                                     // for the new function call.
@@ -1122,7 +1126,9 @@ async fn handle_responses_post(
                                                 };
 
                                                 if let Some(target_id) = target_id {
-                                                    if let Some(fc) = pending_fn_calls.get_mut(&target_id) {
+                                                    if let Some(fc) =
+                                                        pending_fn_calls.get_mut(&target_id)
+                                                    {
                                                         fc.arguments.push_str(fn_args);
                                                     }
                                                 }
@@ -1148,8 +1154,10 @@ async fn handle_responses_post(
 
                                     // Extract usage from final chunk
                                     if let Some(usage) = chunk.get("usage") {
-                                        input_tokens =
-                                            usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(input_tokens);
+                                        input_tokens = usage
+                                            .get("prompt_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(input_tokens);
                                         output_tokens = usage
                                             .get("completion_tokens")
                                             .and_then(|v| v.as_u64())
@@ -1354,10 +1362,7 @@ async fn handle_responses_post(
 
 /// Handle GET /v1/models — pass through to upstream.
 async fn handle_models_get(state: State<ProxyState>, _headers: HeaderMap) -> Response {
-    let upstream_url = format!(
-        "{}/models",
-        state.upstream_base_url.trim_end_matches('/')
-    );
+    let upstream_url = format!("{}/models", state.upstream_base_url.trim_end_matches('/'));
 
     match state
         .http_client

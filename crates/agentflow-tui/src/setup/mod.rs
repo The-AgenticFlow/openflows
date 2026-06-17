@@ -191,7 +191,9 @@ fn detect_cli_path(binary: &str) -> String {
         .ok()
         .and_then(|output| {
             if output.status.success() {
-                String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
             } else {
                 None
             }
@@ -293,14 +295,18 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
         _ => config.selected_cli_backend.clone(),
     };
 
-    let default_model = config.agents.first()
+    let default_model = config
+        .agents
+        .first()
         .and_then(|a| a.model_backend.clone())
-        .unwrap_or_else(|| {
-            match config.selected_provider.as_deref() {
-                Some(p) if p.contains("Anthropic") => "anthropic/claude-3-5-sonnet-20241022".to_string(),
-                Some(p) if p.contains("Fireworks") => "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct".to_string(),
-                _ => "openai/gpt-4o".to_string(),
+        .unwrap_or_else(|| match config.selected_provider.as_deref() {
+            Some(p) if p.contains("Anthropic") => {
+                "anthropic/claude-3-5-sonnet-20241022".to_string()
             }
+            Some(p) if p.contains("Fireworks") => {
+                "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct".to_string()
+            }
+            _ => "openai/gpt-4o".to_string(),
         });
 
     let registry = config::Registry {

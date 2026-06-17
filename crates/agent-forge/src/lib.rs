@@ -1944,7 +1944,10 @@ impl BatchNode for ForgePairNode {
             if let Some(ref m) = model {
                 info!(worker_id, base_id, model = %m, "Model backend resolved from registry");
             } else {
-                info!(worker_id, base_id, "No model_backend in registry, using env var default");
+                info!(
+                    worker_id,
+                    base_id, "No model_backend in registry, using env var default"
+                );
             }
             model
         } else {

@@ -43,8 +43,9 @@ impl WorktreeManager {
                     // Walk up from .git/worktrees/<name> to find the repo root
                     // .git/worktrees/<name> -> .git/worktrees -> .git -> repo_root
                     if let Some(repo_git_dir) = gitdir_path
-                        .parent()  // .git/worktrees
-                        .and_then(|p| p.parent())  // .git
+                        .parent() // .git/worktrees
+                        .and_then(|p| p.parent())
+                    // .git
                     {
                         let repo_root = repo_git_dir.parent().unwrap_or(repo_git_dir).to_path_buf();
                         if repo_root.join(".git").is_dir() || repo_root.join("HEAD").exists() {

@@ -392,7 +392,7 @@ fn probe_endpoint_supports_responses() -> EndpointMode {
                             "codex: endpoint does NOT support /v1/responses (404); using Chat Completions mode"
                         );
                         EndpointMode::ChatCompletions
-                    } else if status >= 200 && status < 300 {
+                    } else if (200..300).contains(&status) {
                         // 2xx = the route exists and processed the request (possibly with
                         // an error in the body, but the route is there)
                         info!(
@@ -456,8 +456,9 @@ fn probe_endpoint_supports_responses() -> EndpointMode {
 /// - If the endpoint returns 404 for `/v1/responses` → start a local proxy that translates
 ///   Responses API requests to Chat Completions format (since Codex CLI only supports
 ///   `wire_api="responses"`)
+///
 /// Strip a provider prefix (e.g. "anthropic/", "openai/", "fireworks/") from a
-/// model identifier.  CLI backends like `claude` and `codex` expect bare model
+/// model identifier. CLI backends like `claude` and `codex` expect bare model
 /// names (e.g. "claude-haiku-4-5-20251001"), but the registry may store them
 /// with a routing prefix (e.g. "anthropic/claude-haiku-4-5-20251001").
 pub(crate) fn strip_provider_prefix(model: &str) -> &str {
@@ -531,9 +532,8 @@ fn append_sse_disable_flags(cmd: &mut Command) {
 /// natively supports `/v1/responses` (e.g., api.openai.com, Fireworks).
 fn configure_responses_proxy(cmd: &mut Command, proxy_url: &str) {
     cmd.arg("-c").arg("model_provider=\"responses_proxy\"");
-    cmd.arg("-c").arg(format!(
-        "model_providers.responses_proxy.name=\"ResponsesProxy\""
-    ));
+    cmd.arg("-c")
+        .arg("model_providers.responses_proxy.name=\"ResponsesProxy\"");
     cmd.arg("-c").arg(format!(
         "model_providers.responses_proxy.base_url=\"{}\"",
         proxy_url.trim_end_matches('/')
@@ -718,6 +718,7 @@ impl Drop for ThreadSafeRuntime {
 /// Holds the initialized state for the responses proxy. The address and runtime
 /// are always set atomically together, preventing a race where the cached address
 /// points to a proxy whose runtime has been dropped.
+#[allow(dead_code)]
 struct ResponsesProxyState {
     /// The proxy base URL (e.g., "http://127.0.0.1:35173").
     addr: String,
@@ -910,7 +911,10 @@ impl ProcessManager {
         // If two threads race here, only one will start the proxy; the other
         // will find it already initialized and return the cached address.
         {
-            let guard = self.responses_proxy.lock().expect("responses_proxy mutex poisoned");
+            let guard = self
+                .responses_proxy
+                .lock()
+                .expect("responses_proxy mutex poisoned");
             if let Some(ref state) = *guard {
                 return Ok(state.addr.clone());
             }
@@ -941,20 +945,23 @@ impl ProcessManager {
         // - We also need block_on on the new runtime to start the proxy.
         // - std::thread::spawn creates a new OS thread where the runtime can be
         //   safely created and kept alive.
-        let handle = std::thread::spawn(move || -> Result<(String, ThreadSafeRuntime, tokio::sync::watch::Sender<bool>)> {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .context("Failed to create Tokio runtime for responses proxy")?;
+        let handle = std::thread::spawn(
+            move || -> Result<(String, ThreadSafeRuntime, tokio::sync::watch::Sender<bool>)> {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .context("Failed to create Tokio runtime for responses proxy")?;
 
-            let (addr, shutdown_tx) = rt.block_on(async {
-                crate::responses_proxy::start_responses_proxy(upstream_clone, api_key_clone).await
-            })?;
+                let (addr, shutdown_tx) = rt.block_on(async {
+                    crate::responses_proxy::start_responses_proxy(upstream_clone, api_key_clone)
+                        .await
+                })?;
 
-            let proxy_url = format!("http://{}:{}", addr.ip(), addr.port());
-            Ok((proxy_url, ThreadSafeRuntime::new(rt), shutdown_tx))
-        });
+                let proxy_url = format!("http://{}:{}", addr.ip(), addr.port());
+                Ok((proxy_url, ThreadSafeRuntime::new(rt), shutdown_tx))
+            },
+        );
 
         let (proxy_url, rt, shutdown_tx) = match handle.join() {
             Ok(result) => result.context("responses_proxy: failed to start")?,
@@ -971,7 +978,10 @@ impl ProcessManager {
         // Store both the address and runtime atomically under the same lock.
         // This prevents a race where the address is cached but the runtime
         // is from a different (killed) proxy instance.
-        let mut guard = self.responses_proxy.lock().expect("responses_proxy mutex poisoned");
+        let mut guard = self
+            .responses_proxy
+            .lock()
+            .expect("responses_proxy mutex poisoned");
         // Another thread may have initialized the proxy while we were starting ours.
         // If so, return the cached address and drop our duplicate runtime.
         if let Some(ref state) = *guard {
@@ -1466,7 +1476,12 @@ trust_level = "trusted"
             // When the responses proxy is active, we skip this because Codex
             // points at the local proxy via model_providers.responses_proxy.base_url
             // instead of using OPENAI_BASE_URL directly.
-            if self.responses_proxy.lock().expect("responses_proxy mutex poisoned").is_none() {
+            if self
+                .responses_proxy
+                .lock()
+                .expect("responses_proxy mutex poisoned")
+                .is_none()
+            {
                 if let Some(base_url_env) = &config.base_url_env {
                     if let Ok(base_url) = std::env::var(base_url_env) {
                         cmd.env(base_url_env, base_url);
@@ -2518,12 +2533,27 @@ mod tests {
 
     #[test]
     fn test_strip_provider_prefix() {
-        assert_eq!(strip_provider_prefix("anthropic/claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+        assert_eq!(
+            strip_provider_prefix("anthropic/claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
         assert_eq!(strip_provider_prefix("openai/gpt-4o"), "gpt-4o");
-        assert_eq!(strip_provider_prefix("fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"), "accounts/fireworks/models/llama-v3p1-8b-instruct");
-        assert_eq!(strip_provider_prefix("gemini/gemini-2.5-pro"), "gemini-2.5-pro");
-        assert_eq!(strip_provider_prefix("groq/llama-3.3-70b-versatile"), "llama-3.3-70b-versatile");
-        assert_eq!(strip_provider_prefix("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+        assert_eq!(
+            strip_provider_prefix("fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"),
+            "accounts/fireworks/models/llama-v3p1-8b-instruct"
+        );
+        assert_eq!(
+            strip_provider_prefix("gemini/gemini-2.5-pro"),
+            "gemini-2.5-pro"
+        );
+        assert_eq!(
+            strip_provider_prefix("groq/llama-3.3-70b-versatile"),
+            "llama-3.3-70b-versatile"
+        );
+        assert_eq!(
+            strip_provider_prefix("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
         assert_eq!(strip_provider_prefix("gpt-4o"), "gpt-4o");
         assert_eq!(strip_provider_prefix(""), "");
     }

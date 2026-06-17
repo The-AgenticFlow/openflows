@@ -134,7 +134,8 @@ impl FallbackClient {
                 }
             }
 
-            if (model.starts_with("accounts/fireworks/") || model.starts_with("fireworks/accounts/fireworks/"))
+            if (model.starts_with("accounts/fireworks/")
+                || model.starts_with("fireworks/accounts/fireworks/"))
                 && FireworksClient::is_configured()
             {
                 info!(
@@ -303,8 +304,8 @@ impl FallbackClient {
     /// Build client chain for direct mode.
     /// Requires individual API keys for each provider.
     fn build_direct_chain(model_override: Option<&str>) -> Result<Self> {
-        let fallback_order =
-            std::env::var("LLM_FALLBACK").unwrap_or_else(|_| "anthropic,openai,fireworks".to_string());
+        let fallback_order = std::env::var("LLM_FALLBACK")
+            .unwrap_or_else(|_| "anthropic,openai,fireworks".to_string());
 
         let provider_names: Vec<&str> = fallback_order.split(',').map(|s| s.trim()).collect();
 

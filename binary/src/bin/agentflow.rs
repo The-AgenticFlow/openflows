@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
     // - SENTINEL final review -> final-review.md
     // - FORGE opens PR -> STATUS.json
     //
-// VesselNode handles the merge gate:
+    // VesselNode handles the merge gate:
     // - Polls CI status until terminal (success/failure/timeout)
     // - Detects merge conflicts early via GitHub's mergeable field
     // - Attempts conflict resolution (GitHub update-branch or local rebase)

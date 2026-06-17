@@ -43,6 +43,7 @@ impl Provisioner {
     }
 
     /// Provision all configuration for a pair using BackendConfig.
+    #[allow(clippy::too_many_arguments)]
     pub async fn provision_pair(
         &self,
         pair_id: &str,
@@ -71,7 +72,8 @@ impl Provisioner {
         // also isn't supported by non-OpenAI providers, so we still skip them for
         // non-OpenAI proxies.
         // For Claude backend, MCP servers work fine regardless.
-        let is_codex_non_responses = cli_backend == CliBackend::Codex && crate::process::codex_use_sse();
+        let is_codex_non_responses =
+            cli_backend == CliBackend::Codex && crate::process::codex_use_sse();
         if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(worktree);
@@ -514,7 +516,11 @@ max_depth = 1
     }
 
     /// Generate .codex/agents/*.toml from existing agent.md files.
-    fn generate_codex_agent_tomls(&self, worktree: &Path, model_backend: Option<&str>) -> Result<()> {
+    fn generate_codex_agent_tomls(
+        &self,
+        worktree: &Path,
+        model_backend: Option<&str>,
+    ) -> Result<()> {
         let agent_ids = ["forge", "sentinel"];
 
         for agent_id in &agent_ids {
@@ -525,7 +531,12 @@ max_depth = 1
     }
 
     /// Generate a single .codex/agents/{role}.toml in the target directory.
-    fn generate_codex_agent_toml_for_role(&self, target: &Path, agent_id: &str, model_backend: Option<&str>) -> Result<()> {
+    fn generate_codex_agent_toml_for_role(
+        &self,
+        target: &Path,
+        agent_id: &str,
+        model_backend: Option<&str>,
+    ) -> Result<()> {
         let agents_dir = target.join(".codex").join("agents");
         fs::create_dir_all(&agents_dir).context("Failed to create .codex/agents directory")?;
 

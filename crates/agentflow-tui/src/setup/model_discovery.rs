@@ -58,6 +58,7 @@ fn discover_backend_models(cli_backend: &str) -> Result<Vec<ModelInfo>> {
 }
 
 /// Query a custom (OpenAI-compatible) provider for available models.
+#[allow(dead_code)]
 async fn discover_custom_provider_models(
     url: &str,
     api_key: Option<&str>,
@@ -120,9 +121,7 @@ async fn discover_custom_provider_models(
 /// fallback client chain can route them correctly without relying on
 /// the MODEL_PROVIDER_MAP environment variable.
 fn discover_codex_models() -> Result<Vec<ModelInfo>> {
-    let output = Command::new("codex")
-        .args(["debug", "models"])
-        .output()?;
+    let output = Command::new("codex").args(["debug", "models"]).output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -138,7 +137,8 @@ fn discover_codex_models() -> Result<Vec<ModelInfo>> {
     let mut models = Vec::new();
     if let Some(model_array) = json.get("models").and_then(|v| v.as_array()) {
         for m in model_array {
-            let raw_slug = m.get("slug")
+            let raw_slug = m
+                .get("slug")
                 .or_else(|| m.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
@@ -152,12 +152,14 @@ fn discover_codex_models() -> Result<Vec<ModelInfo>> {
                 format!("openai/{}", raw_slug)
             };
 
-            let display_name = m.get("display_name")
+            let display_name = m
+                .get("display_name")
                 .or_else(|| m.get("name"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let description = m.get("description")
+            let description = m
+                .get("description")
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
@@ -256,6 +258,7 @@ fn is_valid_anthropic_api_model(model_id: &str) -> bool {
 }
 
 /// Check if an Anthropic model ID is a chat model
+#[allow(dead_code)]
 fn is_anthropic_chat_model(model_id: &str) -> bool {
     // Only accept models that pass the valid API model check
     model_id.starts_with("claude-")
@@ -277,10 +280,26 @@ fn discover_claude_models() -> Result<Vec<ModelInfo>> {
     // Note: -latest aliases don't work with the API, must use dated versions
     // Source: https://docs.anthropic.com/en/docs/about-claude/models
     let known_models = vec![
-        ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", "Latest Claude 3.5 Sonnet (Oct 2024)"),
-        ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku", "Fast, cost-effective (Oct 2024)"),
-        ("claude-3-opus-20240229", "Claude 3 Opus", "Most powerful model (Feb 2024)"),
-        ("claude-3-haiku-20240307", "Claude 3 Haiku", "Fastest responses (Mar 2024)"),
+        (
+            "claude-3-5-sonnet-20241022",
+            "Claude 3.5 Sonnet",
+            "Latest Claude 3.5 Sonnet (Oct 2024)",
+        ),
+        (
+            "claude-3-5-haiku-20241022",
+            "Claude 3.5 Haiku",
+            "Fast, cost-effective (Oct 2024)",
+        ),
+        (
+            "claude-3-opus-20240229",
+            "Claude 3 Opus",
+            "Most powerful model (Feb 2024)",
+        ),
+        (
+            "claude-3-haiku-20240307",
+            "Claude 3 Haiku",
+            "Fastest responses (Mar 2024)",
+        ),
     ];
 
     Ok(known_models
@@ -297,9 +316,7 @@ fn discover_claude_models() -> Result<Vec<ModelInfo>> {
 /// Maps CLI -latest aliases to actual API model IDs
 /// Filters out model IDs that aren't valid Anthropic API model IDs
 fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
-    let output = Command::new("claude")
-        .args(["models"])
-        .output()?;
+    let output = Command::new("claude").args(["models"]).output()?;
 
     if !output.status.success() {
         return Err(anyhow::anyhow!("claude models command failed"));
@@ -313,17 +330,20 @@ fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        
+
         // Map CLI -latest aliases to actual API model IDs
         let api_model_id = map_claude_model_alias(line);
-        
+
         // Only include models that are valid Anthropic API model IDs
         // This filters out marketing names like claude-sonnet-4-6
         if !is_valid_anthropic_api_model(api_model_id) {
-            tracing::debug!("Skipping invalid Anthropic model ID from CLI: {}", api_model_id);
+            tracing::debug!(
+                "Skipping invalid Anthropic model ID from CLI: {}",
+                api_model_id
+            );
             continue;
         }
-        
+
         models.push(ModelInfo {
             slug: format!("anthropic/{}", api_model_id),
             display_name: Some(line.replace('-', " ").to_string()),
@@ -477,9 +497,7 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
 /// Check if a Fireworks model ID is a chat model
 fn is_fireworks_chat_model(model_id: &str) -> bool {
     // Fireworks chat models typically have these patterns
-    model_id.contains("instruct")
-        || model_id.contains("chat")
-        || model_id.starts_with("accounts/")
+    model_id.contains("instruct") || model_id.contains("chat") || model_id.starts_with("accounts/")
 }
 
 /// Get default model for a CLI backend.
@@ -518,19 +536,37 @@ mod tests {
 
     #[test]
     fn test_default_model_for_provider() {
-        assert_eq!(default_model_for_provider("Anthropic"), "anthropic/claude-3-5-sonnet-20241022");
+        assert_eq!(
+            default_model_for_provider("Anthropic"),
+            "anthropic/claude-3-5-sonnet-20241022"
+        );
         assert_eq!(default_model_for_provider("OpenAI"), "openai/gpt-4o");
         assert_eq!(default_model_for_provider("Codex"), "openai/gpt-4o");
-        assert_eq!(default_model_for_provider("Fireworks"), "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct");
+        assert_eq!(
+            default_model_for_provider("Fireworks"),
+            "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"
+        );
         assert_eq!(default_model_for_provider("Unknown"), "openai/gpt-4o");
     }
 
     #[test]
     fn test_map_claude_model_alias() {
-        assert_eq!(map_claude_model_alias("claude-3-5-sonnet-latest"), "claude-3-5-sonnet-20241022");
-        assert_eq!(map_claude_model_alias("claude-3-5-haiku-latest"), "claude-3-5-haiku-20241022");
-        assert_eq!(map_claude_model_alias("claude-3-opus-latest"), "claude-3-opus-20240229");
-        assert_eq!(map_claude_model_alias("claude-3-5-sonnet-20241022"), "claude-3-5-sonnet-20241022"); // already dated
+        assert_eq!(
+            map_claude_model_alias("claude-3-5-sonnet-latest"),
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(
+            map_claude_model_alias("claude-3-5-haiku-latest"),
+            "claude-3-5-haiku-20241022"
+        );
+        assert_eq!(
+            map_claude_model_alias("claude-3-opus-latest"),
+            "claude-3-opus-20240229"
+        );
+        assert_eq!(
+            map_claude_model_alias("claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet-20241022"
+        ); // already dated
     }
 
     #[test]
@@ -582,7 +618,9 @@ mod tests {
 
     #[test]
     fn test_is_fireworks_chat_model() {
-        assert!(is_fireworks_chat_model("accounts/fireworks/models/llama-v3p1-8b-instruct"));
+        assert!(is_fireworks_chat_model(
+            "accounts/fireworks/models/llama-v3p1-8b-instruct"
+        ));
         assert!(!is_fireworks_chat_model("some-embedding-model"));
     }
 }

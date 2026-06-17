@@ -6,8 +6,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use std::io;
 
+use crate::setup::model_discovery::{default_model_for_provider, discover_models, ModelInfo};
 use crate::setup::{AgentConfig, SetupConfig};
-use crate::setup::model_discovery::{discover_models, ModelInfo, default_model_for_provider};
 use crate::util::theme::Theme;
 use crate::widgets::select::SelectableListState;
 
@@ -55,8 +55,9 @@ impl AgentsStep {
                 tracing::warn!("Failed to discover models: {}, using defaults", e);
                 vec![ModelInfo {
                     slug: default_model_for_provider(
-                        config.selected_provider.as_deref().unwrap_or("OpenAI")
-                    ).to_string(),
+                        config.selected_provider.as_deref().unwrap_or("OpenAI"),
+                    )
+                    .to_string(),
                     display_name: Some("Default Model".to_string()),
                     description: None,
                 }]
@@ -426,8 +427,9 @@ impl AgentsStep {
                                     KeyCode::Up => list_state.move_up(),
                                     KeyCode::Down => list_state.move_down(),
                                     KeyCode::Enter => {
-                                        agents[agent_idx_val].model_backend =
-                                            Some(available_models[list_state.selected].slug.clone());
+                                        agents[agent_idx_val].model_backend = Some(
+                                            available_models[list_state.selected].slug.clone(),
+                                        );
                                         state = AgentConfigState::MainList {
                                             agents: agents.clone(),
                                             selected: agent_idx_val,
