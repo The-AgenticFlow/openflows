@@ -1501,6 +1501,7 @@ dependencies = [
 name = "pair-harness"
 version = "0.2.0"
 dependencies = [
+ "agent-client",
  "anyhow",
  "axum 0.8.9",
  "chrono",

@@ -234,9 +234,10 @@ async fn discover_anthropic_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     Ok(models)
 }
 
-/// Check if an Anthropic model ID is a valid API model ID.
-/// Only accepts dated versions like claude-3-5-sonnet-20241022.
-/// Rejects marketing names like claude-sonnet-4-6 and -latest aliases.
+/// Validates an Anthropic model ID returned from /v1/models.
+/// Accepts any `claude-*` ID (dated versions like claude-3-5-sonnet-20241022
+/// and newer versioned IDs like claude-opus-4-6).
+/// Rejects `-latest` aliases and RLHF/eval variants.
 fn is_valid_anthropic_api_model(model_id: &str) -> bool {
     // Anthropic model IDs from /v1/models include both dated versions and
     // newer versioned IDs such as claude-opus-4-6. We accept any claude-* ID

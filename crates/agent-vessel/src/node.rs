@@ -1794,7 +1794,12 @@ impl VesselNode {
                 let ann_lines = d
                     .annotations
                     .iter()
-                    .map(|a| format!("- **{}** `{}:{}` {}", a.check_name, a.path, a.start_line, a.message))
+                    .map(|a| {
+                        format!(
+                            "- **{}** `{}:{}` {}",
+                            a.check_name, a.path, a.start_line, a.message
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(

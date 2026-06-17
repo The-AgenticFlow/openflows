@@ -54,14 +54,50 @@ You stay in the loop only when needed — security concerns, ambiguous specs, or
 | **VESSEL** | DevOps | Monitors CI, handles merge conflicts, squash-merges green PRs |
 | **LORE** | Writer | Documents decisions, updates changelogs, maintains project history |
 
-## What You Need
+## Prerequisites
+
+### System Requirements
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| **Git** | 2.x+ | Required for repo cloning, worktree management, and branching |
+| **Node.js** | 18+ | Required for the GitHub MCP server (`npx -y @modelcontextprotocol/server-github`) |
+| **C compiler** | — | `build-essential` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
+| **OpenSSL dev headers** | — | `pkg-config` + `libssl-dev` (Debian/Ubuntu) or `brew install openssl` (macOS) |
+| **Rust** | 1.70+ | Only required if building from source (`cargo install openflows`) |
+
+### GitHub
 
 - **A GitHub repository** — the repo OpenFlows will work on
-- **A GitHub Personal Access Token** — with `repo` scope
-- **An AI backend** — either Claude Code CLI or Codex CLI with an API key
-- **Node.js 18+** — for the GitHub MCP server
+- **A GitHub Personal Access Token** — with `repo` scope (set as `GITHUB_PERSONAL_ACCESS_TOKEN`)
 
-The `openflows-setup` wizard handles configuration. See [.env.example](.env.example) for all available options.
+### AI Backend (choose one)
+
+| Mode | CLI | Required API Key | Install |
+|------|-----|-------------------|---------|
+| **Claude + Anthropic** | Claude Code | `ANTHROPIC_API_KEY` | `npm install -g @anthropic-ai/claude-code && claude login` |
+| **Codex + OpenAI** | Codex | `OPENAI_API_KEY` | `npm install -g @openai/codex && codex login --with-api-key` |
+| **Codex + Fireworks** | Codex | `FIREWORKS_API_KEY` | `npm install -g @openai/codex && codex login --with-api-key` |
+
+Set `DEFAULT_CLI` to `claude` or `codex` to select your backend.
+
+### Optional (Recommended for Production)
+
+| Service | Purpose | Default |
+|---------|---------|---------|
+| **Redis 7** | Persistent state across restarts | In-memory (state lost on restart) |
+| **LiteLLM proxy** | Per-agent model routing, cost optimization, rate limits | Direct API calls |
+
+Both are included in the Docker Compose stack (`docker compose up`).
+
+### Environment Setup
+
+```bash
+cp .env.example .env
+# Edit .env with your tokens and API keys
+```
+
+The `openflows-setup` wizard handles configuration interactively. See [.env.example](.env.example) for all available options.
 
 ## Documentation
 

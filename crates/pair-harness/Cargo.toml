@@ -20,6 +20,7 @@ libc = "0.2"
 which = "7"
 regex = "1"
 config = { path = "../config" }
+agent-client = { path = "../agent-client" }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 axum = { version = "0.8", features = ["http2"] }
 uuid = { version = "1", features = ["v4"] }

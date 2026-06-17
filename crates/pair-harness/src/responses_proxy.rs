@@ -800,8 +800,14 @@ async fn handle_responses_post(
             // Track whether we've emitted the output_item.added and
             // content_part.added events for the text message.
             let mut text_item_emitted = false;
-            // Track the output index for items. Starts at 0 for the first item.
-            let mut output_index: usize = 0;
+            // The output_index assigned to the text message item. Captured once
+            // when the text item is first emitted so it stays stable even if
+            // function calls arrive later in the stream.
+            let mut text_output_index: usize = 0;
+            // Track the output index for function call items. Function calls
+            // appear first in the output array, so the text message's
+            // output_index equals pending_fn_calls.len() at emit time.
+            let mut fn_output_index: usize = 0;
 
             // Track function calls across streaming chunks.
             let mut pending_fn_calls: std::collections::HashMap<String, PendingFnCall> =
@@ -828,16 +834,57 @@ async fn handle_responses_post(
 
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" {
-                                    // End of stream — finalize the text message item
-                                    // and any pending function calls, then emit
-                                    // response.completed.
+                                    // End of stream — finalize function calls first
+                                    // (indices 0..N), then the text message (index N),
+                                    // then emit response.completed. This ordering
+                                    // matches the ascending output_index sequence.
 
-                                    // Finalize the text message if we emitted it.
+                                    // Finalize function calls first.
+                                    for (idx, (call_id, fc)) in pending_fn_calls.iter().enumerate()
+                                    {
+                                        let fn_done = serde_json::json!({
+                                            "type": "response.function_call_arguments.done",
+                                            "output_index": idx,
+                                            "call_id": call_id,
+                                            "name": fc.name,
+                                            "arguments": fc.arguments
+                                        });
+                                        if tx.try_send(Ok(format!(
+                                            "event: response.function_call_arguments.done\ndata: {}\n\n",
+                                            fn_done
+                                        ))).is_err() {
+                                            return;
+                                        }
+
+                                        let item_done = serde_json::json!({
+                                            "type": "response.output_item.done",
+                                            "output_index": idx,
+                                            "item": {
+                                                "type": "function_call",
+                                                "id": call_id,
+                                                "call_id": call_id,
+                                                "name": fc.name,
+                                                "arguments": fc.arguments,
+                                                "status": "completed"
+                                            }
+                                        });
+                                        if tx
+                                            .try_send(Ok(format!(
+                                                "event: response.output_item.done\ndata: {}\n\n",
+                                                item_done
+                                            )))
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+
+                                    // Finalize the text message after function calls.
                                     if text_item_emitted {
                                         // Emit output_text.done
                                         let text_done = serde_json::json!({
                                             "type": "response.output_text.done",
-                                            "output_index": 0,
+                                            "output_index": text_output_index,
                                             "content_index": 0,
                                             "text": full_text
                                         });
@@ -854,7 +901,7 @@ async fn handle_responses_post(
                                         // Emit content_part.done
                                         let content_done = serde_json::json!({
                                             "type": "response.content_part.done",
-                                            "output_index": 0,
+                                            "output_index": text_output_index,
                                             "content_index": 0,
                                             "part": {
                                                 "type": "output_text",
@@ -874,7 +921,7 @@ async fn handle_responses_post(
                                         // Emit output_item.done for the message
                                         let msg_done = serde_json::json!({
                                             "type": "response.output_item.done",
-                                            "output_index": 0,
+                                            "output_index": text_output_index,
                                             "item": {
                                                 "type": "message",
                                                 "id": msg_id,
@@ -895,47 +942,6 @@ async fn handle_responses_post(
                                         {
                                             return;
                                         }
-                                    }
-
-                                    // Emit function_call_arguments.done and
-                                    // output_item.done for each pending function call.
-                                    for (call_id, fc) in &pending_fn_calls {
-                                        let fn_done = serde_json::json!({
-                                            "type": "response.function_call_arguments.done",
-                                            "output_index": output_index,
-                                            "call_id": call_id,
-                                            "name": fc.name,
-                                            "arguments": fc.arguments
-                                        });
-                                        if tx.try_send(Ok(format!(
-                                            "event: response.function_call_arguments.done\ndata: {}\n\n",
-                                            fn_done
-                                        ))).is_err() {
-                                            return;
-                                        }
-
-                                        let item_done = serde_json::json!({
-                                            "type": "response.output_item.done",
-                                            "output_index": output_index,
-                                            "item": {
-                                                "type": "function_call",
-                                                "id": call_id,
-                                                "call_id": call_id,
-                                                "name": fc.name,
-                                                "arguments": fc.arguments,
-                                                "status": "completed"
-                                            }
-                                        });
-                                        if tx
-                                            .try_send(Ok(format!(
-                                                "event: response.output_item.done\ndata: {}\n\n",
-                                                item_done
-                                            )))
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                        output_index += 1;
                                     }
 
                                     // Build output items for the completed response.
@@ -999,11 +1005,12 @@ async fn handle_responses_post(
                                                 // to put text deltas into.
                                                 if !text_item_emitted {
                                                     text_item_emitted = true;
+                                                    text_output_index = pending_fn_calls.len();
 
                                                     // Emit response.output_item.added for the message
                                                     let item_added = serde_json::json!({
                                                         "type": "response.output_item.added",
-                                                        "output_index": 0,
+                                                        "output_index": text_output_index,
                                                         "item": {
                                                             "type": "message",
                                                             "id": msg_id,
@@ -1022,7 +1029,7 @@ async fn handle_responses_post(
                                                     // Emit response.content_part.added for the text part
                                                     let content_added = serde_json::json!({
                                                         "type": "response.content_part.added",
-                                                        "output_index": 0,
+                                                        "output_index": text_output_index,
                                                         "content_index": 0,
                                                         "part": {
                                                             "type": "output_text",
@@ -1040,7 +1047,7 @@ async fn handle_responses_post(
                                                 full_text.push_str(s);
                                                 let delta_event = serde_json::json!({
                                                     "type": "response.output_text.delta",
-                                                    "output_index": 0,
+                                                    "output_index": text_output_index,
                                                     "content_index": 0,
                                                     "delta": s
                                                 });
@@ -1088,7 +1095,7 @@ async fn handle_responses_post(
                                                     // for the new function call.
                                                     let added_event = serde_json::json!({
                                                         "type": "response.output_item.added",
-                                                        "output_index": output_index,
+                                                        "output_index": fn_output_index,
                                                         "item": {
                                                             "type": "function_call",
                                                             "id": call_id,
@@ -1111,7 +1118,7 @@ async fn handle_responses_post(
                                                             arguments: String::new(),
                                                         },
                                                     );
-                                                    output_index += 1;
+                                                    fn_output_index += 1;
                                                 }
                                             }
 
@@ -1178,11 +1185,44 @@ async fn handle_responses_post(
             // Emit completion events for whatever partial content we received so
             // Codex can salvage the response rather than crashing with
             // "stream disconnected before completion: missing field `total_tokens`".
+
+            // Finalize function calls first (indices 0..N-1).
+            for (idx, (call_id, fc)) in pending_fn_calls.iter().enumerate() {
+                let fn_done = serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "output_index": idx,
+                    "call_id": call_id,
+                    "name": fc.name,
+                    "arguments": fc.arguments
+                });
+                let _ = tx.try_send(Ok(format!(
+                    "event: response.function_call_arguments.done\ndata: {}\n\n",
+                    fn_done
+                )));
+
+                let item_done = serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": {
+                        "type": "function_call",
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": fc.name,
+                        "arguments": fc.arguments,
+                        "status": "completed"
+                    }
+                });
+                let _ = tx.try_send(Ok(format!(
+                    "event: response.output_item.done\ndata: {}\n\n",
+                    item_done
+                )));
+            }
+
+            // Then finalize the text message (index N).
             if text_item_emitted {
-                // Finalize the text message
                 let text_done = serde_json::json!({
                     "type": "response.output_text.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "content_index": 0,
                     "text": full_text
                 });
@@ -1193,7 +1233,7 @@ async fn handle_responses_post(
 
                 let content_done = serde_json::json!({
                     "type": "response.content_part.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "content_index": 0,
                     "part": {
                         "type": "output_text",
@@ -1207,7 +1247,7 @@ async fn handle_responses_post(
 
                 let msg_done = serde_json::json!({
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": text_output_index,
                     "item": {
                         "type": "message",
                         "id": msg_id,
@@ -1223,39 +1263,6 @@ async fn handle_responses_post(
                     "event: response.output_item.done\ndata: {}\n\n",
                     msg_done
                 )));
-            }
-
-            // Finalize any pending function calls
-            for (call_id, fc) in &pending_fn_calls {
-                let fn_done = serde_json::json!({
-                    "type": "response.function_call_arguments.done",
-                    "output_index": output_index,
-                    "call_id": call_id,
-                    "name": fc.name,
-                    "arguments": fc.arguments
-                });
-                let _ = tx.try_send(Ok(format!(
-                    "event: response.function_call_arguments.done\ndata: {}\n\n",
-                    fn_done
-                )));
-
-                let item_done = serde_json::json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": call_id,
-                        "call_id": call_id,
-                        "name": fc.name,
-                        "arguments": fc.arguments,
-                        "status": "completed"
-                    }
-                });
-                let _ = tx.try_send(Ok(format!(
-                    "event: response.output_item.done\ndata: {}\n\n",
-                    item_done
-                )));
-                output_index += 1;
             }
 
             // Build output items for the completed response

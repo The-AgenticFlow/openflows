@@ -335,6 +335,13 @@ fn detect_codex_provider() -> CodexProvider {
 /// NOTE: The HTTP probe runs in a dedicated OS thread to avoid Tokio runtime
 /// conflicts — `reqwest::blocking` creates its own Tokio runtime internally,
 /// which panics if called from within an existing async runtime context.
+///
+/// Although `tokio::task::spawn_blocking` would be preferable to avoid
+/// blocking a Tokio worker thread, this function is called from synchronous
+/// command-construction code (`build_cli_command`/`build_sentinel_command`).
+/// Converting to async would require a broader refactor. The impact is
+/// mitigated by `OnceLock` caching — the probe runs at most once per process,
+/// and the 5s timeout bounds the worst-case blocking duration.
 fn probe_endpoint_supports_responses() -> EndpointMode {
     use std::sync::OnceLock;
     static CACHE: OnceLock<EndpointMode> = OnceLock::new();
@@ -457,19 +464,7 @@ fn probe_endpoint_supports_responses() -> EndpointMode {
 ///   Responses API requests to Chat Completions format (since Codex CLI only supports
 ///   `wire_api="responses"`)
 ///
-/// Strip a provider prefix (e.g. "anthropic/", "openai/", "fireworks/") from a
-/// model identifier. CLI backends like `claude` and `codex` expect bare model
-/// names (e.g. "claude-haiku-4-5-20251001"), but the registry may store them
-/// with a routing prefix (e.g. "anthropic/claude-haiku-4-5-20251001").
-pub(crate) fn strip_provider_prefix(model: &str) -> &str {
-    model
-        .strip_prefix("anthropic/")
-        .or_else(|| model.strip_prefix("openai/"))
-        .or_else(|| model.strip_prefix("fireworks/"))
-        .or_else(|| model.strip_prefix("gemini/"))
-        .or_else(|| model.strip_prefix("groq/"))
-        .unwrap_or(model)
-}
+pub(crate) use agent_client::strip_provider_prefix;
 
 pub fn codex_use_sse() -> bool {
     // NOTE: The former CODEX_USE_SSE env var has been removed. This function
