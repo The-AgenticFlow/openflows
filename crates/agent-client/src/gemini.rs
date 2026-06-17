@@ -62,7 +62,11 @@ impl GeminiClient {
 
 fn normalize_model_name(model: &str) -> String {
     let stripped = crate::strip_provider_prefix(model);
-    stripped.trim().trim_start_matches("models/").to_ascii_lowercase().to_string()
+    stripped
+        .trim()
+        .trim_start_matches("models/")
+        .to_ascii_lowercase()
+        .to_string()
 }
 
 fn validate_model_name(model: &str) -> Result<()> {

@@ -504,7 +504,7 @@ fn append_sse_disable_flags(cmd: &mut Command) {
 
     // Extended set — additional features that register non-function tool types
     // in the Responses API request.  These caused 400 "unknown tool type" errors
-    // on OpenAI-compatible proxies (e.g. api.ai.camer.digital) that only
+    // on OpenAI-compatible proxies (e.g. api.ai.example.com) that only
     // accept type="function".
     cmd.arg("--disable").arg("apps");
     cmd.arg("--disable").arg("multi_agent");
