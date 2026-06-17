@@ -18,6 +18,9 @@ const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
 const KEY_CI_READINESS: &str = "ci_readiness";
 const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
+/// Maximum CI fix attempts before refusing to re-add a PR.
+/// Must match vessel::node::MAX_CI_FIX_ATTEMPTS to stay in sync.
+const MAX_CI_FIX_ATTEMPTS_NEXUS: u32 = 3;
 const CI_SETUP_TICKET_ID: &str = "T-CI-001";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +321,7 @@ impl NexusNode {
                                 || reason.contains("CI timed out")
                                 || reason.contains("no worker available for fix")
                                 || reason.contains("fix attempts")
+                                || reason.contains("See blockers")
                             {
                                 info!(
                                     pr_number = pr.number,
@@ -335,6 +339,23 @@ impl NexusNode {
                             );
                             continue;
                         }
+                    }
+                }
+
+                // Check CI fix attempt counter for ALL PRs (with or without ticket_id).
+                // If a PR has exceeded the CI fix attempt limit, skip re-adding it
+                // to prevent infinite CI fix loops that burn API tokens.
+                {
+                    let ci_fix_key = format!("_ci_fix_attempts_{}", pr.number);
+                    let ci_fix_attempts: u32 = store.get_typed(&ci_fix_key).await.unwrap_or(0);
+                    if ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS_NEXUS {
+                        info!(
+                            pr_number = pr.number,
+                            ticket_id = ?pr.ticket_id,
+                            ci_fix_attempts,
+                            "Skipping re-add of PR that has exceeded CI fix attempt limit — marking for human intervention"
+                        );
+                        continue;
                     }
                 }
 
@@ -420,6 +441,7 @@ impl NexusNode {
                                     || reason.contains("CI timed out")
                                     || reason.contains("no worker available for fix")
                                     || reason.contains("fix attempts")
+                                    || reason.contains("See blockers")
                                 {
                                     info!(
                                         ticket_id = tid,

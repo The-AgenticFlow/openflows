@@ -313,6 +313,13 @@ impl Node for VesselNode {
                         .unwrap_or_else(|| format!("T-{}", pr_number));
 
                     let current_ci_attempts = self.get_ci_fix_attempts(store, *pr_number).await;
+                    info!(
+                        pr_number,
+                        ticket_id = %tid,
+                        current_ci_attempts,
+                        max = MAX_CI_FIX_ATTEMPTS,
+                        "CI fix attempt counter check (CiFailed)"
+                    );
 
                     if current_ci_attempts >= MAX_CI_FIX_ATTEMPTS {
                         warn!(
@@ -487,6 +494,13 @@ impl Node for VesselNode {
                         .unwrap_or_else(|| format!("T-{}", pr_number));
 
                     let current_ci_attempts = self.get_ci_fix_attempts(store, *pr_number).await;
+                    info!(
+                        pr_number,
+                        ticket_id = %tid,
+                        current_ci_attempts,
+                        max = MAX_CI_FIX_ATTEMPTS,
+                        "CI fix attempt counter check (CiTimeout)"
+                    );
 
                     if current_ci_attempts >= MAX_CI_FIX_ATTEMPTS {
                         warn!(
@@ -1775,6 +1789,24 @@ impl VesselNode {
             info!(path = %shared_dir.display(), "Created shared directory for CI_FIX.md");
         }
 
+        let annotations_section = match failure_detail {
+            Some(d) if !d.annotations.is_empty() => {
+                let ann_lines = d
+                    .annotations
+                    .iter()
+                    .map(|a| format!("- **{}** `{}:{}` {}", a.check_name, a.path, a.start_line, a.message))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "\n## Exact Errors (from CI annotations)\n\n\
+                     These are the specific file:line errors from CI. Start by fixing these:\n\n\
+                     {}\n",
+                    ann_lines
+                )
+            }
+            _ => String::new(),
+        };
+
         let job_log_section = match failure_detail {
             Some(d) if !d.job_logs.is_empty() => {
                 let logs = d
@@ -1797,6 +1829,7 @@ impl VesselNode {
             "# CI Fix Required\n\n\
              VESSEL detected that CI checks failed for PR #{}.\n\n\
              ## Failed Checks\n\n{}\n\n\
+             {}{}\
              ## How to Fix\n\n\
              The branch has been updated with the latest origin/main (merged in).\n\
              You now have the latest .github/workflows/ files — read them to find the failing jobs.\n\n\
@@ -1818,9 +1851,10 @@ impl VesselNode {
              - Do NOT push blind fixes — always verify locally first\n\
              - Fix ALL errors before pushing — do not fix one and push, CI will just fail on the next\n\
              - Read .github/workflows/ for the exact CI commands — do not guess\n\
-             - After you push, VESSEL will re-monitor CI automatically{}",
+             - After you push, VESSEL will re-monitor CI automatically",
             pr_placeholder.pr_number,
             reason,
+            annotations_section,
             job_log_section,
         );
 
