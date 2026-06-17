@@ -2,17 +2,24 @@
 
 ## What Is an Agent in OpenFlows?
 
-In OpenFlows, an **agent** is not just an LLM model or a CLI tool. It is a complete, self-contained unit composed of two distinct halves:
+In OpenFlows, an **agent** is not just an LLM model or a CLI tool — it is a complete, self-contained unit composed of two distinct halves:
 
 ```
 Agent = CLI Backend + Agent Configuration (Plugin System)
 ```
 
-The **CLI Backend** (e.g., `claude`, `codex`) is the executable process that runs as a subprocess, receives prompts via stdin, and produces output via stdout/stderr. It is the "muscle" that actually generates code, runs commands, and interacts with the filesystem.
+Take a concrete example: **forge** is one of the five agents in the default team. Forge the agent is *not* the same thing as the `codex` CLI that runs it. Forge is the *combination* of the `codex` CLI backend plus forge's specific agent configuration — its builder persona, its coding skills, its lifecycle hooks, its permissions, and its coordination files. If you swapped forge's CLI backend from `codex` to `claude`, you'd still have forge: the same role, the same persona, the same skills and hooks — just running on a different execution engine. Similarly, **nexus** is another agent that uses the `codex` CLI backend, but with a completely different configuration (coordinator persona, different skills, different hooks). They share the same muscle, but have different brains.
+
+The **CLI Backend** (e.g., `claude`, `codex`) is the executable process that runs as a subprocess, receives prompts via stdin, and produces output via stdout/stderr. It is the "muscle" — the raw engine that generates code, runs commands, and interacts with the filesystem.
 
 The **Agent Configuration** (the plugin system) is the entire filesystem-based harness that orchestrates, constrains, and empowers that CLI. It includes persona definitions, skills, hooks, permissions, settings files, MCP configurations, and the coordination directory structure. It is the "brain" that tells the CLI *what* to do, *how* to do it, and *what* it is allowed to touch.
 
-These two halves are **decoupled**. You can swap the CLI backend used by existing agents without touching their roles or configurations. And you can add entirely new agent roles that reuse existing CLI backends. These are two independent extension paths.
+These two halves are **decoupled**, which means there are two independent ways to extend the system:
+
+1. **Add a new CLI backend** — make existing agents (nexus, forge, sentinel, vessel, lore) run on a different execution engine, without changing their roles, personas, or configurations.
+2. **Add a new agent role** — introduce an entirely new team member with its own persona and skills, reusing any existing CLI backend (or a new one).
+
+You can do either one independently, or combine both. For example, you could add an OpenCode backend (Path A) and then create a new "analyst" agent that uses OpenCode (Path B) — or you could add an analyst agent that simply reuses the existing `claude` backend with no Rust code changes at all.
 
 ---
 
@@ -167,6 +174,53 @@ The `ProcessManager` spawns agents by:
 
 ---
 
+## Understanding the Harness System
+
+The "harness" is the collection of infrastructure that wraps a raw CLI process and turns it into a functioning OpenFlows agent. When we say "agent configuration is the same as the agent," we mean that the harness *is* the agent — without it, you just have a CLI process with no identity, no skills, no permissions, and no coordination.
+
+### What the Harness Provides
+
+Each CLI backend has its own conventions for how it expects to be configured. The harness must understand these conventions to produce a working worktree. Specifically, the harness is responsible for:
+
+1. **Directory layout** — Each backend expects its configuration in a different place. Claude uses `.claude/`, Codex uses `.codex/` (with a separate `.agents/` for agent-level config), and OpenCode would use `.opencode/`. The `BackendConfig` fields `plugin_dir_rel`, `settings_rel`, and `mcp_config_rel` tell the provisioner exactly where to put files for each backend.
+
+2. **Configuration format** — Claude reads `settings.json` with a specific schema for permissions and behavior. Codex reads a different JSON format under `.codex/`. Each backend has its own expected keys, structure, and semantics. The provisioner generates the right format for each backend based on which one is active.
+
+3. **Hook integration** — The lifecycle hooks (`session_start`, `pre_bash_guard`, etc.) must be installed in the location the backend expects. Claude looks for hooks in `.claude/hooks/`, Codex looks for them in `.agents/hooks/`, and OpenCode would look in `.opencode/hooks/`. The same hook scripts are deployed to the right place for whatever backend is running.
+
+4. **Skill and plugin symlinks** — Skills and plugins are symlinked into the backend-specific directory so the CLI can discover them. The provisioner uses `plugin_dir_rel` from `BackendConfig` to know where to create these symlinks.
+
+5. **Command-line flags** — Different backends accept different flags. Claude might use `--dangerously-skip-permissions`, while Codex uses `--full-auto`. The `BackendConfig` stores `base_flags`, `forge_flags`, `sentinel_flags`, and role-specific extra args so the `ProcessManager` can construct the right invocation.
+
+6. **Environment variables** — Each backend expects its own set of env vars for API keys, base URLs, and model overrides. The `BackendConfig` stores `api_key_env`, `base_url_env`, `model_env`, and `home_env_var` so the process spawner injects the right variables.
+
+7. **Stdin/stdout protocol** — Some backends accept prompts via stdin (`uses_stdin_prompt: true`), others require them as command-line arguments. The harness adapts its spawning logic accordingly.
+
+### Why This Matters for New Backends
+
+When you add a new CLI backend (Path A), you are essentially teaching the harness how to speak that backend's language. You need to:
+
+- **Study the target CLI's documentation** to understand its config file format, directory conventions, hook system, and flag syntax. A backend that uses YAML config and reads from `~/.config/mycli/` will need completely different `BackendConfig` values than one that uses JSON and reads from `.mycli/` in the project root.
+
+- **Follow existing conventions** in the codebase. Look at how `BackendConfig::claude()` and `BackendConfig::codex()` are implemented. Your new backend's constructor should follow the same pattern: accept the binary path, worktree, and shared directory, then compute all relative paths and flags.
+
+- **Understand provisioning differences.** The `Provisioner::provision_backend_extras()` method already handles Claude and Codex with conditional logic. You'll add a new branch for your backend. Study what the existing branches do — they create config files, install hooks, symlink skills, and set up MCP. Your backend likely needs the same categories of setup, just at different paths and in different formats.
+
+- **Test with all agent roles.** Each agent (nexus, forge, sentinel, vessel, lore) has different `forge_flags`, `sentinel_flags`, and `*_extra_args` in its `BackendConfig`. Make sure your new backend works correctly with all five roles, not just forge.
+
+### Why This Matters for New Agent Roles
+
+When you add a new agent role (Path B) that reuses an existing backend, you get the harness for free — but you must still understand what the harness provides so you configure your agent correctly:
+
+- Your `.agent.md` persona file defines the agent's identity and instructions. This is what makes "analyst" behave differently from "forge" even though they might both use the `claude` backend.
+- Your skill files (under `orchestration/plugin/skills/`) are what the harness symlinks into the worktree. If you don't create them, your agent won't have the specialized knowledge it needs.
+- Your hook scripts (under `orchestration/plugin/hooks/`) are what the harness installs. If you skip them, your agent won't have lifecycle gates like `pre_bash_guard` or `post_write_lint`.
+- Your `registry.json` entry is what tells the harness to provision your agent at all. Without it, the agent doesn't exist in the system.
+
+The key insight is: **the harness doesn't care about your agent's personality — it cares about your agent's configuration**. As long as you provide the right files in the right places, any backend can run any role.
+
+---
+
 ## Two Independent Extension Paths
 
 OpenFlows supports two fundamentally different ways to extend the system. They are **independent** — you can do one without the other:
@@ -176,11 +230,27 @@ OpenFlows supports two fundamentally different ways to extend the system. They a
 | **A: New CLI Backend** | Add `BackendConfig` for a new tool (e.g., OpenCode). Existing agents run on it. | Agent roles, personas, skills, hooks, registry entries untouched. |
 | **B: New Agent Role** | Add a 6th team member (persona, registry entry, skills, hooks, optional Node). | Existing CLI backends (claude, codex) are reused. No Rust code changes needed if using an existing backend. |
 
+**Which path should you choose?**
+
+- If you want to run your existing team on a different CLI tool (e.g., switching from `codex` to `opencode`), that's **Path A**. You're swapping the engine, not the team.
+- If you want to add a new kind of agent to the team (e.g., an "analyst" that researches codebases), that's **Path B**. You're growing the team, not changing the engine.
+- If you want both — a new engine *and* a new team member — follow Path A first, then Path B. The new backend becomes available to all agents, and the new agent can use any backend.
+
+**Reusing an existing backend vs. implementing your own:**
+
+- **Reusing an existing backend** (e.g., creating a new agent that uses `claude` or `codex`) requires **zero Rust code changes**. You only need to create configuration files: the `.agent.md` persona, a `registry.json` entry, skill files, and hook scripts. The existing `BackendConfig` and `Provisioner` already know how to set up the worktree directory structure for that backend. Your new agent inherits all the infrastructure for free.
+
+- **Implementing your own backend** requires Rust code changes because each CLI tool has its own conventions for configuration files, directory layout, plugin systems, and command-line flags. You must implement a `BackendConfig` constructor that tells the harness where to put config files, what flags to pass, and how to provision the worktree. See the "Understanding the Harness System" section below for details on what this entails.
+
 ---
 
 ## Path A: Adding a New CLI Backend (No New Agents)
 
 This path lets you make your existing agents (nexus, forge, sentinel, vessel, lore) run on a new CLI tool. No new agent roles are created. The team structure stays the same — only the execution engine changes.
+
+**When would you do this?** You'd follow Path A when you want to use a CLI tool that isn't currently supported — for example, if your team prefers OpenCode over Claude, or you want to try a new CLI that just came out. The key point is: you're not adding or removing agents, you're just changing *what runs them*.
+
+**Important**: Path A requires Rust code changes because you must teach the harness how to provision and spawn the new CLI. Each CLI has its own conventions for config file locations, flag syntax, environment variable names, and directory structure. If you skip understanding the target CLI's harness conventions, the integration will fail — the harness will put files in the wrong places, pass the wrong flags, and the CLI won't be able to find its configuration.
 
 ### What You Touch
 - **Rust code**: `crates/config/src/registry.rs`, `crates/pair-harness/src/process.rs`, `crates/pair-harness/src/provision.rs`
@@ -395,6 +465,10 @@ That's it. The same 5 agents now run on OpenCode. No new roles, no new personas,
 
 This path extends the team by adding a 6th agent type. You can back it with any CLI — an existing one (`claude`, `codex`), or a newly added one from Path A.
 
+**When would you do this?** You'd follow Path B when your team needs a new kind of capability — for example, an "analyst" agent that researches codebases, or a "devops" agent that handles infrastructure. The new agent gets its own persona, skills, and hooks, but can reuse an existing backend. If you use `claude` or `codex` as the backend, **no Rust code changes are required** — you only need to create configuration files.
+
+**The relationship between agent and backend**: The `cli` field in your agent's `.agent.md` and `registry.json` entry determines which backend runs it. Set it to `claude`, `codex`, or any backend you've added via Path A. The harness will automatically provision the correct directory structure and config files based on which backend is selected. You don't need to think about the backend-specific details when creating a new agent role — the harness handles that for you.
+
 ### What You Touch
 - **Config files**: `orchestration/agent/registry.json` (new entry), `orchestration/agent/agents/*.agent.md` (new persona), `orchestration/plugin/plugin.json` (new role mapping)
 - **Plugin assets**: `orchestration/plugin/skills/{newagent}-*/`, `orchestration/plugin/hooks/{newagent}/`
@@ -607,13 +681,15 @@ For OpenCode, this means: `OPENCODE_PATH`, `OPENCODE_API_KEY`, `OPENCODE_BASE_UR
 
 ## Summary
 
-An agent in OpenFlows is a **CLI process wrapped in a complete configuration harness**. The CLI provides the execution engine, while the configuration provides identity, persona, skills, hooks, permissions, and coordination protocols.
+An agent in OpenFlows is a **CLI process wrapped in a complete configuration harness**. The CLI provides the execution engine, while the configuration provides identity, persona, skills, hooks, permissions, and coordination protocols. For example, **nexus** and **forge** are two different agents that might both use the `codex` backend — they differ because they have different configurations, not different engines.
+
+**The harness system** is what bridges the gap between a raw CLI process and a fully functioning agent. Each backend has its own conventions for directory layout, config format, hook locations, and command-line flags. The `BackendConfig` struct and `Provisioner` work together to translate a generic agent configuration into the specific format the chosen CLI backend expects. When you add a new backend, you must understand and implement these conventions. When you add a new agent role using an existing backend, the harness handles this translation automatically.
 
 **Extending the system has two independent paths:**
 
-| Path | Goal | Requires Rust Changes? |
-|------|------|----------------------|
-| **A: New CLI Backend** | Make existing agents run on a new tool | Yes (`BackendConfig` + `CliBackend` enum + `Provisioner`) |
-| **B: New Agent Role** | Add a new team member | Only if behavioral `Node` integration needed; otherwise config-only |
+| Path | Goal | Requires Rust Changes? | When to Use |
+|------|------|----------------------|-------------|
+| **A: New CLI Backend** | Make existing agents run on a new tool | Yes (`BackendConfig` + `CliBackend` enum + `Provisioner`) | You want to use a different CLI tool (e.g., OpenCode instead of Claude) |
+| **B: New Agent Role** | Add a new team member | Only if behavioral `Node` integration needed; otherwise config-only | You need a new kind of agent capability (e.g., analyst, devops) |
 
-The architecture is designed so that Path B is often configuration-only (just `.agent.md`, `registry.json`, skills, hooks), while Path A is the only one requiring Rust code. Once a backend is added via Path A, any number of agent roles can use it via Path B with zero additional Rust changes.
+**Key takeaway for developers**: If you just need a new agent role, start with Path B — it's configuration-only and doesn't require touching Rust code. Only follow Path A when you need to integrate a CLI tool that isn't already supported, and be prepared to study that tool's config conventions carefully before implementing the `BackendConfig`.
