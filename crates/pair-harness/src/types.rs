@@ -246,14 +246,20 @@ impl FilesChanged {
     }
 }
 
-/// Segments completed - can be either a count or a list of segment details.
-/// FORGE may write either format depending on the skill version.
+/// Segments completed - can be a count, a list of segment details, or a list of integers.
+/// FORGE may write any of these formats depending on the skill version, e.g.:
+///   - 3                                  → Count(3)
+///   - [1, 2, 3]                          → Numbers([1, 2, 3])
+///   - [{"segment": 1, "status": "..."}]  → List(Vec<SegmentEntry>)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(untagged)]
 pub enum SegmentsCompleted {
     #[default]
     None,
     Count(u32),
+    /// Array of plain integers, e.g. `[1, 2, 3]`. FORGE LLMs often write
+    /// segment numbers this way instead of using the richer `SegmentEntry` format.
+    Numbers(Vec<u32>),
     List(Vec<SegmentEntry>),
 }
 
@@ -262,6 +268,7 @@ impl SegmentsCompleted {
         match self {
             SegmentsCompleted::None => 0,
             SegmentsCompleted::Count(c) => *c,
+            SegmentsCompleted::Numbers(v) => v.len() as u32,
             SegmentsCompleted::List(v) => v.len() as u32,
         }
     }
@@ -647,6 +654,41 @@ mod tests {
             }
             other => panic!("Expected List variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_segments_completed_numbers() {
+        // FORGE LLMs often write "segments_completed": [1, 2, 3] (array of plain
+        // integers) instead of the richer SegmentEntry object format. This is the
+        // exact format that caused the production breakage in STATUS.json parsing.
+        let json = r#"{
+            "status": "COMPLETE",
+            "segments_completed": [1, 2, 3],
+            "notes": "All segments done."
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json)
+            .expect("Failed to parse STATUS.json with segments_completed as integer array");
+        assert_eq!(status.segments_completed.count(), 3);
+        match &status.segments_completed {
+            SegmentsCompleted::Numbers(v) => {
+                assert_eq!(*v, vec![1, 2, 3]);
+            }
+            other => panic!("Expected Numbers variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_segments_completed_numbers_empty() {
+        // Edge case: empty array of integers should parse as Numbers([])
+        let json = r#"{
+            "status": "PENDING",
+            "segments_completed": []
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json)
+            .expect("Failed to parse STATUS.json with empty segments_completed array");
+        assert_eq!(status.segments_completed.count(), 0);
     }
 
     #[test]

@@ -175,15 +175,22 @@ async fn main() -> Result<()> {
         .add_node(
             "vessel",
             vessel,
-            vec![
-                (ACTION_DEPLOYED, "lore"),
-                (ACTION_DEPLOY_FAILED, "nexus"),
-                (ACTION_CI_FIX_NEEDED, "forge_pair"),
-                ("merge_blocked", "nexus"),
-                (ACTION_CONFLICTS_DETECTED, "forge_pair"),
-                (Action::AWAITING_HUMAN, "nexus"),
-                ("no_work", "nexus"),
-            ],
+            {
+                let mut routes = vec![
+                    (ACTION_DEPLOY_FAILED, "nexus"),
+                    (ACTION_CI_FIX_NEEDED, "forge_pair"),
+                    ("merge_blocked", "nexus"),
+                    (ACTION_CONFLICTS_DETECTED, "forge_pair"),
+                    (Action::AWAITING_HUMAN, "nexus"),
+                    ("no_work", "nexus"),
+                ];
+                if lore.is_some() {
+                    routes.insert(0, (ACTION_DEPLOYED, "lore"));
+                } else {
+                    routes.insert(0, (ACTION_DEPLOYED, "nexus"));
+                }
+                routes
+            },
         );
 
     if let Some(ref lore_node) = lore {
