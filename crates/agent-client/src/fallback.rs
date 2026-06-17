@@ -134,7 +134,9 @@ impl FallbackClient {
                 }
             }
 
-            if model.starts_with("accounts/fireworks/") && FireworksClient::is_configured() {
+            if (model.starts_with("accounts/fireworks/") || model.starts_with("fireworks/accounts/fireworks/"))
+                && FireworksClient::is_configured()
+            {
                 info!(
                     model,
                     "Auto-detected Fireworks model from prefix — using FireworksClient directly"
@@ -221,7 +223,7 @@ impl FallbackClient {
 
     fn build_proxy_chain(model_override: Option<&str>) -> Result<Self> {
         let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
-        let model = model_override.unwrap_or("claude-haiku-4-5-20251001");
+        let model = model_override.unwrap_or("claude-3-5-haiku-20241022");
 
         let mapped_provider = model_override.and_then(resolve_provider_for_model);
         let external_connector = external_connector_is_configured();

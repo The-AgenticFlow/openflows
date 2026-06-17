@@ -38,7 +38,7 @@ Configure each agent individually in `orchestration/agent/registry.json`:
     {
       "id": "nexus",
       "cli": "claude",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     },
@@ -52,14 +52,14 @@ Configure each agent individually in `orchestration/agent/registry.json`:
     {
       "id": "sentinel",
       "cli": "claude",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     },
     {
       "id": "vessel",
       "cli": "",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     }

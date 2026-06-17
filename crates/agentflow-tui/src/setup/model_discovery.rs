@@ -236,26 +236,23 @@ async fn discover_anthropic_models(api_key: &str) -> Result<Vec<ModelInfo>> {
 /// Only accepts dated versions like claude-3-5-sonnet-20241022.
 /// Rejects marketing names like claude-sonnet-4-6 and -latest aliases.
 fn is_valid_anthropic_api_model(model_id: &str) -> bool {
-    // Must start with "claude-" followed by a version number and date
-    // Valid pattern: claude-{major}-{minor}-{name}-{YYYYMMDD}
-    // Examples: claude-3-5-sonnet-20241022, claude-3-opus-20240229
-    // Invalid: claude-sonnet-4-6, claude-3-7-sonnet-latest
-    
-    // Check for -latest alias (not valid for API)
+    // Anthropic model IDs from /v1/models include both dated versions and
+    // newer versioned IDs such as claude-opus-4-6. We accept any claude-* ID
+    // that is not a -latest alias and is not an RLHF/eval variant.
+    if !model_id.starts_with("claude-") {
+        return false;
+    }
     if model_id.ends_with("-latest") {
         return false;
     }
-    
-    // Check for dated version pattern: ends with -YYYYMMDD where YYYY is 20xx
-    // This ensures we only accept verified API model IDs
     let parts: Vec<&str> = model_id.split('-').collect();
-    if parts.len() < 4 {
+    if parts.len() < 3 {
         return false;
     }
-    
-    // Last part should be a date like 20241022
-    let last = parts[parts.len() - 1];
-    last.starts_with("202") && last.len() == 8 && last.chars().all(|c| c.is_ascii_digit())
+    if model_id.contains("-rlhf-") || model_id.contains("-eval-") {
+        return false;
+    }
+    true
 }
 
 /// Check if an Anthropic model ID is a chat model
@@ -345,7 +342,6 @@ fn discover_claude_models_from_cli() -> Result<Vec<ModelInfo>> {
 /// The -latest aliases don't work with the API
 fn map_claude_model_alias(alias: &str) -> &str {
     match alias {
-        "claude-3-7-sonnet-latest" => "claude-3-5-sonnet-20241022", // Map to latest working
         "claude-3-5-sonnet-latest" => "claude-3-5-sonnet-20241022",
         "claude-3-5-haiku-latest" => "claude-3-5-haiku-20241022",
         "claude-3-opus-latest" => "claude-3-opus-20240229",
@@ -531,7 +527,6 @@ mod tests {
 
     #[test]
     fn test_map_claude_model_alias() {
-        assert_eq!(map_claude_model_alias("claude-3-7-sonnet-latest"), "claude-3-5-sonnet-20241022");
         assert_eq!(map_claude_model_alias("claude-3-5-sonnet-latest"), "claude-3-5-sonnet-20241022");
         assert_eq!(map_claude_model_alias("claude-3-5-haiku-latest"), "claude-3-5-haiku-20241022");
         assert_eq!(map_claude_model_alias("claude-3-opus-latest"), "claude-3-opus-20240229");
@@ -545,9 +540,12 @@ mod tests {
         assert!(is_anthropic_chat_model("claude-3-opus-20240229"));
         assert!(is_anthropic_chat_model("claude-3-5-haiku-20241022"));
         assert!(is_anthropic_chat_model("claude-3-haiku-20240307"));
-        // Invalid: marketing names without dates
-        assert!(!is_anthropic_chat_model("claude-sonnet-4-6"));
+        // Valid: newer versioned IDs returned by /v1/models
+        assert!(is_anthropic_chat_model("claude-opus-4-6"));
+        assert!(is_anthropic_chat_model("claude-sonnet-4-5"));
+        // Invalid: -latest aliases
         assert!(!is_anthropic_chat_model("claude-3-7-sonnet-latest"));
+        assert!(!is_anthropic_chat_model("claude-3-5-sonnet-latest"));
         // Invalid: RLHF models
         assert!(!is_anthropic_chat_model("claude-3-5-sonnet-rlhf-20241022"));
         // Invalid: eval models
@@ -561,12 +559,12 @@ mod tests {
         assert!(is_valid_anthropic_api_model("claude-3-opus-20240229"));
         assert!(is_valid_anthropic_api_model("claude-3-5-haiku-20241022"));
         assert!(is_valid_anthropic_api_model("claude-3-haiku-20240307"));
+        // Valid: newer versioned IDs returned by /v1/models
+        assert!(is_valid_anthropic_api_model("claude-opus-4-6"));
+        assert!(is_valid_anthropic_api_model("claude-sonnet-4-5"));
         // Invalid: -latest aliases
         assert!(!is_valid_anthropic_api_model("claude-3-7-sonnet-latest"));
         assert!(!is_valid_anthropic_api_model("claude-3-5-sonnet-latest"));
-        // Invalid: marketing names without dates
-        assert!(!is_valid_anthropic_api_model("claude-sonnet-4-6"));
-        assert!(!is_valid_anthropic_api_model("claude-sonnet-4-5"));
         // Invalid: too short
         assert!(!is_valid_anthropic_api_model("claude-3"));
         assert!(!is_valid_anthropic_api_model("claude"));
