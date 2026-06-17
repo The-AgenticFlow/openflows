@@ -3,6 +3,7 @@ use anyhow::Result;
 use mockito::Server;
 use pocketflow_core::{Node, SharedStore};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -67,10 +68,14 @@ async fn test_nexus_e2e_mocked() -> Result<()> {
     store.set("worker_slots", slots).await;
 
     // 4. Run NexusNode
-    // Path relative to binary/
+    // Resolve paths relative to the workspace root so the test works from any CWD.
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir should have parent")
+        .to_path_buf();
     let nexus = Arc::new(NexusNode::new(
-        "../orchestration/agent/agents/nexus.agent.md",
-        "../orchestration/agent/registry.json",
+        workspace_root.join("orchestration/agent/agents/nexus.agent.md"),
+        workspace_root.join("orchestration/agent/registry.json"),
     ));
 
     let action = nexus.run(&store).await?;

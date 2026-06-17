@@ -2,6 +2,7 @@ use agent_nexus::NexusNode;
 use anyhow::Result;
 use pocketflow_core::{Node, SharedStore};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Real E2E Test for Nexus Agent (No Mocks)
@@ -60,9 +61,13 @@ async fn test_nexus_real_e2e() -> Result<()> {
 
     // 3. Initialize Nexus
     println!("Loading Nexus agent persona...");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir should have parent")
+        .to_path_buf();
     let nexus = Arc::new(NexusNode::new(
-        "../orchestration/agent/agents/nexus.agent.md",
-        "../orchestration/agent/registry.json",
+        workspace_root.join("orchestration/agent/agents/nexus.agent.md"),
+        workspace_root.join("orchestration/agent/registry.json"),
     ));
 
     // 4. Run NexusNode
