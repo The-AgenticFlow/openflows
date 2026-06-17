@@ -44,3 +44,4 @@ pair-harness    = { path = "../crates/pair-harness" }
 
 [dev-dependencies]
 mockito = "1"
+tempfile = "3"
