@@ -167,7 +167,11 @@ impl BackendConfig {
             // restricted via the permissions TOML (api.github.com, *.github.com only).
             // The host-side push_and_create_pr() remains as a deterministic fallback
             // if FORGE's push fails for any reason.
-            base_flags: vec!["exec".into(), "--sandbox".into(), "danger-full-access".into()],
+            base_flags: vec![
+                "exec".into(),
+                "--sandbox".into(),
+                "danger-full-access".into(),
+            ],
             forge_flags: vec![],
             forge_pr_flags: vec![],
             sentinel_flags: vec!["--json".into(), "--ephemeral".into()],
@@ -2200,7 +2204,7 @@ trust_level = "trusted"
             "No WORKLOG.md yet".to_string()
         };
 
-format!(
+        format!(
             "You are FORGE, an autonomous coding agent. This is a {mode} cycle — NOT normal implementation.\n\n\
             --- TASK.md ---\n{task}\n\n\
             --- {mode} DETAILS ---\n{rework_content}\n\n\

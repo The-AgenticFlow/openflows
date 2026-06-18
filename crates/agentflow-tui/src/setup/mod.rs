@@ -6,8 +6,8 @@ use std::io;
 pub mod model_discovery;
 pub mod step_agents;
 pub mod step_api;
-pub mod step_done;
 pub mod step_domains;
+pub mod step_done;
 pub mod step_env;
 pub mod step_existing;
 pub mod step_github;
@@ -20,8 +20,8 @@ pub mod step_welcome;
 
 use step_agents::AgentsStep;
 use step_api::ApiStep;
-use step_done::DoneStep;
 use step_domains::DomainsStep;
+use step_done::DoneStep;
 use step_env::EnvStep;
 use step_existing::{ConfigAction, ExistingConfigStep};
 use step_github::GitHubStep;
@@ -93,10 +93,7 @@ impl Default for SetupConfig {
             agent_tokens: Vec::new(),
             agents: Vec::new(),
             domain_mode: DomainMode::Manual,
-            allowed_domains: vec![
-                "api.github.com".to_string(),
-                "*.github.com".to_string(),
-            ],
+            allowed_domains: vec!["api.github.com".to_string(), "*.github.com".to_string()],
         }
     }
 }

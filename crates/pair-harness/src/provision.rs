@@ -13,7 +13,11 @@ use tracing::{debug, info};
 
 use crate::process::{get_backend_config, BackendConfig};
 use crate::types::CliBackend;
-use config::ProjectConfig;
+
+struct ExtrasContext<'a> {
+    redis_url: Option<&'a str>,
+    model_backend: Option<&'a str>,
+}
 
 /// Provisions configuration files for pairs.
 pub struct Provisioner {
@@ -46,21 +50,24 @@ impl Provisioner {
     /// Load allowed domains for an agent from the registry.
     /// Falls back to registry-level defaults, then to the minimum (GitHub only).
     fn resolve_allowed_domains(&self, pair_id: &str) -> Vec<String> {
-        let registry_path = self.orchestrator_dir().join("orchestration").join("agent").join("registry.json");
+        let registry_path = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("agent")
+            .join("registry.json");
         match config::Registry::load(&registry_path) {
             Ok(registry) => {
                 let base_id = registry.normalize_agent_id(pair_id);
                 match registry.get(base_id) {
-                    Some(entry) => entry.resolve_allowed_domains(&registry.allowed_domains).to_vec(),
+                    Some(entry) => entry
+                        .resolve_allowed_domains(&registry.allowed_domains)
+                        .to_vec(),
                     None => registry.allowed_domains.clone(),
                 }
             }
             Err(_) => {
                 // Fallback: GitHub only
-                vec![
-                    "api.github.com".to_string(),
-                    "*.github.com".to_string(),
-                ]
+                vec!["api.github.com".to_string(), "*.github.com".to_string()]
             }
         }
     }
@@ -127,8 +134,10 @@ impl Provisioner {
                 worktree,
                 shared,
                 github_token,
-                redis_url,
-                model_backend,
+                &ExtrasContext {
+                    redis_url,
+                    model_backend,
+                },
             )?;
         }
 
@@ -147,10 +156,11 @@ impl Provisioner {
         worktree: &Path,
         shared: &Path,
         github_token: &str,
-        redis_url: Option<&str>,
-        model_backend: Option<&str>,
+        ctx: &ExtrasContext,
     ) -> Result<()> {
         let is_codex = backend_config.mcp_config_rel.starts_with(".codex");
+        let redis_url = ctx.redis_url;
+        let model_backend = ctx.model_backend;
 
         if is_codex {
             // Codex: generate .codex/config.toml for FORGE worktree
@@ -191,7 +201,12 @@ impl Provisioner {
             // FORGE uses danger-full-access (needs git push + GitHub API access)
             // SENTINEL uses read-only with GitHub API for review comments
             let forge_domains = self.resolve_allowed_domains(pair_id);
-            self.generate_codex_permissions(worktree, shared, "danger-full-access", &forge_domains)?;
+            self.generate_codex_permissions(
+                worktree,
+                shared,
+                "danger-full-access",
+                &forge_domains,
+            )?;
             self.generate_codex_permissions(shared, shared, "read-only", &[])?;
 
             // Codex: symlink skills to .agents/skills/ in worktree (all skills for FORGE)
@@ -454,7 +469,8 @@ impl Provisioner {
 
         let config_path = codex_dir.join("config.toml");
 
-        let network_access = sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access";
+        let network_access =
+            sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access";
         let approval_policy = if sandbox_mode == "read-only" {
             // SENTINEL runs in --ephemeral mode with no interactive terminal,
             // so it must run autonomously. "never" allows the agent to proceed
@@ -466,7 +482,9 @@ impl Provisioner {
         };
 
         let _redis_url_val = redis_url.unwrap_or("");
-        let mcp_shell_args = if sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access" {
+        let mcp_shell_args = if sandbox_mode == "workspace-write"
+            || sandbox_mode == "danger-full-access"
+        {
             r#""orchestration/agent/tooling/run-tests.sh,cargo clippy,cargo test,npx eslint,npx jest,ruff check""#
         } else {
             r#""orchestration/agent/tooling/run-tests.sh,npx eslint,ruff check,cargo clippy""#
@@ -1547,7 +1565,7 @@ developer_instructions = """
         Ok(())
     }
 
-/// Generate Codex permission profiles (.codex/permissions.toml).
+    /// Generate Codex permission profiles (.codex/permissions.toml).
     fn generate_codex_permissions(
         &self,
         target: &Path,

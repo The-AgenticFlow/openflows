@@ -1830,7 +1830,7 @@ impl VesselNode {
             _ => String::new(),
         };
 
-let content = format!(
+        let content = format!(
             "# CI Fix Required\n\n\
              VESSEL detected that CI checks failed for PR #{}.\n\n\
              ## Failed Checks\n\n{}\n\n\

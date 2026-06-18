@@ -43,10 +43,7 @@ impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
             sandbox: SandboxConfig {
-                allowed_domains: vec![
-                    "api.github.com".to_string(),
-                    "*.github.com".to_string(),
-                ],
+                allowed_domains: vec!["api.github.com".to_string(), "*.github.com".to_string()],
             },
         }
     }
@@ -95,8 +92,7 @@ impl ProjectConfig {
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))
+        toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))
     }
 
     /// Get the allowed domains, merging with registry defaults.
@@ -121,8 +117,14 @@ mod tests {
     #[test]
     fn test_load_defaults_when_file_missing() {
         let config = ProjectConfig::load(Path::new("/nonexistent/path"));
-        assert!(config.sandbox.allowed_domains.contains(&"api.github.com".to_string()));
-        assert!(config.sandbox.allowed_domains.contains(&"*.github.com".to_string()));
+        assert!(config
+            .sandbox
+            .allowed_domains
+            .contains(&"api.github.com".to_string()));
+        assert!(config
+            .sandbox
+            .allowed_domains
+            .contains(&"*.github.com".to_string()));
     }
 
     #[test]
@@ -146,8 +148,14 @@ allowed_domains = [
 
         let config = ProjectConfig::load_from_path(f.path()).unwrap();
         assert_eq!(config.sandbox.allowed_domains.len(), 6);
-        assert!(config.sandbox.allowed_domains.contains(&"pypi.org".to_string()));
-        assert!(config.sandbox.allowed_domains.contains(&"api.internal.company.com".to_string()));
+        assert!(config
+            .sandbox
+            .allowed_domains
+            .contains(&"pypi.org".to_string()));
+        assert!(config
+            .sandbox
+            .allowed_domains
+            .contains(&"api.internal.company.com".to_string()));
     }
 
     #[test]
@@ -176,7 +184,7 @@ allowed_domains = [
     #[test]
     fn test_invalid_toml_uses_defaults() {
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, "this is not valid toml {{{}}}").unwrap();
+        write!(f, "this is not valid toml {{}}").unwrap();
 
         let config = ProjectConfig::load_from_path(f.path()).unwrap_err();
         // Should fail to parse

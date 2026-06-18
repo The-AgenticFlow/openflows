@@ -838,7 +838,11 @@ impl ForgePairNode {
             .ok()
             .and_then(|s| {
                 let trimmed = s.trim().to_string();
-                if trimmed.is_empty() { None } else { Some(trimmed) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
             })
             .unwrap_or_else(|| format!("{}: complete implementation", ticket_id));
 
@@ -850,11 +854,7 @@ impl ForgePairNode {
             Self::git_add_safe(&worktree_path)?;
 
             StdCommand::new("git")
-                .args([
-                    "commit",
-                    "-m",
-                    &commit_msg,
-                ])
+                .args(["commit", "-m", &commit_msg])
                 .current_dir(&worktree_path)
                 .output()
                 .context("Failed to git commit")?;

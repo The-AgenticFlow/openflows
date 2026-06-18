@@ -25,12 +25,10 @@ enum DomainsState {
 }
 
 fn default_domains() -> Vec<String> {
-    vec![
-        "api.github.com".to_string(),
-        "*.github.com".to_string(),
-    ]
+    vec!["api.github.com".to_string(), "*.github.com".to_string()]
 }
 
+#[derive(Default)]
 pub struct DomainsStep;
 
 impl DomainsStep {
@@ -56,113 +54,106 @@ impl DomainsStep {
 
         loop {
             match &mut state {
-                DomainsState::ModeSelect { list_state } => {
-                    loop {
-                        terminal.draw(|f| {
-                            let area = f.area();
-                            let chunks = Layout::default()
-                                .direction(Direction::Vertical)
-                                .margin(3)
-                                .constraints([
-                                    Constraint::Length(6),
-                                    Constraint::Min(6),
-                                    Constraint::Length(2),
-                                ])
-                                .split(area);
+                DomainsState::ModeSelect { list_state } => loop {
+                    terminal.draw(|f| {
+                        let area = f.area();
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .margin(3)
+                            .constraints([
+                                Constraint::Length(6),
+                                Constraint::Min(6),
+                                Constraint::Length(2),
+                            ])
+                            .split(area);
 
-                            let title_block = ratatui::widgets::Block::default()
-                                .borders(ratatui::widgets::Borders::BOTTOM)
-                                .border_style(Style::default().fg(theme.border()));
-                            let inner_title = title_block.inner(chunks[0]);
-                            title_block.render(chunks[0], f.buffer_mut());
+                        let title_block = ratatui::widgets::Block::default()
+                            .borders(ratatui::widgets::Borders::BOTTOM)
+                            .border_style(Style::default().fg(theme.border()));
+                        let inner_title = title_block.inner(chunks[0]);
+                        title_block.render(chunks[0], f.buffer_mut());
 
-                            let title = Line::styled(
-                                "◇ DOMAIN CONFIGURATION",
-                                Style::default()
-                                    .fg(theme.accent())
-                                    .add_modifier(Modifier::BOLD),
-                            );
-                            let subtitle = Line::styled(
-                                "  Restrict which network domains agents can reach during execution",
-                                Style::default().fg(theme.muted()),
-                            );
-                            let desc1 = Line::styled(
-                                "  Domains control outbound network access for sandboxed agents.",
-                                Style::default().fg(theme.muted()),
-                            );
-                            let desc2 = Line::styled(
-                                "  Choose 'Manual' to whitelist specific hosts, or 'All' to let agents",
-                                Style::default().fg(theme.muted()),
-                            );
-                            let desc3 = Line::styled(
-                                "  access any internet resource (package registries, APIs, etc.).",
-                                Style::default().fg(theme.muted()),
-                            );
-                            let title_para = ratatui::widgets::Paragraph::new(vec![
-                                title, subtitle, desc1, desc2, desc3,
-                            ]);
-                            title_para.render(inner_title, f.buffer_mut());
+                        let title = Line::styled(
+                            "◇ DOMAIN CONFIGURATION",
+                            Style::default()
+                                .fg(theme.accent())
+                                .add_modifier(Modifier::BOLD),
+                        );
+                        let subtitle = Line::styled(
+                            "  Restrict which network domains agents can reach during execution",
+                            Style::default().fg(theme.muted()),
+                        );
+                        let desc1 = Line::styled(
+                            "  Domains control outbound network access for sandboxed agents.",
+                            Style::default().fg(theme.muted()),
+                        );
+                        let desc2 = Line::styled(
+                            "  Choose 'Manual' to whitelist specific hosts, or 'All' to let agents",
+                            Style::default().fg(theme.muted()),
+                        );
+                        let desc3 = Line::styled(
+                            "  access any internet resource (package registries, APIs, etc.).",
+                            Style::default().fg(theme.muted()),
+                        );
+                        let title_para = ratatui::widgets::Paragraph::new(vec![
+                            title, subtitle, desc1, desc2, desc3,
+                        ]);
+                        title_para.render(inner_title, f.buffer_mut());
 
-                            let list_widget = crate::widgets::select::SelectableList::new(
-                                &list_state.items,
-                                list_state.selected,
-                            );
-                            list_widget.render(chunks[1], f.buffer_mut());
+                        let list_widget = crate::widgets::select::SelectableList::new(
+                            &list_state.items,
+                            list_state.selected,
+                        );
+                        list_widget.render(chunks[1], f.buffer_mut());
 
-                            let help = Line::styled(
-                                "  ↑↓ navigate  │  Enter: select  │  Esc: cancel",
-                                Style::default().fg(theme.muted()),
-                            );
-                            let help_para = Paragraph::new(help);
-                            help_para.render(chunks[2], f.buffer_mut());
-                        })?;
+                        let help = Line::styled(
+                            "  ↑↓ navigate  │  Enter: select  │  Esc: cancel",
+                            Style::default().fg(theme.muted()),
+                        );
+                        let help_para = Paragraph::new(help);
+                        help_para.render(chunks[2], f.buffer_mut());
+                    })?;
 
-                        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-                            if let crossterm::event::Event::Key(key) =
-                                crossterm::event::read()?
-                            {
-                                use crossterm::event::KeyCode;
-                                match key.code {
-                                    KeyCode::Up => list_state.move_up(),
-                                    KeyCode::Down => list_state.move_down(),
-                                    KeyCode::Enter => {
-                                        match list_state.selected {
-                                            0 => {
-                                                let initial_domains = if config
-                                                    .allowed_domains
-                                                    .is_empty()
-                                                {
+                    if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+                        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                            use crossterm::event::KeyCode;
+                            match key.code {
+                                KeyCode::Up => list_state.move_up(),
+                                KeyCode::Down => list_state.move_down(),
+                                KeyCode::Enter => {
+                                    match list_state.selected {
+                                        0 => {
+                                            let initial_domains =
+                                                if config.allowed_domains.is_empty() {
                                                     default_domains()
                                                 } else {
                                                     config.allowed_domains.clone()
                                                 };
-                                                state = DomainsState::ManualInput {
-                                                    domains: initial_domains,
-                                                    current_input: Input::default(),
-                                                    scroll_offset: 0,
-                                                };
-                                            }
-                                            1 => {
-                                                config.domain_mode = DomainMode::All;
-                                                config.allowed_domains =
-                                                    vec!["*".to_string()];
-                                                return Ok(());
-                                            }
-                                            _ => {}
+                                            state = DomainsState::ManualInput {
+                                                domains: initial_domains,
+                                                current_input: Input::default(),
+                                                scroll_offset: 0,
+                                            };
                                         }
-                                        break;
+                                        1 => {
+                                            config.domain_mode = DomainMode::All;
+                                            config.allowed_domains = vec!["*".to_string()];
+                                            return Ok(());
+                                        }
+                                        _ => {}
                                     }
-                                    KeyCode::Esc => {
-                                        return Err(anyhow::anyhow!("Setup cancelled"));
-                                    }
-                                    _ => {
-                                        list_state.handle_key(key);
-                                    }
+                                    break;
+                                }
+                                KeyCode::Esc => {
+                                    return Err(anyhow::anyhow!("Setup cancelled"));
+                                }
+                                _ => {
+                                    list_state.handle_key(key);
                                 }
                             }
                         }
                     }
-                }
+                },
                 DomainsState::ManualInput {
                     domains,
                     current_input,
@@ -270,9 +261,7 @@ impl DomainsStep {
                         })?;
 
                         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-                            if let crossterm::event::Event::Key(key) =
-                                crossterm::event::read()?
-                            {
+                            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                                 use crossterm::event::KeyCode;
                                 use crossterm::event::KeyModifiers;
                                 match key.code {
@@ -282,9 +271,7 @@ impl DomainsStep {
                                         return Ok(());
                                     }
                                     KeyCode::Enter
-                                        if key
-                                            .modifiers
-                                            .contains(KeyModifiers::SHIFT) =>
+                                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
                                     {
                                         config.domain_mode = DomainMode::Manual;
                                         config.allowed_domains = domains.clone();
@@ -305,13 +292,10 @@ impl DomainsStep {
                                         }
                                     }
                                     KeyCode::Backspace => {
-                                        if current_input.value().is_empty()
-                                            && !domains.is_empty()
-                                        {
+                                        if current_input.value().is_empty() && !domains.is_empty() {
                                             domains.pop();
                                         } else {
-                                            let event =
-                                                crossterm::event::Event::Key(key);
+                                            let event = crossterm::event::Event::Key(key);
                                             current_input.handle_event(&event);
                                         }
                                     }

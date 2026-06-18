@@ -103,10 +103,7 @@ fn default_cli() -> String {
 /// Default allowed domains for all agents.
 /// These are domains that the sandbox permits network access to.
 fn default_allowed_domains() -> Vec<String> {
-    vec![
-        "api.github.com".to_string(),
-        "*.github.com".to_string(),
-    ]
+    vec!["api.github.com".to_string(), "*.github.com".to_string()]
 }
 
 /// Environment variable name for overriding the default CLI backend.
