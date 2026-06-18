@@ -250,6 +250,8 @@ Edit `.env` with your API keys and settings.
 | `CLAUDE_PATH` | No | Path to Claude CLI binary (default: `claude`) |
 | `CODEX_PATH` | No | Path to Codex CLI binary (default: `codex`) |
 | `REDIS_URL` | No | Redis URL for persistent state |
+| `AGENTFLOW_DOMAIN_MODE` | No | `manual` or `all` — `all` allows unrestricted internet, `manual` restricts to `AGENTFLOW_ALLOWED_DOMAINS` |
+| `AGENTFLOW_ALLOWED_DOMAINS` | No | Comma-separated list of allowed domains (e.g. `api.github.com,*.github.com,pypi.org`). Only used when `AGENTFLOW_DOMAIN_MODE=manual` |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `AGENTFLOW_WORKSPACE_ROOT` | No | Workspace root directory |
 
@@ -394,6 +396,7 @@ The registry at [`orchestration/agent/registry.json`](orchestration/agent/regist
 | `model_backend` | string | Model identifier passed to the LLM client. Can be a direct provider path (`anthropic/claude-sonnet-4-5`) or a gateway path (`accounts/fireworks/models/glm-5`). |
 | `routing_key` | string | LiteLLM proxy routing key. When `PROXY_URL` is set, this key is used to route requests to the correct backend model. When unset, the agent falls back to direct API access. |
 | `github_token_env` | string | Environment variable name that holds the GitHub PAT for this agent. Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` if not set. Enables per-agent token rotation and scoping. |
+| `allowed_domains` | array or null | Network domains this agent can access (for sandbox configuration). Falls back to the registry-level `allowed_domains` if not set. Use `["*"]` to allow unrestricted internet access. Examples: `["api.github.com", "*.github.com", "pypi.org"]` |
 
 #### Common Operations
 
@@ -528,4 +531,4 @@ make build
 - **[TUTORIAL.md](TUTORIAL.md)** — Complete tutorial with logs and troubleshooting
 - **[RUN.md](RUN.md)** — Day-to-day running and configuration reference
 - **[docs/demo.md](docs/demo.md)** — Live flow walkthrough
-- **[docs/setup-claude-cli.md](docs/setup-claude-cli.md)** — Claude CLI setup
+- **[docs/setup-claude-cli.md](docs/setup-claude-cli.md)** — CLI backend setup (Claude Code and Codex)
