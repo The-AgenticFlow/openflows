@@ -7,6 +7,7 @@ pub mod model_discovery;
 pub mod step_agents;
 pub mod step_api;
 pub mod step_done;
+pub mod step_domains;
 pub mod step_env;
 pub mod step_existing;
 pub mod step_github;
@@ -20,6 +21,7 @@ pub mod step_welcome;
 use step_agents::AgentsStep;
 use step_api::ApiStep;
 use step_done::DoneStep;
+use step_domains::DomainsStep;
 use step_env::EnvStep;
 use step_existing::{ConfigAction, ExistingConfigStep};
 use step_github::GitHubStep;
@@ -41,6 +43,12 @@ pub struct AgentConfig {
     pub github_token_env: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainMode {
+    Manual,
+    All,
+}
+
 #[derive(Debug, Clone)]
 pub struct SetupConfig {
     pub github_pat: String,
@@ -58,6 +66,8 @@ pub struct SetupConfig {
     pub selected_cli_backend: String,
     pub agent_tokens: Vec<(String, String)>,
     pub agents: Vec<AgentConfig>,
+    pub domain_mode: DomainMode,
+    pub allowed_domains: Vec<String>,
 }
 
 impl Default for SetupConfig {
@@ -82,6 +92,11 @@ impl Default for SetupConfig {
             selected_cli_backend: "codex".to_string(),
             agent_tokens: Vec::new(),
             agents: Vec::new(),
+            domain_mode: DomainMode::Manual,
+            allowed_domains: vec![
+                "api.github.com".to_string(),
+                "*.github.com".to_string(),
+            ],
         }
     }
 }
@@ -168,7 +183,13 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
     let repo_step = RepoStep::new();
     repo_step.render(&mut terminal, &theme, &mut config).await?;
 
-    // Step 10: Proxy Config (advanced mode or optional)
+    // Step 10: Domain Configuration
+    let domains_step = DomainsStep::new();
+    domains_step
+        .render(&mut terminal, &theme, &mut config)
+        .await?;
+
+    // Step 11: Proxy Config (advanced mode or optional)
     if setup_mode == SetupMode::Advanced {
         let proxy_step = ProxyStep::new();
         proxy_step
@@ -176,7 +197,7 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
             .await?;
     }
 
-    // Step 11: Completion
+    // Step 12: Completion
     let done_step = DoneStep::new();
     done_step.render(&mut terminal, &theme, &config).await?;
 
@@ -275,6 +296,19 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
     ));
     content.push_str("RUST_LOG=info,agent_team=debug,pocketflow_core=debug\n");
 
+    // Write domain configuration
+    if config.domain_mode == DomainMode::All {
+        content.push_str("AGENTFLOW_DOMAIN_MODE=all\n");
+    } else {
+        content.push_str("AGENTFLOW_DOMAIN_MODE=manual\n");
+    }
+    if !config.allowed_domains.is_empty() {
+        content.push_str(&format!(
+            "AGENTFLOW_ALLOWED_DOMAINS={}\n",
+            config.allowed_domains.join(",")
+        ));
+    }
+
     // GitHub MCP server command
     content.push_str("GITHUB_MCP_CMD=\"npx -y @modelcontextprotocol/server-github\"\n");
 
@@ -311,8 +345,23 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
 
     let registry = config::Registry {
         default_cli: default_cli.clone(),
+        allowed_domains: if config.domain_mode == DomainMode::All {
+            vec!["*".to_string()]
+        } else if config.allowed_domains.is_empty() {
+            vec![
+                "api.github.com".to_string(),
+                "*.github.com".to_string(),
+            ]
+        } else {
+            config.allowed_domains.clone()
+        },
         team: if config.agents.is_empty() {
             // Default agents if none configured - use codex CLI for all supported providers
+            let agent_domains = if config.domain_mode == DomainMode::All {
+                Some(vec!["*".to_string()])
+            } else {
+                None
+            };
             vec![
                 config::RegistryEntry {
                     id: "nexus".to_string(),
@@ -322,6 +371,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("nexus-key".to_string()),
                     github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
+                    allowed_domains: agent_domains.clone(),
                 },
                 config::RegistryEntry {
                     id: "forge".to_string(),
@@ -331,6 +381,11 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("forge-key".to_string()),
                     github_token_env: Some("AGENT_FORGE_GITHUB_TOKEN".to_string()),
+                    allowed_domains: if config.domain_mode == DomainMode::All {
+                        Some(vec!["*".to_string()])
+                    } else {
+                        Some(config.allowed_domains.clone())
+                    },
                 },
                 config::RegistryEntry {
                     id: "sentinel".to_string(),
@@ -340,6 +395,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("sentinel-key".to_string()),
                     github_token_env: Some("AGENT_SENTINEL_GITHUB_TOKEN".to_string()),
+                    allowed_domains: agent_domains.clone(),
                 },
                 config::RegistryEntry {
                     id: "vessel".to_string(),
@@ -349,6 +405,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("vessel-key".to_string()),
                     github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
+                    allowed_domains: agent_domains.clone(),
                 },
                 config::RegistryEntry {
                     id: "lore".to_string(),
@@ -358,6 +415,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("lore-key".to_string()),
                     github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
+                    allowed_domains: agent_domains,
                 },
             ]
         } else {
@@ -373,6 +431,11 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                             None
                         }
                     });
+                    let agent_allowed_domains = if config.domain_mode == DomainMode::All {
+                        Some(vec!["*".to_string()])
+                    } else {
+                        None
+                    };
                     config::RegistryEntry {
                         id: agent.id.clone(),
                         // Update CLI to match selected provider's CLI backend
@@ -382,6 +445,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         model_backend: agent.model_backend.clone(),
                         routing_key: agent.routing_key.clone(),
                         github_token_env: token_env,
+                        allowed_domains: agent_allowed_domains,
                     }
                 })
                 .collect()
