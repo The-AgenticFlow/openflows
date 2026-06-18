@@ -2003,17 +2003,26 @@ impl BatchNode for ForgePairNode {
                 // In these cases the harness should push from the host instead.
                 let needs_host_push = reason.contains("PR not created")
                     || reason.contains("needs push/PR creation")
-                    || reason.contains("push")
+                    || reason.contains("git push")
+                    || reason.contains("push failed")
+                    || reason.contains("failed to push")
+                    || reason.contains("cannot push")
+                    || reason.contains("could not push")
+                    || reason.contains("unable to push")
                     || reason.contains("read-only")
                     || reason.contains("network access")
                     || reason.contains("sandbox")
                     || blockers.iter().any(|b| {
                         let desc = b.description.to_lowercase();
-                        desc.contains("push")
+                        desc.contains("git push")
+                            || desc.contains("push failed")
+                            || desc.contains("failed to push")
+                            || desc.contains("cannot push")
+                            || desc.contains("could not push")
+                            || desc.contains("unable to push")
                             || desc.contains("read-only")
                             || desc.contains("network")
                             || desc.contains("sandbox")
-                            || desc.contains("git")
                     });
 
                 if needs_host_push {
