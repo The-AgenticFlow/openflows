@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
@@ -10,6 +10,7 @@ use tui_input::Input;
 
 use crate::setup::{DomainMode, SetupConfig};
 use crate::util::theme::Theme;
+use crate::widgets::input::InputWidget;
 use crate::widgets::select::SelectableListState;
 
 enum DomainsState {
@@ -19,7 +20,7 @@ enum DomainsState {
     ManualInput {
         domains: Vec<String>,
         current_input: Input,
-        focused: usize,
+        scroll_offset: usize,
     },
 }
 
@@ -63,7 +64,7 @@ impl DomainsStep {
                                 .direction(Direction::Vertical)
                                 .margin(3)
                                 .constraints([
-                                    Constraint::Length(4),
+                                    Constraint::Length(6),
                                     Constraint::Min(6),
                                     Constraint::Length(2),
                                 ])
@@ -82,15 +83,24 @@ impl DomainsStep {
                                     .add_modifier(Modifier::BOLD),
                             );
                             let subtitle = Line::styled(
-                                "  Control which domains agents can access",
+                                "  Restrict which network domains agents can reach during execution",
                                 Style::default().fg(theme.muted()),
                             );
-                            let hint = Line::styled(
-                                "  'Manual' lets you pick specific domains · 'All' allows unrestricted internet",
+                            let desc1 = Line::styled(
+                                "  Domains control outbound network access for sandboxed agents.",
                                 Style::default().fg(theme.muted()),
                             );
-                            let title_para =
-                                ratatui::widgets::Paragraph::new(vec![title, subtitle, hint]);
+                            let desc2 = Line::styled(
+                                "  Choose 'Manual' to whitelist specific hosts, or 'All' to let agents",
+                                Style::default().fg(theme.muted()),
+                            );
+                            let desc3 = Line::styled(
+                                "  access any internet resource (package registries, APIs, etc.).",
+                                Style::default().fg(theme.muted()),
+                            );
+                            let title_para = ratatui::widgets::Paragraph::new(vec![
+                                title, subtitle, desc1, desc2, desc3,
+                            ]);
                             title_para.render(inner_title, f.buffer_mut());
 
                             let list_widget = crate::widgets::select::SelectableList::new(
@@ -100,7 +110,7 @@ impl DomainsStep {
                             list_widget.render(chunks[1], f.buffer_mut());
 
                             let help = Line::styled(
-                                "  ↑↓ navigate  │  Enter: select",
+                                "  ↑↓ navigate  │  Enter: select  │  Esc: cancel",
                                 Style::default().fg(theme.muted()),
                             );
                             let help_para = Paragraph::new(help);
@@ -129,14 +139,13 @@ impl DomainsStep {
                                                 state = DomainsState::ManualInput {
                                                     domains: initial_domains,
                                                     current_input: Input::default(),
-                                                    focused: 0,
+                                                    scroll_offset: 0,
                                                 };
                                             }
                                             1 => {
                                                 config.domain_mode = DomainMode::All;
-                                                config.allowed_domains = vec![
-                                                    "*".to_string(),
-                                                ];
+                                                config.allowed_domains =
+                                                    vec!["*".to_string()];
                                                 return Ok(());
                                             }
                                             _ => {}
@@ -157,12 +166,28 @@ impl DomainsStep {
                 DomainsState::ManualInput {
                     domains,
                     current_input,
-                    focused,
+                    scroll_offset,
                 } => {
                     loop {
                         terminal.draw(|f| {
                             let area = f.area();
-                            let y_start = area.height / 2u16.saturating_sub(8).max(1);
+                            let chunks = Layout::default()
+                                .direction(Direction::Vertical)
+                                .margin(2)
+                                .constraints([
+                                    Constraint::Length(5),
+                                    Constraint::Length(3),
+                                    Constraint::Min(3),
+                                    Constraint::Length(2),
+                                ])
+                                .split(area);
+
+                            // Title + description
+                            let title_block = ratatui::widgets::Block::default()
+                                .borders(ratatui::widgets::Borders::BOTTOM)
+                                .border_style(Style::default().fg(theme.border()));
+                            let inner_title = title_block.inner(chunks[0]);
+                            title_block.render(chunks[0], f.buffer_mut());
 
                             let title = Line::styled(
                                 "◇ ALLOWED DOMAINS",
@@ -171,22 +196,32 @@ impl DomainsStep {
                                     .add_modifier(Modifier::BOLD),
                             );
                             let subtitle = Line::styled(
-                                "  Type domain patterns, Enter to add, Backspace to remove last",
+                                "  Add domains agents need to reach (registries, APIs, internal hosts)",
                                 Style::default().fg(theme.muted()),
                             );
-                            let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
-                            title_para.render(
-                                Rect::new(2, y_start, area.width - 4, 2),
-                                f.buffer_mut(),
+                            let hint = Line::styled(
+                                "  These domains are written to .env as AGENTFLOW_ALLOWED_DOMAINS",
+                                Style::default().fg(theme.muted()),
                             );
+                            let title_para = ratatui::widgets::Paragraph::new(vec![
+                                title, subtitle, hint,
+                            ]);
+                            title_para.render(inner_title, f.buffer_mut());
 
-                            let input_area = Rect::new(2, y_start + 3, area.width - 4, 3);
-                            let input_widget = crate::widgets::input::InputWidget::new(
+                            // Input field
+                            let input_widget = InputWidget::new(
                                 current_input,
-                                "Add domain (e.g. api.example.com, *.example.org)",
+                                "Add domain (e.g. pypi.org, *.example.com)",
                             )
-                            .focused(*focused == 0);
-                            input_widget.render(input_area, f.buffer_mut());
+                            .focused(true);
+                            input_widget.render(chunks[1], f.buffer_mut());
+
+                            // Domain list with scrolling
+                            let max_visible = (chunks[2].height as usize).saturating_sub(1);
+                            let total_lines = domains.len() + 1; // +1 for header
+                            if *scroll_offset > 0 && *scroll_offset + max_visible > total_lines {
+                                *scroll_offset = total_lines.saturating_sub(max_visible);
+                            }
 
                             let mut domain_lines: Vec<Line> = Vec::new();
                             domain_lines.push(Line::styled(
@@ -196,40 +231,42 @@ impl DomainsStep {
                                     .add_modifier(Modifier::BOLD),
                             ));
 
-                            for (i, domain) in domains.iter().enumerate() {
-                                let check_icon = "✓";
+                            let visible_domains: Vec<(usize, &String)> = domains
+                                .iter()
+                                .enumerate()
+                                .skip(*scroll_offset)
+                                .take(max_visible.saturating_sub(1))
+                                .collect();
+
+                            for (_i, domain) in &visible_domains {
                                 domain_lines.push(Line::styled(
-                                    format!("    {} {}", check_icon, domain),
+                                    format!("  ✓ {}", domain),
                                     Style::default().fg(theme.fg()),
                                 ));
-                                if i > 12 {
-                                    domain_lines.push(Line::styled(
-                                        format!("    ... and {} more", domains.len() - 13),
-                                        Style::default().fg(theme.muted()),
-                                    ));
-                                    break;
-                                }
+                            }
+
+                            if total_lines > max_visible + *scroll_offset {
+                                domain_lines.push(Line::styled(
+                                    format!(
+                                        "  ... and {} more (scroll with ↑↓)",
+                                        total_lines - max_visible - *scroll_offset
+                                    ),
+                                    Style::default().fg(theme.muted()),
+                                ));
                             }
 
                             let domains_para = Paragraph::new(domain_lines);
-                            let domains_area =
-                                Rect::new(2, y_start + 7, area.width - 4, area.height / 2);
-                            domains_para.render(domains_area, f.buffer_mut());
+                            domains_para.render(chunks[2], f.buffer_mut());
 
-                            let mut help_lines = vec![
+                            // Help text
+                            let help_lines = vec![
                                 Line::styled(
-                                    "  Enter: add domain  │  Shift+Enter or Tab: finish  │  Backspace on empty: remove last  │  Esc: cancel",
+                                    "  Enter: add/finish  │  Tab: finish  │  Backspace empty: remove last  │  ↑↓: scroll list  │  Esc: cancel",
                                     Style::default().fg(theme.muted()),
                                 ),
                             ];
-                            help_lines.push(Line::styled(
-                                "  Type domain specifics of your project (package registries, APIs, internal hosts)",
-                                Style::default().fg(theme.muted()),
-                            ));
                             let help_para = Paragraph::new(help_lines);
-                            let help_area =
-                                Rect::new(2, area.height - 3, area.width - 4, 2);
-                            help_para.render(help_area, f.buffer_mut());
+                            help_para.render(chunks[3], f.buffer_mut());
                         })?;
 
                         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
@@ -239,12 +276,7 @@ impl DomainsStep {
                                 use crossterm::event::KeyCode;
                                 use crossterm::event::KeyModifiers;
                                 match key.code {
-                                    KeyCode::Tab => {
-                                        config.domain_mode = DomainMode::Manual;
-                                        config.allowed_domains = domains.clone();
-                                        return Ok(());
-                                    }
-                                    KeyCode::BackTab => {
+                                    KeyCode::Tab | KeyCode::BackTab => {
                                         config.domain_mode = DomainMode::Manual;
                                         config.allowed_domains = domains.clone();
                                         return Ok(());
@@ -261,15 +293,11 @@ impl DomainsStep {
                                     KeyCode::Enter => {
                                         let value = current_input.value().trim().to_string();
                                         if !value.is_empty() {
-                                            let new_domain = if value.starts_with('*') {
-                                                value
-                                            } else {
-                                                value
-                                            };
-                                            if !domains.contains(&new_domain) {
-                                                domains.push(new_domain);
+                                            if !domains.contains(&value) {
+                                                domains.push(value);
                                             }
                                             *current_input = Input::default();
+                                            *scroll_offset = domains.len().saturating_sub(5);
                                         } else {
                                             config.domain_mode = DomainMode::Manual;
                                             config.allowed_domains = domains.clone();
@@ -285,6 +313,17 @@ impl DomainsStep {
                                             let event =
                                                 crossterm::event::Event::Key(key);
                                             current_input.handle_event(&event);
+                                        }
+                                    }
+                                    KeyCode::Up if current_input.value().is_empty() => {
+                                        if *scroll_offset > 0 {
+                                            *scroll_offset -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down if current_input.value().is_empty() => {
+                                        let max_visible = 5;
+                                        if *scroll_offset + max_visible < domains.len() {
+                                            *scroll_offset += 1;
                                         }
                                     }
                                     KeyCode::Esc => {
