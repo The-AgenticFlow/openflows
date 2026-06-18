@@ -616,8 +616,16 @@ max_depth = 1
         // because Codex CLI expects bare model names.
         let model = model_backend
             .map(|m| crate::process::strip_provider_prefix(m).to_string())
-            .or_else(|| std::env::var("FIREWORKS_MODEL").ok().map(|m| crate::process::strip_provider_prefix(&m).to_string()))
-            .or_else(|| std::env::var("OPENAI_MODEL").ok().map(|m| crate::process::strip_provider_prefix(&m).to_string()))
+            .or_else(|| {
+                std::env::var("FIREWORKS_MODEL")
+                    .ok()
+                    .map(|m| crate::process::strip_provider_prefix(&m).to_string())
+            })
+            .or_else(|| {
+                std::env::var("OPENAI_MODEL")
+                    .ok()
+                    .map(|m| crate::process::strip_provider_prefix(&m).to_string())
+            })
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         let toml_content = format!(

@@ -453,10 +453,7 @@ impl McpSession {
 /// After this function returns, the caller should spawn a background task
 /// to continuously drain `stderr` so the OS pipe buffer (~64KB) doesn't
 /// fill up and block the child process.
-async fn wait_for_ready_impl(
-    stderr: &mut BufReader<ChildStderr>,
-    child: &mut Child,
-) -> Result<()> {
+async fn wait_for_ready_impl(stderr: &mut BufReader<ChildStderr>, child: &mut Child) -> Result<()> {
     let startup_timeout = Duration::from_secs(
         std::env::var("MCP_STARTUP_TIMEOUT_SECS")
             .ok()
