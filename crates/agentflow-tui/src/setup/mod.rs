@@ -345,23 +345,15 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
 
     let registry = config::Registry {
         default_cli: default_cli.clone(),
-        allowed_domains: if config.domain_mode == DomainMode::All {
-            vec!["*".to_string()]
-        } else if config.allowed_domains.is_empty() {
-            vec![
-                "api.github.com".to_string(),
-                "*.github.com".to_string(),
-            ]
-        } else {
-            config.allowed_domains.clone()
-        },
+        allowed_domains: vec![
+            "api.github.com".to_string(),
+            "*.github.com".to_string(),
+            "pypi.org".to_string(),
+            "registry.npmjs.org".to_string(),
+            "crates.io".to_string(),
+        ],
         team: if config.agents.is_empty() {
             // Default agents if none configured - use codex CLI for all supported providers
-            let agent_domains = if config.domain_mode == DomainMode::All {
-                Some(vec!["*".to_string()])
-            } else {
-                None
-            };
             vec![
                 config::RegistryEntry {
                     id: "nexus".to_string(),
@@ -371,7 +363,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("nexus-key".to_string()),
                     github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
-                    allowed_domains: agent_domains.clone(),
+                    allowed_domains: None,
                 },
                 config::RegistryEntry {
                     id: "forge".to_string(),
@@ -381,11 +373,13 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("forge-key".to_string()),
                     github_token_env: Some("AGENT_FORGE_GITHUB_TOKEN".to_string()),
-                    allowed_domains: if config.domain_mode == DomainMode::All {
-                        Some(vec!["*".to_string()])
-                    } else {
-                        Some(config.allowed_domains.clone())
-                    },
+                    allowed_domains: Some(vec![
+                        "api.github.com".to_string(),
+                        "*.github.com".to_string(),
+                        "pypi.org".to_string(),
+                        "registry.npmjs.org".to_string(),
+                        "crates.io".to_string(),
+                    ]),
                 },
                 config::RegistryEntry {
                     id: "sentinel".to_string(),
@@ -395,7 +389,10 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("sentinel-key".to_string()),
                     github_token_env: Some("AGENT_SENTINEL_GITHUB_TOKEN".to_string()),
-                    allowed_domains: agent_domains.clone(),
+                    allowed_domains: Some(vec![
+                        "api.github.com".to_string(),
+                        "*.github.com".to_string(),
+                    ]),
                 },
                 config::RegistryEntry {
                     id: "vessel".to_string(),
@@ -405,7 +402,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("vessel-key".to_string()),
                     github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
-                    allowed_domains: agent_domains.clone(),
+                    allowed_domains: None,
                 },
                 config::RegistryEntry {
                     id: "lore".to_string(),
@@ -415,7 +412,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     model_backend: Some(default_model.clone()),
                     routing_key: Some("lore-key".to_string()),
                     github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
-                    allowed_domains: agent_domains,
+                    allowed_domains: None,
                 },
             ]
         } else {
@@ -431,11 +428,6 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                             None
                         }
                     });
-                    let agent_allowed_domains = if config.domain_mode == DomainMode::All {
-                        Some(vec!["*".to_string()])
-                    } else {
-                        None
-                    };
                     config::RegistryEntry {
                         id: agent.id.clone(),
                         // Update CLI to match selected provider's CLI backend
@@ -445,7 +437,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         model_backend: agent.model_backend.clone(),
                         routing_key: agent.routing_key.clone(),
                         github_token_env: token_env,
-                        allowed_domains: agent_allowed_domains,
+                        allowed_domains: None,
                     }
                 })
                 .collect()
