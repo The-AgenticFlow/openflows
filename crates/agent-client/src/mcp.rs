@@ -50,11 +50,12 @@ pub struct McpSession {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    /// Stderr reader kept alive so the server's stderr pipe doesn't fill up
-    /// and block the process.  Not actively read after startup readiness
-    /// detection completes.
+    /// Stderr reader — after startup readiness detection, a background task
+    /// continuously drains stderr to prevent the OS pipe buffer (~64KB on Linux)
+    /// from filling up and blocking the child process. Without draining, servers
+    /// that produce more than ~64KB of stderr after startup would hang indefinitely.
     #[allow(dead_code)]
-    stderr: Option<BufReader<ChildStderr>>,
+    stderr_drain: Option<tokio::task::JoinHandle<()>>,
     next_id: u64,
     request_timeout: Duration,
 }
@@ -73,29 +74,51 @@ impl McpSession {
             .args(&cmd[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped()) // capture stderr for readiness detection
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn GitHub MCP server")?;
 
-        let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
-        let stderr = BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
-
-        let mut session = Self {
-            child,
-            stdin,
-            stdout,
-            stderr: Some(stderr),
-            next_id: 1,
-            request_timeout: timeout,
-        };
+        let mut stderr = BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
 
         // Wait for the server to signal readiness on stderr before sending
         // any JSON-RPC messages.  This is critical when launching via `npx`,
         // which has significant startup overhead (package resolution, download,
         // Node.js bootstrap) and does not reliably forward stdio until the
         // actual server process is running.
-        session.wait_for_ready().await?;
+        wait_for_ready_impl(&mut stderr, &mut child).await?;
+
+        // After readiness detection, spawn a background task to continuously
+        // drain stderr. If the OS pipe buffer (~64KB) fills up, the child
+        // process will block on write() and hang indefinitely.
+        let stderr_drain = tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match stderr.read_line(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = buf.trim();
+                        if !trimmed.is_empty() {
+                            debug!(line = trimmed, "MCP server stderr (drain)");
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
+
+        let mut session = Self {
+            child,
+            stdin,
+            stdout,
+            stderr_drain: Some(stderr_drain),
+            next_id: 1,
+            request_timeout: timeout,
+        };
 
         session.initialize().await?;
         Ok(session)
@@ -178,127 +201,46 @@ impl McpSession {
                     .spawn()
                     .context("Failed to spawn hosted MCP npx bridge")?;
 
+                let mut stderr =
+                    BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
+
+                // Wait for mcp-proxy to signal readiness before initializing.
+                wait_for_ready_impl(&mut stderr, &mut child).await?;
+
+                // Drain stderr in the background to prevent pipe buffer deadlock.
+                let stderr_drain = tokio::spawn(async move {
+                    let mut stderr = stderr;
+                    let mut buf = String::new();
+                    loop {
+                        buf.clear();
+                        match stderr.read_line(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let trimmed = buf.trim();
+                                if !trimmed.is_empty() {
+                                    debug!(line = trimmed, "MCP proxy stderr (drain)");
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
                 let stdin = child.stdin.take().context("Failed to open MCP stdin")?;
                 let stdout =
                     BufReader::new(child.stdout.take().context("Failed to open MCP stdout")?);
-                let stderr =
-                    BufReader::new(child.stderr.take().context("Failed to open MCP stderr")?);
 
                 let mut session = Self {
                     child,
                     stdin,
                     stdout,
-                    stderr: Some(stderr),
+                    stderr_drain: Some(stderr_drain),
                     next_id: 1,
                     request_timeout: Self::default_timeout(),
                 };
 
-                // Wait for mcp-proxy to signal readiness before initializing.
-                session.wait_for_ready().await?;
-
                 session.initialize().await?;
                 Ok(session)
-            }
-        }
-    }
-
-    // ── Private: Startup readiness ──────────────────────────────────────────
-
-    /// Wait for the MCP server to signal readiness on stderr.
-    ///
-    /// When launched via `npx`, the MCP server process does not accept
-    /// JSON-RPC input until the Node.js process has finished resolving and
-    /// downloading the package.  The `@modelcontextprotocol/server-github`
-    /// package prints "GitHub MCP Server running on stdio" to stderr once it
-    /// is ready to receive requests.
-    ///
-    /// This method reads stderr lines until one of the `READY_PATTERNS` is
-    /// detected.  If no pattern is found within the startup timeout, the
-    /// method logs a warning and proceeds anyway — the server may not print
-    /// a readiness signal, or this may be a mock/test server.
-    async fn wait_for_ready(&mut self) -> Result<()> {
-        let startup_timeout = Duration::from_secs(
-            std::env::var("MCP_STARTUP_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS),
-        );
-
-        let stderr = match &mut self.stderr {
-            Some(s) => s,
-            None => {
-                info!("No stderr reader — assuming MCP server is ready");
-                return Ok(());
-            }
-        };
-
-        let start = std::time::Instant::now();
-        let mut line = String::new();
-
-        info!("Waiting for MCP server readiness signal on stderr...");
-
-        loop {
-            if start.elapsed() > startup_timeout {
-                warn!(
-                    elapsed_secs = start.elapsed().as_secs(),
-                    timeout_secs = startup_timeout.as_secs(),
-                    "MCP server startup timeout exceeded — proceeding without readiness signal"
-                );
-                return Ok(());
-            }
-
-            line.clear();
-            match tokio::time::timeout(Duration::from_secs(5), stderr.read_line(&mut line)).await {
-                Ok(Ok(0)) => {
-                    // EOF — server closed stderr
-                    let status = self.child.try_wait();
-                    match status {
-                        Ok(Some(exit)) => {
-                            bail!(
-                                "MCP server exited during startup: {} — \
-                                 the server may have crashed or the command is invalid.",
-                                exit
-                            );
-                        }
-                        Ok(None) => {
-                            // Process still alive but closed stderr — some servers
-                            // close stderr after startup.  Proceed with initialization.
-                            info!("MCP server closed stderr during startup — proceeding with initialization");
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Could not check MCP server status after stderr EOF — proceeding");
-                            return Ok(());
-                        }
-                    }
-                }
-                Ok(Ok(_bytes)) => {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        info!(line = trimmed, "MCP server stderr");
-                        let lower = trimmed.to_lowercase();
-                        if READY_PATTERNS.iter().any(|p| lower.contains(p)) {
-                            info!("MCP server ready (detected readiness signal on stderr)");
-                            return Ok(());
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!(error = %e, "Error reading MCP server stderr — proceeding with initialization");
-                    return Ok(());
-                }
-                Err(_) => {
-                    // 5-second timeout on this individual read.
-                    // Check if the server is still alive before continuing to wait.
-                    if let Ok(Some(status)) = self.child.try_wait() {
-                        bail!(
-                            "MCP server exited during startup: {} — \
-                             the server may have crashed or the startup command is invalid.",
-                            status
-                        );
-                    }
-                    // Server still alive but no stderr output yet — keep waiting
-                }
             }
         }
     }
@@ -490,6 +432,106 @@ impl McpSession {
             .await?;
 
         serde_json::from_value(result).context("Failed to parse MCP tool result")
+    }
+}
+
+// ── Startup readiness detection ──────────────────────────────────────────
+
+/// Wait for the MCP server to signal readiness on stderr.
+///
+/// When launched via `npx`, the MCP server process does not accept
+/// JSON-RPC input until the Node.js process has finished resolving and
+/// downloading the package.  The `@modelcontextprotocol/server-github`
+/// package prints "GitHub MCP Server running on stdio" to stderr once it
+/// is ready to receive requests.
+///
+/// This function reads stderr lines until one of the `READY_PATTERNS` is
+/// detected.  If no pattern is found within the startup timeout, it logs
+/// a warning and proceeds anyway — the server may not print a readiness
+/// signal, or this may be a mock/test server.
+///
+/// After this function returns, the caller should spawn a background task
+/// to continuously drain `stderr` so the OS pipe buffer (~64KB) doesn't
+/// fill up and block the child process.
+async fn wait_for_ready_impl(
+    stderr: &mut BufReader<ChildStderr>,
+    child: &mut Child,
+) -> Result<()> {
+    let startup_timeout = Duration::from_secs(
+        std::env::var("MCP_STARTUP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS),
+    );
+
+    let start = std::time::Instant::now();
+    let mut line = String::new();
+
+    info!("Waiting for MCP server readiness signal on stderr...");
+
+    loop {
+        if start.elapsed() > startup_timeout {
+            warn!(
+                elapsed_secs = start.elapsed().as_secs(),
+                timeout_secs = startup_timeout.as_secs(),
+                "MCP server startup timeout exceeded — proceeding without readiness signal"
+            );
+            return Ok(());
+        }
+
+        line.clear();
+        match tokio::time::timeout(Duration::from_secs(5), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => {
+                // EOF — server closed stderr
+                let status = child.try_wait();
+                match status {
+                    Ok(Some(exit)) => {
+                        bail!(
+                            "MCP server exited during startup: {} — \
+                             the server may have crashed or the command is invalid.",
+                            exit
+                        );
+                    }
+                    Ok(None) => {
+                        // Process still alive but closed stderr — some servers
+                        // close stderr after startup.  Proceed with initialization.
+                        info!("MCP server closed stderr during startup — proceeding with initialization");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Could not check MCP server status after stderr EOF — proceeding");
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(Ok(_bytes)) => {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    info!(line = trimmed, "MCP server stderr");
+                    let lower = trimmed.to_lowercase();
+                    if READY_PATTERNS.iter().any(|p| lower.contains(p)) {
+                        info!("MCP server ready (detected readiness signal on stderr)");
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Error reading MCP server stderr — proceeding with initialization");
+                return Ok(());
+            }
+            Err(_) => {
+                // 5-second timeout on this individual read.
+                // Check if the server is still alive before continuing to wait.
+                if let Ok(Some(status)) = child.try_wait() {
+                    bail!(
+                        "MCP server exited during startup: {} — \
+                         the server may have crashed or the startup command is invalid.",
+                        status
+                    );
+                }
+                // Server still alive but no stderr output yet — keep waiting
+            }
+        }
     }
 }
 
