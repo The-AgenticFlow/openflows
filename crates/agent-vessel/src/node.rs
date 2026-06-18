@@ -1830,7 +1830,7 @@ impl VesselNode {
             _ => String::new(),
         };
 
-        let content = format!(
+let content = format!(
             "# CI Fix Required\n\n\
              VESSEL detected that CI checks failed for PR #{}.\n\n\
              ## Failed Checks\n\n{}\n\n\
@@ -1838,29 +1838,34 @@ impl VesselNode {
              ## How to Fix\n\n\
              The branch has been updated with the latest origin/main (merged in).\n\
              You now have the latest .github/workflows/ files — read them to find the failing jobs.\n\n\
-             **IMPORTANT: Do NOT push without running ALL checks locally first.**\n\n\
+             **After fixing, push your changes directly — the sandbox has network access for git push and GitHub API.**\n\n\
              1. Read .github/workflows/ — find the workflow(s) matching the failed check names above.\n\
              2. Match the check name to the job name in the workflow YAML.\n\
              3. Install any missing tools the workflow expects (pip, npm, ruff, etc.).\n\
              4. Install project deps as the workflow does (pip install -r requirements.txt, npm ci, etc.).\n\
              5. Run the failing job's exact `run:` steps locally from the workflow YAML.\n\
-             6. Fix ALL errors before pushing — do not fix one and push, CI will just fail on the next.\n\
-             7. After ALL checks pass locally: `git add -A && git commit -m \"fix CI failures\" && git push`\n\
-             8. Write STATUS.json with `\"status\": \"PR_OPENED\"` and your PR number\n\n\
+             6. Fix ALL errors — do not fix one error and stop, CI will just fail on the next.\n\
+             7. Verify ALL checks pass locally.\n\
+             8. Write a COMMIT_MSG.md file in the shared directory ({}) describing your changes (first line = subject, blank line, then body).\n\
+             9. Run: `git add -A && git commit -m \"fix CI failures\" && git push`\n\
+             10. Write STATUS.json with `\"status\": \"PR_OPENED\"` and your PR number\n\n\
+             **Fallback:** If `git push` or `git commit` fails (e.g., in restricted environments), write STATUS.json with `\"status\": \"COMPLETE\"` instead — the harness will handle the commit and push for you.\n\n\
              If merge conflict markers are present in any files, resolve them BEFORE running CI checks.\n\n\
              ## WORKLOG Updates — CRITICAL\n\n\
              You MUST update WORKLOG.md in the shared directory as you work. The watchdog monitors\n\
              WORKLOG.md — if you don't update it, your pair will be killed after 20 minutes of silence.\n\n\
              ## Rules\n\n\
              - Do NOT change the PR description or title\n\
-             - Do NOT push blind fixes — always verify locally first\n\
-             - Fix ALL errors before pushing — do not fix one and push, CI will just fail on the next\n\
+             - Try to push yourself first — the sandbox has git and network access\n\
+             - If push fails, write `\"status\": \"COMPLETE\"` and the harness will push for you\n\
+             - Fix ALL errors before writing STATUS.json — do not write COMPLETE until all local checks pass\n\
              - Read .github/workflows/ for the exact CI commands — do not guess\n\
              - After you push, VESSEL will re-monitor CI automatically",
             pr_placeholder.pr_number,
             reason,
             annotations_section,
             job_log_section,
+            shared_dir.display(),
         );
 
         let path = shared_dir.join("CI_FIX.md");

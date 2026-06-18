@@ -75,6 +75,11 @@ pub struct RegistryEntry {
     pub routing_key: Option<String>, // LiteLLM proxy routing key, e.g. "forge-key"
     #[serde(default)]
     pub github_token_env: Option<String>, // Per-agent GitHub token env var, e.g. "AGENT_NEXUS_GITHUB_TOKEN"
+    /// Network domains this agent is allowed to access (for sandbox configuration).
+    /// Falls back to the registry-level `allowed_domains` if not set per-agent.
+    /// Examples: ["api.github.com", "*.github.com", "pypi.org", "crates.io"]
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
 }
 
 /// The full registry — a thin wrapper around the team list.
@@ -83,11 +88,25 @@ pub struct Registry {
     /// Default CLI backend for agents without explicit cli field
     #[serde(default = "default_cli")]
     pub default_cli: String,
+    /// Network domains allowed for all agents by default (for sandbox configuration).
+    /// Individual agents can override with their own `allowed_domains`.
+    /// Examples: ["api.github.com", "*.github.com", "pypi.org", "crates.io"]
+    #[serde(default = "default_allowed_domains")]
+    pub allowed_domains: Vec<String>,
     pub team: Vec<RegistryEntry>,
 }
 
 fn default_cli() -> String {
     "claude".to_string()
+}
+
+/// Default allowed domains for all agents.
+/// These are domains that the sandbox permits network access to.
+fn default_allowed_domains() -> Vec<String> {
+    vec![
+        "api.github.com".to_string(),
+        "*.github.com".to_string(),
+    ]
 }
 
 /// Environment variable name for overriding the default CLI backend.
@@ -105,6 +124,15 @@ impl RegistryEntry {
             &self.cli
         };
         CliBackend::parse(cli)
+    }
+
+    /// Get the allowed domains for this agent, falling back to the provided
+    /// registry-level defaults if the agent doesn't have its own list.
+    pub fn resolve_allowed_domains<'a>(&'a self, registry_defaults: &'a [String]) -> &'a [String] {
+        match &self.allowed_domains {
+            Some(domains) if !domains.is_empty() => domains.as_slice(),
+            _ => registry_defaults,
+        }
     }
 }
 
@@ -171,7 +199,7 @@ impl Registry {
 
     /// Normalize agent ID by stripping instance suffix (e.g., "forge-1" -> "forge").
     /// Returns the base ID if no suffix, or if the ID is exactly in the registry.
-    fn normalize_agent_id<'a>(&self, agent_id: &'a str) -> &'a str {
+    pub fn normalize_agent_id<'a>(&self, agent_id: &'a str) -> &'a str {
         if self.get(agent_id).is_some() {
             return agent_id;
         }

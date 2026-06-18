@@ -161,7 +161,13 @@ impl BackendConfig {
 
         Self {
             binary_path: PathBuf::from(binary),
-            base_flags: vec!["exec".into(), "--sandbox".into(), "workspace-write".into()],
+            // FORGE needs network access (git push, GitHub API) to push changes and
+            // create PRs directly. The `danger-full-access` sandbox mode allows this
+            // while still providing filesystem write access. Network domains are
+            // restricted via the permissions TOML (api.github.com, *.github.com only).
+            // The host-side push_and_create_pr() remains as a deterministic fallback
+            // if FORGE's push fails for any reason.
+            base_flags: vec!["exec".into(), "--sandbox".into(), "danger-full-access".into()],
             forge_flags: vec![],
             forge_pr_flags: vec![],
             sentinel_flags: vec!["--json".into(), "--ephemeral".into()],
@@ -1310,9 +1316,14 @@ trust_level = "trusted"
         let config = self.get_backend(backend);
         let mut cmd = Command::new(&config.binary_path);
 
-        for arg in &config.base_flags {
-            cmd.arg(arg);
-        }
+        // SENTINEL uses workspace-write sandbox — it needs to write review files
+        // to the shared directory and needs GitHub API access for posting review
+        // comments, but should NOT have full filesystem access like FORGE.
+        // FORGE uses danger-full-access (set in base_flags) because it needs
+        // git push and full filesystem access for code changes.
+        cmd.arg("exec");
+        cmd.arg("--sandbox");
+        cmd.arg("workspace-write");
 
         // Pass model from ProcessManager's model_backend override (from registry.json)
         // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
@@ -2189,29 +2200,35 @@ trust_level = "trusted"
             "No WORKLOG.md yet".to_string()
         };
 
-        format!(
+format!(
             "You are FORGE, an autonomous coding agent. This is a {mode} cycle — NOT normal implementation.\n\n\
             --- TASK.md ---\n{task}\n\n\
             --- {mode} DETAILS ---\n{rework_content}\n\n\
             --- WORKLOG.md (previous progress) ---\n{worklog}\n\n\
             IMPORTANT - Directory Structure:\n\
             - CURRENT DIRECTORY (worktree): Write ALL source code, tests, package.json here\n\
-            - SHARED DIRECTORY ({shared_path}): Write WORKLOG.md, STATUS.json here\n\n\
+            - SHARED DIRECTORY ({shared_path}): Write WORKLOG.md, STATUS.json, and COMMIT_MSG.md here\n\n\
             VALID STATUS.json VALUES — use only these exact strings in the \"status\" field:\n\
             - \"PR_OPENED\" — work complete, PR created (include pr_url, pr_number, branch)\n\
-            - \"COMPLETE\" — all work done, PR creation deferred to harness\n\
+            - \"COMPLETE\" — all work done; write this if you cannot push (harness will push for you)\n\
             - \"BLOCKED\" — cannot proceed (include reason, blockers)\n\
             - \"FUEL_EXHAUSTED\" — budget/tokens exhausted\n\
             - \"PENDING_REVIEW\" — work paused, waiting for review\n\
             Do NOT use any other status value — it will be treated as BLOCKED and your work wasted.\n\n\
+            COMMIT_MSG.md:\n\
+            Write a COMMIT_MSG.md file in the shared directory describing what you changed and why.\n\
+            First line = short subject, blank line, then body. The harness will use this as the git commit message\n\
+            if it has to push for you.\n\n\
             CRITICAL: Follow the instructions in TASK.md exactly. This is a {mode} cycle — \
             do NOT re-implement already-completed segments. Focus ONLY on fixing the issues \
             described in the {mode} details above.\n\n\
             You MUST update {shared_path}/WORKLOG.md as you work — the watchdog will kill your \
             process if WORKLOG.md is not updated within 20 minutes.\n\n\
-            After fixing issues, commit and push:\n\
-            - git add -A && git commit -m \"{mode}: <description>\"\n\
-            - git push (or git push -u origin HEAD if first push)\n\n\
+            After fixing issues:\n\
+            - First try to commit and push yourself: `git add -A && git commit -F {shared_path}/COMMIT_MSG.md && git push`\n\
+            - If push succeeds, write STATUS.json with status PR_OPENED\n\
+            - If push fails, write STATUS.json with status COMPLETE — the harness will commit and push for you\n\
+            - Do NOT write BLOCKED just because push failed — that wastes your completed work\n\n\
             If a PR already exists for this branch, do NOT create a new one — just push and update STATUS.json.",
             mode = mode,
             task = task,

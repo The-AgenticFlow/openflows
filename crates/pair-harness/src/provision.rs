@@ -13,6 +13,7 @@ use tracing::{debug, info};
 
 use crate::process::{get_backend_config, BackendConfig};
 use crate::types::CliBackend;
+use config::ProjectConfig;
 
 /// Provisions configuration files for pairs.
 pub struct Provisioner {
@@ -39,6 +40,28 @@ impl Provisioner {
             PathBuf::from(orch_dir)
         } else {
             self.project_root.clone()
+        }
+    }
+
+    /// Load allowed domains for an agent from the registry.
+    /// Falls back to registry-level defaults, then to the minimum (GitHub only).
+    fn resolve_allowed_domains(&self, pair_id: &str) -> Vec<String> {
+        let registry_path = self.orchestrator_dir().join("orchestration").join("agent").join("registry.json");
+        match config::Registry::load(&registry_path) {
+            Ok(registry) => {
+                let base_id = registry.normalize_agent_id(pair_id);
+                match registry.get(base_id) {
+                    Some(entry) => entry.resolve_allowed_domains(&registry.allowed_domains).to_vec(),
+                    None => registry.allowed_domains.clone(),
+                }
+            }
+            Err(_) => {
+                // Fallback: GitHub only
+                vec![
+                    "api.github.com".to_string(),
+                    "*.github.com".to_string(),
+                ]
+            }
         }
     }
 
@@ -99,6 +122,7 @@ impl Provisioner {
         // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
             self.provision_backend_extras(
+                pair_id,
                 &backend_config,
                 worktree,
                 shared,
@@ -118,6 +142,7 @@ impl Provisioner {
     /// The `BackendConfig` drives which config directories and file formats are used.
     fn provision_backend_extras(
         &self,
+        pair_id: &str,
         backend_config: &BackendConfig,
         worktree: &Path,
         shared: &Path,
@@ -129,13 +154,14 @@ impl Provisioner {
 
         if is_codex {
             // Codex: generate .codex/config.toml for FORGE worktree
+            // FORGE uses danger-full-access sandbox to allow git push and GitHub API
             self.generate_codex_config_toml(
                 worktree,
                 worktree,
                 shared,
                 github_token,
                 redis_url,
-                "workspace-write",
+                "danger-full-access",
             )?;
 
             // Codex: generate .codex/config.toml for SENTINEL shared dir
@@ -162,8 +188,11 @@ impl Provisioner {
             self.deploy_codex_plugin(shared)?;
 
             // Codex: generate permission profiles
-            self.generate_codex_permissions(worktree, shared, "workspace-write")?;
-            self.generate_codex_permissions(shared, shared, "read-only")?;
+            // FORGE uses danger-full-access (needs git push + GitHub API access)
+            // SENTINEL uses read-only with GitHub API for review comments
+            let forge_domains = self.resolve_allowed_domains(pair_id);
+            self.generate_codex_permissions(worktree, shared, "danger-full-access", &forge_domains)?;
+            self.generate_codex_permissions(shared, shared, "read-only", &[])?;
 
             // Codex: symlink skills to .agents/skills/ in worktree (all skills for FORGE)
             self.symlink_skills_to_agents(worktree)?;
@@ -425,7 +454,7 @@ impl Provisioner {
 
         let config_path = codex_dir.join("config.toml");
 
-        let network_access = sandbox_mode == "workspace-write";
+        let network_access = sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access";
         let approval_policy = if sandbox_mode == "read-only" {
             // SENTINEL runs in --ephemeral mode with no interactive terminal,
             // so it must run autonomously. "never" allows the agent to proceed
@@ -437,7 +466,7 @@ impl Provisioner {
         };
 
         let _redis_url_val = redis_url.unwrap_or("");
-        let mcp_shell_args = if sandbox_mode == "workspace-write" {
+        let mcp_shell_args = if sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access" {
             r#""orchestration/agent/tooling/run-tests.sh,cargo clippy,cargo test,npx eslint,npx jest,ruff check""#
         } else {
             r#""orchestration/agent/tooling/run-tests.sh,npx eslint,ruff check,cargo clippy""#
@@ -559,9 +588,9 @@ max_depth = 1
             .context(format!("Failed to read {}", agent_md_path.display()))?;
 
         let (role, sandbox_mode) = match agent_id {
-            "forge" => ("builder", "workspace-write"),
+            "forge" => ("builder", "danger-full-access"),
             "sentinel" => ("reviewer", "read-only"),
-            _ => ("unknown", "workspace-write"),
+            _ => ("unknown", "danger-full-access"),
         };
 
         // Resolve model: registry model_backend (highest priority) > FIREWORKS_MODEL > OPENAI_MODEL > default
@@ -1518,22 +1547,40 @@ developer_instructions = """
         Ok(())
     }
 
-    /// Generate Codex permission profiles (.codex/permissions.toml).
+/// Generate Codex permission profiles (.codex/permissions.toml).
     fn generate_codex_permissions(
         &self,
         target: &Path,
         shared: &Path,
         profile: &str,
+        allowed_domains: &[String],
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        fs::create_dir_all(&codex_dir)?;
+        fs::create_dir_all(&codex_dir).context("Failed to create .codex directory")?;
 
         let permissions_path = codex_dir.join("permissions.toml");
+
+        // Build domain allowlist sections for network-enabled profiles.
+        // Domains come from the agent's registry entry (per-agent override)
+        // or the registry-level defaults.
+        let domain_lines: Vec<String> = if allowed_domains.is_empty() {
+            // Fallback: GitHub only
+            vec![
+                r#""api.github.com" = "allow""#.to_string(),
+                r#""*.github.com" = "allow""#.to_string(),
+            ]
+        } else {
+            allowed_domains
+                .iter()
+                .map(|d| format!(r#""{}" = "allow""#, d))
+                .collect()
+        };
+        let domains_block = domain_lines.join("\n");
 
         let content = match profile {
             "workspace-write" => format!(
                 r#"# Auto-generated by AgentFlow Provisioner
-# FORGE permissions: workspace-write with network access
+# FORGE/SENTINEL permissions: workspace-write with network access
 
 default_permissions = "workspace-write"
 
@@ -1549,13 +1596,39 @@ default_permissions = "workspace-write"
 enabled = true
 
 [permissions.workspace-write.network.domains]
-"api.github.com" = "allow"
-"*.github.com" = "allow"
+{domains}
 "#,
                 shared = shared.display(),
+                domains = domains_block,
+            ),
+            "danger-full-access" => format!(
+                r#"# Auto-generated by AgentFlow Provisioner
+# FORGE permissions: full filesystem + restricted network
+# FORGE needs git push and GitHub API access, plus any domains required
+# by the project (package registries, API endpoints, etc.).
+# Network is restricted to the allowlist below — no arbitrary access.
+
+default_permissions = "danger-full-access"
+
+[permissions.danger-full-access.filesystem]
+":minimal" = "read"
+
+[permissions.danger-full-access.filesystem.":workspace_roots"]
+"." = "write"
+"{shared}" = "write"
+"**/*.env" = "deny"
+
+[permissions.danger-full-access.network]
+enabled = true
+
+[permissions.danger-full-access.network.domains]
+{domains}
+"#,
+                shared = shared.display(),
+                domains = domains_block,
             ),
             "read-only" => r#"# Auto-generated by AgentFlow Provisioner
-# SENTINEL permissions: read-only
+# SENTINEL permissions: read-only with GitHub API access
 
 default_permissions = "read-only"
 
@@ -1566,7 +1639,11 @@ default_permissions = "read-only"
 "." = "read"
 
 [permissions.read-only.network]
-enabled = false
+enabled = true
+
+[permissions.read-only.network.domains]
+"api.github.com" = "allow"
+"*.github.com" = "allow"
 "#
             .to_string(),
             _ => String::new(),

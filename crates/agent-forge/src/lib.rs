@@ -830,6 +830,18 @@ impl ForgePairNode {
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
 
+        // Try to read a COMMIT_MSG.md written by FORGE in the shared directory.
+        // This lets the agent describe its own changes instead of using a
+        // generic "complete implementation" message.
+        let shared_dir = worktree_path.join(".pair-shared");
+        let commit_msg = std::fs::read_to_string(shared_dir.join("COMMIT_MSG.md"))
+            .ok()
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            })
+            .unwrap_or_else(|| format!("{}: complete implementation", ticket_id));
+
         if has_changes {
             info!(
                 worker = worker_id,
@@ -841,7 +853,7 @@ impl ForgePairNode {
                 .args([
                     "commit",
                     "-m",
-                    &format!("{}: complete implementation", ticket_id),
+                    &commit_msg,
                 ])
                 .current_dir(&worktree_path)
                 .output()
@@ -1986,7 +1998,25 @@ impl BatchNode for ForgePairNode {
                 }))
             }
             PairOutcome::Blocked { reason, blockers } => {
-                if reason.contains("PR not created") || reason.contains("needs push/PR creation") {
+                // Detect cases where FORGE completed the work locally but could not
+                // push from inside the sandbox (read-only .git, no network, etc.).
+                // In these cases the harness should push from the host instead.
+                let needs_host_push = reason.contains("PR not created")
+                    || reason.contains("needs push/PR creation")
+                    || reason.contains("push")
+                    || reason.contains("read-only")
+                    || reason.contains("network access")
+                    || reason.contains("sandbox")
+                    || blockers.iter().any(|b| {
+                        let desc = b.description.to_lowercase();
+                        desc.contains("push")
+                            || desc.contains("read-only")
+                            || desc.contains("network")
+                            || desc.contains("sandbox")
+                            || desc.contains("git")
+                    });
+
+                if needs_host_push {
                     info!(
                         worker = worker_id,
                         ticket = ticket_id,
