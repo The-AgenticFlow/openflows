@@ -100,15 +100,12 @@ forge/STATUS.json
 # Worker runtime data (top-level forge/ directory only)
 /forge/
 
-# Orchestration runtime data (but keep plugin and agent config)
+# Orchestration runtime data (keep plugin and agent config tracked)
 orchestration/locks/
 orchestration/pairs/
-!orchestration/plugin/
-!orchestration/agent/
 
 # Worker worktrees (runtime only)
 worktrees/
-orchestration/
 
 # Kilo runtime data (plans, sessions, node_modules)
 .kilo/
