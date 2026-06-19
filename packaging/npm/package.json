@@ -1,8 +1,7 @@
 {
-  "name": "@the-agenticflow/openflows",
+  "name": "openflows",
   "version": "0.1.2",
   "description": "Autonomous AI development team — turns GitHub issues into working PRs",
-  "main": "index.js",
   "bin": {
     "openflows": "./bin/openflows.js",
     "openflows-setup": "./bin/openflows-setup.js",
@@ -39,12 +38,5 @@
   "cpu": [
     "x64",
     "arm64"
-  ],
-  "optionalDependencies": {
-    "@openflows/linux-x64-gnu": "0.1.0",
-    "@openflows/linux-x64-musl": "0.1.0",
-    "@openflows/linux-arm64-gnu": "0.1.0",
-    "@openflows/darwin-x64": "0.1.0",
-    "@openflows/darwin-arm64": "0.1.0"
-  }
+  ]
 }

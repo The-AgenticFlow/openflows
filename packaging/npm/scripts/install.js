@@ -123,7 +123,7 @@ async function fetchLatestTag(includePrerelease = false) {
 async function main() {
     const platform = detectPlatform();
     const channel = process.env.AGENTFLOW_CHANNEL || (process.env.npm_package_version?.includes('-dev.') ? 'edge' : 'stable');
-    console.log(`[@the-agenticflow/openflows] Downloading binary for ${platform} (${channel})...`);
+    console.log(`[openflows] Downloading binary for ${platform} (${channel})...`);
 
     // Ensure bin directory exists
     if (!fs.existsSync(BIN_DIR)) {
@@ -136,7 +136,7 @@ async function main() {
         if (channel === 'edge') {
             tag = await fetchLatestTag(true);
             if (!tag) {
-                console.warn('[@the-agenticflow/openflows] No edge release found, falling back to latest stable');
+                console.warn('[openflows] No edge release found, falling back to latest stable');
                 tag = await fetchLatestTag(false);
             }
         } else {
@@ -159,7 +159,7 @@ async function main() {
             const muslArchiveName = `openflows-${tag}-x86_64-unknown-linux-musl.tar.gz`;
             const muslDownloadUrl = `https://github.com/${REPO}/releases/download/${tag}/${muslArchiveName}`;
             const muslTmpFile = path.join(os.tmpdir(), muslArchiveName);
-            console.log(`[@the-agenticflow/openflows] Trying musl fallback...`);
+            console.log(`[openflows] Trying musl fallback...`);
             await download(muslDownloadUrl, muslTmpFile);
             await extractTarGz(muslTmpFile, BIN_DIR);
             fs.unlinkSync(muslTmpFile);
