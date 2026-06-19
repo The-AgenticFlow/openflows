@@ -7,7 +7,7 @@ set -euo pipefail
 
 REPO="The-AgenticFlow/AgentFlow"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
-BINARIES=("agentflow" "agentflow-setup" "agentflow-dashboard" "agentflow-doctor")
+BINARIES=("openflows" "openflows-setup" "openflows-dashboard" "openflows-doctor")
 
 # Colors
 RED='\033[0;31m'
@@ -95,15 +95,40 @@ ensure_node() {
     success "Node.js $(node --version)"
 }
 
-# Install Claude Code CLI
-ensure_claude() {
+# Check for AI CLI backend (Claude Code or Codex)
+ensure_ai_cli() {
+    local has_claude=false
+    local has_codex=false
+
     if has_cmd claude; then
         success "Claude Code CLI $(claude --version 2>/dev/null || echo 'installed')"
-        return
+        has_claude=true
     fi
-    info "Installing Claude Code CLI..."
-    npm install -g @anthropic-ai/claude-code
-    success "Claude Code CLI installed"
+
+    if has_cmd codex; then
+        success "Codex CLI $(codex --version 2>/dev/null || echo 'installed')"
+        has_codex=true
+    fi
+
+    if [ "$has_claude" = false ] && [ "$has_codex" = false ]; then
+        warn "No AI CLI backend found."
+        echo ""
+        echo "  OpenFlows requires either Claude Code (Anthropic) or Codex (OpenAI)."
+        echo ""
+        echo "  To install Claude Code:"
+        echo "    npm install -g @anthropic-ai/claude-code"
+        echo "    claude login"
+        echo ""
+        echo "  To install Codex:"
+        echo "    npm install -g @openai/codex"
+        echo "    codex login"
+        echo ""
+        echo "  You can also use npx without installing globally:"
+        echo "    npx @anthropic-ai/claude-code"
+        echo "    npx @openai/codex"
+        echo ""
+        info "Continuing without AI CLI - you'll need to install one before running OpenFlows"
+    fi
 }
 
 # Download pre-built binary from GitHub Releases
@@ -198,10 +223,10 @@ run_setup() {
     echo "Would you like to run the setup wizard now? (Y/n)"
     read -r response
     if [[ "$response" =~ ^[Yy]$ ]] || [[ -z "$response" ]]; then
-        if has_cmd agentflow-setup; then
-            agentflow-setup
+        if has_cmd openflows-setup; then
+            openflows-setup
         else
-            warn "agentflow-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
+            warn "openflows-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
         fi
     fi
 }
@@ -226,7 +251,7 @@ main() {
     ensure_rust
     ensure_git
     ensure_node
-    ensure_claude
+    ensure_ai_cli
     echo ""
 
     # Try to download pre-built binary
@@ -267,14 +292,14 @@ main() {
     echo "╚══════════════════════════════════════════════╝"
     echo ""
     echo "  Available commands:"
-    echo "    agentflow         - Start orchestration"
-    echo "    agentflow-setup   - Guided setup wizard"
-    echo "    agentflow-dashboard - Live monitoring TUI"
-    echo "    agentflow-doctor  - Diagnostic checks"
+    echo "    openflows         - Start orchestration"
+    echo "    openflows-setup   - Guided setup wizard"
+    echo "    openflows-dashboard - Live monitoring TUI"
+    echo "    openflows-doctor  - Diagnostic checks"
     echo ""
     echo "  Next steps:"
-    echo "    1. Run 'agentflow-setup' to configure API keys"
-    echo "    2. Run 'agentflow' to start the autonomous team"
+    echo "    1. Run 'openflows-setup' to configure API keys"
+    echo "    2. Run 'openflows' to start the autonomous team"
     echo ""
     echo "  Docs: https://openflows.dev"
     echo ""

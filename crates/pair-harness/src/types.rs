@@ -61,6 +61,10 @@ pub struct PairConfig {
     pub watchdog_timeout_secs: u64,
     /// CLI backend to use for this pair (claude or codex)
     pub cli_backend: CliBackend,
+    /// Model to use for this pair's CLI backend (e.g., "deepseek-v4-flash", "gpt-5.5").
+    /// Read from registry.json's `model_backend` field. When set, this overrides
+    /// the OPENAI_MODEL / ANTHROPIC_MODEL environment variables for the spawned process.
+    pub model_backend: Option<String>,
     pub verify_command: Option<String>,
     pub max_verify_attempts: u32,
 }
@@ -106,6 +110,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -133,6 +138,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -160,6 +166,7 @@ impl PairConfig {
             max_resets: 10,
             watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
             cli_backend: CliBackend::default(),
+            model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -168,6 +175,13 @@ impl PairConfig {
     /// Set the CLI backend for this pair.
     pub fn with_cli_backend(mut self, backend: CliBackend) -> Self {
         self.cli_backend = backend;
+        self
+    }
+
+    /// Set the model backend for this pair (e.g., "deepseek-v4-flash" from registry.json).
+    /// This overrides the model passed to the CLI process via environment variable.
+    pub fn with_model_backend(mut self, model: Option<String>) -> Self {
+        self.model_backend = model.filter(|m| !m.is_empty());
         self
     }
 }
@@ -232,14 +246,20 @@ impl FilesChanged {
     }
 }
 
-/// Segments completed - can be either a count or a list of segment details.
-/// FORGE may write either format depending on the skill version.
+/// Segments completed - can be a count, a list of segment details, or a list of integers.
+/// FORGE may write any of these formats depending on the skill version, e.g.:
+///   - 3                                  → Count(3)
+///   - [1, 2, 3]                          → Numbers([1, 2, 3])
+///   - [{"segment": 1, "status": "..."}]  → List(Vec<SegmentEntry>)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(untagged)]
 pub enum SegmentsCompleted {
     #[default]
     None,
     Count(u32),
+    /// Array of plain integers, e.g. `[1, 2, 3]`. FORGE LLMs often write
+    /// segment numbers this way instead of using the richer `SegmentEntry` format.
+    Numbers(Vec<u32>),
     List(Vec<SegmentEntry>),
 }
 
@@ -248,6 +268,7 @@ impl SegmentsCompleted {
         match self {
             SegmentsCompleted::None => 0,
             SegmentsCompleted::Count(c) => *c,
+            SegmentsCompleted::Numbers(v) => v.len() as u32,
             SegmentsCompleted::List(v) => v.len() as u32,
         }
     }
@@ -633,6 +654,41 @@ mod tests {
             }
             other => panic!("Expected List variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_segments_completed_numbers() {
+        // FORGE LLMs often write "segments_completed": [1, 2, 3] (array of plain
+        // integers) instead of the richer SegmentEntry object format. This is the
+        // exact format that caused the production breakage in STATUS.json parsing.
+        let json = r#"{
+            "status": "COMPLETE",
+            "segments_completed": [1, 2, 3],
+            "notes": "All segments done."
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json)
+            .expect("Failed to parse STATUS.json with segments_completed as integer array");
+        assert_eq!(status.segments_completed.count(), 3);
+        match &status.segments_completed {
+            SegmentsCompleted::Numbers(v) => {
+                assert_eq!(*v, vec![1, 2, 3]);
+            }
+            other => panic!("Expected Numbers variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_segments_completed_numbers_empty() {
+        // Edge case: empty array of integers should parse as Numbers([])
+        let json = r#"{
+            "status": "PENDING",
+            "segments_completed": []
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json)
+            .expect("Failed to parse STATUS.json with empty segments_completed array");
+        assert_eq!(status.segments_completed.count(), 0);
     }
 
     #[test]

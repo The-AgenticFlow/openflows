@@ -1,3 +1,8 @@
+---
+name: forge-coding
+description: Core coding skill for the FORGE builder agent
+---
+
 # FORGE Coding Skill
 
 ## Your role

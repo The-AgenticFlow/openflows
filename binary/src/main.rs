@@ -122,6 +122,8 @@ async fn main() -> Result<()> {
         }
     };
     let registry_path = orchestrator_dir.join("orchestration/agent/registry.json");
+    let registry = config::Registry::load(&registry_path)?;
+    
     let nexus = Arc::new(NexusNode::new(
         orchestrator_dir.join("orchestration/agent/agents/nexus.agent.md"),
         registry_path.clone(),
@@ -136,13 +138,18 @@ async fn main() -> Result<()> {
             VesselConfig::from_env()
         }),
     ));
-    let lore = Arc::new(LoreNode::new_with_registry(
-        &workspace_dir,
-        orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
-        orchestrator_dir.join("orchestration/agent/registry.json"),
-    )?);
+    let lore = if registry.get("lore").is_some() {
+        Some(Arc::new(LoreNode::new_with_registry(
+            &workspace_dir,
+            orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
+            registry_path.clone(),
+        )?))
+    } else {
+        info!("lore agent is inactive — skipping lore node initialization");
+        None
+    };
 
-    let flow = Flow::new("nexus")
+    let mut flow = Flow::new("nexus")
         .add_node(
             "nexus",
             nexus,
@@ -168,22 +175,33 @@ async fn main() -> Result<()> {
         .add_node(
             "vessel",
             vessel,
-            vec![
-                (ACTION_DEPLOYED, "lore"),
-                (ACTION_DEPLOY_FAILED, "nexus"),
-                (ACTION_CI_FIX_NEEDED, "forge_pair"),
-                ("merge_blocked", "nexus"),
-                (ACTION_CONFLICTS_DETECTED, "forge_pair"),
-                (Action::AWAITING_HUMAN, "nexus"),
-                ("no_work", "nexus"),
-            ],
-        )
-        .add_node(
+            {
+                let mut routes = vec![
+                    (ACTION_DEPLOY_FAILED, "nexus"),
+                    (ACTION_CI_FIX_NEEDED, "forge_pair"),
+                    ("merge_blocked", "nexus"),
+                    (ACTION_CONFLICTS_DETECTED, "forge_pair"),
+                    (Action::AWAITING_HUMAN, "nexus"),
+                    ("no_work", "nexus"),
+                ];
+                if lore.is_some() {
+                    routes.insert(0, (ACTION_DEPLOYED, "lore"));
+                } else {
+                    routes.insert(0, (ACTION_DEPLOYED, "nexus"));
+                }
+                routes
+            },
+        );
+
+    if let Some(ref lore_node) = lore {
+        flow = flow.add_node(
             "lore",
-            lore,
+            lore_node.clone(),
             vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
-        )
-        .max_steps(20);
+        );
+    }
+    
+    let flow = flow.max_steps(20);
 
     // 5. Run Flow
     info!("Starting Flow execution loop...");

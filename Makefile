@@ -2,7 +2,7 @@
 
 SHELL := /bin/bash
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-BINARIES := agentflow agentflow-setup agentflow-dashboard agentflow-doctor
+BINARIES := openflows openflows-setup openflows-dashboard openflows-doctor
 
 help:
 	@echo "OpenFlows Build System"
@@ -70,20 +70,20 @@ docker-run:
 cross-linux:
 	@echo "Cross-compiling for Linux..."
 	rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-gnu
-	cargo build --release --target x86_64-unknown-linux-musl --bin agentflow --bin agentflow-setup --bin agentflow-dashboard --bin agentflow-doctor
-	cargo build --release --target aarch64-unknown-linux-gnu --bin agentflow --bin agentflow-setup --bin agentflow-dashboard --bin agentflow-doctor
+	cargo build --release --target x86_64-unknown-linux-musl --bin openflows --bin openflows-setup --bin openflows-dashboard --bin openflows-doctor
+	cargo build --release --target aarch64-unknown-linux-gnu --bin openflows --bin openflows-setup --bin openflows-dashboard --bin openflows-doctor
 	@echo "Linux binaries built:"
-	@ls -lh target/x86_64-unknown-linux-musl/release/agentflow*
-	@ls -lh target/aarch64-unknown-linux-gnu/release/agentflow*
+	@ls -lh target/x86_64-unknown-linux-musl/release/openflows*
+	@ls -lh target/aarch64-unknown-linux-gnu/release/openflows*
 
 cross-mac:
 	@echo "Cross-compiling for macOS..."
 	rustup target add x86_64-apple-darwin aarch64-apple-darwin
-	cargo build --release --target x86_64-apple-darwin --bin agentflow --bin agentflow-setup --bin agentflow-dashboard --bin agentflow-doctor
-	cargo build --release --target aarch64-apple-darwin --bin agentflow --bin agentflow-setup --bin agentflow-dashboard --bin agentflow-doctor
+	cargo build --release --target x86_64-apple-darwin --bin openflows --bin openflows-setup --bin openflows-dashboard --bin openflows-doctor
+	cargo build --release --target aarch64-apple-darwin --bin openflows --bin openflows-setup --bin openflows-dashboard --bin openflows-doctor
 	@echo "macOS binaries built:"
-	@ls -lh target/x86_64-apple-darwin/release/agentflow*
-	@ls -lh target/aarch64-apple-darwin/release/agentflow*
+	@ls -lh target/x86_64-apple-darwin/release/openflows*
+	@ls -lh target/aarch64-apple-darwin/release/openflows*
 
 dist: release
 	@echo "Creating distribution tarballs..."

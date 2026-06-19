@@ -52,6 +52,10 @@ pub fn check_claude() -> Option<String> {
     check_command("claude")
 }
 
+pub fn check_codex() -> Option<String> {
+    check_command("codex")
+}
+
 pub fn check_gh_cli() -> Option<String> {
     check_command("gh")
 }

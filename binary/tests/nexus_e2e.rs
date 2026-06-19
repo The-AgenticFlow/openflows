@@ -3,6 +3,7 @@ use anyhow::Result;
 use mockito::Server;
 use pocketflow_core::{Node, SharedStore};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -57,7 +58,28 @@ async fn test_nexus_e2e_mocked() -> Result<()> {
     std::env::set_var("GITHUB_MCP_CMD", "python3 ../scripts/mock_mcp.py");
     std::env::set_var("AGENT_NEXUS_GITHUB_TOKEN", "ghp_test_token_for_e2e");
 
-    // 3. Initialize SharedStore
+    // 3. Create a temporary registry.json so the test doesn't depend on a
+    //    workspace file that may not exist in CI.
+    let tmp_dir = tempfile::tempdir()?;
+    let registry_path = tmp_dir.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        json!({
+            "default_cli": "claude",
+            "team": [{
+                "id": "nexus",
+                "cli": "claude",
+                "active": true,
+                "instances": 1,
+                "model_backend": "anthropic/claude-haiku-4-5-20251001",
+                "routing_key": "nexus-key",
+                "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
+            }]
+        })
+        .to_string(),
+    )?;
+
+    // 4. Initialize SharedStore
     let store = SharedStore::new_in_memory();
 
     // Inject initial worker slots
@@ -66,11 +88,15 @@ async fn test_nexus_e2e_mocked() -> Result<()> {
     });
     store.set("worker_slots", slots).await;
 
-    // 4. Run NexusNode
-    // Path relative to binary/
+    // 5. Run NexusNode
+    // Resolve persona path relative to the workspace root so the test works from any CWD.
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir should have parent")
+        .to_path_buf();
     let nexus = Arc::new(NexusNode::new(
-        "../orchestration/agent/agents/nexus.agent.md",
-        "../orchestration/agent/registry.json",
+        workspace_root.join("orchestration/agent/agents/nexus.agent.md"),
+        registry_path,
     ));
 
     let action = nexus.run(&store).await?;

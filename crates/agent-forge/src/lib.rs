@@ -830,6 +830,22 @@ impl ForgePairNode {
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
 
+        // Try to read a COMMIT_MSG.md written by FORGE in the shared directory.
+        // This lets the agent describe its own changes instead of using a
+        // generic "complete implementation" message.
+        let shared_dir = worktree_path.join(".pair-shared");
+        let commit_msg = std::fs::read_to_string(shared_dir.join("COMMIT_MSG.md"))
+            .ok()
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .unwrap_or_else(|| format!("{}: complete implementation", ticket_id));
+
         if has_changes {
             info!(
                 worker = worker_id,
@@ -838,11 +854,7 @@ impl ForgePairNode {
             Self::git_add_safe(&worktree_path)?;
 
             StdCommand::new("git")
-                .args([
-                    "commit",
-                    "-m",
-                    &format!("{}: complete implementation", ticket_id),
-                ])
+                .args(["commit", "-m", &commit_msg])
                 .current_dir(&worktree_path)
                 .output()
                 .context("Failed to git commit")?;
@@ -1928,8 +1940,35 @@ impl BatchNode for ForgePairNode {
             backend
         };
 
+        // Resolve model_backend from registry for this worker.
+        // This overrides the OPENAI_MODEL / ANTHROPIC_MODEL env vars
+        // passed to the spawned CLI process, ensuring each agent uses
+        // the model specified in registry.json's model_backend field.
+        let model_backend = if let Some(registry_path) = &self.registry_path {
+            let registry = config::Registry::load(registry_path)?;
+            let base_id = worker_id
+                .rfind('-')
+                .map(|i| &worker_id[..i])
+                .unwrap_or(&worker_id);
+            let model = registry
+                .get(base_id)
+                .and_then(|entry| entry.model_backend.clone());
+            if let Some(ref m) = model {
+                info!(worker_id, base_id, model = %m, "Model backend resolved from registry");
+            } else {
+                info!(
+                    worker_id,
+                    base_id, "No model_backend in registry, using env var default"
+                );
+            }
+            model
+        } else {
+            None
+        };
+
         let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)
-            .with_cli_backend(cli_backend);
+            .with_cli_backend(cli_backend)
+            .with_model_backend(model_backend);
 
         let mut pair = ForgeSentinelPair::new(config);
         let outcome = pair
@@ -1959,7 +1998,34 @@ impl BatchNode for ForgePairNode {
                 }))
             }
             PairOutcome::Blocked { reason, blockers } => {
-                if reason.contains("PR not created") || reason.contains("needs push/PR creation") {
+                // Detect cases where FORGE completed the work locally but could not
+                // push from inside the sandbox (read-only .git, no network, etc.).
+                // In these cases the harness should push from the host instead.
+                let needs_host_push = reason.contains("PR not created")
+                    || reason.contains("needs push/PR creation")
+                    || reason.contains("git push")
+                    || reason.contains("push failed")
+                    || reason.contains("failed to push")
+                    || reason.contains("cannot push")
+                    || reason.contains("could not push")
+                    || reason.contains("unable to push")
+                    || reason.contains("read-only")
+                    || reason.contains("network access")
+                    || reason.contains("sandbox")
+                    || blockers.iter().any(|b| {
+                        let desc = b.description.to_lowercase();
+                        desc.contains("git push")
+                            || desc.contains("push failed")
+                            || desc.contains("failed to push")
+                            || desc.contains("cannot push")
+                            || desc.contains("could not push")
+                            || desc.contains("unable to push")
+                            || desc.contains("read-only")
+                            || desc.contains("network")
+                            || desc.contains("sandbox")
+                    });
+
+                if needs_host_push {
                     info!(
                         worker = worker_id,
                         ticket = ticket_id,

@@ -35,6 +35,11 @@ impl ApiStep {
     ) -> Result<()> {
         let provider_name = config.selected_provider.clone().unwrap_or_default();
 
+        // Skip API key input if user chose to skip
+        if provider_name == "Skip for now" {
+            return Ok(());
+        }
+
         let mut fields: Vec<ApiField> = Vec::new();
 
         let provider_field = match provider_name.as_str() {
@@ -44,16 +49,10 @@ impl ApiStep {
                 input: Input::new(config.anthropic_key.clone()),
                 required: true,
             }),
-            "OpenAI" => Some(ApiField {
+            "OpenAI (Codex)" => Some(ApiField {
                 label: "OpenAI API Key".to_string(),
                 env_key: "OPENAI_API_KEY".to_string(),
                 input: Input::new(config.openai_key.clone().unwrap_or_default()),
-                required: true,
-            }),
-            "Google Gemini" => Some(ApiField {
-                label: "Google Gemini API Key".to_string(),
-                env_key: "GEMINI_API_KEY".to_string(),
-                input: Input::new(config.gemini_key.clone().unwrap_or_default()),
                 required: true,
             }),
             "Fireworks AI" => Some(ApiField {
@@ -62,35 +61,6 @@ impl ApiStep {
                 input: Input::new(config.fireworks_key.clone().unwrap_or_default()),
                 required: true,
             }),
-            "LiteLLM Proxy" => {
-                let proxy_fields = vec![
-                    ApiField {
-                        label: "LiteLLM Proxy URL".to_string(),
-                        env_key: "LITELLM_URL".to_string(),
-                        input: Input::new(std::env::var("LITELLM_URL").unwrap_or_default()),
-                        required: true,
-                    },
-                    ApiField {
-                        label: "LiteLLM API Key (optional)".to_string(),
-                        env_key: "LITELLM_API_KEY".to_string(),
-                        input: Input::new(std::env::var("LITELLM_API_KEY").unwrap_or_default()),
-                        required: false,
-                    },
-                ];
-                return self
-                    .render_fields(terminal, theme, config, proxy_fields, &provider_name)
-                    .await;
-            }
-            "Ollama (Local)" => Some(ApiField {
-                label: "Ollama Host URL".to_string(),
-                env_key: "OLLAMA_HOST".to_string(),
-                input: Input::new(
-                    std::env::var("OLLAMA_HOST")
-                        .unwrap_or_else(|_| "http://localhost:11434".to_string()),
-                ),
-                required: true,
-            }),
-            "Skip for now" => return Ok(()),
             _ => return Ok(()),
         };
 
@@ -209,24 +179,8 @@ impl ApiStep {
                                             config.openai_key =
                                                 if value.is_empty() { None } else { Some(value) };
                                         }
-                                        "GEMINI_API_KEY" => {
-                                            config.gemini_key =
-                                                if value.is_empty() { None } else { Some(value) };
-                                        }
                                         "FIREWORKS_API_KEY" => {
                                             config.fireworks_key =
-                                                if value.is_empty() { None } else { Some(value) };
-                                        }
-                                        "LITELLM_URL" => {
-                                            config.proxy_url =
-                                                if value.is_empty() { None } else { Some(value) };
-                                        }
-                                        "LITELLM_API_KEY" => {
-                                            config.proxy_api_key =
-                                                if value.is_empty() { None } else { Some(value) };
-                                        }
-                                        "OLLAMA_HOST" => {
-                                            config.gateway_url =
                                                 if value.is_empty() { None } else { Some(value) };
                                         }
                                         _ => {}

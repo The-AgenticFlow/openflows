@@ -1,3 +1,8 @@
+---
+name: sentinel-review
+description: Review skill for the SENTINEL reviewer agent
+---
+
 # SENTINEL Review Skill
 
 ## Your role

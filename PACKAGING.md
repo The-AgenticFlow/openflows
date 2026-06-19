@@ -138,10 +138,10 @@ Each release tarball contains:
 
 ```
 openflows-v0.1.0-x86_64-unknown-linux-musl/
-├── agentflow              # Main orchestration binary
-├── agentflow-setup        # Setup wizard TUI
-├── agentflow-dashboard    # Live monitoring TUI
-├── agentflow-doctor       # Diagnostic tool
+├── openflows              # Main orchestration binary
+├── openflows-setup        # Setup wizard TUI
+├── openflows-dashboard    # Live monitoring TUI
+├── openflows-doctor       # Diagnostic tool
 ├── orchestration/         # Agent personas, registry, hooks, skills
 ├── README.md
 └── LICENSE
