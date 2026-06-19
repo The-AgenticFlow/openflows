@@ -1,5 +1,5 @@
 {
-  "name": "openflows",
+  "name": "@the-agenticflow/openflows",
   "version": "0.1.2",
   "description": "Autonomous AI development team — turns GitHub issues into working PRs",
   "bin": {
