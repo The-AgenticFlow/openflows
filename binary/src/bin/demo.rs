@@ -11,29 +11,31 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-fn load_env() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
+fn load_env() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| std::env::var("HOME"))
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    let openflows_home = std::env::var("OPENFLOWS_HOME")
-        .unwrap_or_else(|_| format!("{}/.openflows", home));
+        .map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        .unwrap_or_else(|_| ".openflows".to_string());
     let env_paths = vec![
-        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
+        std::path::PathBuf::from(format!("{}/.env", home)),
         std::env::current_dir().unwrap_or_default().join(".env"),
     ];
     for path in &env_paths {
         if path.exists() {
-            if dotenvy::from_path(path).is_ok() {
-                return path.clone();
+            match dotenvy::from_path(path) {
+                Ok(_) => return Ok(path.clone()),
+                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
     }
-    std::path::PathBuf::new()
+    Ok(std::path::PathBuf::new())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_path = load_env();
+    let env_path = load_env()?;
     if !env_path.as_os_str().is_empty() {
         eprintln!("Loaded environment from {}", env_path.display());
     }

@@ -13,29 +13,31 @@ use pocketflow_core::{Action, Flow, SharedStore};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-fn load_env() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
+fn load_env() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| std::env::var("HOME"))
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    let openflows_home = std::env::var("OPENFLOWS_HOME")
-        .unwrap_or_else(|_| format!("{}/.openflows", home));
+        .map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        .unwrap_or_else(|_| ".openflows".to_string());
     let env_paths = vec![
-        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
+        std::path::PathBuf::from(format!("{}/.env", home)),
         std::env::current_dir().unwrap_or_default().join(".env"),
     ];
     for path in &env_paths {
         if path.exists() {
-            if dotenvy::from_path(path).is_ok() {
-                return path.clone();
+            match dotenvy::from_path(path) {
+                Ok(_) => return Ok(path.clone()),
+                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
     }
-    std::path::PathBuf::new()
+    Ok(std::path::PathBuf::new())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_path = load_env();
+    let env_path = load_env()?;
     if !env_path.as_os_str().is_empty() {
         eprintln!("Loaded environment from {}", env_path.display());
     }
@@ -114,28 +116,30 @@ async fn main() -> Result<()> {
     // 1. Validate Environment
     // Resolve orchestrator_dir: search for orchestration/agent/registry.json in
     // order: (1) next to the binary, (2) the binary's parent dir (npm layout),
-    // (3) AGENTFLOW_HOME, (4) current directory (dev mode).
+    // (3) OPENFLOWS_HOME, (4) current directory (dev mode).
     let orchestrator_dir = {
-        let home = std::env::var("AGENTFLOW_HOME")
-            .ok()
-            .or_else(|| std::env::var("HOME").ok())
-            .unwrap_or_else(|| "/tmp".to_string());
-        let candidates = vec![
+        let mut candidates = vec![
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.to_path_buf())),
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())),
-            Some(std::path::PathBuf::from(&home).join(".agentflow")),
-            std::env::current_dir().ok(),
         ];
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .ok();
+        if let Some(home) = openflows_home {
+            candidates.push(Some(std::path::PathBuf::from(home)));
+        }
+        candidates.push(std::env::current_dir().ok());
         candidates
             .into_iter()
             .flatten()
             .find(|dir| dir.join("orchestration/agent/registry.json").exists())
             .ok_or_else(|| anyhow::anyhow!(
-                "Could not find orchestration/agent/registry.json in: binary dir, binary parent, AGENTFLOW_HOME, or current directory"
+                "Could not find orchestration/agent/registry.json in: binary dir, binary parent, OPENFLOWS_HOME, or current directory"
             ))?
     };
     let registry_path = orchestrator_dir

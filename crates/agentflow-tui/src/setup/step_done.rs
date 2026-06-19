@@ -5,7 +5,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use std::io;
-use std::path::Path;
 
 use crate::setup::write_env_file;
 use crate::setup::write_registry_file;
@@ -41,6 +40,7 @@ impl DoneStep {
         write_env_file(config, &openflows_home)?;
         let current_dir = std::env::current_dir()?;
         write_registry_file(config, &current_dir)?;
+        write_registry_file(config, &openflows_home)?;
 
         let env_path = openflows_home.join(".env");
         let registry_path = current_dir
@@ -51,7 +51,10 @@ impl DoneStep {
         let mut checks = Vec::new();
 
         if env_path.exists() {
-            checks.push((format!(".env written to {}", env_path.display()), CheckState::Pass));
+            checks.push((
+                format!(".env written to {}", env_path.display()),
+                CheckState::Pass,
+            ));
         } else {
             checks.push((".env file write failed".to_string(), CheckState::Fail));
         }
