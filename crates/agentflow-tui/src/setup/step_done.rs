@@ -27,10 +27,22 @@ impl DoneStep {
         theme: &Theme,
         config: &SetupConfig,
     ) -> Result<()> {
+        let home = std::env::var("OPENFLOWS_HOME").unwrap_or_else(|_| {
+            format!(
+                "{}/.openflows",
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".to_string())
+            )
+        });
+        let openflows_home = std::path::PathBuf::from(&home);
+        std::fs::create_dir_all(&openflows_home)?;
+
+        write_env_file(config, &openflows_home)?;
         let current_dir = std::env::current_dir()?;
-        write_env_file(config, &current_dir)?;
         write_registry_file(config, &current_dir)?;
 
+        let env_path = openflows_home.join(".env");
         let registry_path = current_dir
             .join("orchestration")
             .join("agent")
@@ -38,8 +50,8 @@ impl DoneStep {
 
         let mut checks = Vec::new();
 
-        if Path::new(".env").exists() {
-            checks.push((".env file written".to_string(), CheckState::Pass));
+        if env_path.exists() {
+            checks.push((format!(".env written to {}", env_path.display()), CheckState::Pass));
         } else {
             checks.push((".env file write failed".to_string(), CheckState::Fail));
         }

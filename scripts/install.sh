@@ -190,6 +190,12 @@ download_binary() {
             chmod +x "${INSTALL_DIR}/${bin}"
         fi
     done
+
+    if [ -d "${extract_dir}/orchestration" ]; then
+        cp -r "${extract_dir}/orchestration" "${INSTALL_DIR}/"
+        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+    fi
+
     rm -rf "${extract_dir}"
 
     success "Downloaded and extracted to ${INSTALL_DIR}/"
