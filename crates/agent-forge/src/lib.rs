@@ -1411,6 +1411,7 @@ impl ForgePairNode {
         use std::process::Command as StdCommand;
 
         let mut changed_files = std::collections::HashSet::new();
+        let mut any_diff_succeeded = false;
 
         // 1. Check files changed in commits compared to origin/default_branch
         let origin_ref = format!("origin/{}", default_branch);
@@ -1421,6 +1422,7 @@ impl ForgePairNode {
 
         if let Ok(out) = output {
             if out.status.success() {
+                any_diff_succeeded = true;
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 for line in stdout.lines() {
                     let trimmed = line.trim();
@@ -1439,6 +1441,7 @@ impl ForgePairNode {
 
         if let Ok(out) = output {
             if out.status.success() {
+                any_diff_succeeded = true;
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 for line in stdout.lines() {
                     let trimmed = line.trim();
@@ -1447,6 +1450,13 @@ impl ForgePairNode {
                     }
                 }
             }
+        }
+
+        if !any_diff_succeeded {
+            return Err(anyhow::anyhow!(
+                "Pre-push validation failed: Could not compute diff against '{}' or 'origin/{}' to validate staged files. Aborting push to prevent potential leak.",
+                default_branch, default_branch
+            ));
         }
 
         // Check if any of these files are denylisted
@@ -1470,7 +1480,7 @@ impl ForgePairNode {
         Self::untrack_secret_containing_files(worktree_path)?;
 
         let output = StdCommand::new("git")
-            .args(["status", "--porcelain", "-z"])
+            .args(["status", "--porcelain", "-z", "-uall"])
             .current_dir(worktree_path)
             .output()
             .context("Failed to run git status")?;
@@ -2673,6 +2683,18 @@ Implement the counter experience.
         assert!(config::is_denylisted(Path::new(".env.local")));
         assert!(config::is_denylisted(Path::new(".env.production")));
         assert!(config::is_denylisted(Path::new("src/.env")));
+
+        // Root-anchored dirs NOT denylisted at subdirectory depth
+        assert!(!config::is_denylisted(Path::new("src/worktrees/foo.rs")));
+        assert!(!config::is_denylisted(Path::new(
+            "lib/orchestration/config.json"
+        )));
+        assert!(!config::is_denylisted(Path::new("src/.codex-home/data.db")));
+
+        // Tightened .env prefix — .envrc, .environment no longer matched
+        assert!(!config::is_denylisted(Path::new(".envrc")));
+        assert!(!config::is_denylisted(Path::new(".environment")));
+        assert!(!config::is_denylisted(Path::new("src/.envrc")));
 
         // Allowed paths
         assert!(!config::is_denylisted(Path::new("src/main.rs")));

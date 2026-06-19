@@ -1463,7 +1463,7 @@ impl ForgeSentinelPair {
                  7. Fix ALL errors found\n\
                  8. Update WORKLOG.md with what you fixed\n\
                  9. Run ALL failing checks again to confirm everything passes\n\
-                  10. (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"fix CI failures\"\n\
+                  10. (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared))(/|$)|(^|/)\\.env($|/|\\.)|^worktrees/|^orchestration/|^\\.codex-home/' | xargs -r git add && git commit -m \"fix CI failures\"\n\
                   11. git push (or git push -u origin HEAD if first push; if rejected, use git push --force-with-lease -u origin HEAD)\n\
                   12. Write STATUS.json with status PR_OPENED\n\n\
                   If you cannot push (e.g., .git is read-only or network errors), write STATUS.json with status COMPLETE instead and the harness will push for you.\n\n\

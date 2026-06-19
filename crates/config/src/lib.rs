@@ -11,19 +11,22 @@ pub use registry::{CliBackend, Registry, RegistryEntry, DEFAULT_CLI_ENV_VAR};
 pub use state::*;
 
 pub fn is_denylisted(path: &std::path::Path) -> bool {
-    path.components().any(|component| {
+    for (i, component) in path.components().enumerate() {
         if let std::path::Component::Normal(os_str) = component {
             let s = os_str.to_string_lossy();
-            s == ".codex"
-                || s == ".claude"
-                || s == ".agents"
-                || s == ".pair-shared"
-                || s == "worktrees"
-                || s == "orchestration"
-                || s == ".codex-home"
-                || s.starts_with(".env")
-        } else {
-            false
+            // Config/sync dirs: denylisted at any depth
+            if s == ".codex" || s == ".claude" || s == ".agents" || s == ".pair-shared" {
+                return true;
+            }
+            // Root-level orchestration metadata dirs (not user project dirs)
+            if i == 0 && (s == "worktrees" || s == "orchestration" || s == ".codex-home") {
+                return true;
+            }
+            // .env and .env.* files at any depth
+            if s == ".env" || s.starts_with(".env.") {
+                return true;
+            }
         }
-    })
+    }
+    false
 }
