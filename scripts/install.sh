@@ -238,9 +238,7 @@ resolve_edge_tag() {
     fi
     if [ -z "$tag" ]; then
         tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=50" 2>/dev/null \
-            | grep -B1 '"prerelease": true' \
-            | grep '"tag_name"' | head -1 \
-            | sed 's/.*"tag_name": "//;s/".*//' || echo "")
+            | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name' 2>/dev/null || echo "")
     fi
     echo "$tag"
 }

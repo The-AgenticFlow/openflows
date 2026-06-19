@@ -176,7 +176,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
+      - name: Extract version and tags
         id: version
         run: |
           VERSION="${{ needs.resolve-version.outputs.version }}"
@@ -184,13 +184,19 @@ jobs:
           VERSION=$(echo "$VERSION" | sed 's|/|-|g')
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
+          if [[ "${{ needs.resolve-version.outputs.is_prerelease }}" == "true" ]]; then
+            echo "CHANNEL_TAG=edge" >> "$GITHUB_OUTPUT"
+          else
+            echo "CHANNEL_TAG=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/the-agenticflow/openflows:latest
+            ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.CHANNEL_TAG }}
             ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
