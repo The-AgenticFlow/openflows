@@ -6,12 +6,18 @@ on:
       - 'v*'
     branches:
       - main
+    paths-ignore:
+      - 'packaging/homebrew/**'
   workflow_dispatch:
     inputs:
       version:
         description: 'Release version (e.g., v0.1.0)'
         required: true
         type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,16 +42,17 @@ jobs:
         run: |
           if [[ -n "${{ github.event.inputs.version }}" ]]; then
             VERSION="${{ github.event.inputs.version }}"
-            IS_PRERELEASE="false"
+            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF_NAME}"
-            IS_PRERELEASE="false"
+            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
           elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
-            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-            LAST_VERSION="${LAST_TAG#v}"
-            COMMIT_COUNT=$(git rev-list --count "${LAST_TAG}..HEAD" 2>/dev/null || echo "0")
+            LAST_STABLE_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -1 || echo "")
+            if [ -z "$LAST_STABLE_TAG" ]; then LAST_STABLE_TAG="v0.0.0"; fi
+            LAST_VERSION="${LAST_STABLE_TAG#v}"
+            COMMIT_COUNT=$(git rev-list --count "${LAST_STABLE_TAG}..HEAD" 2>/dev/null || echo "0")
             SHORT_SHA=$(git rev-parse --short HEAD)
-            VERSION="v${LAST_VERSION}-dev.${COMMIT_COUNT}+${SHORT_SHA}"
+            VERSION="v${LAST_VERSION}-dev.${COMMIT_COUNT}.${SHORT_SHA}"
             IS_PRERELEASE="true"
           else
             echo "::error::Unexpected ref: ${GITHUB_REF}"
@@ -327,6 +334,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Update Homebrew formula
         run: |
@@ -342,5 +352,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add packaging/homebrew/openflows.rb
-          git commit -m "chore: update Homebrew formula for ${{ needs.resolve-version.outputs.version }}" || echo "No changes to commit"
-          git push
+          git commit -m "chore: update Homebrew formula for ${{ needs.resolve-version.outputs.version }} [skip ci]" || { echo "No changes"; exit 0; }
+          git push origin HEAD:main

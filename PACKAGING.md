@@ -9,7 +9,7 @@ OpenFlows ships through two release channels:
 | Channel | Tag Pattern | Published When | Stability |
 |---------|------------|----------------|-----------|
 | **Stable** | `vX.Y.Z` | Version tag is pushed | Production-ready |
-| **Edge** | `vX.Y.Z-dev.N+SHA` | Every push to `main` | Bleeding-edge, may be unstable |
+| **Edge** | `vX.Y.Z-dev.N.SHA` | Every push to `main` | Bleeding-edge, may be unstable |
 
 ### Stable Releases
 
@@ -31,7 +31,7 @@ This creates a full release with:
 
 Every push to the `main` branch automatically creates a pre-release build:
 
-- GitHub Release marked as **prerelease** with a generated version like `v0.1.0-dev.42+abc1234`
+- GitHub Release marked as **prerelease** with a generated version like `v0.1.0-dev.42.abc1234`
 - Docker image tagged with the dev version (the `latest` tag is also updated)
 - npm package published under the `next` dist-tag
 
@@ -154,7 +154,7 @@ make install    # Copies to ~/.local/bin
 
 Triggers `.github/workflows/release.yml` which:
 
-1. **Resolves version** — auto-generates `v{last_version}-dev.{commit_count}+{short_sha}`
+1. **Resolves version** — auto-generates `v{last_version}-dev.{commit_count}.{short_sha}`
 2. **Builds binaries** for 4 platforms:
    - `x86_64-unknown-linux-musl` (Linux x86_64, static)
    - `aarch64-unknown-linux-gnu` (Linux ARM64)
@@ -193,7 +193,7 @@ You can also trigger a release manually via GitHub Actions:
 | Trigger | Version Format | Release Type | npm dist-tag |
 |---------|---------------|--------------|--------------|
 | Tag push (`v0.2.0`) | `v0.2.0` | Stable | `latest` |
-| Main push | `v0.1.0-dev.42+abc1234` | Pre-release | `next` |
+| Main push | `v0.1.0-dev.42.abc1234` | Pre-release | `next` |
 | Manual dispatch | User-specified | Depends on version string | Depends |
 
 ## Binary Contents
