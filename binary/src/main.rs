@@ -18,10 +18,25 @@ use crate::state::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match dotenvy::dotenv() {
-        Ok(path) => eprintln!("Loaded environment from {}", path.display()),
-        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
+    let openflows_home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+        .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+        .unwrap_or_else(|_| ".openflows".to_string());
+    let env_paths = vec![
+        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
+        std::env::current_dir().unwrap_or_default().join(".env"),
+    ];
+    for path in &env_paths {
+        if path.exists() {
+            match dotenvy::from_path(path) {
+                Ok(_) => {
+                    eprintln!("Loaded environment from {}", path.display());
+                    break;
+                }
+                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
     // Initialize tracing: default to INFO level, allow RUST_LOG to override
     tracing_subscriber::fmt()
@@ -105,21 +120,33 @@ async fn main() -> Result<()> {
     store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
 
     // 4. Build Flow - use orchestration/agent directory for personas
-    // Resolve orchestrator_dir: first try relative to the binary itself (npm install),
-    // then fall back to current directory (dev mode).
+    // Resolve orchestrator_dir: search for orchestration/agent/registry.json in
+    // order: (1) next to the binary, (2) the binary's parent dir (npm layout),
+    // (3) OPENFLOWS_HOME, (4) current directory (dev mode).
     let orchestrator_dir = {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        if let Some(ref dir) = exe_dir {
-            if dir.join("orchestration/agent/registry.json").exists() {
-                dir.clone()
-            } else {
-                std::env::current_dir()?
-            }
-        } else {
-            std::env::current_dir()?
+        let mut candidates = vec![
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf())),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())),
+        ];
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .ok();
+        if let Some(home) = openflows_home {
+            candidates.push(Some(std::path::PathBuf::from(home)));
         }
+        candidates.push(std::env::current_dir().ok());
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|dir| dir.join("orchestration/agent/registry.json").exists())
+            .ok_or_else(|| anyhow::anyhow!(
+                "Could not find orchestration/agent/registry.json in: binary dir, binary parent, OPENFLOWS_HOME, or current directory"
+            ))?
     };
     let registry_path = orchestrator_dir.join("orchestration/agent/registry.json");
     let registry = config::Registry::load(&registry_path)?;

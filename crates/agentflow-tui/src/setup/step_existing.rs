@@ -42,7 +42,24 @@ impl ExistingConfigStep {
     }
 
     pub fn detect_existing_config(project_dir: &Path) -> Option<SetupConfig> {
-        let env_path = project_dir.join(".env");
+        let openflows_env = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .ok()
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join(".env"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    "{}/.openflows/.env",
+                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                ))
+            });
+        let local_env = project_dir.join(".env");
+        let env_path = if openflows_env.exists() {
+            openflows_env
+        } else {
+            local_env
+        };
         if !env_path.exists() {
             return None;
         }

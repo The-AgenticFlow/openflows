@@ -11,6 +11,7 @@ const { execSync } = require('child_process');
 
 const REPO = 'The-AgenticFlow/AgentFlow';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
+const PKG_DIR = path.join(__dirname, '..');
 
 function detectPlatform() {
     const platform = os.platform();
@@ -177,6 +178,17 @@ async function main() {
             fs.renameSync(src, dst);
             fs.chmodSync(dst, 0o755);
         }
+    }
+
+    // Move orchestration config to package root so the binary can find it
+    const orchestrationSrc = path.join(BIN_DIR, 'orchestration');
+    const orchestrationDst = path.join(PKG_DIR, 'orchestration');
+    if (fs.existsSync(orchestrationSrc)) {
+        if (fs.existsSync(orchestrationDst)) {
+            fs.rmSync(orchestrationDst, { recursive: true });
+        }
+        fs.renameSync(orchestrationSrc, orchestrationDst);
+        console.log('[openflows] Installed orchestration config');
     }
 
     if (fs.existsSync(tmpFile)) {
