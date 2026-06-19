@@ -60,6 +60,8 @@ Or build manually with Cargo:
 ```bash
 cargo build --release -p openflows
 # Binaries at target/release/{openflows,openflows-setup,openflows-dashboard,openflows-doctor}
+# You also need the orchestration/ directory — copy it to ~/.local/bin/ or set OPENFLOWS_HOME
+cp -r orchestration ~/.local/bin/
 ```
 
 ## How It Works
