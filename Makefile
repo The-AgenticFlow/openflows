@@ -40,8 +40,13 @@ install: release
 		chmod +x "$$INSTALL_DIR/$$bin"; \
 		echo "  Installed $$INSTALL_DIR/$$bin"; \
 	done
+	@if [ -d "orchestration" ]; then \
+		INSTALL_DIR="$${AGENTFLOW_INSTALL_DIR:-$$HOME/.local/bin}"; \
+		cp -r orchestration "$$INSTALL_DIR/"; \
+		echo "  Installed orchestration config to $$INSTALL_DIR/orchestration/"; \
+	fi
 	@echo ""
-	@echo "Make sure $$INSTALL_DIR is in your PATH."
+	@echo "Make sure $${AGENTFLOW_INSTALL_DIR:-$$HOME/.local/bin} is in your PATH."
 
 clean:
 	cargo clean

@@ -12,10 +12,10 @@ Give it a GitHub repo and some issues, and OpenFlows handles everything — writ
 
 ```bash
 # Stable release
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 
 # Or edge (pre-release from main)
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash -s -- --edge
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
 ```
 
 Then set up and run:
@@ -45,8 +45,8 @@ openflows
 ### Install from Source
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 
 # Build and install release binaries
 make install   # installs to ~/.local/bin
@@ -60,6 +60,8 @@ Or build manually with Cargo:
 ```bash
 cargo build --release -p openflows
 # Binaries at target/release/{openflows,openflows-setup,openflows-dashboard,openflows-doctor}
+# You also need the orchestration/ directory — copy it to ~/.local/bin/ or set OPENFLOWS_HOME
+cp -r orchestration ~/.local/bin/
 ```
 
 ## How It Works

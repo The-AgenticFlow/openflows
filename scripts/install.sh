@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-REPO="The-AgenticFlow/AgentFlow"
+REPO="The-AgenticFlow/openflows"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
 BINARIES=("openflows" "openflows-setup" "openflows-dashboard" "openflows-doctor")
 CHANNEL="stable"

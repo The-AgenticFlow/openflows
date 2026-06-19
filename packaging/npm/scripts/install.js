@@ -9,7 +9,7 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
-const REPO = 'The-AgenticFlow/AgentFlow';
+const REPO = 'The-AgenticFlow/openflows';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 const PKG_DIR = path.join(__dirname, '..');
 

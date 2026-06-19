@@ -19,8 +19,8 @@ This guide walks you through running a complete autonomous development cycle, fr
 ### 1. Clone and Configure
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 
 # Copy environment template
 cp .env.example .env
@@ -303,7 +303,7 @@ GITHUB_REPOSITORY=your-username/my-calculator
 ### 4. Run Orchestration
 
 ```bash
-cd AgentFlow
+cd openflows
 cargo run --bin openflows
 ```
 

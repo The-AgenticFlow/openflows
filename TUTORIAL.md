@@ -59,8 +59,8 @@ For the GitHub token, ensure these scopes:
 ### 1. Clone OpenFlows
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 ```
 
 ### 2. Create `.env` File
@@ -804,7 +804,7 @@ OpenFlows/                                    # Orchestrator project
 - [DEMO.md](DEMO.md) - Quick demo guide
 - [CONTRIBUTING.md](CONTRIBUTING.md) - Development guidelines  
 - [docs/forge-sentinel-arch.md](docs/forge-sentinel-arch.md) - Architecture deep dive
-- [GitHub Discussions](https://github.com/The-AgenticFlow/AgentFlow/discussions) - Ask questions
+- [GitHub Discussions](https://github.com/The-AgenticFlow/openflows/discussions) - Ask questions
 
 ---
 
