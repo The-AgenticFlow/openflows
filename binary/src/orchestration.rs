@@ -71,6 +71,11 @@ impl OrchestrationResolver {
 
     pub fn ensure_orchestration_dir(&self) -> Result<std::path::PathBuf> {
         let orch_dir = self.orchestrator_dir.join("orchestration");
+
+        // Read the previously recorded version BEFORE writing anything,
+        // so we can detect stale on-disk files.
+        let disk_version = self.read_disk_version(&orch_dir);
+
         let mut written = 0usize;
 
         for file in bundled_files() {
@@ -99,16 +104,15 @@ impl OrchestrationResolver {
             );
         }
 
-        let disk_version = self.read_disk_version(&orch_dir);
         if let Some(ref dv) = disk_version {
             if dv != ORCHESTRATION_VERSION {
                 warn!(
                     disk_version = %dv,
                     bundled_version = ORCHESTRATION_VERSION,
                     dir = %orch_dir.display(),
-                    "Orchestration files on disk are from an older version. \
-                     Run 'openflows --reset-orchestration' to update them, \
-                     or edit them manually at your own risk."
+                    "Orchestration files on disk are from an older version ({}). \
+                     Run 'openflows --reset-orchestration' to update them.",
+                    dv
                 );
             }
         }
@@ -119,7 +123,6 @@ impl OrchestrationResolver {
     pub fn reset_orchestration_dir(&self) -> Result<std::path::PathBuf> {
         let orch_dir = self.orchestrator_dir.join("orchestration");
         let mut written = 0usize;
-        let skipped_custom = 0usize;
 
         for file in bundled_files() {
             let target = orch_dir.join(file.relative_path);
@@ -137,7 +140,6 @@ impl OrchestrationResolver {
         info!(
             dir = %orch_dir.display(),
             written,
-            skipped_custom,
             version = ORCHESTRATION_VERSION,
             "Reset all orchestration files to bundled defaults"
         );

@@ -109,3 +109,4 @@ worktrees/
 
 # Kilo runtime data (plans, sessions, node_modules)
 .kilo/
+orchestration/

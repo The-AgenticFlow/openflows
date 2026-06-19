@@ -68,7 +68,15 @@ async fn main() -> Result<()> {
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
-                std::process::exit(1);
+                eprintln!("openflows (agentflow) — Autonomous AI Development Team");
+                eprintln!();
+                eprintln!("USAGE:");
+                eprintln!("  openflows                          Start the orchestration loop");
+                eprintln!(
+                    "  openflows --reset-orchestration    Reset orchestration files to defaults"
+                );
+                eprintln!("  openflows --help                   Show this help message");
+                std::process::exit(0);
             }
         }
     }
