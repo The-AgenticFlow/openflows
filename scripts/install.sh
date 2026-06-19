@@ -206,6 +206,7 @@ build_from_source() {
     info "Building OpenFlows from source..."
     local repo_dir
     repo_dir=$(mktemp -d)
+    trap "rm -rf '$repo_dir'" RETURN
 
     git clone --depth 1 "https://github.com/${REPO}.git" "$repo_dir"
     cd "$repo_dir"
@@ -224,8 +225,6 @@ build_from_source() {
         cp -r orchestration "${INSTALL_DIR}/"
         success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
     fi
-
-    rm -rf "$repo_dir"
 }
 
 resolve_stable_tag() {

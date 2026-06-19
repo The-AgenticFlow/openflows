@@ -89,6 +89,18 @@ impl OrchestrationResolver {
             }
             std::fs::write(&target, file.content)
                 .with_context(|| format!("Failed to write bundled file {}", target.display()))?;
+
+            // Shell scripts need executable permissions so the
+            // orchestration system can invoke them as hooks.
+            if file.relative_path.ends_with(".sh") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("Failed to set permissions on {}", target.display()))?;
+                }
+            }
+
             written += 1;
             info!(path = %target.display(), "Wrote bundled orchestration file");
         }
@@ -132,6 +144,16 @@ impl OrchestrationResolver {
             }
             std::fs::write(&target, file.content)
                 .with_context(|| format!("Failed to write bundled file {}", target.display()))?;
+
+            if file.relative_path.ends_with(".sh") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                        .with_context(|| format!("Failed to set permissions on {}", target.display()))?;
+                }
+            }
+
             written += 1;
         }
 
