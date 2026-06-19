@@ -12,13 +12,16 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 fn load_env() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var("OPENFLOWS_HOME")
-        .or_else(|_| std::env::var("HOME"))
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+    let openflows_home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        })
+        .or_else(|_| {
+            std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        })
         .unwrap_or_else(|_| ".openflows".to_string());
     let env_paths = vec![
-        std::path::PathBuf::from(format!("{}/.env", home)),
+        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
         std::env::current_dir().unwrap_or_default().join(".env"),
     ];
     for path in &env_paths {
