@@ -60,7 +60,7 @@ For the GitHub token, ensure these scopes:
 
 ```bash
 git clone https://github.com/The-AgenticFlow/openflows.git
-cd AgentFlow
+cd openflows
 ```
 
 ### 2. Create `.env` File

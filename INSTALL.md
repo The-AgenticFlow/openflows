@@ -98,7 +98,7 @@ Use this path if you want to contribute code, debug issues, or run the latest un
 ```bash
 # Clone the repository
 git clone https://github.com/The-AgenticFlow/openflows.git
-cd AgentFlow
+cd openflows
 
 # Verify Rust is installed (need 1.70+)
 rustc --version

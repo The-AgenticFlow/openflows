@@ -46,7 +46,7 @@ openflows
 
 ```bash
 git clone https://github.com/The-AgenticFlow/openflows.git
-cd AgentFlow
+cd openflows
 
 # Build and install release binaries
 make install   # installs to ~/.local/bin

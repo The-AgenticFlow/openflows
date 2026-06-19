@@ -124,7 +124,7 @@ All crates are published to crates.io. The `openflows` package includes all bina
 
 ```bash
 git clone https://github.com/The-AgenticFlow/openflows.git
-cd AgentFlow
+cd openflows
 make release    # Builds all binaries in release mode
 make install    # Copies to ~/.local/bin
 ```

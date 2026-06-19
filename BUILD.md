@@ -68,7 +68,7 @@ See [docs/setup-claude-cli.md](docs/setup-claude-cli.md) and [docs/cli-backend-c
 
 ```bash
 git clone https://github.com/The-AgenticFlow/openflows.git
-cd AgentFlow
+cd openflows
 ```
 
 ## Build Commands
