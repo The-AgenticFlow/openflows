@@ -206,7 +206,6 @@ build_from_source() {
     info "Building OpenFlows from source..."
     local repo_dir
     repo_dir=$(mktemp -d)
-    trap "rm -rf '$repo_dir'" EXIT
 
     git clone --depth 1 "https://github.com/${REPO}.git" "$repo_dir"
     cd "$repo_dir"
@@ -220,6 +219,13 @@ build_from_source() {
             success "Built and installed ${bin}"
         fi
     done
+
+    if [ -d "orchestration" ]; then
+        cp -r orchestration "${INSTALL_DIR}/"
+        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+    fi
+
+    rm -rf "$repo_dir"
 }
 
 resolve_stable_tag() {
@@ -353,10 +359,11 @@ main() {
         echo ""
     fi
     echo "  Available commands:"
-    echo "    openflows         - Start orchestration"
-    echo "    openflows-setup   - Guided setup wizard"
-    echo "    openflows-dashboard - Live monitoring TUI"
-    echo "    openflows-doctor  - Diagnostic checks"
+    echo "    openflows                  - Start orchestration"
+    echo "    openflows --reset-orchestration - Reset config files to defaults"
+    echo "    openflows-setup           - Guided setup wizard"
+    echo "    openflows-dashboard       - Live monitoring TUI"
+    echo "    openflows-doctor          - Diagnostic checks"
     echo ""
     echo "  Next steps:"
     echo "    1. Run 'openflows-setup' to configure API keys"

@@ -499,7 +499,17 @@ impl NexusNode {
     }
 
     async fn load_persona(&self) -> Result<AgentPersona> {
-        let content = tokio::fs::read_to_string(&self.persona_path).await?;
+        let content = tokio::fs::read_to_string(&self.persona_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to load nexus persona from {:?}: {}. \
+                     Ensure the orchestration/agent/agents/ directory with .agent.md files \
+                     is installed alongside the binary or in OPENFLOWS_HOME.",
+                    self.persona_path,
+                    e
+                )
+            })?;
         Ok(AgentPersona {
             id: "nexus".to_string(),
             role: "orchestrator".to_string(),
