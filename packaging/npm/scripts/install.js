@@ -142,7 +142,7 @@ async function main() {
     }
 
     // Rename binaries to match expected names
-    const binaries = ['agentflow', 'agentflow-setup', 'agentflow-dashboard', 'agentflow-doctor', 'anthropic-proxy'];
+    const binaries = ['openflows', 'openflows-setup', 'openflows-dashboard', 'openflows-doctor', 'anthropic-proxy'];
     for (const bin of binaries) {
         const src = path.join(BIN_DIR, bin);
         const dst = path.join(BIN_DIR, `${bin}-bin`);

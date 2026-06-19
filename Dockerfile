@@ -39,13 +39,13 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN groupadd -r openflows && useradd -r -g openflows -m -d /home/openflows openflows
 
 # Copy binaries from builder
-COPY --from=builder /app/target/release/agentflow /usr/local/bin/
-COPY --from=builder /app/target/release/agentflow-setup /usr/local/bin/
-COPY --from=builder /app/target/release/agentflow-dashboard /usr/local/bin/
-COPY --from=builder /app/target/release/agentflow-doctor /usr/local/bin/
+COPY --from=builder /app/target/release/openflows /usr/local/bin/
+COPY --from=builder /app/target/release/openflows-setup /usr/local/bin/
+COPY --from=builder /app/target/release/openflows-dashboard /usr/local/bin/
+COPY --from=builder /app/target/release/openflows-doctor /usr/local/bin/
 
 # Set permissions
-RUN chmod +x /usr/local/bin/agentflow*
+RUN chmod +x /usr/local/bin/openflows*
 
 # Create workspace directory
 RUN mkdir -p /workspace && chown -R openflows:openflows /workspace
@@ -56,7 +56,7 @@ WORKDIR /workspace
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep -x agentflow > /dev/null || exit 1
+    CMD pgrep -x openflows > /dev/null || exit 1
 
-ENTRYPOINT ["agentflow"]
+ENTRYPOINT ["openflows"]
 CMD ["--help"]

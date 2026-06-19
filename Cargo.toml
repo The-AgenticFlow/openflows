@@ -45,6 +45,9 @@ dotenvy    = "0.15"
 # yaml
 serde_yaml = "0.9"
 
+# toml
+toml = "0.8"
+
 # regex
 regex = "1"
 

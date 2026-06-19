@@ -14,6 +14,11 @@ use tracing::{debug, info};
 use crate::process::{get_backend_config, BackendConfig};
 use crate::types::CliBackend;
 
+struct ExtrasContext<'a> {
+    redis_url: Option<&'a str>,
+    model_backend: Option<&'a str>,
+}
+
 /// Provisions configuration files for pairs.
 pub struct Provisioner {
     /// Project root directory
@@ -42,7 +47,33 @@ impl Provisioner {
         }
     }
 
+    /// Load allowed domains for an agent from the registry.
+    /// Falls back to registry-level defaults, then to the minimum (GitHub only).
+    fn resolve_allowed_domains(&self, pair_id: &str) -> Vec<String> {
+        let registry_path = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("agent")
+            .join("registry.json");
+        match config::Registry::load(&registry_path) {
+            Ok(registry) => {
+                let base_id = registry.normalize_agent_id(pair_id);
+                match registry.get(base_id) {
+                    Some(entry) => entry
+                        .resolve_allowed_domains(&registry.allowed_domains)
+                        .to_vec(),
+                    None => registry.allowed_domains.clone(),
+                }
+            }
+            Err(_) => {
+                // Fallback: GitHub only
+                vec!["api.github.com".to_string(), "*.github.com".to_string()]
+            }
+        }
+    }
+
     /// Provision all configuration for a pair using BackendConfig.
+    #[allow(clippy::too_many_arguments)]
     pub async fn provision_pair(
         &self,
         pair_id: &str,
@@ -51,6 +82,7 @@ impl Provisioner {
         github_token: &str,
         redis_url: Option<&str>,
         cli_backend: CliBackend,
+        model_backend: Option<&str>,
     ) -> Result<()> {
         info!(pair = pair_id, backend = ?cli_backend, "Provisioning pair configuration");
 
@@ -63,14 +95,23 @@ impl Provisioner {
         self.create_sentinel_settings(shared, &backend_config)?;
 
         // 3. Create FORGE mcp.json (if backend uses MCP config)
-        if !backend_config.mcp_config_rel.as_os_str().is_empty() {
+        // When the endpoint does not support the Responses API (/v1/responses returns 404),
+        // we are in Chat Completions mode and MCP servers would use tool types that are
+        // incompatible with the endpoint. Skip MCP config in that case.
+        // For endpoints that DO support /v1/responses, MCP tools use type="mcp" which
+        // also isn't supported by non-OpenAI providers, so we still skip them for
+        // non-OpenAI proxies.
+        // For Claude backend, MCP servers work fine regardless.
+        let is_codex_non_responses =
+            cli_backend == CliBackend::Codex && crate::process::codex_use_sse();
+        if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(worktree);
             mcp_gen.generate_forge_config(worktree, shared, &mcp_path)?;
         }
 
         // 4. Create SENTINEL mcp.json
-        if !backend_config.mcp_config_rel.as_os_str().is_empty() {
+        if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(shared);
             mcp_gen.generate_sentinel_config(worktree, shared, &mcp_path)?;
@@ -88,11 +129,15 @@ impl Provisioner {
         // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
             self.provision_backend_extras(
+                pair_id,
                 &backend_config,
                 worktree,
                 shared,
                 github_token,
-                redis_url,
+                &ExtrasContext {
+                    redis_url,
+                    model_backend,
+                },
             )?;
         }
 
@@ -106,23 +151,27 @@ impl Provisioner {
     /// The `BackendConfig` drives which config directories and file formats are used.
     fn provision_backend_extras(
         &self,
+        pair_id: &str,
         backend_config: &BackendConfig,
         worktree: &Path,
         shared: &Path,
         github_token: &str,
-        redis_url: Option<&str>,
+        ctx: &ExtrasContext,
     ) -> Result<()> {
         let is_codex = backend_config.mcp_config_rel.starts_with(".codex");
+        let redis_url = ctx.redis_url;
+        let model_backend = ctx.model_backend;
 
         if is_codex {
             // Codex: generate .codex/config.toml for FORGE worktree
+            // FORGE uses danger-full-access sandbox to allow git push and GitHub API
             self.generate_codex_config_toml(
                 worktree,
                 worktree,
                 shared,
                 github_token,
                 redis_url,
-                "workspace-write",
+                "danger-full-access",
             )?;
 
             // Codex: generate .codex/config.toml for SENTINEL shared dir
@@ -136,10 +185,10 @@ impl Provisioner {
             )?;
 
             // Codex: generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
-            self.generate_codex_agent_tomls(worktree)?;
+            self.generate_codex_agent_tomls(worktree, model_backend)?;
 
             // Codex: generate .codex/agents/sentinel.toml in shared dir
-            self.generate_codex_agent_toml_for_role(shared, "sentinel")?;
+            self.generate_codex_agent_toml_for_role(shared, "sentinel", model_backend)?;
 
             // Codex: install hook scripts and generate .codex/hooks.json
             self.generate_codex_hooks_json(worktree, shared)?;
@@ -149,8 +198,16 @@ impl Provisioner {
             self.deploy_codex_plugin(shared)?;
 
             // Codex: generate permission profiles
-            self.generate_codex_permissions(worktree, shared, "workspace-write")?;
-            self.generate_codex_permissions(shared, shared, "read-only")?;
+            // FORGE uses danger-full-access (needs git push + GitHub API access)
+            // SENTINEL uses read-only with GitHub API for review comments
+            let forge_domains = self.resolve_allowed_domains(pair_id);
+            self.generate_codex_permissions(
+                worktree,
+                shared,
+                "danger-full-access",
+                &forge_domains,
+            )?;
+            self.generate_codex_permissions(shared, shared, "read-only", &[])?;
 
             // Codex: symlink skills to .agents/skills/ in worktree (all skills for FORGE)
             self.symlink_skills_to_agents(worktree)?;
@@ -413,7 +470,8 @@ impl Provisioner {
 
         let config_path = codex_dir.join("config.toml");
 
-        let network_access = sandbox_mode == "workspace-write";
+        let network_access =
+            sandbox_mode == "workspace-write" || sandbox_mode == "danger-full-access";
         let approval_policy = if sandbox_mode == "read-only" {
             // SENTINEL runs in --ephemeral mode with no interactive terminal,
             // so it must run autonomously. "never" allows the agent to proceed
@@ -425,14 +483,26 @@ impl Provisioner {
         };
 
         let _redis_url_val = redis_url.unwrap_or("");
-        let mcp_shell_args = if sandbox_mode == "workspace-write" {
+        let mcp_shell_args = if sandbox_mode == "workspace-write"
+            || sandbox_mode == "danger-full-access"
+        {
             r#""orchestration/agent/tooling/run-tests.sh,cargo clippy,cargo test,npx eslint,npx jest,ruff check""#
         } else {
             r#""orchestration/agent/tooling/run-tests.sh,npx eslint,ruff check,cargo clippy""#
         };
 
-        let config = format!(
-            r#"# Auto-generated by AgentFlow Provisioner
+        // When the endpoint doesn't support the Responses API (probed at startup),
+        // MCP servers must be excluded from config.toml because:
+        // 1. MCP tools are registered with type="mcp" in the Responses API
+        // 2. Non-OpenAI providers reject non-function tool types with 400 errors
+        // 3. The filesystem MCP server also has an npm dependency issue (missing zod)
+        // MCP servers are only compatible with providers that support the full
+        // Responses API tool type schema (i.e., OpenAI's own endpoints).
+        let include_mcp_servers = !crate::process::codex_use_sse();
+
+        let config = if include_mcp_servers {
+            format!(
+                r#"# Auto-generated by AgentFlow Provisioner
 # DO NOT EDIT — changes will be overwritten on next provision
 
 approval_policy = "{approval_policy}"
@@ -460,9 +530,33 @@ args = ["--allowlist", {mcp_shell_args}]
 max_threads = 6
 max_depth = 1
 "#,
-            worktree = worktree.display(),
-            shared = shared.display(),
-        );
+                worktree = worktree.display(),
+                shared = shared.display(),
+            )
+        } else {
+            format!(
+                r#"# Auto-generated by AgentFlow Provisioner
+# DO NOT EDIT — changes will be overwritten on next provision
+#
+# MCP servers are DISABLED because the endpoint does not natively support
+# the Responses API (/v1/responses returned 404). A local proxy translates
+# between Responses API and Chat Completions format. Non-OpenAI providers
+# reject MCP tool types (type="mcp") in the Responses API, causing
+# "unknown tool type" 400 errors. GitHub operations are available via
+# the FORGE/SENTINEL agent's built-in tools and gh CLI instead.
+
+approval_policy = "{approval_policy}"
+sandbox_mode = "{sandbox_mode}"
+
+[sandbox_{sandbox_mode}]
+network_access = {network_access}
+
+[agents]
+max_threads = 6
+max_depth = 1
+"#,
+            )
+        };
 
         fs::write(&config_path, config).context("Failed to write .codex/config.toml")?;
         info!(path = %config_path.display(), "Codex config.toml generated");
@@ -470,18 +564,27 @@ max_depth = 1
     }
 
     /// Generate .codex/agents/*.toml from existing agent.md files.
-    fn generate_codex_agent_tomls(&self, worktree: &Path) -> Result<()> {
+    fn generate_codex_agent_tomls(
+        &self,
+        worktree: &Path,
+        model_backend: Option<&str>,
+    ) -> Result<()> {
         let agent_ids = ["forge", "sentinel"];
 
         for agent_id in &agent_ids {
-            self.generate_codex_agent_toml_for_role(worktree, agent_id)?;
+            self.generate_codex_agent_toml_for_role(worktree, agent_id, model_backend)?;
         }
 
         Ok(())
     }
 
     /// Generate a single .codex/agents/{role}.toml in the target directory.
-    fn generate_codex_agent_toml_for_role(&self, target: &Path, agent_id: &str) -> Result<()> {
+    fn generate_codex_agent_toml_for_role(
+        &self,
+        target: &Path,
+        agent_id: &str,
+        model_backend: Option<&str>,
+    ) -> Result<()> {
         let agents_dir = target.join(".codex").join("agents");
         fs::create_dir_all(&agents_dir).context("Failed to create .codex/agents directory")?;
 
@@ -504,15 +607,27 @@ max_depth = 1
             .context(format!("Failed to read {}", agent_md_path.display()))?;
 
         let (role, sandbox_mode) = match agent_id {
-            "forge" => ("builder", "workspace-write"),
+            "forge" => ("builder", "danger-full-access"),
             "sentinel" => ("reviewer", "read-only"),
-            _ => ("unknown", "workspace-write"),
+            _ => ("unknown", "danger-full-access"),
         };
 
-        // Resolve model from env vars (same logic as BackendConfig::codex())
-        let model = std::env::var("FIREWORKS_MODEL")
-            .or_else(|_| std::env::var("OPENAI_MODEL"))
-            .unwrap_or_else(|_| "gpt-5.4".to_string());
+        // Resolve model: registry model_backend (highest priority) > FIREWORKS_MODEL > OPENAI_MODEL > default
+        // Provider prefixes (e.g. "anthropic/", "openai/") must be stripped
+        // because Codex CLI expects bare model names.
+        let model = model_backend
+            .map(|m| crate::process::strip_provider_prefix(m).to_string())
+            .or_else(|| {
+                std::env::var("FIREWORKS_MODEL")
+                    .ok()
+                    .map(|m| crate::process::strip_provider_prefix(&m).to_string())
+            })
+            .or_else(|| {
+                std::env::var("OPENAI_MODEL")
+                    .ok()
+                    .map(|m| crate::process::strip_provider_prefix(&m).to_string())
+            })
+            .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         let toml_content = format!(
             r#"# Auto-generated by AgentFlow Provisioner
@@ -1465,16 +1580,34 @@ developer_instructions = """
         target: &Path,
         shared: &Path,
         profile: &str,
+        allowed_domains: &[String],
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        fs::create_dir_all(&codex_dir)?;
+        fs::create_dir_all(&codex_dir).context("Failed to create .codex directory")?;
 
         let permissions_path = codex_dir.join("permissions.toml");
+
+        // Build domain allowlist sections for network-enabled profiles.
+        // Domains come from the agent's registry entry (per-agent override)
+        // or the registry-level defaults.
+        let domain_lines: Vec<String> = if allowed_domains.is_empty() {
+            // Fallback: GitHub only
+            vec![
+                r#""api.github.com" = "allow""#.to_string(),
+                r#""*.github.com" = "allow""#.to_string(),
+            ]
+        } else {
+            allowed_domains
+                .iter()
+                .map(|d| format!(r#""{}" = "allow""#, d))
+                .collect()
+        };
+        let domains_block = domain_lines.join("\n");
 
         let content = match profile {
             "workspace-write" => format!(
                 r#"# Auto-generated by AgentFlow Provisioner
-# FORGE permissions: workspace-write with network access
+# FORGE/SENTINEL permissions: workspace-write with network access
 
 default_permissions = "workspace-write"
 
@@ -1490,13 +1623,39 @@ default_permissions = "workspace-write"
 enabled = true
 
 [permissions.workspace-write.network.domains]
-"api.github.com" = "allow"
-"*.github.com" = "allow"
+{domains}
 "#,
                 shared = shared.display(),
+                domains = domains_block,
+            ),
+            "danger-full-access" => format!(
+                r#"# Auto-generated by AgentFlow Provisioner
+# FORGE permissions: full filesystem + restricted network
+# FORGE needs git push and GitHub API access, plus any domains required
+# by the project (package registries, API endpoints, etc.).
+# Network is restricted to the allowlist below — no arbitrary access.
+
+default_permissions = "danger-full-access"
+
+[permissions.danger-full-access.filesystem]
+":minimal" = "read"
+
+[permissions.danger-full-access.filesystem.":workspace_roots"]
+"." = "write"
+"{shared}" = "write"
+"**/*.env" = "deny"
+
+[permissions.danger-full-access.network]
+enabled = true
+
+[permissions.danger-full-access.network.domains]
+{domains}
+"#,
+                shared = shared.display(),
+                domains = domains_block,
             ),
             "read-only" => r#"# Auto-generated by AgentFlow Provisioner
-# SENTINEL permissions: read-only
+# SENTINEL permissions: read-only with GitHub API access
 
 default_permissions = "read-only"
 
@@ -1507,7 +1666,11 @@ default_permissions = "read-only"
 "." = "read"
 
 [permissions.read-only.network]
-enabled = false
+enabled = true
+
+[permissions.read-only.network.domains]
+"api.github.com" = "allow"
+"*.github.com" = "allow"
 "#
             .to_string(),
             _ => String::new(),

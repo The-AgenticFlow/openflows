@@ -61,7 +61,8 @@ impl GeminiClient {
 }
 
 fn normalize_model_name(model: &str) -> String {
-    model
+    let stripped = crate::strip_provider_prefix(model);
+    stripped
         .trim()
         .trim_start_matches("models/")
         .to_ascii_lowercase()

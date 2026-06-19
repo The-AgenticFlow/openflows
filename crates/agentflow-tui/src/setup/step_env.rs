@@ -40,11 +40,16 @@ impl EnvStep {
             ));
         }
 
-        if let Some(version) = env_check::check_claude() {
+        let has_claude = env_check::check_claude();
+        let has_codex = env_check::check_codex();
+
+        if let Some(version) = has_claude {
             checks.push((format!("Claude Code CLI {}", version), CheckState::Pass));
+        } else if let Some(version) = has_codex {
+            checks.push((format!("Codex CLI {}", version), CheckState::Pass));
         } else {
             checks.push((
-                "Claude Code CLI not found (required)".to_string(),
+                "Neither Claude Code CLI nor Codex CLI found (one is required)".to_string(),
                 CheckState::Fail,
             ));
         }

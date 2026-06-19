@@ -1,3 +1,8 @@
+---
+name: forge-planning
+description: Planning skill for the FORGE builder agent
+---
+
 # FORGE Planning Skill
 
 ## Writing PLAN.md

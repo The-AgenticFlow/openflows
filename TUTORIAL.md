@@ -1,6 +1,6 @@
-# AgentFlow Complete Tutorial: Build an App from Zero
+# OpenFlows Complete Tutorial: Build an App from Zero
 
-This tutorial walks you through running AgentFlow to autonomously build a web application from scratch. You'll see exactly what logs to expect, which files are created, and where everything happens.
+This tutorial walks you through running OpenFlows to autonomously build a web application from scratch. You'll see exactly what logs to expect, which files are created, and where everything happens.
 
 ## Table of Contents
 
@@ -56,7 +56,7 @@ For the GitHub token, ensure these scopes:
 
 ## Environment Configuration
 
-### 1. Clone AgentFlow
+### 1. Clone OpenFlows
 
 ```bash
 git clone https://github.com/The-AgenticFlow/AgentFlow.git
@@ -123,7 +123,7 @@ Then start the proxy before running the orchestration:
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run orchestration
-cargo run --bin real_test
+cargo run --bin openflows
 ```
 
 When your provider adds native Anthropic support, just change `PROXY_URL` to point directly to the gateway and remove `GATEWAY_*`.
@@ -139,7 +139,7 @@ Run the setup checker to ensure everything is configured correctly:
 **Expected output:**
 
 ```
-🔍 AgentFlow Setup Checker
+🔍 OpenFlows Setup Checker
 =============================
 
 1. Checking System Requirements...
@@ -164,7 +164,7 @@ Run the setup checker to ensure everything is configured correctly:
 ✓ Cargo.toml found
 ✓ Project compiles successfully
 
-4. Checking AgentFlow Configuration...
+4. Checking OpenFlows Configuration...
 --------------------------------------
 ✓ NEXUS persona found
 ✓ FORGE persona found
@@ -178,8 +178,8 @@ Run the setup checker to ensure everything is configured correctly:
 =============================
 ✓ All checks passed!
 
-You're ready to run AgentFlow:
-  cargo run --bin real_test
+You're ready to run OpenFlows:
+  cargo run --bin openflows
 ```
 
 If any checks fail, follow the error messages to fix the issues.
@@ -188,7 +188,7 @@ If any checks fail, follow the error messages to fix the issues.
 
 ## Creating a Target Project
 
-AgentFlow needs a GitHub repository with issues to work on. Let's create a simple calculator project.
+OpenFlows needs a GitHub repository with issues to work on. Let's create a simple calculator project.
 
 ### Option A: Using GitHub CLI
 
@@ -227,10 +227,10 @@ gh issue list
 5. Go to Issues tab
 6. Create 2 issues with the titles and descriptions from Option A
 
-### 3. Update AgentFlow `.env`
+### 3. Update OpenFlows `.env`
 
 ```bash
-cd /path/to/AgentFlow
+cd /path/to/OpenFlows
 nano .env
 ```
 
@@ -246,26 +246,26 @@ GITHUB_REPOSITORY=your-username/test-calculator
 ### 1. Build and Run
 
 ```bash
-cd /path/to/AgentFlow
+cd /path/to/OpenFlows
 
 # Build the project (first time only)
-cargo build --release --bin real_test
+cargo build --release --bin openflows
 
 # Run the orchestration
-cargo run --bin real_test
+cargo run --bin openflows
 ```
 
 **Expected output on startup:**
 
 ```
-2026-03-31T00:00:01.234Z  INFO real_test: Starting REAL End-to-End Orchestration (No Mocks)
-2026-03-31T00:00:02.456Z  INFO real_test: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-test-calculator
-2026-03-31T00:00:02.789Z  INFO real_test: Running orchestration loop for repository: your-username/test-calculator
+2026-03-31T00:00:01.234Z  INFO openflows: Starting REAL End-to-End Orchestration (No Mocks)
+2026-03-31T00:00:02.456Z  INFO openflows: Target repository workspace ready workspace=/home/christian/.agentflow/workspaces/your-username-test-calculator
+2026-03-31T00:00:02.789Z  INFO openflows: Running orchestration loop for repository: your-username/test-calculator
 ```
 
 ### 2. Understanding the Workspace
 
-AgentFlow creates an isolated workspace structure:
+OpenFlows creates an isolated workspace structure:
 
 ```
 ~/.agentflow/
@@ -417,7 +417,7 @@ The cycle repeats for each issue!
 ```
 2026-03-31T00:30:12.123Z  INFO agent_nexus: No more open issues
 2026-03-31T00:30:12.234Z  INFO agent_nexus: All workers idle
-2026-03-31T00:30:12.345Z  INFO real_test: Orchestration flow halted with action: no_work
+2026-03-31T00:30:12.345Z  INFO openflows: Orchestration flow halted with action: no_work
 ```
 
 ---
@@ -426,7 +426,7 @@ The cycle repeats for each issue!
 
 ### 1. Understanding the File Structure
 
-AgentFlow uses a specific directory structure for work completion:
+OpenFlows uses a specific directory structure for work completion:
 
 ```bash
 ~/.agentflow/workspaces/your-username-test-calculator/
@@ -712,7 +712,7 @@ chmod -R u+w ~/.agentflow/workspaces/
 ./scripts/start_proxy.sh
 
 # Terminal 2
-cargo run --bin real_test
+cargo run --bin openflows
 ```
 
 Ensure `.env` has `GATEWAY_URL` and `GATEWAY_API_KEY` set. See the [OpenAI-only gateways](#if-your-gateway-only-supports-openai-format) section above.
@@ -740,7 +740,7 @@ curl -H "Authorization: token $GITHUB_PERSONAL_ACCESS_TOKEN" \
 ## Directory Structure Reference
 
 ```
-AgentFlow/                                    # Orchestrator project
+OpenFlows/                                    # Orchestrator project
 ├── .env                                      # Your API keys (DO NOT COMMIT)
 ├── orchestration/agent/
 │   ├── agents/
@@ -748,10 +748,10 @@ AgentFlow/                                    # Orchestrator project
 │   │   └── forge.agent.md                   # Builder persona
 │   └── registry.json                         # Worker slot definitions
 ├── binary/src/bin/
-│   └── real_test.rs                          # Main entry point
+│   └── openflows.rs                          # Main entry point
 └── crates/                                   # Implementation crates
 
-~/.agentflow/                                 # AgentFlow runtime directory
+~/.agentflow/                                 # OpenFlows runtime directory
 └── workspaces/
     └── your-username-test-calculator/        # Target project workspace
         ├── main/                             # Main repository clone

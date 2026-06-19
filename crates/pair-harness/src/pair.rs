@@ -407,14 +407,16 @@ impl ForgeSentinelPair {
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (Some(redis_url), None) => ProcessManager::with_redis(
                     &config.github_token,
                     redis_url,
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (None, Some(proxy_url)) => ProcessManager::with_proxy(
                     &config.github_token,
                     None,
@@ -422,10 +424,12 @@ impl ForgeSentinelPair {
                     &config.worktree,
                     &config.shared,
                 )
-                .with_default_backend(cli_backend),
+                .with_default_backend(cli_backend)
+                .with_model_backend(config.model_backend.clone()),
                 (None, None) => {
                     ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
                         .with_default_backend(cli_backend)
+                        .with_model_backend(config.model_backend.clone())
                 }
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
@@ -1146,6 +1150,7 @@ impl ForgeSentinelPair {
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
                 self.config.cli_backend,
+                self.config.model_backend.as_deref(),
             )
             .await
     }
@@ -1458,18 +1463,20 @@ impl ForgeSentinelPair {
                  7. Fix ALL errors found\n\
                  8. Update WORKLOG.md with what you fixed\n\
                  9. Run ALL failing checks again to confirm everything passes\n\
-                 10. (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"fix CI failures\" && git push\n\
-                 11. Write STATUS.json with status PR_OPENED\n\n\
-                 If a PR already exists for this branch, do NOT create a new one — just push and update STATUS.json\n\n\
+                  10. (git diff --name-only HEAD; git ls-files --others --exclude-standard) | grep -vE '(^|/)(\\.(codex|claude|agents|pair-shared|env[^/]*)|worktrees|orchestration)(/|$)' | xargs -r git add && git commit -m \"fix CI failures\"\n\
+                  11. git push (or git push -u origin HEAD if first push; if rejected, use git push --force-with-lease -u origin HEAD)\n\
+                  12. Write STATUS.json with status PR_OPENED\n\n\
+                  If you cannot push (e.g., .git is read-only or network errors), write STATUS.json with status COMPLETE instead and the harness will push for you.\n\n\
+If a PR already exists for this branch, do NOT create a new one — just push and update STATUS.json\n\n\
                  VALID STATUS.json status values: PR_OPENED, COMPLETE, BLOCKED, FUEL_EXHAUSTED, PENDING_REVIEW. \
                  Do NOT use any other value — an invalid status will be treated as BLOCKED and your fix will be wasted.",
-                ticket.id,
-                WorktreeManager::branch_name(&self.config.pair_id, &ticket.id),
-                failure_summary,
-                if job_log_section.is_empty() { String::new() } else { format!("## Job Log Output (for reference)\n\n{}\n\n", job_log_section) },
-                conflict_notice,
-                self.config.shared.display(),
-            )
+                 ticket.id,
+                 WorktreeManager::branch_name(&self.config.pair_id, &ticket.id),
+                 failure_summary,
+                 if job_log_section.is_empty() { String::new() } else { format!("## Job Log Output (for reference)\n\n{}\n\n", job_log_section) },
+                 conflict_notice,
+                 self.config.shared.display(),
+             )
         } else {
             format!(
                 "Implement ticket {}.\n\nBranch: {}\n\nWhen done, open a PR and write STATUS.json.\n\n\
@@ -2035,10 +2042,28 @@ impl ForgeSentinelPair {
                     .to_string(),
                 blockers: vec![],
             },
-            "BLOCKED" => PairOutcome::Blocked {
-                reason: "See blockers".to_string(),
-                blockers: status.blockers,
-            },
+            "BLOCKED" => {
+                // Enrich the reason with blocker descriptions so downstream
+                // consumers (ForgePairNode) can detect push-related failures
+                // and attempt host-side push.  Without this, the reason is
+                // always the generic "See blockers" which never matches
+                // the "needs push/PR creation" heuristic.
+                let blocker_summary: String = status
+                    .blockers
+                    .iter()
+                    .map(|b| format!("{}: {}", b.blocker_type, b.description))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let reason = if blocker_summary.is_empty() {
+                    "See blockers".to_string()
+                } else {
+                    blocker_summary
+                };
+                PairOutcome::Blocked {
+                    reason,
+                    blockers: status.blockers,
+                }
+            }
             "FUEL_EXHAUSTED" => PairOutcome::FuelExhausted {
                 reason: "Fuel exhausted".to_string(),
                 reset_count: status.context_resets,

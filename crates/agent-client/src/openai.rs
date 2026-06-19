@@ -65,8 +65,8 @@ impl OpenAiClient {
     /// Used when the registry specifies a `model_backend` that maps to OpenAI-compatible.
     pub fn from_env_with_model(model_override: &str) -> Result<Self> {
         let mut client = Self::from_env()?;
-        client.model = model_override.to_string();
-        tracing::info!(model = %model_override, "OpenAiClient model overridden from registry");
+        client.model = crate::strip_provider_prefix(model_override).to_string();
+        tracing::info!(model = %client.model, "OpenAiClient model overridden from registry");
         Ok(client)
     }
 
@@ -95,7 +95,7 @@ impl OpenAiClient {
             http: Client::new(),
             api_url,
             api_key,
-            model: model_override.to_string(),
+            model: crate::strip_provider_prefix(model_override).to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
         })
     }
@@ -238,7 +238,7 @@ impl LlmClient for OpenAiClient {
         let raw: Value = serde_json::from_str(&raw_text).context(format!(
             "Failed to parse OpenAI response (status={}, body={})",
             status,
-            &raw_text[..raw_text.len().min(500)]
+            crate::truncate::truncate_str(&raw_text, 500)
         ))?;
 
         if !status.is_success() {

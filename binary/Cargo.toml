@@ -5,23 +5,23 @@ edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "agentflow"
+name = "openflows"
 path = "src/bin/agentflow.rs"
 
 [[bin]]
-name = "demo"
+name = "openflows-demo"
 path = "src/bin/demo.rs"
 
 [[bin]]
-name = "agentflow-setup"
+name = "openflows-setup"
 path = "src/bin/setup.rs"
 
 [[bin]]
-name = "agentflow-dashboard"
+name = "openflows-dashboard"
 path = "src/bin/dashboard.rs"
 
 [[bin]]
-name = "agentflow-doctor"
+name = "openflows-doctor"
 path = "src/bin/doctor.rs"
 
 [dependencies]
@@ -44,3 +44,4 @@ pair-harness    = { path = "../crates/pair-harness" }
 
 [dev-dependencies]
 mockito = "1"
+tempfile = "3"

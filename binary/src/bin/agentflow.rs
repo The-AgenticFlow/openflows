@@ -29,8 +29,21 @@ async fn main() -> Result<()> {
         .init();
 
     // Startup diagnostics
-    let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| "claude".to_string());
+    // DEFAULT_CLI env var is checked later via Registry::effective_default_cli()
+    // Pre-load registry here just for startup log (full load happens after)
+    let registry_path = std::env::current_dir()
+        .ok()
+        .map(|p| p.join("orchestration").join("agent").join("registry.json"));
+    let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| {
+        registry_path
+            .as_ref()
+            .filter(|p| p.exists())
+            .and_then(|p| config::Registry::load(p).ok())
+            .map(|r| r.default_cli.clone())
+            .unwrap_or_else(|| "claude".to_string())
+    });
     let has_fireworks = std::env::var("FIREWORKS_API_KEY").is_ok();
+    let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
     let has_proxy = std::env::var("PROXY_URL").is_ok();
     let has_anthropic = std::env::var("ANTHROPIC_API_KEY").is_ok();
 
@@ -38,6 +51,17 @@ async fn main() -> Result<()> {
     info!("  CLI Backend: {}", default_cli);
     if default_cli == "codex" && has_fireworks {
         info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
+    } else if default_cli == "codex" && has_openai {
+        let base_url = std::env::var("OPENAI_BASE_URL").ok();
+        // The endpoint mode (ResponsesApi vs ChatCompletions) is determined at
+        // runtime by probing /v1/responses — see process.rs::probe_endpoint_supports_responses().
+        // If the endpoint doesn't support /v1/responses, a local proxy is started
+        // to translate between the two formats.
+        if let Some(url) = base_url {
+            info!("  LLM Mode: Codex + OpenAI-compatible provider at {} (endpoint mode probed at startup)", url);
+        } else {
+            info!("  LLM Mode: Codex + OpenAI (direct — no proxy needed)");
+        }
     } else if default_cli == "claude" && has_anthropic && !has_proxy {
         info!("  LLM Mode: Claude + Direct Anthropic Key");
     } else if has_proxy {
@@ -140,11 +164,16 @@ async fn main() -> Result<()> {
         registry_path.clone(),
     ));
     let vessel = Arc::new(VesselNode::from_env());
-    let lore = Arc::new(LoreNode::new_with_registry(
-        &workspace_dir,
-        orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
-        registry_path,
-    )?);
+    let lore = if registry.get("lore").is_some() {
+        Some(Arc::new(LoreNode::new_with_registry(
+            &workspace_dir,
+            orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
+            registry_path.clone(),
+        )?))
+    } else {
+        info!("lore agent is inactive — skipping lore node initialization");
+        None
+    };
 
     // 4. Setup Flow with Routing
     // The ForgePairNode handles the full FORGE-SENTINEL lifecycle:
@@ -155,12 +184,12 @@ async fn main() -> Result<()> {
     //
     // VesselNode handles the merge gate:
     // - Polls CI status until terminal (success/failure/timeout)
-    // - Detects merge conflicts early via GitHub's `mergeable` field
+    // - Detects merge conflicts early via GitHub's mergeable field
     // - Attempts conflict resolution (GitHub update-branch or local rebase)
     // - Routes unresolvable conflicts back to forge_pair for rework
     // - Merges PR if CI green
     // - Emits ticket_merged event for dependency resolution
-    let flow = Flow::new("nexus")
+    let mut flow = Flow::new("nexus")
         .add_node(
             "nexus",
             nexus,
@@ -182,24 +211,30 @@ async fn main() -> Result<()> {
                 (Action::NO_TICKETS, "nexus"),
             ],
         )
-        .add_node(
-            "vessel",
-            vessel,
-            vec![
-                (ACTION_DEPLOYED, "lore"),
+        .add_node("vessel", vessel, {
+            let mut routes = vec![
                 (ACTION_DEPLOY_FAILED, "nexus"),
                 (ACTION_CI_FIX_NEEDED, "forge_pair"),
                 ("merge_blocked", "nexus"),
                 (ACTION_CONFLICTS_DETECTED, "forge_pair"),
                 (Action::AWAITING_HUMAN, "nexus"),
                 ("no_work", "nexus"),
-            ],
-        )
-        .add_node(
+            ];
+            if lore.is_some() {
+                routes.insert(0, (ACTION_DEPLOYED, "lore"));
+            } else {
+                routes.insert(0, (ACTION_DEPLOYED, "nexus"));
+            }
+            routes
+        });
+
+    if let Some(ref lore_node) = lore {
+        flow = flow.add_node(
             "lore",
-            lore,
+            lore_node.clone(),
             vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
         );
+    }
 
     // 5. Initialize Shared Store
     let store = SharedStore::new_in_memory();
