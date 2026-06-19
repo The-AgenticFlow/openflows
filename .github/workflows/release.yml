@@ -47,7 +47,7 @@ jobs:
             VERSION="${GITHUB_REF_NAME}"
             if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
           elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
-            LAST_STABLE_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -1 || echo "")
+            LAST_STABLE_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | grep -v -- '-dev\.' | head -1 || echo "")
             if [ -z "$LAST_STABLE_TAG" ]; then LAST_STABLE_TAG="v0.0.0"; fi
             LAST_VERSION="${LAST_STABLE_TAG#v}"
             COMMIT_COUNT=$(git rev-list --count "${LAST_STABLE_TAG}..HEAD" 2>/dev/null || echo "0")
