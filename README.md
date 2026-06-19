@@ -12,10 +12,10 @@ Give it a GitHub repo and some issues, and OpenFlows handles everything — writ
 
 ```bash
 # Stable release
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 
 # Or edge (pre-release from main)
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash -s -- --edge
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
 ```
 
 Then set up and run:
@@ -45,7 +45,7 @@ openflows
 ### Install from Source
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
+git clone https://github.com/The-AgenticFlow/openflows.git
 cd AgentFlow
 
 # Build and install release binaries

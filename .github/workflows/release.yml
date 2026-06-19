@@ -253,7 +253,7 @@ jobs:
           echo "## Installation" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           echo '```bash' >> CHANGELOG.md
-          echo 'curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash' >> CHANGELOG.md
+          echo 'curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash' >> CHANGELOG.md
           echo '```' >> CHANGELOG.md
 
           cat CHANGELOG.md

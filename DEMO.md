@@ -19,7 +19,7 @@ This guide walks you through running a complete autonomous development cycle, fr
 ### 1. Clone and Configure
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
+git clone https://github.com/The-AgenticFlow/openflows.git
 cd AgentFlow
 
 # Copy environment template

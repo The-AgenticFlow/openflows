@@ -39,7 +39,7 @@ Choose one of these if you only want to run OpenFlows and do not plan to modify 
 ### Option 1: One-Line Install (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 ```
 
 This installs all binaries to `~/.local/bin` and offers to run the setup wizard.
@@ -97,7 +97,7 @@ Use this path if you want to contribute code, debug issues, or run the latest un
 
 ```bash
 # Clone the repository
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
+git clone https://github.com/The-AgenticFlow/openflows.git
 cd AgentFlow
 
 # Verify Rust is installed (need 1.70+)

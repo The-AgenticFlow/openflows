@@ -43,13 +43,13 @@ Edge builds let you test the latest changes without waiting for a stable release
 
 ```bash
 # Stable release (default)
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 
 # Edge (pre-release from main)
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash -s -- --edge
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
 
 # Custom install directory
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash -s -- --dir /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --dir /usr/local/bin
 ```
 
 **What it does:**
@@ -123,7 +123,7 @@ All crates are published to crates.io. The `openflows` package includes all bina
 ### 6. Build from Source
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
+git clone https://github.com/The-AgenticFlow/openflows.git
 cd AgentFlow
 make release    # Builds all binaries in release mode
 make install    # Copies to ~/.local/bin
