@@ -56,14 +56,17 @@ impl OrchestrationResolver {
 
     fn write_version_file(&self, orch_dir: &std::path::Path) -> Result<()> {
         let version_path = orch_dir.join(".version");
-        std::fs::write(&version_path, ORCHESTRATION_VERSION)
-            .with_context(|| format!("Failed to write version file to {}", version_path.display()))?;
+        std::fs::write(&version_path, ORCHESTRATION_VERSION).with_context(|| {
+            format!("Failed to write version file to {}", version_path.display())
+        })?;
         Ok(())
     }
 
     fn read_disk_version(&self, orch_dir: &std::path::Path) -> Option<String> {
         let version_path = orch_dir.join(".version");
-        std::fs::read_to_string(version_path).ok().map(|s| s.trim().to_string())
+        std::fs::read_to_string(version_path)
+            .ok()
+            .map(|s| s.trim().to_string())
     }
 
     pub fn ensure_orchestration_dir(&self) -> Result<std::path::PathBuf> {
@@ -147,7 +150,8 @@ impl OrchestrationResolver {
     }
 
     pub fn registry_path(&self) -> std::path::PathBuf {
-        self.orchestrator_dir.join("orchestration/agent/registry.json")
+        self.orchestrator_dir
+            .join("orchestration/agent/registry.json")
     }
 
     pub fn persona_path(&self, filename: &str) -> std::path::PathBuf {
@@ -174,7 +178,8 @@ impl OrchestrationResolver {
                  Searched: {}\n\
                  Run 'openflows --reset-orchestration' to regenerate all files from defaults.",
                 registry.display(),
-                self.candidates.iter()
+                self.candidates
+                    .iter()
                     .map(|c| c.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")

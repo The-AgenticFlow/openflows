@@ -48,7 +48,10 @@ async fn main() -> Result<()> {
                 let _ = load_env()?;
                 let resolver = openflows::orchestration::OrchestrationResolver::new()?;
                 let orch_dir = resolver.reset_orchestration_dir()?;
-                println!("Orchestration files reset to bundled defaults at: {}", orch_dir.display());
+                println!(
+                    "Orchestration files reset to bundled defaults at: {}",
+                    orch_dir.display()
+                );
                 println!("Version: {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
@@ -57,7 +60,9 @@ async fn main() -> Result<()> {
                 eprintln!();
                 eprintln!("USAGE:");
                 eprintln!("  openflows                          Start the orchestration loop");
-                eprintln!("  openflows --reset-orchestration    Reset orchestration files to defaults");
+                eprintln!(
+                    "  openflows --reset-orchestration    Reset orchestration files to defaults"
+                );
                 eprintln!("  openflows --help                   Show this help message");
                 std::process::exit(0);
             }
