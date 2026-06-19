@@ -97,7 +97,9 @@ impl OrchestrationResolver {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-                        .with_context(|| format!("Failed to set permissions on {}", target.display()))?;
+                        .with_context(|| {
+                            format!("Failed to set permissions on {}", target.display())
+                        })?;
                 }
             }
 
@@ -150,7 +152,9 @@ impl OrchestrationResolver {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-                        .with_context(|| format!("Failed to set permissions on {}", target.display()))?;
+                        .with_context(|| {
+                            format!("Failed to set permissions on {}", target.display())
+                        })?;
                 }
             }
 
