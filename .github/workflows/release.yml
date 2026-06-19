@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+    paths-ignore:
+      - 'packaging/homebrew/**'
   workflow_dispatch:
     inputs:
       version:
@@ -11,14 +15,76 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build binaries for all platforms ─────────────────────────────
+  resolve-version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      prerelease_flag: ${{ steps.version.outputs.prerelease_flag }}
+      npm_version: ${{ steps.version.outputs.npm_version }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
+          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            LAST_STABLE_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | grep -v -- '-dev\.' | head -1 || echo "")
+            if [ -z "$LAST_STABLE_TAG" ]; then LAST_STABLE_TAG="v0.0.0"; fi
+            LAST_VERSION="${LAST_STABLE_TAG#v}"
+            COMMIT_COUNT=$(git rev-list --count "${LAST_STABLE_TAG}..HEAD" 2>/dev/null || echo "0")
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            VERSION="v${LAST_VERSION}-dev.${COMMIT_COUNT}.${SHORT_SHA}"
+            IS_PRERELEASE="true"
+          else
+            echo "::error::Unexpected ref: ${GITHUB_REF}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            echo "prerelease_flag=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          NPM_VERSION="${VERSION#v}"
+          NPM_TAG="latest"
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            NPM_TAG="next"
+          fi
+          echo "npm_version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved version: ${VERSION}"
+          echo "Is prerelease: ${IS_PRERELEASE}"
+          echo "npm version: ${NPM_VERSION}"
+          echo "npm dist-tag: ${NPM_TAG}"
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: resolve-version
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +108,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      # Install musl tools for Linux static builds
       - name: Install musl tools (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -64,7 +129,7 @@ jobs:
 
       - name: Create tarball
         run: |
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${{ needs.resolve-version.outputs.version }}"
           PLATFORM="${{ matrix.target }}"
           ARCHIVE="openflows-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${ARCHIVE}"
@@ -73,12 +138,11 @@ jobs:
             cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
           done
 
-          # Include orchestration config
           cp -r orchestration "dist/${ARCHIVE}/"
           cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
 
           tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
-          echo "ARCHIVE_NAME=${ARCHIVE}.tar.gz" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Generate checksum
         run: |
@@ -92,11 +156,10 @@ jobs:
           path: dist/*
           retention-days: 5
 
-  # ── Docker image ─────────────────────────────────────────────────
   docker:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, resolve-version]
     permissions:
       packages: write
       contents: read
@@ -113,13 +176,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
+      - name: Extract version and tags
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Sanitize version for Docker tags (replace / with -)
+          VERSION="${{ needs.resolve-version.outputs.version }}"
+          VERSION="${VERSION#v}"
           VERSION=$(echo "$VERSION" | sed 's|/|-|g')
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ needs.resolve-version.outputs.is_prerelease }}" == "true" ]]; then
+            echo "CHANNEL_TAG=edge" >> "$GITHUB_OUTPUT"
+          else
+            echo "CHANNEL_TAG=latest" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -127,16 +196,15 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/the-agenticflow/openflows:latest
+            ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.CHANNEL_TAG }}
             ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Create GitHub Release ────────────────────────────────────────
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build, docker]
+    needs: [build, docker, resolve-version]
     permissions:
       contents: write
     steps:
@@ -154,11 +222,22 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${{ needs.resolve-version.outputs.version }}"
+          IS_PRERELEASE="${{ needs.resolve-version.outputs.is_prerelease }}"
+
           PREV_TAG=$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")
 
           echo "## What's Changed" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
+
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            echo "### Continuous build from main" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "This is an automated pre-release build from the \`main\` branch." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "**Note:** This build may contain unstable changes. For production use, install the latest stable release." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          fi
 
           if [ -n "$PREV_TAG" ]; then
             echo "### Changes since $PREV_TAG" >> CHANGELOG.md
@@ -182,24 +261,56 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          name: "OpenFlows ${{ github.event.inputs.version || github.ref_name }}"
+          tag_name: ${{ needs.resolve-version.outputs.version }}
+          name: "OpenFlows ${{ needs.resolve-version.outputs.version }}"
           body_path: CHANGELOG.md
           files: |
             dist/*.tar.gz
             dist/*.sha256
           draft: false
-          prerelease: ${{ contains(github.event.inputs.version || github.ref_name, 'rc') || contains(github.event.inputs.version || github.ref_name, 'beta') || contains(github.event.inputs.version || github.ref_name, 'alpha') }}
+          prerelease: ${{ needs.resolve-version.outputs.is_prerelease == 'true' }}
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Publish to crates.io ─────────────────────────────────────────
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [build, resolve-version]
+    if: needs.resolve-version.outputs.is_prerelease == 'false' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Update package version
+        working-directory: packaging/npm
+        run: |
+          npm version ${{ needs.resolve-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm
+        working-directory: packaging/npm
+        run: |
+          npm publish --access public --tag ${{ needs.resolve-version.outputs.npm_tag }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   publish-crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: build
-    if: ${{ !contains(github.event.inputs.version || github.ref_name, 'rc') && !contains(github.event.inputs.version || github.ref_name, 'beta') }}
+    needs: [build, resolve-version]
+    if: needs.resolve-version.outputs.is_prerelease == 'false'
     steps:
       - uses: actions/checkout@v4
 
@@ -219,5 +330,33 @@ jobs:
           cargo publish -p pair-harness --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
           cargo publish -p agentflow-tui --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
           cargo publish -p openflows --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: [build, resolve-version]
+    if: needs.resolve-version.outputs.is_prerelease == 'false'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION="${{ needs.resolve-version.outputs.version }}"
+          VERSION="${VERSION#v}"
+          SHA=$(git rev-parse HEAD)
+
+          sed -i "s/tag:.*/tag:      \"v${VERSION}\",/" packaging/homebrew/openflows.rb
+          sed -i "s/revision:.*/revision: \"${SHA}\"/" packaging/homebrew/openflows.rb
+
+      - name: Commit and push Homebrew formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/homebrew/openflows.rb
+          git commit -m "chore: update Homebrew formula for ${{ needs.resolve-version.outputs.version }} [skip ci]" || { echo "No changes"; exit 0; }
+          git push origin HEAD:main
