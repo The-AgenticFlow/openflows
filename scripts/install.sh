@@ -116,21 +116,53 @@ download_binary() {
 
     local download_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
 
+    local download_ok=false
     if has_cmd curl; then
-        curl -fsSL "$download_url" -o "/tmp/${asset_name}" || {
-            fail "Failed to download ${asset_name}"
-            info "Falling back to building from source..."
-            return 1
-        }
+        if curl -fsSL "$download_url" -o "/tmp/${asset_name}" 2>/dev/null; then
+            download_ok=true
+        fi
     elif has_cmd wget; then
-        wget -q "$download_url" -O "/tmp/${asset_name}" || {
-            fail "Failed to download ${asset_name}"
-            info "Falling back to building from source..."
-            return 1
-        }
+        if wget -q "$download_url" -O "/tmp/${asset_name}" 2>/dev/null; then
+            download_ok=true
+        fi
     else
         fail "Neither curl nor wget found"
         return 1
+    fi
+
+    if [ "$download_ok" = false ]; then
+        local alt_platform=""
+        case "$platform" in
+            x86_64-unknown-linux-gnu)  alt_platform="x86_64-unknown-linux-musl" ;;
+            x86_64-unknown-linux-musl) alt_platform="x86_64-unknown-linux-gnu" ;;
+            aarch64-unknown-linux-gnu) alt_platform="aarch64-unknown-linux-musl" ;;
+            *) ;; 
+        esac
+
+        if [ -n "$alt_platform" ]; then
+            local alt_asset="openflows-${tag}-${alt_platform}.tar.gz"
+            local alt_url="https://github.com/${REPO}/releases/download/${tag}/${alt_asset}"
+            warn "No binary for ${platform}, trying ${alt_platform}..."
+            if has_cmd curl; then
+                if curl -fsSL "$alt_url" -o "/tmp/${alt_asset}" 2>/dev/null; then
+                    download_ok=true
+                    asset_name="$alt_asset"
+                    platform="$alt_platform"
+                fi
+            elif has_cmd wget; then
+                if wget -q "$alt_url" -O "/tmp/${alt_asset}" 2>/dev/null; then
+                    download_ok=true
+                    asset_name="$alt_asset"
+                    platform="$alt_platform"
+                fi
+            fi
+        fi
+
+        if [ "$download_ok" = false ]; then
+            fail "Failed to download binary for ${platform}"
+            info "Falling back to building from source..."
+            return 1
+        fi
     fi
 
     tar -xzf "/tmp/${asset_name}" -C /tmp/
