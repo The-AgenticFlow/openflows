@@ -181,10 +181,8 @@ download_binary() {
         local alt_platform=""
         case "$platform" in
             x86_64-unknown-linux-gnu)  alt_platform="x86_64-unknown-linux-musl" ;;
-            x86_64-unknown-linux-musl) alt_platform="x86_64-unknown-linux-gnu" ;;
             aarch64-unknown-linux-gnu) alt_platform="aarch64-unknown-linux-musl" ;;
-            aarch64-unknown-linux-musl) alt_platform="aarch64-unknown-linux-gnu" ;;
-            *) ;; 
+            *) ;;
         esac
 
         if [ -n "$alt_platform" ]; then
