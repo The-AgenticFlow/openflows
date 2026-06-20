@@ -183,6 +183,7 @@ download_binary() {
             x86_64-unknown-linux-gnu)  alt_platform="x86_64-unknown-linux-musl" ;;
             x86_64-unknown-linux-musl) alt_platform="x86_64-unknown-linux-gnu" ;;
             aarch64-unknown-linux-gnu) alt_platform="aarch64-unknown-linux-musl" ;;
+            aarch64-unknown-linux-musl) alt_platform="aarch64-unknown-linux-gnu" ;;
             *) ;; 
         esac
 
