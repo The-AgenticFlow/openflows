@@ -1,0 +1,50 @@
+{
+  "default_cli": "claude",
+  "team": [
+    {
+      "id": "nexus",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "routing_key": "nexus-key",
+      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
+    },
+    {
+      "id": "forge",
+      "cli": "claude",
+      "active": true,
+      "instances": 2,
+      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "routing_key": "forge-key",
+      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN"
+    },
+    {
+      "id": "sentinel",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "routing_key": "sentinel-key",
+      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN"
+    },
+    {                                                                                                           
+      "id": "vessel",
+      "cli": "claude",
+      "active": true,
+      "instances": 1,
+      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "routing_key": "vessel-key",
+      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN"
+    },
+    {
+      "id": "lore",
+      "cli": "claude",
+      "active": false,
+      "instances": 1,
+      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "routing_key": "lore-key",
+      "github_token_env": "AGENT_LORE_GITHUB_TOKEN"
+    }
+  ]
+}

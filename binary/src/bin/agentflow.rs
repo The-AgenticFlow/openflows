@@ -40,6 +40,47 @@ fn load_env() -> anyhow::Result<std::path::PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--reset-orchestration" => {
+                eprintln!("Loading environment...");
+                let _ = load_env()?;
+                let resolver = openflows::orchestration::OrchestrationResolver::new()?;
+                let orch_dir = resolver.reset_orchestration_dir()?;
+                println!(
+                    "Orchestration files reset to bundled defaults at: {}",
+                    orch_dir.display()
+                );
+                println!("Version: {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                eprintln!("openflows (agentflow) — Autonomous AI Development Team");
+                eprintln!();
+                eprintln!("USAGE:");
+                eprintln!("  openflows                          Start the orchestration loop");
+                eprintln!(
+                    "  openflows --reset-orchestration    Reset orchestration files to defaults"
+                );
+                eprintln!("  openflows --help                   Show this help message");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                eprintln!("openflows (agentflow) — Autonomous AI Development Team");
+                eprintln!();
+                eprintln!("USAGE:");
+                eprintln!("  openflows                          Start the orchestration loop");
+                eprintln!(
+                    "  openflows --reset-orchestration    Reset orchestration files to defaults"
+                );
+                eprintln!("  openflows --help                   Show this help message");
+                std::process::exit(0);
+            }
+        }
+    }
+
     let env_path = load_env()?;
     if !env_path.as_os_str().is_empty() {
         eprintln!("Loaded environment from {}", env_path.display());
@@ -53,19 +94,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Startup diagnostics
-    // DEFAULT_CLI env var is checked later via Registry::effective_default_cli()
-    // Pre-load registry here just for startup log (full load happens after)
-    let registry_path = std::env::current_dir()
-        .ok()
-        .map(|p| p.join("orchestration").join("agent").join("registry.json"));
-    let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| {
-        registry_path
-            .as_ref()
-            .filter(|p| p.exists())
-            .and_then(|p| config::Registry::load(p).ok())
-            .map(|r| r.default_cli.clone())
-            .unwrap_or_else(|| "claude".to_string())
-    });
+    let default_cli = std::env::var("DEFAULT_CLI").unwrap_or_else(|_| "claude".to_string());
     let has_fireworks = std::env::var("FIREWORKS_API_KEY").is_ok();
     let has_openai = std::env::var("OPENAI_API_KEY").is_ok();
     let has_proxy = std::env::var("PROXY_URL").is_ok();
@@ -77,10 +106,6 @@ async fn main() -> Result<()> {
         info!("  LLM Mode: Codex + Fireworks (direct — no proxy needed)");
     } else if default_cli == "codex" && has_openai {
         let base_url = std::env::var("OPENAI_BASE_URL").ok();
-        // The endpoint mode (ResponsesApi vs ChatCompletions) is determined at
-        // runtime by probing /v1/responses — see process.rs::probe_endpoint_supports_responses().
-        // If the endpoint doesn't support /v1/responses, a local proxy is started
-        // to translate between the two formats.
         if let Some(url) = base_url {
             info!("  LLM Mode: Codex + OpenAI-compatible provider at {} (endpoint mode probed at startup)", url);
         } else {
@@ -116,39 +141,15 @@ async fn main() -> Result<()> {
 
     info!("Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)");
 
-    // 1. Validate Environment
-    // Resolve orchestrator_dir: search for orchestration/agent/registry.json in
-    // order: (1) next to the binary, (2) the binary's parent dir (npm layout),
-    // (3) OPENFLOWS_HOME, (4) current directory (dev mode).
-    let orchestrator_dir = {
-        let mut candidates = vec![
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())),
-        ];
-        let openflows_home = std::env::var("OPENFLOWS_HOME")
-            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
-            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
-            .ok();
-        if let Some(home) = openflows_home {
-            candidates.push(Some(std::path::PathBuf::from(home)));
-        }
-        candidates.push(std::env::current_dir().ok());
-        candidates
-            .into_iter()
-            .flatten()
-            .find(|dir| dir.join("orchestration/agent/registry.json").exists())
-            .ok_or_else(|| anyhow::anyhow!(
-                "Could not find orchestration/agent/registry.json in: binary dir, binary parent, OPENFLOWS_HOME, or current directory"
-            ))?
-    };
-    let registry_path = orchestrator_dir
-        .join("orchestration")
-        .join("agent")
-        .join("registry.json");
+    // 1. Resolve and ensure orchestration directory
+    use openflows::orchestration::OrchestrationResolver;
+    let resolver = OrchestrationResolver::new()?;
+    let orch_dir = resolver.ensure_orchestration_dir()?;
+    resolver.validate()?;
+
+    info!(dir = %orch_dir.display(), "Orchestration directory resolved");
+
+    let registry_path = resolver.registry_path();
     let registry = config::Registry::load(&registry_path)?;
     let github_token = registry
         .resolve_github_token("forge")
@@ -156,13 +157,11 @@ async fn main() -> Result<()> {
     let repo = std::env::var("GITHUB_REPOSITORY")
         .expect("GITHUB_REPOSITORY must be set (e.g. owner/repo)");
 
-    // Ensure LLM provider is set for AgentRunner
     if std::env::var("LLM_PROVIDER").is_err() {
         std::env::set_var("LLM_PROVIDER", "openai");
     }
 
     // 2. Clone/Update the target repository workspace
-    // Use ~/.agentflow/workspaces as base directory for all workspaces
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .expect("Could not determine home directory");
@@ -176,34 +175,21 @@ async fn main() -> Result<()> {
     info!(workspace = %workspace_dir.display(), "Target repository workspace ready");
 
     std::env::set_var("AGENTFLOW_WORKSPACE_ROOT", &workspace_dir);
-
-    // Set ORCHESTRATOR_DIR so pair harness can find the plugin
-    std::env::set_var("ORCHESTRATOR_DIR", &orchestrator_dir);
+    std::env::set_var("ORCHESTRATOR_DIR", resolver.orchestrator_dir());
 
     // 3. Initialize Nodes
-    // NEXUS: Orchestrator that assigns work
-    // ForgePairNode: Event-driven FORGE-SENTINEL pair with full review lifecycle
-    // VesselNode: Merge gatekeeper - polls CI, merges PRs, emits ticket_merged events
-    let persona_path = orchestrator_dir
-        .join("orchestration")
-        .join("agent")
-        .join("agents")
-        .join("nexus.agent.md");
-    let registry_path = orchestrator_dir
-        .join("orchestration")
-        .join("agent")
-        .join("registry.json");
-
-    let nexus = Arc::new(NexusNode::new(persona_path, registry_path.clone()));
+    let nexus_persona = resolver.persona_path("nexus.agent.md");
+    let nexus = Arc::new(NexusNode::new(nexus_persona, registry_path.clone()));
     let forge_pair = Arc::new(ForgePairNode::new_with_registry(
         &workspace_dir,
         registry_path.clone(),
     ));
     let vessel = Arc::new(VesselNode::from_env());
     let lore = if registry.get("lore").is_some() {
+        let lore_persona = resolver.persona_path("lore.agent.md");
         Some(Arc::new(LoreNode::new_with_registry(
             &workspace_dir,
-            orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
+            lore_persona,
             registry_path.clone(),
         )?))
     } else {
@@ -212,19 +198,6 @@ async fn main() -> Result<()> {
     };
 
     // 4. Setup Flow with Routing
-    // The ForgePairNode handles the full FORGE-SENTINEL lifecycle:
-    // - FORGE writes PLAN.md -> SENTINEL reviews -> CONTRACT.md
-    // - FORGE implements segments -> SENTINEL evaluates -> segment-N-eval.md
-    // - SENTINEL final review -> final-review.md
-    // - FORGE opens PR -> STATUS.json
-    //
-    // VesselNode handles the merge gate:
-    // - Polls CI status until terminal (success/failure/timeout)
-    // - Detects merge conflicts early via GitHub's mergeable field
-    // - Attempts conflict resolution (GitHub update-branch or local rebase)
-    // - Routes unresolvable conflicts back to forge_pair for rework
-    // - Merges PR if CI green
-    // - Emits ticket_merged event for dependency resolution
     let mut flow = Flow::new("nexus")
         .add_node(
             "nexus",
@@ -275,8 +248,6 @@ async fn main() -> Result<()> {
     // 5. Initialize Shared Store
     let store = SharedStore::new_in_memory();
     store.set("repository", serde_json::json!(repo)).await;
-
-    // Initial tickets list - Nexus will fetch from GitHub if this is empty
     store.set(KEY_TICKETS, serde_json::json!([])).await;
     store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
     store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
