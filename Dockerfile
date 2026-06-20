@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY binary ./binary
+COPY orchestration ./orchestration
 
 # Build release binaries
 RUN cargo build --release -p openflows
