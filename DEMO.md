@@ -1,4 +1,4 @@
-# AgentFlow Demo Guide
+# OpenFlows Demo Guide
 
 This guide walks you through running a complete autonomous development cycle, from zero to a working application.
 
@@ -19,8 +19,8 @@ This guide walks you through running a complete autonomous development cycle, fr
 ### 1. Clone and Configure
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 
 # Copy environment template
 cp .env.example .env
@@ -68,7 +68,7 @@ GATEWAY_API_KEY=your-gateway-api-key
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run the orchestration
-cargo run --bin real_test
+cargo run --bin openflows
 ```
 
 ### 3. Prepare Target Repository
@@ -97,8 +97,8 @@ gh issue create --title "Add UI styling" --body "Style the calculator with a mod
 **If you have direct Anthropic API access** (or a LiteLLM proxy that supports Anthropic format):
 
 ```bash
-# From AgentFlow directory
-cargo run --bin real_test
+# From OpenFlows directory
+cargo run --bin openflows
 ```
 
 **If your gateway only supports OpenAI format** (needs the local Anthropic-to-OpenAI proxy):
@@ -108,7 +108,7 @@ cargo run --bin real_test
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run the orchestration
-cargo run --bin real_test
+cargo run --bin openflows
 ```
 
 ### What Happens During Execution
@@ -187,7 +187,7 @@ Example STATUS.json:
 ## Architecture Overview
 
 ```
-AgentFlow/
+OpenFlows/
 |-- orchestration/agent/
 |   |-- agents/
 |   |   |-- nexus.agent.md    # Orchestrator persona
@@ -202,7 +202,7 @@ AgentFlow/
 |   |-- pocketflow-core/      # Flow engine, shared store, routing
 |
 |-- binary/src/bin/
-|   |-- real_test.rs          # Live orchestration entry point
+|   |-- openflows.rs          # Live orchestration entry point
 |   |-- demo.rs               # Mocked demo
 |
 |-- .env                      # Your API keys (not in git)
@@ -303,8 +303,8 @@ GITHUB_REPOSITORY=your-username/my-calculator
 ### 4. Run Orchestration
 
 ```bash
-cd AgentFlow
-cargo run --bin real_test
+cd openflows
+cargo run --bin openflows
 ```
 
 ### 5. Watch the Magic

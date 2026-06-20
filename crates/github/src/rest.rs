@@ -370,6 +370,7 @@ impl GithubRestClient {
                     }],
                     still_running: vec![],
                     job_logs: vec![],
+                    annotations: vec![],
                 });
             }
         };
@@ -379,6 +380,7 @@ impl GithubRestClient {
                 failed_checks: vec![],
                 still_running: vec![],
                 job_logs: vec![],
+                annotations: vec![],
             });
         }
 
@@ -422,17 +424,42 @@ impl GithubRestClient {
             }
         };
 
+        // Fetch annotations for each failed check run to provide exact
+        // file:line error details to the CI fix agent.
+        let mut annotations: Vec<CheckAnnotationDetail> = Vec::new();
+        for (name, id) in &failed_run_ids {
+            match self.get_check_annotations(owner, repo, *id).await {
+                Ok(anns) => {
+                    for ann in anns {
+                        if let (Some(path), Some(start_line), Some(message)) =
+                            (ann.path, ann.start_line, ann.message)
+                        {
+                            annotations.push(CheckAnnotationDetail {
+                                check_name: name.clone(),
+                                path,
+                                start_line,
+                                message,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, check_run_id = id, "Failed to fetch annotations for check run");
+                }
+            }
+        }
+
         Ok(CiFailureDetail {
             failed_checks,
             still_running: pending,
             job_logs,
+            annotations,
         })
     }
 
     /// Get annotations for a specific check run.
     /// Annotations contain exact file:line references and error messages.
-    #[allow(dead_code)]
-    async fn get_check_annotations(
+    pub async fn get_check_annotations(
         &self,
         owner: &str,
         repo: &str,
@@ -983,6 +1010,18 @@ pub struct CiFailureDetail {
     pub still_running: Vec<String>,
     /// Raw job log excerpts for each failed job (job_name, last N lines)
     pub job_logs: Vec<(String, String)>,
+    /// Annotations from failed check runs (file, line, message)
+    pub annotations: Vec<CheckAnnotationDetail>,
+}
+
+/// A single annotation from a failed check run, containing the exact
+/// file path, line number, and error message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckAnnotationDetail {
+    pub check_name: String,
+    pub path: String,
+    pub start_line: u64,
+    pub message: String,
 }
 
 impl CiFailureDetail {
@@ -1009,6 +1048,12 @@ impl fmt::Display for CiFailureDetail {
                 writeln!(f, "  {}", name)?;
             }
         }
+        if !self.annotations.is_empty() {
+            writeln!(f, "\nAnnotations (exact errors with file & line):")?;
+            for ann in &self.annotations {
+                writeln!(f, "  {}:{} {}", ann.path, ann.start_line, ann.message)?;
+            }
+        }
         if !self.job_logs.is_empty() {
             writeln!(f, "\nJob logs (last 150 lines per failed job):")?;
             for (i, (name, log)) in self.job_logs.iter().enumerate() {
@@ -1022,6 +1067,7 @@ impl fmt::Display for CiFailureDetail {
         if self.failed_checks.is_empty()
             && self.still_running.is_empty()
             && self.job_logs.is_empty()
+            && self.annotations.is_empty()
         {
             write!(f, "No check runs found for this commit")?;
         }
@@ -1058,15 +1104,14 @@ struct CheckRunOutput {
     text: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct CheckAnnotation {
+#[derive(Deserialize, Debug, Clone)]
+pub struct CheckAnnotation {
     #[serde(default)]
-    path: Option<String>,
+    pub path: Option<String>,
     #[serde(default)]
-    start_line: Option<u64>,
+    pub start_line: Option<u64>,
     #[serde(default)]
-    message: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Deserialize)]

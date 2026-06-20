@@ -1,0 +1,26 @@
+{
+  "model": {
+    "review_model": "glm-5p1",
+    "summary_model": "gemma-4",
+    "endpoint": "https://api.ai.camer.digital/v1"
+  },
+  "context": {
+    "max_tokens": 64000,
+    "output_reserve_tokens": 16000,
+    "summarizer_concurrency": 8
+  },
+  "index": {
+    "exclude_patterns": [
+      "target",
+      "node_modules",
+      "vendor",
+      ".git",
+      "build",
+      ".gradle",
+      ".mvn",
+      "dist",
+      "out",
+      "coverage"
+    ]
+  }
+}

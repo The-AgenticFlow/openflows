@@ -81,7 +81,7 @@ nano .env
 **Show**: Terminal running AgentFlow
 
 ```bash
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 **Narration**:
@@ -92,7 +92,7 @@ cargo run --bin agentflow
 
 Terminal 1:
 ```bash
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 Terminal 2:
@@ -161,7 +161,7 @@ Open `http://localhost:8000` in browser and demo the calculator.
 **Narration**:
 > "That's AgentFlow - an autonomous development team that can handle your GitHub issues from start to finish. Check out the repository to learn more and try it yourself."
 
-**Show**: GitHub repo URL: `github.com/The-AgenticFlow/AgentFlow`
+**Show**: GitHub repo URL: `github.com/The-AgenticFlow/openflows`
 
 ## Recording Tips
 
@@ -267,7 +267,7 @@ Show:
 ## Need Help?
 
 If you need help creating a demo video:
-- Open a discussion: https://github.com/The-AgenticFlow/AgentFlow/discussions
+- Open a discussion: https://github.com/The-AgenticFlow/openflows/discussions
 - We may feature community demos in the README!
 
 ---

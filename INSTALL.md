@@ -2,22 +2,44 @@
 
 > Complete guide for installing, configuring, and running OpenFlows.
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [End User Installation](#end-user-installation)
+  - [Option 1: One-Line Install (Recommended)](#option-1-one-line-install-recommended)
+  - [Option 2: Homebrew (macOS)](#option-2-homebrew-macos)
+  - [Option 3: Docker](#option-3-docker)
+  - [Option 4: npm](#option-4-npm)
+  - [Option 5: Cargo](#option-5-cargo)
+- [Developer Installation (From Source)](#developer-installation-from-source)
+  - [Step 1: Clone & Prerequisites](#step-1-clone--prerequisites)
+  - [Step 2: Build](#step-2-build)
+  - [Step 3: Configure Environment](#step-3-configure-environment)
+  - [Step 4: Verify](#step-4-verify)
+- [After Installation](#after-installation)
+- [Environment Setup](#environment-setup)
+- [Proxy Configuration (LiteLLM Routing)](#proxy-configuration-litellm-routing)
+- [Per-Agent Configuration](#per-agent-configuration)
+- [Running OpenFlows](#running-openflows)
+- [Troubleshooting](#troubleshooting)
+
 ## Requirements
 
-- **Rust 1.70+**
-- **Node.js 18+** (for GitHub MCP server)
-- **Claude Code CLI** - [Setup Guide](docs/setup-claude-cli.md)
+- **Rust 1.70+** — Required for building from source. Pre-built binaries do not need Rust.
+- **Node.js 18+** — Required for the GitHub MCP server.
+- **Claude Code CLI** or **Codex CLI** — The AI agent execution backend. See [docs/setup-claude-cli.md](docs/setup-claude-cli.md) and [docs/cli-backend-configuration.md](docs/cli-backend-configuration.md).
 - **API Keys:**
-  - `ANTHROPIC_API_KEY` (required)
   - `GITHUB_PERSONAL_ACCESS_TOKEN` (required)
-  - Optional provider keys: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`
+  - Provider key depending on mode: `ANTHROPIC_API_KEY`, `FIREWORKS_API_KEY`, `OPENAI_API_KEY`, etc.
 
-## Quick Start
+## End User Installation
+
+Choose one of these if you only want to run OpenFlows and do not plan to modify the source code.
 
 ### Option 1: One-Line Install (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 ```
 
 This installs all binaries to `~/.local/bin` and offers to run the setup wizard.
@@ -40,56 +62,24 @@ docker run -it --rm \
   ghcr.io/the-agenticflow/openflows:latest setup
 ```
 
-### Option 4: npm (Node.js Package Manager)
-
-Install globally via npm for easy updates and cross-platform support:
+### Option 4: npm
 
 ```bash
-# Install the package globally (@the-agenticflow scope)
+# Install globally
 npm install -g @the-agenticflow/openflows
 
 # Verify installation
 openflows --version
 
-# Run the interactive setup wizard
+# Run setup wizard
 openflows-setup
-
-# Start the autonomous orchestration
-openflows
-
-# Monitor with the dashboard (optional, separate terminal)
-openflows-dashboard
-
-# Diagnose issues
-openflows-doctor
 ```
 
-**Updating via npm:**
+**Update:** `npm update -g @the-agenticflow/openflows`
 
-```bash
-npm update -g @the-agenticflow/openflows
-```
+**Uninstall:** `npm uninstall -g @the-agenticflow/openflows`
 
-**Uninstalling:**
-
-```bash
-npm uninstall -g @the-agenticflow/openflows
-```
-
-**Note:** The npm package includes platform-specific native binaries as optional dependencies. The correct binary for your platform (Linux x86_64/aarch64, macOS x86_64/Apple Silicon) is automatically downloaded during installation via the `postinstall` script.
-
-### Option 5: Build from Source
-
-```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
-make release          # or: cargo build --release -p openflows
-make install          # installs to ~/.local/bin
-openflows-setup       # Guided setup wizard
-openflows             # Start orchestration
-```
-
-### Option 6: Cargo Install
+### Option 5: Cargo
 
 ```bash
 cargo install openflows
@@ -97,21 +87,120 @@ openflows-setup
 openflows
 ```
 
+---
+
+## Developer Installation (From Source)
+
+Use this path if you want to contribute code, debug issues, or run the latest unreleased changes.
+
+### Step 1: Clone & Prerequisites
+
+```bash
+# Clone the repository
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
+
+# Verify Rust is installed (need 1.70+)
+rustc --version
+# If not installed: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Verify Node.js is installed (need 18+)
+node --version
+
+# Verify Git is installed
+git --version
+```
+
+### Step 2: Build
+
+OpenFlows provides a Makefile with common tasks. You can use it or run cargo directly:
+
+**Using Make (recommended):**
+
+```bash
+# Build all binaries in debug mode (fastest compile)
+make build
+
+# Build all binaries in release mode (optimized)
+make release
+
+# Install locally to ~/.local/bin
+make install
+```
+
+**Using Cargo directly:**
+
+```bash
+# Development build
+cargo build --workspace
+
+# Release build
+cargo build --release -p openflows
+```
+
+**Available binaries built:**
+
+| Binary | Purpose |
+|--------|---------|
+| `openflows` | Main orchestration — connects to GitHub, spawns AI agents, creates real PRs |
+| `demo` | Mocked demonstration with fake data (no API keys required) |
+| `openflows-setup` | Interactive TUI setup wizard |
+| `openflows-dashboard` | Live worker status monitor |
+| `openflows-doctor` | Environment diagnostic tool |
+
+After a successful build, binaries are located in `target/debug/` or `target/release/`.
+
+### Step 3: Configure Environment
+
+```bash
+# Copy the example environment file
+cp .env.example .env
+
+# Edit .env with your settings
+nano .env   # or your preferred editor
+```
+
+The `.env.example` file documents three setup modes:
+
+- **Mode A (Recommended):** Codex + Fireworks — simplest, no proxy needed.
+- **Mode B:** Claude + Direct Anthropic Key — if you have an Anthropic API key.
+- **Mode C:** Claude + Proxy — for third-party gateways that require protocol translation.
+
+At minimum you must set:
+- `GITHUB_REPOSITORY` — target repo in `owner/repo` format
+- `GITHUB_PERSONAL_ACCESS_TOKEN` — GitHub PAT with `repo` scope
+- One LLM provider key (see `.env.example` for which key your mode needs)
+
+### Step 4: Verify
+
+```bash
+# Run diagnostics
+./target/debug/openflows-doctor
+
+# Run the mocked demo (no API keys needed)
+cargo run --bin demo
+
+# Run the full test suite
+cargo test --workspace
+```
+
+---
+
 ## After Installation
 
 ### Standard Commands (All Install Methods)
 
-1. **Configure** — Run `openflows-setup` (or `agentflow-setup`) for the guided TUI wizard
-2. **Verify** — Run `openflows-doctor` (or `agentflow-doctor`) to check your environment
-3. **Run** — Run `openflows` (or `agentflow`) to start the autonomous team
-4. **Monitor** — Run `openflows-dashboard` (or `agentflow-dashboard`) for live worker status
+1. **Configure** — `openflows-setup` runs the interactive TUI wizard
+2. **Verify** — `openflows-doctor` checks your environment
+3. **Run** — `openflows` starts the autonomous team
+4. **Monitor** — `openflows-dashboard` shows live worker status
 
 ### npm-Specific Workflow
 
 If you installed via npm, you can also use npx without global installation:
 
 ```bash
-# Run setup wizard without installing (uses @the-agenticflow scope)
+# Run setup wizard without installing
 npx @the-agenticflow/openflows-setup
 
 # Start orchestration directly
@@ -119,70 +208,6 @@ npx @the-agenticflow/openflows
 
 # Check status
 npx @the-agenticflow/openflows-doctor
-```
-
-**Using npx with specific versions:**
-
-```bash
-# Run a specific version
-npx @the-agenticflow/openflows@0.1.2
-
-# Run the latest version
-npx @the-agenticflow/openflows@latest
-```
-
-**Package Scripts (if integrating into a Node.js project):**
-
-Add to your `package.json`:
-
-```json
-{
-  "scripts": {
-    "agent:setup": "openflows-setup",
-    "agent:start": "openflows",
-    "agent:doctor": "openflows-doctor",
-    "agent:dashboard": "openflows-dashboard"
-  },
-  "devDependencies": {
-    "@the-agenticflow/openflows": "^0.1.2"
-  }
-}
-```
-
-Or install as a dev dependency:
-
-```bash
-npm install --save-dev @the-agenticflow/openflows
-```
-
-Then run:
-
-```bash
-npm run agent:setup      # Configure the system
-npm run agent:start      # Start the orchestration
-npm run agent:doctor     # Check environment
-npm run agent:dashboard  # Monitor workers
-```
-
-**Programmatic API (Node.js):**
-
-```javascript
-const { spawn } = require('child_process');
-const path = require('path');
-
-// Run openflows commands programmatically
-const openflows = spawn('openflows', ['--version'], {
-  stdio: 'inherit',
-  env: {
-    ...process.env,
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-    GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PERSONAL_ACCESS_TOKEN
-  }
-});
-
-openflows.on('exit', (code) => {
-  console.log(`OpenFlows exited with code ${code}`);
-});
 ```
 
 ---
@@ -205,7 +230,8 @@ Edit `.env` with your API keys and settings.
 |----------|-------------|
 | `GITHUB_REPOSITORY` | Target repository in `owner/repo` format |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub PAT with `repo` scope |
-| `ANTHROPIC_API_KEY` | Anthropic API key (or use proxy mode) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (required in direct Claude mode) |
+| `FIREWORKS_API_KEY` | Fireworks API key (required in Codex + Fireworks mode) |
 
 ### All Environment Variables
 
@@ -213,17 +239,19 @@ Edit `.env` with your API keys and settings.
 |----------|----------|-------------|
 | `GITHUB_REPOSITORY` | Yes | Target repository (`owner/repo`) |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | Yes | GitHub PAT with `repo` scope |
-| `ANTHROPIC_API_KEY` | Yes* | Anthropic API key (required in direct mode) |
+| `DEFAULT_CLI` | Yes* | CLI backend: `codex` or `claude` |
+| `ANTHROPIC_API_KEY` | Yes* | Anthropic API key (required in direct Claude mode) |
+| `FIREWORKS_API_KEY` | Yes* | Fireworks API key (required in Codex + Fireworks mode) |
+| `OPENAI_API_KEY` | Yes* | OpenAI/Fireworks key (required in Codex mode) |
 | `PROXY_URL` | No | LiteLLM proxy URL for routing |
 | `PROXY_API_KEY` | No | API key for hosted LiteLLM proxy |
 | `GATEWAY_URL` | No | OpenAI-compatible gateway URL |
 | `GATEWAY_API_KEY` | No | Gateway API key |
-| `OPENAI_API_KEY` | No | OpenAI API key |
-| `GEMINI_API_KEY` | No | Google Gemini API key |
-| `GROQ_API_KEY` | No | Groq API key |
-| `FIREWORKS_API_KEY` | No | Fireworks AI API key |
 | `CLAUDE_PATH` | No | Path to Claude CLI binary (default: `claude`) |
+| `CODEX_PATH` | No | Path to Codex CLI binary (default: `codex`) |
 | `REDIS_URL` | No | Redis URL for persistent state |
+| `AGENTFLOW_DOMAIN_MODE` | No | `manual` or `all` — `all` allows unrestricted internet, `manual` restricts to `AGENTFLOW_ALLOWED_DOMAINS` |
+| `AGENTFLOW_ALLOWED_DOMAINS` | No | Comma-separated list of allowed domains (e.g. `api.github.com,*.github.com,pypi.org`). Only used when `AGENTFLOW_DOMAIN_MODE=manual` |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `AGENTFLOW_WORKSPACE_ROOT` | No | Workspace root directory |
 
@@ -282,7 +310,7 @@ If your LLM gateway only supports the OpenAI Chat Completions format (`/v1/chat/
 ./scripts/start_proxy.sh
 
 # Terminal 2: Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 Configure `.env`:
@@ -362,12 +390,13 @@ The registry at [`orchestration/agent/registry.json`](orchestration/agent/regist
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | Agent name. Used in logs, worktree names (`forge-1`, `forge-2`), and branch names. |
-| `cli` | string | CLI tool to spawn. Currently only `"claude"` (Claude Code) is supported. |
+| `cli` | string | CLI tool to spawn. Currently only `"claude"` or `"codex"` is supported. |
 | `active` | bool | When `false`, the agent is excluded from orchestration entirely. |
 | `instances` | int | Number of parallel worker slots. FORGE uses this directly (`forge-1`, `forge-2`, ...). Other agents with `instances > 1` get numbered slots (`vessel-1`, `vessel-2`). Agents with `instances == 1` use their bare ID (`nexus`, `sentinel`). |
 | `model_backend` | string | Model identifier passed to the LLM client. Can be a direct provider path (`anthropic/claude-sonnet-4-5`) or a gateway path (`accounts/fireworks/models/glm-5`). |
 | `routing_key` | string | LiteLLM proxy routing key. When `PROXY_URL` is set, this key is used to route requests to the correct backend model. When unset, the agent falls back to direct API access. |
 | `github_token_env` | string | Environment variable name that holds the GitHub PAT for this agent. Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` if not set. Enables per-agent token rotation and scoping. |
+| `allowed_domains` | array or null | Network domains this agent can access (for sandbox configuration). Falls back to the registry-level `allowed_domains` if not set. Use `["*"]` to allow unrestricted internet access. Examples: `["api.github.com", "*.github.com", "pypi.org"]` |
 
 #### Common Operations
 
@@ -405,10 +434,10 @@ Run the full orchestration with real GitHub API and Claude CLI:
 
 ```bash
 # Via cargo
-cargo run --bin agentflow
+cargo run --bin openflows
 
 # Or directly after build
-./target/release/agentflow
+./target/release/openflows
 ```
 
 This mode:
@@ -419,20 +448,20 @@ This mode:
 
 ### Development Mode
 
-Dry-run with local node implementations:
+Test with mocked data (no API keys required):
 
 ```bash
-cargo run --bin agentflow-demo
+cargo run --bin demo
 ```
 
 Uses in-memory implementations without external API calls.
 
-### Mocked Demo
+### Dashboard
 
-Pre-configured demonstration with fake data:
+Monitor worker status in real time:
 
 ```bash
-cargo run --bin demo
+cargo run --bin openflows-dashboard
 ```
 
 ---
@@ -455,12 +484,13 @@ Set your GitHub PAT:
 GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxxxx
 ```
 
-### "claude: command not found"
+### "claude: command not found" or "codex: command not found"
 
-Install Claude CLI or set the path:
+Install the CLI backend or set the path:
 
 ```env
 CLAUDE_PATH=/path/to/claude
+CODEX_PATH=/path/to/codex
 ```
 
 See [docs/setup-claude-cli.md](docs/setup-claude-cli.md) for detailed setup.
@@ -481,12 +511,24 @@ Or remove `REDIS_URL` to use in-memory store.
 - Reduce concurrent workers in `orchestration/agent/registry.json`
 - Add fallback providers in `LLM_FALLBACK`
 
+### Build errors
+
+```bash
+# Update Rust toolchain
+rustup update
+
+# Clean and rebuild
+cargo clean
+make build
+```
+
 ---
 
 ## Additional Resources
 
-- **[TUTORIAL.md](TUTORIAL.md)** - Complete tutorial with logs, file structure, and troubleshooting
-- **[RUN.md](RUN.md)** - Running and configuration guide
-- **[docs/demo.md](docs/demo.md)** - Live flow walkthrough
-- **[docs/setup-claude-cli.md](docs/setup-claude-cli.md)** - Claude CLI setup
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Development guidelines
+- **[BUILD.md](BUILD.md)** — Detailed build instructions and platform-specific notes
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — Contributor workflow, testing, and style guide
+- **[TUTORIAL.md](TUTORIAL.md)** — Complete tutorial with logs and troubleshooting
+- **[RUN.md](RUN.md)** — Day-to-day running and configuration reference
+- **[docs/demo.md](docs/demo.md)** — Live flow walkthrough
+- **[docs/setup-claude-cli.md](docs/setup-claude-cli.md)** — CLI backend setup (Claude Code and Codex)

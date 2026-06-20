@@ -2,14 +2,16 @@
 # OpenFlows Installer
 # Usage: curl -fsSL https://get.openflows.dev | bash
 #   or:  curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+# Install latest stable:  curl -fsSL https://get.openflows.dev | bash
+# Install edge (main):    curl -fsSL https://get.openflows.dev | bash -s -- --edge
 
 set -euo pipefail
 
-REPO="The-AgenticFlow/AgentFlow"
+REPO="The-AgenticFlow/openflows"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
-BINARIES=("agentflow" "agentflow-setup" "agentflow-dashboard" "agentflow-doctor")
+BINARIES=("openflows" "openflows-setup" "openflows-dashboard" "openflows-doctor")
+CHANNEL="stable"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -21,7 +23,34 @@ success() { echo -e "${GREEN}  ✓${NC} $1"; }
 warn()    { echo -e "${YELLOW}  ⚠${NC} $1"; }
 fail()    { echo -e "${RED}  ✗${NC} $1" >&2; }
 
-# Detect OS and architecture
+usage() {
+    echo "Usage: $(basename "$0") [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --edge       Install the latest pre-release build from main"
+    echo "  --stable     Install the latest stable release (default)"
+    echo "  --dir DIR    Installation directory (default: ~/.local/bin)"
+    echo "  -h, --help   Show this help message"
+    echo ""
+    echo "Environment variables:"
+    echo "  AGENTFLOW_INSTALL_DIR  Installation directory (default: ~/.local/bin)"
+    echo "  AGENTFLOW_CHANNEL      Release channel: stable or edge (default: stable)"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --edge)   CHANNEL="edge"; shift ;;
+        --stable) CHANNEL="stable"; shift ;;
+        --dir)   INSTALL_DIR="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ -n "${AGENTFLOW_CHANNEL:-}" ]]; then
+    CHANNEL="$AGENTFLOW_CHANNEL"
+fi
+
 detect_platform() {
     local os arch
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -34,7 +63,6 @@ detect_platform() {
     case "$os" in
         darwin) os="apple-darwin" ;;
         linux)
-            # Prefer musl for portability
             if ldd --version 2>&1 | grep -qi musl; then
                 os="unknown-linux-musl"
             else
@@ -46,10 +74,8 @@ detect_platform() {
     echo "${arch}-${os}"
 }
 
-# Check if a command exists
 has_cmd() { command -v "$1" &>/dev/null; }
 
-# Check/install Rust toolchain
 ensure_rust() {
     if has_cmd rustc; then
         success "Rust $(rustc --version)"
@@ -63,7 +89,6 @@ ensure_rust() {
     success "Rust $(rustc --version)"
 }
 
-# Check Git
 ensure_git() {
     if has_cmd git; then
         success "Git $(git --version)"
@@ -73,7 +98,6 @@ ensure_git() {
     fi
 }
 
-# Check/install Node.js
 ensure_node() {
     if has_cmd node; then
         local node_ver
@@ -95,18 +119,41 @@ ensure_node() {
     success "Node.js $(node --version)"
 }
 
-# Install Claude Code CLI
-ensure_claude() {
+ensure_ai_cli() {
+    local has_claude=false
+    local has_codex=false
+
     if has_cmd claude; then
         success "Claude Code CLI $(claude --version 2>/dev/null || echo 'installed')"
-        return
+        has_claude=true
     fi
-    info "Installing Claude Code CLI..."
-    npm install -g @anthropic-ai/claude-code
-    success "Claude Code CLI installed"
+
+    if has_cmd codex; then
+        success "Codex CLI $(codex --version 2>/dev/null || echo 'installed')"
+        has_codex=true
+    fi
+
+    if [ "$has_claude" = false ] && [ "$has_codex" = false ]; then
+        warn "No AI CLI backend found."
+        echo ""
+        echo "  OpenFlows requires either Claude Code (Anthropic) or Codex (OpenAI)."
+        echo ""
+        echo "  To install Claude Code:"
+        echo "    npm install -g @anthropic-ai/claude-code"
+        echo "    claude login"
+        echo ""
+        echo "  To install Codex:"
+        echo "    npm install -g @openai/codex"
+        echo "    codex login"
+        echo ""
+        echo "  You can also use npx without installing globally:"
+        echo "    npx @anthropic-ai/claude-code"
+        echo "    npx @openai/codex"
+        echo ""
+        info "Continuing without AI CLI - you'll need to install one before running OpenFlows"
+    fi
 }
 
-# Download pre-built binary from GitHub Releases
 download_binary() {
     local platform="$1"
     local tag="$2"
@@ -176,18 +223,23 @@ download_binary() {
             chmod +x "${INSTALL_DIR}/${bin}"
         fi
     done
+
+    if [ -d "${extract_dir}/orchestration" ]; then
+        cp -r "${extract_dir}/orchestration" "${INSTALL_DIR}/"
+        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+    fi
+
     rm -rf "${extract_dir}"
 
     success "Downloaded and extracted to ${INSTALL_DIR}/"
     return 0
 }
 
-# Build from source as fallback
 build_from_source() {
     info "Building OpenFlows from source..."
     local repo_dir
     repo_dir=$(mktemp -d)
-    trap "rm -rf '$repo_dir'" EXIT
+    trap "rm -rf '$repo_dir'" RETURN
 
     git clone --depth 1 "https://github.com/${REPO}.git" "$repo_dir"
     cd "$repo_dir"
@@ -201,9 +253,40 @@ build_from_source() {
             success "Built and installed ${bin}"
         fi
     done
+
+    if [ -d "orchestration" ]; then
+        cp -r orchestration "${INSTALL_DIR}/"
+        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+    fi
 }
 
-# Add install dir to PATH if needed
+resolve_stable_tag() {
+    local tag=""
+    if has_cmd gh; then
+        tag=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo "")
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | head -1 \
+            | sed 's/.*"tag_name": "//;s/".*//' || echo "")
+    fi
+    echo "$tag"
+}
+
+resolve_edge_tag() {
+    local tag=""
+    if has_cmd gh; then
+        tag=$(gh release list --repo "$REPO" --limit 50 --json tagName,isPrerelease \
+            -q '.[] | select(.isPrerelease == true) | .tagName' 2>/dev/null \
+            | head -1 || echo "")
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=50" 2>/dev/null \
+            | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name' 2>/dev/null || echo "")
+    fi
+    echo "$tag"
+}
+
 ensure_path() {
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
         warn "${INSTALL_DIR} is not in your PATH"
@@ -225,63 +308,66 @@ ensure_path() {
     fi
 }
 
-# Offer to run setup wizard
 run_setup() {
     echo ""
     echo "Would you like to run the setup wizard now? (Y/n)"
     read -r response
     if [[ "$response" =~ ^[Yy]$ ]] || [[ -z "$response" ]]; then
-        if has_cmd agentflow-setup; then
-            agentflow-setup
+        if has_cmd openflows-setup; then
+            openflows-setup
         else
-            warn "agentflow-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
+            warn "openflows-setup not found in PATH. Run it manually after adding $INSTALL_DIR to PATH."
         fi
     fi
 }
 
-# Main
 main() {
     echo ""
-    echo "╔══════════════════════════════════════════════╗"
-    echo "║        OpenFlows Installer                   ║"
-    echo "║        Autonomous AI Development Team        ║"
-    echo "╚══════════════════════════════════════════════╝"
+    if [ "$CHANNEL" = "edge" ]; then
+        echo "╔══════════════════════════════════════════════╗"
+        echo "║   OpenFlows Installer (EDGE channel)       ║"
+        echo "║   ⚠ Pre-release build from main branch      ║"
+        echo "╚══════════════════════════════════════════════╝"
+    else
+        echo "╔══════════════════════════════════════════════╗"
+        echo "║        OpenFlows Installer                   ║"
+        echo "║        Autonomous AI Development Team        ║"
+        echo "╚══════════════════════════════════════════════╝"
+    fi
     echo ""
 
     local platform
     platform=$(detect_platform)
     info "Platform: $platform"
     info "Install directory: $INSTALL_DIR"
+    info "Channel: $CHANNEL"
     echo ""
 
-    # Check prerequisites
     info "Checking prerequisites..."
     ensure_rust
     ensure_git
     ensure_node
-    ensure_claude
+    ensure_ai_cli
     echo ""
 
-    # Try to download pre-built binary
     mkdir -p "$INSTALL_DIR"
     local installed=false
+    local tag=""
 
-    if has_cmd gh; then
-        local latest
-        latest=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo "")
-        if [ -n "$latest" ]; then
-            if download_binary "$platform" "$latest"; then
+    if [ "$CHANNEL" = "edge" ]; then
+        tag=$(resolve_edge_tag)
+        if [ -n "$tag" ]; then
+            info "Found edge release: $tag"
+            if download_binary "$platform" "$tag"; then
                 installed=true
             fi
+        else
+            warn "No edge release found. Falling back to building from latest main..."
         fi
-    fi
-
-    if [ "$installed" = false ]; then
-        # Try direct download without gh CLI
-        local latest
-        latest=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "//;s/".*//' || echo "")
-        if [ -n "$latest" ]; then
-            if download_binary "$platform" "$latest"; then
+    else
+        tag=$(resolve_stable_tag)
+        if [ -n "$tag" ]; then
+            if download_binary "$platform" "$tag"; then
                 installed=true
             fi
         fi
@@ -299,15 +385,21 @@ main() {
     echo "║        Installation Complete!                ║"
     echo "╚══════════════════════════════════════════════╝"
     echo ""
+    if [ "$CHANNEL" = "edge" ]; then
+        echo "  ⚠ Installed EDGE (pre-release) build: $tag"
+        echo "    For stability, use: curl -fsSL https://get.openflows.dev | bash"
+        echo ""
+    fi
     echo "  Available commands:"
-    echo "    agentflow         - Start orchestration"
-    echo "    agentflow-setup   - Guided setup wizard"
-    echo "    agentflow-dashboard - Live monitoring TUI"
-    echo "    agentflow-doctor  - Diagnostic checks"
+    echo "    openflows                  - Start orchestration"
+    echo "    openflows --reset-orchestration - Reset config files to defaults"
+    echo "    openflows-setup           - Guided setup wizard"
+    echo "    openflows-dashboard       - Live monitoring TUI"
+    echo "    openflows-doctor          - Diagnostic checks"
     echo ""
     echo "  Next steps:"
-    echo "    1. Run 'agentflow-setup' to configure API keys"
-    echo "    2. Run 'agentflow' to start the autonomous team"
+    echo "    1. Run 'openflows-setup' to configure API keys"
+    echo "    2. Run 'openflows' to start the autonomous team"
     echo ""
     echo "  Docs: https://openflows.dev"
     echo ""

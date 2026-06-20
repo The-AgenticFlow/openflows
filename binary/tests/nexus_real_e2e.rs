@@ -2,6 +2,7 @@ use agent_nexus::NexusNode;
 use anyhow::Result;
 use pocketflow_core::{Node, SharedStore};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Real E2E Test for Nexus Agent (No Mocks)
@@ -58,11 +59,36 @@ async fn test_nexus_real_e2e() -> Result<()> {
     println!("Target Repository: {}", repo);
     store.set("repository", json!(repo)).await;
 
-    // 3. Initialize Nexus
+    // 3. Create a temporary registry.json so the test doesn't depend on a
+    //    workspace file that may not exist in CI.
+    let tmp_dir = tempfile::tempdir()?;
+    let registry_path = tmp_dir.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        json!({
+            "default_cli": "claude",
+            "team": [{
+                "id": "nexus",
+                "cli": "claude",
+                "active": true,
+                "instances": 1,
+                "model_backend": "anthropic/claude-haiku-4-5-20251001",
+                "routing_key": "nexus-key",
+                "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
+            }]
+        })
+        .to_string(),
+    )?;
+
+    // 4. Initialize Nexus
     println!("Loading Nexus agent persona...");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir should have parent")
+        .to_path_buf();
     let nexus = Arc::new(NexusNode::new(
-        "../orchestration/agent/agents/nexus.agent.md",
-        "../orchestration/agent/registry.json",
+        workspace_root.join("orchestration/agent/agents/nexus.agent.md"),
+        registry_path,
     ));
 
     // 4. Run NexusNode

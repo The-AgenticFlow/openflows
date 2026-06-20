@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::nodes::{ForgePairNode, LoreNode, NexusNode, VesselConfig, VesselNode};
+use openflows::orchestration::OrchestrationResolver;
 use crate::state::{
     Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_CI_FIX_NEEDED,
     ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE,
@@ -16,12 +17,66 @@ use crate::state::{
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
 
+fn print_usage_and_exit() -> ! {
+    eprintln!("openflows — Autonomous AI Development Team");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  openflows                  Start the orchestration loop");
+    eprintln!("  openflows --reset-orchestration  Reset all orchestration files to bundled defaults");
+    eprintln!("  openflows --help            Show this help message");
+    eprintln!();
+    eprintln!("The orchestration directory is resolved by searching:");
+    eprintln!("  1. Next to the binary");
+    eprintln!("  2. Binary's parent directory (npm layout)");
+    eprintln!("  3. OPENFLOWS_HOME (~/.openflows)");
+    eprintln!("  4. Current working directory");
+    eprintln!();
+    eprintln!("On first run, all missing orchestration files are written from");
+    eprintln!("built-in defaults. Use --reset-orchestration to overwrite all files.");
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    match dotenvy::dotenv() {
-        Ok(path) => eprintln!("Loaded environment from {}", path.display()),
-        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--reset-orchestration" => {
+                let resolver = OrchestrationResolver::new()?;
+                let orch_dir = resolver.reset_orchestration_dir()?;
+                println!("Orchestration files reset to bundled defaults at: {}", orch_dir.display());
+                println!("Version: {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print_usage_and_exit();
+            }
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                print_usage_and_exit();
+            }
+        }
+    }
+
+    let openflows_home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+        .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+        .unwrap_or_else(|_| ".openflows".to_string());
+    let env_paths = vec![
+        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
+        std::env::current_dir().unwrap_or_default().join(".env"),
+    ];
+    for path in &env_paths {
+        if path.exists() {
+            match dotenvy::from_path(path) {
+                Ok(_) => {
+                    eprintln!("Loaded environment from {}", path.display());
+                    break;
+                }
+                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
     // Initialize tracing: default to INFO level, allow RUST_LOG to override
     tracing_subscriber::fmt()
@@ -104,28 +159,21 @@ async fn main() -> Result<()> {
         .await;
     store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
 
-    // 4. Build Flow - use orchestration/agent directory for personas
-    // Resolve orchestrator_dir: first try relative to the binary itself (npm install),
-    // then fall back to current directory (dev mode).
-    let orchestrator_dir = {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        if let Some(ref dir) = exe_dir {
-            if dir.join("orchestration/agent/registry.json").exists() {
-                dir.clone()
-            } else {
-                std::env::current_dir()?
-            }
-        } else {
-            std::env::current_dir()?
-        }
-    };
-    let registry_path = orchestrator_dir.join("orchestration/agent/registry.json");
-    let nexus = Arc::new(NexusNode::new(
-        orchestrator_dir.join("orchestration/agent/agents/nexus.agent.md"),
-        registry_path.clone(),
-    ));
+    // 4. Resolve and ensure orchestration directory is complete
+    //    Bundled files are embedded at compile time and materialized on disk if missing.
+    let resolver = OrchestrationResolver::new()?;
+    let orch_dir = resolver.ensure_orchestration_dir()?;
+    resolver.validate()?;
+
+    info!(dir = %orch_dir.display(), "Orchestration directory resolved");
+
+    let registry_path = resolver.registry_path();
+    let registry = config::Registry::load(&registry_path)?;
+
+    std::env::set_var("ORCHESTRATOR_DIR", resolver.orchestrator_dir());
+
+    let nexus_persona = resolver.persona_path("nexus.agent.md");
+    let nexus = Arc::new(NexusNode::new(nexus_persona, registry_path.clone()));
     let forge_pair = Arc::new(ForgePairNode::new_with_registry(
         &workspace_dir,
         registry_path.clone(),
@@ -136,13 +184,19 @@ async fn main() -> Result<()> {
             VesselConfig::from_env()
         }),
     ));
-    let lore = Arc::new(LoreNode::new_with_registry(
-        &workspace_dir,
-        orchestrator_dir.join("orchestration/agent/agents/lore.agent.md"),
-        orchestrator_dir.join("orchestration/agent/registry.json"),
-    )?);
+    let lore = if registry.get("lore").is_some() {
+        let lore_persona = resolver.persona_path("lore.agent.md");
+        Some(Arc::new(LoreNode::new_with_registry(
+            &workspace_dir,
+            lore_persona,
+            registry_path.clone(),
+        )?))
+    } else {
+        info!("lore agent is inactive — skipping lore node initialization");
+        None
+    };
 
-    let flow = Flow::new("nexus")
+    let mut flow = Flow::new("nexus")
         .add_node(
             "nexus",
             nexus,
@@ -168,22 +222,33 @@ async fn main() -> Result<()> {
         .add_node(
             "vessel",
             vessel,
-            vec![
-                (ACTION_DEPLOYED, "lore"),
-                (ACTION_DEPLOY_FAILED, "nexus"),
-                (ACTION_CI_FIX_NEEDED, "forge_pair"),
-                ("merge_blocked", "nexus"),
-                (ACTION_CONFLICTS_DETECTED, "forge_pair"),
-                (Action::AWAITING_HUMAN, "nexus"),
-                ("no_work", "nexus"),
-            ],
-        )
-        .add_node(
+            {
+                let mut routes = vec![
+                    (ACTION_DEPLOY_FAILED, "nexus"),
+                    (ACTION_CI_FIX_NEEDED, "forge_pair"),
+                    ("merge_blocked", "nexus"),
+                    (ACTION_CONFLICTS_DETECTED, "forge_pair"),
+                    (Action::AWAITING_HUMAN, "nexus"),
+                    ("no_work", "nexus"),
+                ];
+                if lore.is_some() {
+                    routes.insert(0, (ACTION_DEPLOYED, "lore"));
+                } else {
+                    routes.insert(0, (ACTION_DEPLOYED, "nexus"));
+                }
+                routes
+            },
+        );
+
+    if let Some(ref lore_node) = lore {
+        flow = flow.add_node(
             "lore",
-            lore,
+            lore_node.clone(),
             vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
-        )
-        .max_steps(20);
+        );
+    }
+    
+    let flow = flow.max_steps(20);
 
     // 5. Run Flow
     info!("Starting Flow execution loop...");

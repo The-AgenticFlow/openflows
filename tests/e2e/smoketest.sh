@@ -78,21 +78,21 @@ log_ok "Environment validated"
 
 if $DRY_RUN; then
     log_header "DRY RUN — showing execution plan"
-    log_info "Would run: cargo run --bin agentflow"
+    log_info "Would run: cargo run --bin openflows"
     log_info "Target repo: $REPO"
     log_info "Registry: orchestration/agent/registry.json (5 agents)"
     log_info "Open issues will be discovered by NEXUS at runtime"
     exit 0
 fi
 
-log_header "BUILDING AGENTFLOW"
-cargo build --bin agentflow 2>&1
+log_header "BUILDING OPENFLOWS"
+cargo build --bin openflows 2>&1
 log_ok "Build succeeded"
 
 log_header "RUNNING ORCHESTRATION"
 export GITHUB_REPOSITORY="$REPO"
 
-cargo run --bin agentflow 2>&1 | tee /tmp/agentflow-smoketest.log
+cargo run --bin openflows 2>&1 | tee /tmp/openflows-smoketest.log
 
 EXIT_CODE=${PIPESTATUS[0]}
 
@@ -125,7 +125,7 @@ echo "  Exit code:  $EXIT_CODE"
 echo "  Issues open: $OPEN_COUNT"
 echo "  PRs merged:  $MERGED_COUNT / $PR_COUNT"
 echo ""
-echo "  Full log: /tmp/agentflow-smoketest.log"
+echo "  Full log: /tmp/openflows-smoketest.log"
 echo ""
 
 exit $EXIT_CODE

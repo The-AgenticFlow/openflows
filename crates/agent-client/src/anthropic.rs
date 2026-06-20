@@ -102,8 +102,8 @@ impl AnthropicClient {
 
     pub fn from_env_with_model(model_override: &str) -> Result<Self> {
         let mut client = Self::from_env()?;
-        client.model = model_override.to_string();
-        tracing::info!(model = %model_override, "AnthropicClient model overridden from registry");
+        client.model = crate::strip_provider_prefix(model_override).to_string();
+        tracing::info!(model = %client.model, "AnthropicClient model overridden from registry");
         Ok(client)
     }
 
@@ -218,19 +218,12 @@ impl LlmClient for AnthropicClient {
             .text()
             .await
             .context("Failed to read Anthropic response body")?;
-        let truncation_len = raw_text.len().min(500);
-        let truncation_len = raw_text
-            .char_indices()
-            .take_while(|(i, _)| *i <= truncation_len)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        debug!(stop_reason = %raw_text.len(), status = %status, body = %&raw_text[..truncation_len], "← Anthropic raw response");
+        debug!(stop_reason = %raw_text.len(), status = %status, body = %crate::truncate::truncate_str(&raw_text, 500), "← Anthropic raw response");
 
         let raw: Value = serde_json::from_str(&raw_text).context(format!(
             "Failed to parse Anthropic response (status={}, body={})",
             status,
-            &raw_text[..truncation_len]
+            crate::truncate::truncate_str(&raw_text, 500)
         ))?;
 
         if !status.is_success() {

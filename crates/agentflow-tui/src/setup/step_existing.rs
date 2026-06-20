@@ -42,7 +42,24 @@ impl ExistingConfigStep {
     }
 
     pub fn detect_existing_config(project_dir: &Path) -> Option<SetupConfig> {
-        let env_path = project_dir.join(".env");
+        let openflows_env = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .ok()
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join(".env"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    "{}/.openflows/.env",
+                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                ))
+            });
+        let local_env = project_dir.join(".env");
+        let env_path = if openflows_env.exists() {
+            openflows_env
+        } else {
+            local_env
+        };
         if !env_path.exists() {
             return None;
         }
@@ -62,13 +79,12 @@ impl ExistingConfigStep {
                     }
                     "GITHUB_PERSONAL_ACCESS_TOKEN" => config.github_pat = value.to_string(),
                     "GITHUB_REPOSITORY" => config.repo = value.to_string(),
-                    "GEMINI_API_KEY" => {
-                        config.gemini_key = Some(value.to_string());
-                        config.selected_provider = Some("Google Gemini".to_string());
-                    }
                     "OPENAI_API_KEY" => {
                         config.openai_key = Some(value.to_string());
-                        config.selected_provider = Some("OpenAI".to_string());
+                        // Only set provider if not already set by Fireworks
+                        if config.selected_provider.is_none() {
+                            config.selected_provider = Some("OpenAI (Codex)".to_string());
+                        }
                     }
                     "FIREWORKS_API_KEY" => {
                         config.fireworks_key = Some(value.to_string());

@@ -45,8 +45,8 @@ impl FireworksClient {
 
     pub fn from_env_with_model(model_override: &str) -> Result<Self> {
         let mut client = Self::from_env()?;
-        client.model = model_override.to_string();
-        tracing::info!(model = %model_override, "FireworksClient model overridden");
+        client.model = crate::strip_provider_prefix(model_override).to_string();
+        tracing::info!(model = %client.model, "FireworksClient model overridden");
         Ok(client)
     }
 
@@ -187,7 +187,7 @@ impl LlmClient for FireworksClient {
         let raw: Value = serde_json::from_str(&raw_text).context(format!(
             "Failed to parse Fireworks response (status={}, body={})",
             status,
-            &raw_text[..raw_text.len().min(500)]
+            crate::truncate::truncate_str(&raw_text, 500)
         ))?;
 
         if !status.is_success() {

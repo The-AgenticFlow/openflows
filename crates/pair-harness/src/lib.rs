@@ -13,6 +13,7 @@ pub mod pair;
 pub mod process;
 pub mod provision;
 pub mod reset;
+pub mod responses_proxy;
 pub mod types;
 pub mod watchdog;
 pub mod watcher;
@@ -25,6 +26,7 @@ pub use pair::ForgeSentinelPair;
 pub use process::{ProcessManager, SentinelMode};
 pub use provision::Provisioner;
 pub use reset::ResetManager;
+pub use responses_proxy::start_responses_proxy;
 pub use types::{
     CliBackend, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, Ticket,
     VerificationResult, VerificationState,

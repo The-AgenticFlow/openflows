@@ -1,3 +1,8 @@
+---
+name: sentinel-criteria
+description: Evaluation criteria for the SENTINEL reviewer agent
+---
+
 # SENTINEL Evaluation Criteria
 
 ## The five criteria - all must pass for any approval

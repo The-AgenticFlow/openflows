@@ -38,7 +38,7 @@ Configure each agent individually in `orchestration/agent/registry.json`:
     {
       "id": "nexus",
       "cli": "claude",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     },
@@ -52,14 +52,14 @@ Configure each agent individually in `orchestration/agent/registry.json`:
     {
       "id": "sentinel",
       "cli": "claude",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     },
     {
       "id": "vessel",
       "cli": "",
-      "model": "claude-haiku-4-5-20251001",
+      "model": "claude-3-5-haiku-20241022",
       "active": true,
       "instances": 1
     }
@@ -263,7 +263,7 @@ For any other provider, you MUST run the `anthropic-mock` proxy:
 cargo run -p anthropic-mock
 
 # Terminal 2: Run orchestration
-cargo run --bin agentflow
+cargo run --bin openflows
 ```
 
 The proxy translates:
