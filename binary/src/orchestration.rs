@@ -28,12 +28,18 @@ impl OrchestrationResolver {
         if let Some(ref home) = openflows_home_path {
             candidates.push(home.clone());
         }
-        if let Some(exe_path) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        if let Some(exe_path) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
             if !exe_path.as_os_str().is_empty() {
                 candidates.push(exe_path);
             }
         }
-        if let Some(exe_parent) = std::env::current_exe().ok().and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())) {
+        if let Some(exe_parent) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+        {
             if !exe_parent.as_os_str().is_empty() {
                 candidates.push(exe_parent);
             }
@@ -55,7 +61,9 @@ impl OrchestrationResolver {
                 let home = openflows_home_path.unwrap_or_else(|| {
                     let home = std::env::var("OPENFLOWS_HOME")
                         .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
-                        .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+                        .or_else(|_| {
+                            std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h))
+                        })
                         .unwrap_or_else(|_| ".openflows".to_string());
                     std::path::PathBuf::from(home)
                 });
