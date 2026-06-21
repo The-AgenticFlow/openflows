@@ -77,9 +77,9 @@ impl VesselNode {
         let workspace_root = std::env::var("AGENTFLOW_WORKSPACE_ROOT")
             .map(std::path::PathBuf::from)
             .ok();
-        let ws_path = workspace_root.as_ref().map(|p| {
-            p.join("orchestration").join("agent").join("registry.json")
-        });
+        let ws_path = workspace_root
+            .as_ref()
+            .map(|p| p.join("orchestration").join("agent").join("registry.json"));
         let cwd_path = std::env::current_dir()
             .ok()
             .map(|p| p.join("orchestration").join("agent").join("registry.json"));
@@ -87,7 +87,11 @@ impl VesselNode {
         let registry_path = if oh_path.exists() {
             Some(oh_path)
         } else if let Some(ref p) = ws_path {
-            if p.exists() { Some(p.clone()) } else { cwd_path }
+            if p.exists() {
+                Some(p.clone())
+            } else {
+                cwd_path
+            }
         } else {
             cwd_path
         };
