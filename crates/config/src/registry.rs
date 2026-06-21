@@ -255,7 +255,10 @@ impl Registry {
         // Existence check must also consider inactive agents, including the
         // suffix-stripped base (e.g. "lore-1" -> "lore"), since normalize_agent_id
         // only strips suffixes for *active* agents.
-        let stripped = agent_id.rsplit_once('-').map(|(b, _)| b).unwrap_or(agent_id);
+        let stripped = agent_id
+            .rsplit_once('-')
+            .map(|(b, _)| b)
+            .unwrap_or(agent_id);
         let entry_exists = self
             .team
             .iter()
