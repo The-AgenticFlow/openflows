@@ -187,11 +187,17 @@ async fn main() -> Result<()> {
     let vessel = Arc::new(VesselNode::from_env());
     let lore = if registry.get("lore").is_some() {
         let lore_persona = resolver.persona_path("lore.agent.md");
-        Some(Arc::new(LoreNode::new_with_registry(
+        match LoreNode::new_with_registry(
             &workspace_dir,
             lore_persona,
             registry_path.clone(),
-        )?))
+        ) {
+            Ok(node) => Some(Arc::new(node)),
+            Err(e) => {
+                warn!("lore agent is active but could not initialize — skipping: {}", e);
+                None
+            }
+        }
     } else {
         info!("lore agent is inactive — skipping lore node initialization");
         None
