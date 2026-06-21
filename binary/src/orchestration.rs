@@ -165,8 +165,14 @@ impl OrchestrationResolver {
 
             // Preserve user-customized registry.json so reset doesn't
             // discard agent toggles, model backends, etc. configured via setup.
+            // If registry.json is corrupted, users can delete it manually and
+            // re-run --reset-orchestration to restore defaults.
             if file.relative_path == "agent/registry.json" && target.exists() {
-                info!(path = %target.display(), "Preserving existing registry.json — manual edits will not be overwritten");
+                info!(
+                    path = %target.display(),
+                    "Preserving existing registry.json — manual edits will not be overwritten. \
+                     To reset it, delete this file and re-run --reset-orchestration."
+                );
                 continue;
             }
 

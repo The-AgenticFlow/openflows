@@ -154,6 +154,29 @@ ensure_ai_cli() {
     fi
 }
 
+# Copy orchestration files, preserving user-customized registry.json in OPENFLOWS_HOME.
+install_orchestration() {
+    local src_dir="$1"
+    local oh_dir="${OPENFLOWS_HOME:-$HOME/.openflows}"
+    local reg_path="orchestration/agent/registry.json"
+    local backup=""
+
+    if [ -f "${oh_dir}/${reg_path}" ]; then
+        backup=$(mktemp)
+        cp "${oh_dir}/${reg_path}" "$backup"
+    fi
+
+    cp -r "${src_dir}/orchestration" "${INSTALL_DIR}/"
+    success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+
+    if [ -n "$backup" ] && [ -f "$backup" ]; then
+        mkdir -p "${oh_dir}/orchestration/agent"
+        cp "$backup" "${oh_dir}/${reg_path}"
+        rm -f "$backup"
+        info "Preserved existing registry.json in ${oh_dir} (run 'openflows-setup' to reconfigure)"
+    fi
+}
+
 download_binary() {
     local platform="$1"
     local tag="$2"
@@ -223,20 +246,7 @@ download_binary() {
     done
 
     if [ -d "${extract_dir}/orchestration" ]; then
-        # Back up user-customized registry.json before overwriting
-        local registry_backup=""
-        if [ -f "${INSTALL_DIR}/orchestration/agent/registry.json" ]; then
-            registry_backup=$(mktemp)
-            cp "${INSTALL_DIR}/orchestration/agent/registry.json" "$registry_backup"
-        fi
-        cp -r "${extract_dir}/orchestration" "${INSTALL_DIR}/"
-        # Restore user-customized registry.json if it existed before
-        if [ -n "$registry_backup" ] && [ -f "$registry_backup" ]; then
-            cp "$registry_backup" "${INSTALL_DIR}/orchestration/agent/registry.json"
-            rm -f "$registry_backup"
-            info "Preserved existing registry.json (run 'openflows-setup' to reconfigure)"
-        fi
-        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+        install_orchestration "${extract_dir}"
     fi
 
     rm -rf "${extract_dir}"
@@ -265,20 +275,7 @@ build_from_source() {
     done
 
     if [ -d "orchestration" ]; then
-        # Back up user-customized registry.json before overwriting
-        local registry_backup=""
-        if [ -f "${INSTALL_DIR}/orchestration/agent/registry.json" ]; then
-            registry_backup=$(mktemp)
-            cp "${INSTALL_DIR}/orchestration/agent/registry.json" "$registry_backup"
-        fi
-        cp -r orchestration "${INSTALL_DIR}/"
-        # Restore user-customized registry.json if it existed before
-        if [ -n "$registry_backup" ] && [ -f "$registry_backup" ]; then
-            cp "$registry_backup" "${INSTALL_DIR}/orchestration/agent/registry.json"
-            rm -f "$registry_backup"
-            info "Preserved existing registry.json (run 'openflows-setup' to reconfigure)"
-        fi
-        success "Installed orchestration config to ${INSTALL_DIR}/orchestration/"
+        install_orchestration "."
     fi
 }
 
