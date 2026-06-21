@@ -28,20 +28,16 @@ impl OrchestrationResolver {
         if let Some(ref home) = openflows_home_path {
             candidates.push(home.clone());
         }
-        if let Some(exe_path) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        {
-            if !exe_path.as_os_str().is_empty() {
-                candidates.push(exe_path);
-            }
-        }
-        if let Some(exe_parent) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
-        {
-            if !exe_parent.as_os_str().is_empty() {
-                candidates.push(exe_parent);
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if !dir.as_os_str().is_empty() {
+                    candidates.push(dir.to_path_buf());
+                }
+                if let Some(parent) = dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        candidates.push(parent.to_path_buf());
+                    }
+                }
             }
         }
         if let Ok(cwd) = std::env::current_dir() {
