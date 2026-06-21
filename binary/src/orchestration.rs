@@ -162,6 +162,14 @@ impl OrchestrationResolver {
 
         for file in bundled_files() {
             let target = orch_dir.join(file.relative_path);
+
+            // Preserve user-customized registry.json so reset doesn't
+            // discard agent toggles, model backends, etc. configured via setup.
+            if file.relative_path == "agent/registry.json" && target.exists() {
+                info!(path = %target.display(), "Preserving existing registry.json — manual edits will not be overwritten");
+                continue;
+            }
+
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("Failed to create directory {}", parent.display()))?;
@@ -189,7 +197,7 @@ impl OrchestrationResolver {
             dir = %orch_dir.display(),
             written,
             version = ORCHESTRATION_VERSION,
-            "Reset all orchestration files to bundled defaults"
+            "Reset orchestration files to bundled defaults (preserved user registry)"
         );
 
         Ok(orch_dir)
