@@ -274,9 +274,12 @@ impl Registry {
                 if entry_exists {
                     // Agent exists but is inactive — this is an error, not a fallback case.
                     // Silently returning the global PAT would mask misconfiguration.
+                    // Use the stripped id so the message matches the registry key
+                    // (e.g. "lore" rather than the instance id "lore-1").
+                    let display_id = if base_id == agent_id { stripped } else { base_id };
                     anyhow::bail!(
                         "Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow",
-                        base_id
+                        display_id
                     );
                 } else {
                     // Agent not found at all — fall back to global PAT for backward compat
