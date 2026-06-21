@@ -42,10 +42,22 @@ impl AgentsStep {
     ) -> Result<()> {
         let mut agents: Vec<AgentConfig> = Vec::new();
 
-        let registry_path = std::env::current_dir()?
+        // Search for registry in OPENFLOWS_HOME first, then CWD
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .unwrap_or_else(|_| ".openflows".to_string());
+        let registry_path = std::path::PathBuf::from(&openflows_home)
             .join("orchestration")
             .join("agent")
             .join("registry.json");
+        let registry_path = if registry_path.exists() {
+            registry_path
+        } else {
+            std::env::current_dir()?
+                .join("orchestration")
+                .join("agent")
+                .join("registry.json")
+        };
 
         // Discover models dynamically from the selected provider
         let discovered_models = match discover_models(config).await {

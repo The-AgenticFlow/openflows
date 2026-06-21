@@ -249,6 +249,7 @@ impl Registry {
     /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
     /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` for backward compatibility.
     /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
+    /// Returns an error if the agent exists but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
         // Check if agent exists at all (active or inactive)
@@ -261,13 +262,18 @@ impl Registry {
                     .context("GITHUB_PERSONAL_ACCESS_TOKEN not set (fallback for agent without github_token_env)")?,
             },
             None => {
-                let msg = if entry_exists {
-                    format!("Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow", base_id)
+                if entry_exists {
+                    // Agent exists but is inactive — this is an error, not a fallback case.
+                    // Silently returning the global PAT would mask misconfiguration.
+                    anyhow::bail!(
+                        "Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow",
+                        base_id
+                    );
                 } else {
-                    format!("Agent '{}' not found in registry", base_id)
-                };
-                std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
-                    .context(msg)?
+                    // Agent not found at all — fall back to global PAT for backward compat
+                    std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
+                        .context(format!("Agent '{}' not found in registry", base_id))?
+                }
             }
         };
         Ok(token)

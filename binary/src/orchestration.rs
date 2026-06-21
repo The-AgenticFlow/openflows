@@ -50,9 +50,14 @@ impl OrchestrationResolver {
                 let registry = dir.join("orchestration/agent/registry.json");
                 if registry.exists() {
                     // Reject candidates that are inside an orchestration subdirectory
-                    // to prevent doubled paths like /foo/orchestration/agent/orchestration/agent/
-                    if dir.ends_with("orchestration/agent") || dir.ends_with("orchestration/agent/") {
-                        warn!(dir = %dir.display(), "Skipping candidate inside orchestration/agent — would cause doubled paths");
+                    // to prevent doubled paths like /foo/orchestration/orchestration/agent/
+                    let dir_str = dir.to_string_lossy();
+                    if dir_str.ends_with("/orchestration/agent")
+                        || dir_str.ends_with("/orchestration")
+                        || dir_str.ends_with("/orchestration/agent/")
+                        || dir_str.ends_with("/orchestration/")
+                    {
+                        warn!(dir = %dir.display(), "Skipping candidate inside orchestration subdirectory — would cause doubled paths");
                         return None;
                     }
                     Some((dir.clone(), true))

@@ -50,10 +50,22 @@ impl GitHubStep {
                 }
             }
         } else {
-            let registry_path = std::env::current_dir()?
+            // Search for registry in OPENFLOWS_HOME first, then CWD
+            let openflows_home = std::env::var("OPENFLOWS_HOME")
+                .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+                .unwrap_or_else(|_| ".openflows".to_string());
+            let oh_path = std::path::PathBuf::from(&openflows_home)
                 .join("orchestration")
                 .join("agent")
                 .join("registry.json");
+            let registry_path = if oh_path.exists() {
+                oh_path
+            } else {
+                std::env::current_dir()?
+                    .join("orchestration")
+                    .join("agent")
+                    .join("registry.json")
+            };
 
             if registry_path.exists() {
                 if let Ok(registry) = config::Registry::load(&registry_path) {
