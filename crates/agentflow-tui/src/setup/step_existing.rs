@@ -112,10 +112,23 @@ impl ExistingConfigStep {
         }
 
         // Also load agents from registry.json
-        let registry_path = project_dir
+        // Search in OPENFLOWS_HOME first, then project_dir
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .unwrap_or_else(|_| ".openflows".to_string());
+        let oh_registry = std::path::PathBuf::from(&openflows_home)
             .join("orchestration")
             .join("agent")
             .join("registry.json");
+        let registry_path = if oh_registry.exists() {
+            oh_registry
+        } else {
+            project_dir
+                .join("orchestration")
+                .join("agent")
+                .join("registry.json")
+        };
 
         if registry_path.exists() {
             if let Ok(registry) = config::Registry::load(&registry_path) {
