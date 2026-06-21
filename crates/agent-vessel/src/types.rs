@@ -42,7 +42,7 @@ impl VesselConfig {
     /// Create config using GITHUB_PERSONAL_ACCESS_TOKEN (fallback).
     pub fn from_env() -> Self {
         let github_token = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
-            .expect("GITHUB_PERSONAL_ACCESS_TOKEN must be set");
+            .expect("GITHUB_PERSONAL_ACCESS_TOKEN (or AGENT_VESSEL_GITHUB_TOKEN via registry) must be set");
 
         Self {
             ci_poll: CiPollConfig::default(),

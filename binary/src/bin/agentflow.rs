@@ -1,7 +1,7 @@
 use agent_forge::ForgePairNode;
 use agent_lore::LoreNode;
 use agent_nexus::NexusNode;
-use agent_vessel::VesselNode;
+use agent_vessel::{VesselConfig, VesselNode};
 use anyhow::Result;
 use config::{
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
@@ -184,7 +184,12 @@ async fn main() -> Result<()> {
         &workspace_dir,
         registry_path.clone(),
     ));
-    let vessel = Arc::new(VesselNode::from_env());
+    let vessel = Arc::new(VesselNode::new(
+        VesselConfig::from_registry(&registry_path).unwrap_or_else(|e| {
+            warn!(error = %e, "Failed to load vessel config from registry, using fallback");
+            VesselConfig::from_env()
+        }),
+    ));
     let lore = if registry.get("lore").is_some() {
         let lore_persona = resolver.persona_path("lore.agent.md");
         match LoreNode::new_with_registry(&workspace_dir, lore_persona, registry_path.clone()) {
