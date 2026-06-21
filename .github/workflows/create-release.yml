@@ -1,0 +1,91 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.1.6)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release?'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-and-tag:
+    name: Bump version & create tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must match vMAJOR.MINOR.PATCH (e.g., v1.1.6), got: $VERSION"
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version in Cargo.toml
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+          echo "Bumping binary version to $VERSION_NUM"
+          sed -i "s/^version = \".*\"/version = \"${VERSION_NUM}\"/" binary/Cargo.toml
+
+      - name: Commit version bump
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          git add binary/Cargo.toml
+          git commit -m "release: bump version to ${VERSION}"
+
+      - name: Create and push tag
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          git push origin "HEAD:main" "${VERSION}"
+
+      - name: Create GitHub Release
+        if: github.event.inputs.prerelease != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: "OpenFlows ${{ github.event.inputs.version }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Pre-release
+        if: github.event.inputs.prerelease == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: "OpenFlows ${{ github.event.inputs.version }} (pre-release)"
+          draft: false
+          prerelease: true
+          body: |
+            This is a pre-release build of OpenFlows ${{ github.event.inputs.version }}.
+
+            **Note:** This build may contain unstable changes. For production use, install the latest stable release.
+
+            ## Installation
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
