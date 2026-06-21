@@ -252,8 +252,14 @@ impl Registry {
     /// Returns an error if the agent exists but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
-        // Check if agent exists at all (active or inactive)
-        let entry_exists = self.team.iter().any(|e| e.id == base_id);
+        // Existence check must also consider inactive agents, including the
+        // suffix-stripped base (e.g. "lore-1" -> "lore"), since normalize_agent_id
+        // only strips suffixes for *active* agents.
+        let stripped = agent_id.rsplit_once('-').map(|(b, _)| b).unwrap_or(agent_id);
+        let entry_exists = self
+            .team
+            .iter()
+            .any(|e| e.id == base_id || e.id == stripped);
         let token = match self.get(base_id) {
             Some(entry) => match &entry.github_token_env {
                 Some(env_var) => std::env::var(env_var)
