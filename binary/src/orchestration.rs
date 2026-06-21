@@ -17,36 +17,58 @@ pub struct OrchestrationResolver {
 
 impl OrchestrationResolver {
     pub fn new() -> Result<Self> {
-        let mut candidates = vec![
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())),
-        ];
         let openflows_home = std::env::var("OPENFLOWS_HOME")
             .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
             .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
             .ok();
-        if let Some(ref home) = openflows_home {
-            candidates.push(Some(std::path::PathBuf::from(home)));
+        let openflows_home_path = openflows_home.map(std::path::PathBuf::from);
+
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+        if let Some(ref home) = openflows_home_path {
+            candidates.push(home.clone());
         }
-        candidates.push(std::env::current_dir().ok());
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if !dir.as_os_str().is_empty() {
+                    candidates.push(dir.to_path_buf());
+                }
+                if let Some(parent) = dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        candidates.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd);
+        }
 
-        let candidates: Vec<std::path::PathBuf> = candidates.into_iter().flatten().collect();
-
-        let orchestrator_dir = candidates
+        let (orchestrator_dir, found_registry) = candidates
             .iter()
-            .find(|dir| dir.join("orchestration/agent/registry.json").exists())
-            .cloned()
+            .find_map(|dir| {
+                if dir.join("orchestration/agent/registry.json").exists() {
+                    Some((dir.clone(), true))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| {
-                let home = std::env::var("OPENFLOWS_HOME")
-                    .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
-                    .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
-                    .unwrap_or_else(|_| ".openflows".to_string());
-                std::path::PathBuf::from(home)
+                let home = openflows_home_path.unwrap_or_else(|| {
+                    let home = std::env::var("OPENFLOWS_HOME")
+                        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+                        .or_else(|_| {
+                            std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h))
+                        })
+                        .unwrap_or_else(|_| ".openflows".to_string());
+                    std::path::PathBuf::from(home)
+                });
+                (home, false)
             });
+
+        if found_registry {
+            info!(dir = %orchestrator_dir.display(), "Found existing registry at");
+        }
 
         Ok(Self {
             candidates,
