@@ -222,7 +222,7 @@ download_binary() {
         fi
     done
 
-if [ -d "${extract_dir}/orchestration" ]; then
+    if [ -d "${extract_dir}/orchestration" ]; then
         # Back up user-customized registry.json before overwriting
         local registry_backup=""
         if [ -f "${INSTALL_DIR}/orchestration/agent/registry.json" ]; then
@@ -264,7 +264,7 @@ build_from_source() {
         fi
     done
 
-if [ -d "orchestration" ]; then
+    if [ -d "orchestration" ]; then
         # Back up user-customized registry.json before overwriting
         local registry_backup=""
         if [ -f "${INSTALL_DIR}/orchestration/agent/registry.json" ]; then
