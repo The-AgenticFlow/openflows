@@ -22,6 +22,7 @@ const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
 /// Must match vessel::node::MAX_CI_FIX_ATTEMPTS to stay in sync.
 const MAX_CI_FIX_ATTEMPTS_NEXUS: u32 = 3;
 const CI_SETUP_TICKET_ID: &str = "T-CI-001";
+const ASSIGNMENT_FAILURE_MARKER: &str = "<!-- openflows-assignment-failure -->";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -591,6 +592,41 @@ impl NexusNode {
         }
     }
 
+    /// Post a diagnostic comment on a GitHub issue only if no comment with the
+    /// given marker tag already exists. This prevents spamming the same issue
+    /// across multiple nexus cycles when assignment consistently fails.
+    async fn post_comment_once(
+        client: &github::GithubRestClient,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        marker: &str,
+        comment: &str,
+    ) {
+        match client
+            .issue_has_comment_with_marker(owner, repo, issue_number, marker)
+            .await
+        {
+            Ok(true) => {
+                info!(owner, repo, issue_number, "Assignment-failure comment already exists — skipping");
+            }
+            Ok(false) => {
+                if let Err(ce) = client.comment_on_issue(owner, repo, issue_number, comment).await {
+                    warn!(error = %ce, "Failed to post assignment-failure comment on issue");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to check for existing assignment-failure comment — posting anyway"
+                );
+                if let Err(ce) = client.comment_on_issue(owner, repo, issue_number, comment).await {
+                    warn!(error = %ce, "Failed to post assignment-failure comment on issue");
+                }
+            }
+        }
+    }
+
     /// Sync work assignment to GitHub by assigning the issue to the worker.
     /// The worker's GitHub username is resolved dynamically by calling the GitHub API
     /// (GET /user) with the worker's token, which is more robust than reading a static
@@ -654,6 +690,35 @@ impl NexusNode {
         let identity_manager = config::IdentityManager::load(&self.registry_path)
             .context("Failed to load IdentityManager from registry")?;
 
+        let registry = identity_manager
+            .registry()
+            .context("Failed to read registry for worker token check")?;
+
+        let base_id = registry.normalize_agent_id(worker_id);
+        #[allow(clippy::needless_borrow)]
+        let worker_entry = registry.get(&base_id);
+
+        let has_dedicated_token = worker_entry
+            .as_ref()
+            .map(|e| e.github_token_env.is_some())
+            .unwrap_or(false);
+
+        if !has_dedicated_token {
+            warn!(
+                worker_id,
+                "Worker has no dedicated github_token_env — cannot safely determine its GitHub identity"
+            );
+            let comment = format!(
+                "<!-- openflows-assignment-failure -->\n\
+                 ⚠️ **Could not assign this issue to `{}`** — the agent does not have a dedicated \
+                 GitHub token configured. Please add a `github_token_env` field for this agent in \
+                 `registry.json` so its identity can be resolved dynamically.",
+                worker_id
+            );
+            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
+            return Ok(());
+        }
+
         let worker_token_result = identity_manager.resolve_github_token(worker_id);
         if let Err(e) = &worker_token_result {
             warn!(
@@ -661,14 +726,17 @@ impl NexusNode {
                 error = %e,
                 "Failed to resolve GitHub token for worker"
             );
+            let env_var_name = worker_entry
+                .as_ref()
+                .and_then(|e| e.github_token_env.as_deref())
+                .unwrap_or("<missing>");
             let comment = format!(
-                "⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token is not configured. \
-                 Please check that `github_token_env` is set correctly in the registry for this agent.",
-                worker_id
+                "<!-- openflows-assignment-failure -->\n\
+                 ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token environment \
+                 variable is not set. Please check that `{}` is configured in the environment.",
+                worker_id, env_var_name
             );
-            if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
-                warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
-            }
+            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
             return Ok(());
         }
 
@@ -682,14 +750,13 @@ impl NexusNode {
                 "Failed to resolve GitHub username from worker token"
             );
             let comment = format!(
-                "⚠️ **Could not assign this issue to `{}`** — failed to look up the agent's GitHub identity via the API. \
-                 This usually means the agent's GitHub token is invalid or expired. \
-                 Error: {}",
+                "<!-- openflows-assignment-failure -->\n\
+                 ⚠️ **Could not assign this issue to `{}`** — failed to look up the agent's GitHub \
+                 identity via the API. This usually means the agent's GitHub token is invalid or \
+                 expired.\n\nError: {}",
                 worker_id, e
             );
-            if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
-                warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
-            }
+            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
             return Ok(());
         }
 
@@ -713,13 +780,13 @@ impl NexusNode {
                             github_username
                         );
                         let comment = format!(
-                            "⚠️ **Could not assign this issue to `@{}`** — this GitHub user is not a collaborator on `{}/{}`. \
-                             To fix this, add `{}` as a collaborator or adjust repository permissions.",
+                            "<!-- openflows-assignment-failure -->\n\
+                             ⚠️ **Could not assign this issue to `@{}`** — this GitHub user is not a \
+                             collaborator on `{}/{}`. To fix this, add `{}` as a collaborator or \
+                             adjust repository permissions.",
                             github_username, owner, repo, github_username
                         );
-                        if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
-                            warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
-                        }
+                        Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
                         (github_username.clone(), false)
                     } else {
                         return Err(e);

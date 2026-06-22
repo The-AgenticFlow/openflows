@@ -767,6 +767,28 @@ impl GithubRestClient {
         Ok(login.to_string())
     }
 
+    /// Check whether a diagnostic comment with the given marker tag already exists on an issue.
+    /// The marker is an HTML comment like `<!-- openflows-assignment-failure -->` embedded in the body.
+    pub async fn issue_has_comment_with_marker(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        marker: &str,
+    ) -> Result<bool> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments?per_page=100",
+            GITHUB_API_BASE, owner, repo, issue_number
+        );
+        let comments: Vec<serde_json::Value> = self.get_json(&url).await?;
+        Ok(comments.iter().any(|c| {
+            c["body"]
+                .as_str()
+                .map(|b| b.contains(marker))
+                .unwrap_or(false)
+        }))
+    }
+
     /// Post a comment on a GitHub issue.
     pub async fn comment_on_issue(
         &self,
