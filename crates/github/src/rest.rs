@@ -819,7 +819,12 @@ impl GithubRestClient {
             );
         }
 
-        info!(owner, repo, issue = issue_number, "Comment posted on GitHub issue");
+        info!(
+            owner,
+            repo,
+            issue = issue_number,
+            "Comment posted on GitHub issue"
+        );
         Ok(())
     }
 

@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
-    ACTION_NO_WORK,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
@@ -608,10 +607,16 @@ impl NexusNode {
             .await
         {
             Ok(true) => {
-                info!(owner, repo, issue_number, "Assignment-failure comment already exists — skipping");
+                info!(
+                    owner,
+                    repo, issue_number, "Assignment-failure comment already exists — skipping"
+                );
             }
             Ok(false) => {
-                if let Err(ce) = client.comment_on_issue(owner, repo, issue_number, comment).await {
+                if let Err(ce) = client
+                    .comment_on_issue(owner, repo, issue_number, comment)
+                    .await
+                {
                     warn!(error = %ce, "Failed to post assignment-failure comment on issue");
                 }
             }
@@ -620,7 +625,10 @@ impl NexusNode {
                     error = %e,
                     "Failed to check for existing assignment-failure comment — posting anyway"
                 );
-                if let Err(ce) = client.comment_on_issue(owner, repo, issue_number, comment).await {
+                if let Err(ce) = client
+                    .comment_on_issue(owner, repo, issue_number, comment)
+                    .await
+                {
                     warn!(error = %ce, "Failed to post assignment-failure comment on issue");
                 }
             }
@@ -715,7 +723,15 @@ impl NexusNode {
                  `registry.json` so its identity can be resolved dynamically.",
                 worker_id
             );
-            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
+            Self::post_comment_once(
+                &nexus_client,
+                owner,
+                repo,
+                issue_number,
+                ASSIGNMENT_FAILURE_MARKER,
+                &comment,
+            )
+            .await;
             return Ok(());
         }
 
@@ -736,7 +752,15 @@ impl NexusNode {
                  variable is not set. Please check that `{}` is configured in the environment.",
                 worker_id, env_var_name
             );
-            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
+            Self::post_comment_once(
+                &nexus_client,
+                owner,
+                repo,
+                issue_number,
+                ASSIGNMENT_FAILURE_MARKER,
+                &comment,
+            )
+            .await;
             return Ok(());
         }
 
@@ -756,43 +780,58 @@ impl NexusNode {
                  expired.\n\nError: {}",
                 worker_id, e
             );
-            Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
+            Self::post_comment_once(
+                &nexus_client,
+                owner,
+                repo,
+                issue_number,
+                ASSIGNMENT_FAILURE_MARKER,
+                &comment,
+            )
+            .await;
             return Ok(());
         }
 
         let github_username = username_result.unwrap();
 
-        let (assignee_display, assignment_success) =
-            match nexus_client
-                .assign_issue(owner, repo, issue_number, &github_username)
-                .await
-            {
-                Ok(_) => (github_username.clone(), true),
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.starts_with("Validation failed (422)") {
-                        warn!(
-                            worker_id,
-                            ticket_id,
-                            github_username,
-                            error = %e,
-                            "GitHub user '{}' is not a valid assignee for this repository",
-                            github_username
-                        );
-                        let comment = format!(
+        let (assignee_display, assignment_success) = match nexus_client
+            .assign_issue(owner, repo, issue_number, &github_username)
+            .await
+        {
+            Ok(_) => (github_username.clone(), true),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.starts_with("Validation failed (422)") {
+                    warn!(
+                        worker_id,
+                        ticket_id,
+                        github_username,
+                        error = %e,
+                        "GitHub user '{}' is not a valid assignee for this repository",
+                        github_username
+                    );
+                    let comment = format!(
                             "<!-- openflows-assignment-failure -->\n\
                              ⚠️ **Could not assign this issue to `@{}`** — this GitHub user is not a \
                              collaborator on `{}/{}`. To fix this, add `{}` as a collaborator or \
                              adjust repository permissions.",
                             github_username, owner, repo, github_username
                         );
-                        Self::post_comment_once(&nexus_client, owner, repo, issue_number, ASSIGNMENT_FAILURE_MARKER, &comment).await;
-                        (github_username.clone(), false)
-                    } else {
-                        return Err(e);
-                    }
+                    Self::post_comment_once(
+                        &nexus_client,
+                        owner,
+                        repo,
+                        issue_number,
+                        ASSIGNMENT_FAILURE_MARKER,
+                        &comment,
+                    )
+                    .await;
+                    (github_username.clone(), false)
+                } else {
+                    return Err(e);
                 }
-            };
+            }
+        };
 
         if assignment_success {
             info!(
