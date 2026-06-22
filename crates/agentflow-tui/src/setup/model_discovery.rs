@@ -525,9 +525,11 @@ fn is_openai_chat_model(model_id: &str) -> bool {
         && !model_id.contains("realtime")
 }
 
-/// Fetch available models from Fireworks API via the OpenAI-compatible
-/// `/inference/v1/models` endpoint.  Uses a 30 s timeout and follows
-/// OpenAI-style pagination (`has_more` / `after`) to retrieve all pages.
+/// Fetch available models from Fireworks API using the native
+/// `/v1/accounts/fireworks/models` endpoint (the OpenAI-compatible
+/// `/inference/v1/models` endpoint has been returning 500 errors).
+/// Uses 30 s timeout, pageSize=200 pagination, and filters for
+/// serverless chat/text models with contextLength > 0.
 async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -537,26 +539,23 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let mut page_token: Option<String> = None;
 
     loop {
-        // The OpenAI-compatible /inference/v1/models endpoint doesn't support
-        // ?limit=; it returns all models in one response.  We use after= for
-        // cursor-based pagination only if has_more is true.
-        let mut url = "https://api.fireworks.ai/inference/v1/models".to_string();
+        let mut url =
+            "https://api.fireworks.ai/v1/accounts/fireworks/models?pageSize=200".to_string();
         if let Some(ref token) = page_token {
-            url.push_str(&format!("?after={}", token));
+            url.push_str(&format!("&pageToken={}", token));
         }
 
-        tracing::info!(url = %url, "Fetching Fireworks models");
+        tracing::info!(url = %url, "Fetching Fireworks models page");
 
         let response = match client
             .get(&url)
             .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, "Fireworks models request failed");
+                tracing::warn!(error = %e, "Fireworks native models request failed");
                 return Err(anyhow::anyhow!(
                     "Failed to reach Fireworks API: {}. Check your network connection and API key.",
                     e
@@ -567,20 +566,172 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            tracing::warn!(status = %status, body = %body, "Fireworks API error listing models");
+            tracing::warn!(status = %status, body = %body, "Fireworks native API error listing models");
+            // Fall back to the OpenAI-compatible endpoint as a backup
+            tracing::info!("Native API failed, trying OpenAI-compatible endpoint as fallback");
+            return discover_fireworks_models_openai_compat(api_key, &client).await;
+        }
+
+        let json: serde_json::Value = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to parse Fireworks native models response as JSON");
+                return Err(anyhow::anyhow!(
+                    "Failed to parse Fireworks models response: {}",
+                    e
+                ));
+            }
+        };
+
+        let model_array = json
+            .get("models")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        tracing::info!(
+            raw_count = model_array.len(),
+            "Fireworks native API returned models in this page"
+        );
+
+        for m in &model_array {
+            let name = m
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Only include serverless models available for inference
+            let supports_serverless = m
+                .get("supportsServerless")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !supports_serverless {
+                continue;
+            }
+
+            // Must have a positive context length (excludes image gen, etc.)
+            let ctx_len = m
+                .get("contextLength")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if ctx_len == 0 {
+                continue;
+            }
+
+            // Exclude known non-chat families
+            if !is_fireworks_chat_model(&name) {
+                continue;
+            }
+
+            let display_name = m
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Build a description with context length and capabilities
+            let supports_tools = m
+                .get("supportsTools")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let supports_vision = m
+                .get("supportsImageInput")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let mut desc_parts = vec![format!("{}K ctx", ctx_len / 1024)];
+            if supports_tools {
+                desc_parts.push("tools".to_string());
+            }
+            if supports_vision {
+                desc_parts.push("vision".to_string());
+            }
+            let description = Some(desc_parts.join(", "));
+
+            all_models.push(ModelInfo {
+                slug: format!("fireworks/{}", name),
+                display_name,
+                description,
+            });
+        }
+
+        // Check for next page
+        let next_token = json
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        if next_token.is_none() || model_array.is_empty() {
+            break;
+        }
+        page_token = next_token;
+    }
+
+    tracing::info!(count = all_models.len(), "Discovered Fireworks models via native API");
+
+    if all_models.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No chat models found in Fireworks account — the API returned empty results"
+        ));
+    }
+
+    Ok(all_models)
+}
+
+/// Fallback: try the OpenAI-compatible /inference/v1/models endpoint.
+/// This endpoint has been known to return 500 errors, so it's only used
+/// when the native API fails.
+async fn discover_fireworks_models_openai_compat(
+    api_key: &str,
+    client: &reqwest::Client,
+) -> Result<Vec<ModelInfo>> {
+    let mut all_models: Vec<ModelInfo> = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut url = "https://api.fireworks.ai/inference/v1/models".to_string();
+        if let Some(ref token) = page_token {
+            url.push_str(&format!("?after={}", token));
+        }
+
+        tracing::info!(url = %url, "Fetching Fireworks models (OpenAI-compat fallback)");
+
+        let response = match client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Fireworks OpenAI-compat models request failed");
+                return Err(anyhow::anyhow!(
+                    "Failed to reach Fireworks API (both native and OpenAI-compat): {}",
+                    e
+                ));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body,
+                "Fireworks OpenAI-compat endpoint also failed"
+            );
             return Err(anyhow::anyhow!(
-                "Fireworks API returned status {} when listing models: {}",
-                status,
-                body.chars().take(200).collect::<String>()
+                "Fireworks API returned status {} (both endpoints failed)",
+                status
             ));
         }
 
         let json: serde_json::Value = match response.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to parse Fireworks models response as JSON");
                 return Err(anyhow::anyhow!(
-                    "Failed to parse Fireworks models response: {}",
+                    "Failed to parse Fireworks OpenAI-compat response: {}",
                     e
                 ));
             }
@@ -592,11 +743,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             .cloned()
             .unwrap_or_default();
 
-        tracing::info!(
-            raw_count = model_array.len(),
-            "Fireworks API returned models in this page"
-        );
-
         for m in &model_array {
             let raw_id = m
                 .get("id")
@@ -605,7 +751,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 .to_string();
 
             if !is_fireworks_chat_model(&raw_id) {
-                tracing::debug!(model = %raw_id, "Skipping non-chat Fireworks model");
                 continue;
             }
 
@@ -627,7 +772,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             });
         }
 
-        // Check for OpenAI-style pagination
         let has_more = json
             .get("has_more")
             .and_then(|v| v.as_bool())
@@ -637,7 +781,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             break;
         }
 
-        // Use the last model ID as the pagination cursor
         if let Some(last) = model_array.last() {
             page_token = last.get("id").and_then(|v| v.as_str()).map(String::from);
         } else {
@@ -645,11 +788,14 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         }
     }
 
-    tracing::info!(count = all_models.len(), "Discovered Fireworks models via API");
+    tracing::info!(
+        count = all_models.len(),
+        "Discovered Fireworks models via OpenAI-compat fallback"
+    );
 
     if all_models.is_empty() {
         return Err(anyhow::anyhow!(
-            "No chat models found in Fireworks account — the API returned empty results"
+            "No chat models found in Fireworks account"
         ));
     }
 
@@ -688,15 +834,18 @@ fn discover_known_fireworks_models() -> Result<Vec<ModelInfo>> {
 }
 
 /// Check if a Fireworks model ID is a chat/instruct/text model suitable for
-/// agent use.  Excludes embedding, image-generation, audio, and other
-/// non-chat model families.
+/// agent use.  Excludes embedding, reranker, image-generation, audio, and
+/// other non-chat model families.
 ///
-/// The `/inference/v1/models` endpoint already filters to models available for
-/// inference, so we only need to exclude clearly non-chat categories.
+/// When using the native API, the `supportsServerless` and `contextLength`
+/// filters already narrow down to inference-ready models.  This filter
+/// further excludes names that are clearly not text-generation models.
 fn is_fireworks_chat_model(model_id: &str) -> bool {
     // Exclude known non-chat model families
     if model_id.contains("embedding")
         || model_id.contains("-embed-")
+        || model_id.contains("reranker")
+        || model_id.contains("-rerank-")
         || model_id.contains("whisper")
         || model_id.contains("tts")
         || model_id.contains("dall-e")
@@ -709,10 +858,7 @@ fn is_fireworks_chat_model(model_id: &str) -> bool {
         return false;
     }
 
-    // Accept all models under accounts/fireworks/models/ — these are
-    // Fireworks-hosted serverless models available for text generation.
-    // The /inference/v1/models endpoint already pre-filters to inference-ready
-    // models, so anything it returns with this prefix is a valid chat model.
+    // Accept all models under accounts/fireworks/models/
     model_id.starts_with("accounts/fireworks/models/")
 }
 
@@ -894,24 +1040,20 @@ mod tests {
         assert!(is_fireworks_chat_model(
             "accounts/fireworks/models/glm-5p1"
         ));
-        assert!(is_fireworks_chat_model(
-            "accounts/fireworks/models/gemma-4-31b-it-nvfp4"
-        ));
-        assert!(is_fireworks_chat_model(
-            "accounts/fireworks/models/llama-v3p3-70b-instruct"
-        ));
-        // Non-chat models are excluded even with the prefix
+        // Non-chat models are excluded
         assert!(!is_fireworks_chat_model(
-            "accounts/fireworks/models/text-embedding-3"
+            "accounts/fireworks/models/qwen3-embedding-8b"
         ));
         assert!(!is_fireworks_chat_model(
-            "accounts/fireworks/models/flux-1-schnell"
+            "accounts/fireworks/models/qwen3-reranker-8b"
+        ));
+        assert!(!is_fireworks_chat_model(
+            "accounts/fireworks/models/flux-1-schnell-fp8"
         ));
         assert!(!is_fireworks_chat_model(
             "accounts/fireworks/models/whisper-large"
         ));
         // Models without the Fireworks prefix are not accepted
-        // (the /inference/v1/models endpoint returns Fireworks-prefixed IDs)
         assert!(!is_fireworks_chat_model("some-random-model"));
         assert!(!is_fireworks_chat_model("embedding-model"));
     }
