@@ -70,13 +70,35 @@ pub async fn discover_models(config: &SetupConfig) -> Result<Vec<ModelInfo>> {
         Some(p) if p.contains("Fireworks") => {
             if let Some(ref key) = config.fireworks_key {
                 if !key.is_empty() {
-                    if let Ok(models) = discover_fireworks_models(key).await {
-                        if !models.is_empty() {
+                    match discover_fireworks_models(key).await {
+                        Ok(models) if !models.is_empty() => {
+                            tracing::info!(
+                                count = models.len(),
+                                "Discovered Fireworks models via live API"
+                            );
                             return Ok(models);
                         }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "Fireworks API returned 0 chat models — falling back to minimal list"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Fireworks API model discovery failed — falling back to minimal list"
+                            );
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        "Fireworks API key is empty — skipping live discovery, using minimal list"
+                    );
                 }
-                tracing::warn!("Fireworks API model discovery failed or returned no results, using known models");
+            } else {
+                tracing::warn!(
+                    "No Fireworks API key configured — skipping live discovery, using minimal list"
+                );
             }
             discover_known_fireworks_models()
         }
@@ -504,9 +526,8 @@ fn is_openai_chat_model(model_id: &str) -> bool {
 }
 
 /// Fetch available models from Fireworks API via the OpenAI-compatible
-/// `/inference/v1/models` endpoint.  Uses a 30 s timeout, requests up to
-/// 200 models per page, and follows pagination tokens so we discover *all*
-/// models rather than just the first 50.
+/// `/inference/v1/models` endpoint.  Uses a 30 s timeout and follows
+/// OpenAI-style pagination (`has_more` / `after`) to retrieve all pages.
 async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -516,12 +537,15 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let mut page_token: Option<String> = None;
 
     loop {
-        let mut url = "https://api.fireworks.ai/inference/v1/models?limit=200".to_string();
+        // The OpenAI-compatible /inference/v1/models endpoint doesn't support
+        // ?limit=; it returns all models in one response.  We use after= for
+        // cursor-based pagination only if has_more is true.
+        let mut url = "https://api.fireworks.ai/inference/v1/models".to_string();
         if let Some(ref token) = page_token {
-            url.push_str(&format!("&after={}", token));
+            url.push_str(&format!("?after={}", token));
         }
 
-        tracing::debug!(url = %url, "Fetching Fireworks models page");
+        tracing::info!(url = %url, "Fetching Fireworks models");
 
         let response = match client
             .get(&url)
@@ -534,7 +558,7 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             Err(e) => {
                 tracing::warn!(error = %e, "Fireworks models request failed");
                 return Err(anyhow::anyhow!(
-                    "Failed to reach Fireworks API: {}. Check your network connection.",
+                    "Failed to reach Fireworks API: {}. Check your network connection and API key.",
                     e
                 ));
             }
@@ -568,6 +592,11 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             .cloned()
             .unwrap_or_default();
 
+        tracing::info!(
+            raw_count = model_array.len(),
+            "Fireworks API returned models in this page"
+        );
+
         for m in &model_array {
             let raw_id = m
                 .get("id")
@@ -576,6 +605,7 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 .to_string();
 
             if !is_fireworks_chat_model(&raw_id) {
+                tracing::debug!(model = %raw_id, "Skipping non-chat Fireworks model");
                 continue;
             }
 
@@ -597,7 +627,7 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             });
         }
 
-        // OpenAI-compatible pagination: check for has_more / last ID
+        // Check for OpenAI-style pagination
         let has_more = json
             .get("has_more")
             .and_then(|v| v.as_bool())
