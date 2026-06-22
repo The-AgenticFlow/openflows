@@ -335,7 +335,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                 "anthropic/claude-3-5-sonnet-20241022".to_string()
             }
             Some(p) if p.contains("Fireworks") => {
-                "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct".to_string()
+                "fireworks/accounts/fireworks/models/deepseek-v3p1".to_string()
             }
             _ => "openai/gpt-4o".to_string(),
         });
