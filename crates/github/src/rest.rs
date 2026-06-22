@@ -739,6 +739,68 @@ impl GithubRestClient {
         self.get_json(&url).await
     }
 
+    /// Get the authenticated user's login name using the current token.
+    /// Calls GET /user and returns the "login" field.
+    pub async fn get_authenticated_user_login(&self) -> Result<String> {
+        let url = format!("{}/user", GITHUB_API_BASE);
+        let resp = self.send_with_retry(|| self.build_get(&url)).await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to get authenticated user (status {}): {}",
+                status,
+                body_text
+            );
+        }
+
+        let user: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse GitHub user response")?;
+
+        let login = user["login"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("GitHub user response missing 'login' field"))?;
+
+        Ok(login.to_string())
+    }
+
+    /// Post a comment on a GitHub issue.
+    pub async fn comment_on_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        comment_body: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            GITHUB_API_BASE, owner, repo, issue_number
+        );
+        let payload = serde_json::json!({ "body": comment_body });
+        let body_bytes = serde_json::to_vec(&payload)?;
+
+        let resp = self
+            .send_with_retry(|| self.build_post(&url, &body_bytes))
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to post comment on issue #{} (status {}): {}",
+                issue_number,
+                status,
+                body_text
+            );
+        }
+
+        info!(owner, repo, issue = issue_number, "Comment posted on GitHub issue");
+        Ok(())
+    }
+
     /// Assign a GitHub issue to a user.
     /// The assignee should be a GitHub username (e.g., "forge-bot").
     /// Returns Ok(()) on success, or an error with the HTTP status code on failure.

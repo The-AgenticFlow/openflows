@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    AgentDef, Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
     ACTION_NO_WORK,
 };
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
@@ -591,20 +591,22 @@ impl NexusNode {
         }
     }
 
-    /// Sync work assignment to GitHub by assigning the issue to the forge worker.
-    /// The forge worker's GitHub username is loaded from the agent definition (forge.agent.md).
+    /// Sync work assignment to GitHub by assigning the issue to the worker.
+    /// The worker's GitHub username is resolved dynamically by calling the GitHub API
+    /// (GET /user) with the worker's token, which is more robust than reading a static
+    /// field from the agent definition and works across repos where the bot is a member.
+    ///
+    /// If identity resolution fails, a helpful comment is posted on the issue instead
+    /// of silently skipping assignment.
     async fn sync_assignment_to_github(
         &self,
         worker_id: &str,
         ticket_id: &str,
         issue_url: &str,
     ) -> Result<()> {
-        // Parse owner/repo from issue URL and extract issue number
-        // Expected format: https://github.com/{owner}/{repo}/issues/{number}
         let parsed_url = url::Url::parse(issue_url)
             .with_context(|| format!("Invalid issue URL format: {}", issue_url))?;
 
-        // Validate host is github.com (case-insensitive)
         let host = parsed_url
             .host_str()
             .ok_or_else(|| anyhow::anyhow!("Missing host in URL"))?;
@@ -612,7 +614,6 @@ impl NexusNode {
             anyhow::bail!("URL host must be github.com, got: {}", host);
         }
 
-        // Parse path segments: /{owner}/{repo}/issues/{number}
         let path_segments: Vec<&str> = parsed_url
             .path_segments()
             .map(|s| s.collect::<Vec<_>>())
@@ -625,7 +626,6 @@ impl NexusNode {
             );
         }
 
-        // Check that the third segment is "issues" (or "pull" for PRs)
         let issue_type = path_segments[2];
         if issue_type != "issues" && issue_type != "pull" {
             anyhow::bail!(
@@ -637,114 +637,102 @@ impl NexusNode {
         let owner = path_segments[0];
         let repo = path_segments[1];
 
-        // Extract issue number, stripping any trailing slashes or query parameters
         let number_str = path_segments[3].trim_end_matches('/');
         let issue_number: u64 = number_str
             .parse()
             .with_context(|| format!("Could not parse issue number from: {}", number_str))?;
 
-        let token = match self.resolve_github_token() {
+        let nexus_token = match self.resolve_github_token() {
             Ok(t) => t,
             Err(e) => {
-                anyhow::bail!("GitHub token not configured: {}", e);
+                anyhow::bail!("GitHub token not configured for nexus: {}", e);
             }
         };
 
-        let client = github::GithubRestClient::new(&token);
+        let nexus_client = github::GithubRestClient::new(&nexus_token);
 
-        // Load the agent definition to get the GitHub username for the worker
-        // Worker IDs are typically in format "forge-1", "forge-2", etc.
-        let agent_type = worker_id.split('-').next().unwrap_or("forge");
-        let agent_def_path = self
-            .registry_path
-            .parent()
-            .map(|p| p.join("agents").join(format!("{}.agent.md", agent_type)))
-            .unwrap_or_else(|| {
-                PathBuf::from(format!(
-                    "orchestration/agent/agents/{}.agent.md",
-                    agent_type
-                ))
-            });
+        let identity_manager = config::IdentityManager::load(&self.registry_path)
+            .context("Failed to load IdentityManager from registry")?;
 
-        let github_username = match AgentDef::load(&agent_def_path) {
-            Ok(def) => def.github.trim().to_string(),
-            Err(e) => {
-                warn!(
-                    worker_id,
-                    agent_type,
-                    path = %agent_def_path.display(),
-                    error = %e,
-                    "Failed to load agent definition — using empty GitHub username"
-                );
-                String::new()
+        let worker_token_result = identity_manager.resolve_github_token(worker_id);
+        if let Err(e) = &worker_token_result {
+            warn!(
+                worker_id,
+                error = %e,
+                "Failed to resolve GitHub token for worker"
+            );
+            let comment = format!(
+                "⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token is not configured. \
+                 Please check that `github_token_env` is set correctly in the registry for this agent.",
+                worker_id
+            );
+            if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
+                warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
             }
-        };
+            return Ok(());
+        }
 
-        // Only attempt assignment if a valid GitHub username is configured
-        let (assignee_display, assignment_success) = if !github_username.is_empty() {
-            match client
+        let worker_token = worker_token_result.unwrap();
+        let worker_client = github::GithubRestClient::new(&worker_token);
+        let username_result = worker_client.get_authenticated_user_login().await;
+        if let Err(e) = &username_result {
+            warn!(
+                worker_id,
+                error = %e,
+                "Failed to resolve GitHub username from worker token"
+            );
+            let comment = format!(
+                "⚠️ **Could not assign this issue to `{}`** — failed to look up the agent's GitHub identity via the API. \
+                 This usually means the agent's GitHub token is invalid or expired. \
+                 Error: {}",
+                worker_id, e
+            );
+            if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
+                warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
+            }
+            return Ok(());
+        }
+
+        let github_username = username_result.unwrap();
+
+        let (assignee_display, assignment_success) =
+            match nexus_client
                 .assign_issue(owner, repo, issue_number, &github_username)
                 .await
             {
                 Ok(_) => (github_username.clone(), true),
                 Err(e) => {
                     let err_str = e.to_string();
-                    // Check if it's a validation error (422) for invalid assignee
                     if err_str.starts_with("Validation failed (422)") {
                         warn!(
                             worker_id,
                             ticket_id,
                             github_username,
                             error = %e,
-                            "GitHub user '{}' is not a valid assignee for this repository — skipping assignment",
+                            "GitHub user '{}' is not a valid assignee for this repository",
                             github_username
                         );
-                        // Continue without failing - assignment is not critical
+                        let comment = format!(
+                            "⚠️ **Could not assign this issue to `@{}`** — this GitHub user is not a collaborator on `{}/{}`. \
+                             To fix this, add `{}` as a collaborator or adjust repository permissions.",
+                            github_username, owner, repo, github_username
+                        );
+                        if let Err(ce) = nexus_client.comment_on_issue(owner, repo, issue_number, &comment).await {
+                            warn!(worker_id, ticket_id, error = %ce, "Failed to post assignment-failure comment on issue");
+                        }
                         (github_username.clone(), false)
                     } else {
                         return Err(e);
                     }
                 }
-            }
-        } else {
-            warn!(
-                worker_id,
-                ticket_id, "No GitHub username configured for worker — skipping assignment"
-            );
-            ("<none>".to_string(), false)
-        };
+            };
 
         if assignment_success {
-            #[cfg(debug_assertions)]
-            info!(
-                worker_id,
-                ticket_id,
-                issue_url,
-                assignee = assignee_display,
-                "Successfully synced assignment to GitHub"
-            );
-            #[cfg(not(debug_assertions))]
             info!(
                 worker_id,
                 ticket_id,
                 assignee = assignee_display,
                 "Successfully synced assignment to GitHub"
-            );
-        } else {
-            #[cfg(debug_assertions)]
-            info!(
-                worker_id,
-                ticket_id,
-                issue_url,
-                attempted_assignee = assignee_display,
-                "GitHub assignment skipped (not critical)"
-            );
-            #[cfg(not(debug_assertions))]
-            info!(
-                worker_id,
-                ticket_id,
-                attempted_assignee = assignee_display,
-                "GitHub assignment skipped (not critical)"
             );
         }
 
