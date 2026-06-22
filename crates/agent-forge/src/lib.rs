@@ -13,11 +13,45 @@ use pair_harness::{
 };
 use pocketflow_core::{Action, BatchNode, SharedStore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{info, warn};
+
+/// Custom deserializer that converts an empty string to `None` for `Option<u64>`.
+/// LLMs frequently write `"pr_number": ""` instead of `"pr_number": null` or
+/// `"pr_number": 42`, which causes serde to fail. This deserializer gracefully
+/// handles that case, and also converts numeric strings like `"42"`.
+fn deserialize_opt_u64_from_maybe_string<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeU64 {
+        Number(u64),
+        Null,
+        String(String),
+    }
+
+    match MaybeU64::deserialize(deserializer) {
+        Ok(MaybeU64::Number(n)) => Ok(Some(n)),
+        Ok(MaybeU64::Null) => Ok(None),
+        Ok(MaybeU64::String(s)) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                s.parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| de::Error::custom(format!("cannot parse \"{}\" as u64", s)))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeStatus {
@@ -35,7 +69,11 @@ pub struct ForgeStatus {
     #[serde(alias = "pr")]
     pub pr_url: Option<String>,
     /// PR number if a PR was opened
-    pub pr_number: Option<u32>,
+    #[serde(
+        deserialize_with = "deserialize_opt_u64_from_maybe_string",
+        default
+    )]
+    pub pr_number: Option<u64>,
     /// Notes about the work done
     pub notes: Option<String>,
     /// Summary of changes (optional)
@@ -863,6 +901,12 @@ impl ForgePairNode {
         // Check for commits beyond the default branch.
         // First try the local branch name, then fall back to the remote-tracking
         // ref (origin/{default_branch}) which is more reliable after fetches.
+        // Before checking, fetch the default branch to ensure the remote ref is up-to-date.
+        let _ = StdCommand::new("git")
+            .args(["fetch", "origin", default_branch])
+            .current_dir(&worktree_path)
+            .output();
+
         let has_commits = Self::has_commits_beyond_branch(&worktree_path, default_branch);
 
         if !has_commits {
@@ -1393,6 +1437,47 @@ impl ForgePairNode {
                     if let Ok(count_str) = String::from_utf8(o.stdout) {
                         if let Ok(count) = count_str.trim().parse::<u32>() {
                             if count > 0 {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If the default branch doesn't exist at all (e.g., new repo with only
+        // feature branches), check if HEAD has any commits. Any commits at all
+        // means the branch has work worth pushing, since there's no base to
+        // compare against. This handles the case where a repo was created with
+        // only a forge-1/T-CI-001 branch and no main/master.
+        let branch_exists_locally = local_output
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let branch_exists_remotely = origin_output
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !branch_exists_locally && !branch_exists_remotely {
+            // The default branch ref doesn't exist at all.
+            // If HEAD has any commits, they are inherently "beyond" a non-existent base.
+            let head_commits = StdCommand::new("git")
+                .args(["rev-list", "--count", "HEAD"])
+                .current_dir(worktree_path)
+                .output();
+
+            if let Ok(o) = head_commits {
+                if o.status.success() {
+                    if let Ok(count_str) = String::from_utf8(o.stdout) {
+                        if let Ok(count) = count_str.trim().parse::<u32>() {
+                            if count > 0 {
+                                tracing::info!(
+                                    default_branch = %default_branch,
+                                    count,
+                                    "Default branch doesn't exist; HEAD has {} commits, treating as pushable",
+                                    count
+                                );
                                 return true;
                             }
                         }
