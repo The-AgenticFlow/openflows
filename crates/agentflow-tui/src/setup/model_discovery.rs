@@ -236,12 +236,18 @@ fn discover_codex_models() -> Result<Vec<ModelInfo>> {
 async fn discover_anthropic_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let mut all_models: Vec<ModelInfo> = Vec::new();
     let mut after_id: Option<String> = None;
+    let max_pages = 10;
+    let mut page_count = 0;
 
     loop {
+        if page_count >= max_pages {
+            break;
+        }
         let mut url = "https://api.anthropic.com/v1/models?limit=1000".to_string();
         if let Some(ref id) = after_id {
             url.push_str(&format!("&after_id={}", id));
@@ -310,9 +316,15 @@ async fn discover_anthropic_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             break;
         }
 
+        page_count += 1;
+
         // Use the last model ID as the pagination cursor
         if let Some(last) = model_array.last() {
-            after_id = last.get("id").and_then(|v| v.as_str()).map(String::from);
+            let next = last.get("id").and_then(|v| v.as_str()).map(String::from);
+            if next.as_ref().map_or(true, |t| t.is_empty()) {
+                break;
+            }
+            after_id = next;
         } else {
             break;
         }
@@ -425,12 +437,11 @@ fn map_claude_model_alias(alias: &str) -> &str {
 async fn discover_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let mut all_models: Vec<ModelInfo> = Vec::new();
 
-    // OpenAI returns all models in a single response (no cursor-based pagination),
-    // but supports a `limit` query param for fine-grained control.
     let url = "https://api.openai.com/v1/models?limit=500";
 
     let response = match client
@@ -528,24 +539,39 @@ fn is_openai_chat_model(model_id: &str) -> bool {
 /// Fetch available models from Fireworks API using the native
 /// `/v1/accounts/fireworks/models` endpoint (the OpenAI-compatible
 /// `/inference/v1/models` endpoint has been returning 500 errors).
-/// Uses 30 s timeout, pageSize=200 pagination, and filters for
+/// Uses 30 s per-request timeout, pageSize=200 pagination, and filters for
 /// serverless chat/text models with contextLength > 0.
+/// Hard limit of 5 pages (~1000 models) and 60 s total wall-clock time.
 async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let mut all_models: Vec<ModelInfo> = Vec::new();
     let mut page_token: Option<String> = None;
+    let max_pages = 5;
+    let mut page_count = 0;
+    let start = std::time::Instant::now();
+    let max_duration = std::time::Duration::from_secs(60);
 
     loop {
+        if page_count >= max_pages {
+            tracing::info!("Reached max page limit ({}) for Fireworks models", max_pages);
+            break;
+        }
+        if start.elapsed() > max_duration {
+            tracing::info!("Reached max duration ({:?}) for Fireworks models", max_duration);
+            break;
+        }
+
         let mut url =
             "https://api.fireworks.ai/v1/accounts/fireworks/models?pageSize=200".to_string();
         if let Some(ref token) = page_token {
             url.push_str(&format!("&pageToken={}", token));
         }
 
-        tracing::info!(url = %url, "Fetching Fireworks models page");
+        tracing::info!(url = %url, page = page_count + 1, "Fetching Fireworks models page");
 
         let response = match client
             .get(&url)
@@ -555,6 +581,17 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         {
             Ok(r) => r,
             Err(e) => {
+                if e.is_timeout() {
+                    tracing::warn!("Fireworks API request timed out after 30s");
+                    // If we already have some models from previous pages, return them
+                    if !all_models.is_empty() {
+                        tracing::info!(count = all_models.len(), "Returning partial results after timeout");
+                        return Ok(all_models);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Fireworks API request timed out after 30s. Check your network connection."
+                    ));
+                }
                 tracing::warn!(error = %e, "Fireworks native models request failed");
                 return Err(anyhow::anyhow!(
                     "Failed to reach Fireworks API: {}. Check your network connection and API key.",
@@ -566,16 +603,25 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            tracing::warn!(status = %status, body = %body, "Fireworks native API error listing models");
-            // Fall back to the OpenAI-compatible endpoint as a backup
-            tracing::info!("Native API failed, trying OpenAI-compatible endpoint as fallback");
+            tracing::warn!(status = %status, body = %body, "Fireworks native API error");
+            // If we already have models from previous pages, return partial results
+            if !all_models.is_empty() {
+                tracing::info!(count = all_models.len(), "Returning partial results after API error");
+                return Ok(all_models);
+            }
+            // Otherwise try the OpenAI-compat fallback
+            tracing::info!("Native API failed, trying OpenAI-compatible fallback");
             return discover_fireworks_models_openai_compat(api_key, &client).await;
         }
 
         let json: serde_json::Value = match response.json().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to parse Fireworks native models response as JSON");
+                if !all_models.is_empty() {
+                    tracing::info!(count = all_models.len(), "Returning partial results after JSON parse failure");
+                    return Ok(all_models);
+                }
+                tracing::warn!(error = %e, "Failed to parse Fireworks native models response");
                 return Err(anyhow::anyhow!(
                     "Failed to parse Fireworks models response: {}",
                     e
@@ -591,7 +637,8 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
 
         tracing::info!(
             raw_count = model_array.len(),
-            "Fireworks native API returned models in this page"
+            page = page_count + 1,
+            "Fireworks native API returned models"
         );
 
         for m in &model_array {
@@ -601,7 +648,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 .unwrap_or("unknown")
                 .to_string();
 
-            // Only include serverless models available for inference
             let supports_serverless = m
                 .get("supportsServerless")
                 .and_then(|v| v.as_bool())
@@ -610,7 +656,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 continue;
             }
 
-            // Must have a positive context length (excludes image gen, etc.)
             let ctx_len = m
                 .get("contextLength")
                 .and_then(|v| v.as_u64())
@@ -619,7 +664,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 continue;
             }
 
-            // Exclude known non-chat families
             if !is_fireworks_chat_model(&name) {
                 continue;
             }
@@ -629,7 +673,6 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            // Build a description with context length and capabilities
             let supports_tools = m
                 .get("supportsTools")
                 .and_then(|v| v.as_bool())
@@ -655,11 +698,14 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
             });
         }
 
-        // Check for next page
+        page_count += 1;
+
+        // Check for next page — break on missing, null, or empty token
         let next_token = json
             .get("nextPageToken")
             .and_then(|v| v.as_str())
-            .map(String::from);
+            .map(String::from)
+            .filter(|t| !t.is_empty());
 
         if next_token.is_none() || model_array.is_empty() {
             break;
@@ -671,7 +717,7 @@ async fn discover_fireworks_models(api_key: &str) -> Result<Vec<ModelInfo>> {
 
     if all_models.is_empty() {
         return Err(anyhow::anyhow!(
-            "No chat models found in Fireworks account — the API returned empty results"
+            "No chat models found in Fireworks account"
         ));
     }
 
@@ -687,8 +733,13 @@ async fn discover_fireworks_models_openai_compat(
 ) -> Result<Vec<ModelInfo>> {
     let mut all_models: Vec<ModelInfo> = Vec::new();
     let mut page_token: Option<String> = None;
+    let max_pages = 5;
+    let mut page_count = 0;
 
     loop {
+        if page_count >= max_pages {
+            break;
+        }
         let mut url = "https://api.fireworks.ai/inference/v1/models".to_string();
         if let Some(ref token) = page_token {
             url.push_str(&format!("?after={}", token));
@@ -772,6 +823,8 @@ async fn discover_fireworks_models_openai_compat(
             });
         }
 
+        page_count += 1;
+
         let has_more = json
             .get("has_more")
             .and_then(|v| v.as_bool())
@@ -782,7 +835,11 @@ async fn discover_fireworks_models_openai_compat(
         }
 
         if let Some(last) = model_array.last() {
-            page_token = last.get("id").and_then(|v| v.as_str()).map(String::from);
+            let next = last.get("id").and_then(|v| v.as_str()).map(String::from);
+            if next.as_ref().map_or(true, |t| t.is_empty()) {
+                break;
+            }
+            page_token = next;
         } else {
             break;
         }
