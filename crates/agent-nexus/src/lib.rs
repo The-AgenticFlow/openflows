@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_AWAITING_HUMAN,
+    ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
@@ -891,6 +892,8 @@ impl NexusNode {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let pending_prs: Vec<Value> =
+            store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
         let mut changed_tickets = false;
         let mut changed_slots = false;
 
@@ -907,6 +910,25 @@ impl NexusNode {
                             worker_id, "Recovering orphaned ticket — resetting to Open"
                         );
                         ticket.status = TicketStatus::Open;
+                        changed_tickets = true;
+                    }
+                }
+                // Self-healing: tickets marked "completed with pr_opened" but with no
+                // actual PR in the system are broken state. Reset them to Open so they
+                // can be re-assigned instead of being permanently stuck.
+                TicketStatus::Completed { outcome, .. } if outcome == "pr_opened" => {
+                    let has_pending_pr = pending_prs.iter().any(|pr| {
+                        pr.get("ticket_id").and_then(|v| v.as_str()) == Some(&ticket.id)
+                    });
+                    if !has_pending_pr {
+                        info!(
+                            ticket_id = %ticket.id,
+                            "Recovering completed_without_pr ticket — resetting to Open for re-assignment \
+                             (PR data was lost, issue may still be open on GitHub)"
+                        );
+                        ticket.status = TicketStatus::Open;
+                        // Reset attempts so it can be worked on again
+                        ticket.attempts = 0;
                         changed_tickets = true;
                     }
                 }
@@ -1198,6 +1220,8 @@ impl Node for NexusNode {
             AgentRunner::from_env_with_token(model_backend.as_deref(), &github_token).await?;
         let persona = self.load_persona().await?;
 
+        // The runner now handles unparseable responses with retry and fallback
+        // rather than crashing. If it still fails, we produce a safe fallback.
         let decision: AgentDecision = runner.run(&persona, context, 10).await?;
 
         Ok(json!(decision))
@@ -1323,6 +1347,72 @@ impl Node for NexusNode {
                 );
                 return Ok(Action::new(STOP_SIGNAL));
             }
+        }
+
+        // Handle awaiting_human: the LLM decided it needs human input
+        // to proceed. This is the self-healing escalation path — instead
+        // of crashing when stuck, the system pauses and asks for help.
+        if decision.action == ACTION_AWAITING_HUMAN || decision.action == "awaiting_human" {
+            info!(
+                notes = %decision.notes,
+                "Nexus: LLM requests human intervention — marking stuck tickets"
+            );
+
+            // Store the human escalation reason in the shared store for the TUI/dashboard
+            store.set("_awaiting_human_reason", json!({
+                "notes": decision.notes,
+                "assign_to": decision.assign_to,
+                "ticket_id": decision.ticket_id,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            })).await;
+
+            // If a specific ticket was mentioned, mark it as awaiting human
+            if let Some(ticket_id) = &decision.ticket_id {
+                let mut tickets: Vec<Ticket> =
+                    store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                if let Some(ticket) = tickets.iter_mut().find(|t| t.id == *ticket_id) {
+                    info!(
+                        ticket_id = %ticket.id,
+                        "Marking ticket as awaiting_human intervention"
+                    );
+                    ticket.status = TicketStatus::AwaitingHuman {
+                        worker_id: decision.assign_to.clone().unwrap_or_else(|| "nexus".to_string()),
+                        reason: decision.notes.clone(),
+                        attempts: ticket.attempts,
+                    };
+                    store.set(KEY_TICKETS, json!(tickets)).await;
+
+                    // If a worker was assigned to this ticket, suspend them
+                    if let Some(worker_id) = &decision.assign_to {
+                        let mut slots: HashMap<String, WorkerSlot> =
+                            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                        if let Some(slot) = slots.get_mut(worker_id) {
+                            slot.status = WorkerStatus::Suspended {
+                                ticket_id: ticket_id.clone(),
+                                reason: "awaiting_human_intervention".to_string(),
+                                issue_url: decision.issue_url.clone(),
+                            };
+                            store
+                                .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                                .await;
+                        }
+                    }
+                } else {
+                    // Ticket not found in store - this might be because it wasn't
+                    // tracked yet (e.g. completed_without_pr case)
+                    info!(
+                        ticket_id,
+                        "Ticket not found in store for awaiting_human — will be handled in reconciliation"
+                    );
+                }
+            }
+
+            // Reset no_work count since we've identified a specific condition
+            // that needs human intervention (not just "no work to do")
+            store.set(KEY_NO_WORK_COUNT, json!(0)).await;
         }
 
         if decision.action == "approve_command" || decision.action == "reject_command" {
