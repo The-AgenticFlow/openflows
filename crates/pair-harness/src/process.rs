@@ -2572,8 +2572,8 @@ mod tests {
         );
         assert_eq!(strip_provider_prefix("openai/gpt-4o"), "gpt-4o");
         assert_eq!(
-            strip_provider_prefix("fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct"),
-            "accounts/fireworks/models/llama-v3p1-8b-instruct"
+            strip_provider_prefix("fireworks/accounts/fireworks/models/deepseek-v3p1"),
+            "accounts/fireworks/models/deepseek-v3p1"
         );
         assert_eq!(
             strip_provider_prefix("gemini/gemini-2.5-pro"),

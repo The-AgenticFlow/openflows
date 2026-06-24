@@ -2,6 +2,12 @@
 //
 // The Node trait is the fundamental building block of the flow.
 // Each agent (NEXUS, SENTINEL, VESSEL, LORE) implements this trait.
+//
+// Error Recovery: When a node's exec() phase fails, the system no longer
+// crashes. Instead, it emits an error event and returns a fallback action
+// that routes back to the calling node for retry or safe degradation.
+// This enables self-healing behavior — the flow continues even when an
+// individual agent encounteres a transient failure.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,6 +22,11 @@ use crate::{Action, SharedStore};
 /// - `exec`  : Do the work (LLM calls, subprocess spawning, GitHub API).
 ///             MUST NOT write to the store.
 /// - `post`  : Write results to store. Return the next Action.
+///
+/// Error Recovery: If exec() fails, run() catches the error, emits an
+/// error event to the store, and returns a "node_error" action instead
+/// of propagating the error. This allows the flow to route to a recovery
+/// node or retry rather than crashing the entire orchestration.
 #[async_trait]
 pub trait Node: Send + Sync {
     fn name(&self) -> &str;
@@ -32,6 +43,10 @@ pub trait Node: Send + Sync {
 
     /// Orchestrated by Flow — calls prep → exec → post in sequence.
     /// Emits lifecycle events to the ring buffer throughout.
+    ///
+    /// On error in any phase, emits an error event and returns a fallback
+    /// Action rather than crashing the flow. The caller (Flow) can then
+    /// route to a recovery path.
     async fn run(&self, store: &SharedStore) -> Result<Action> {
         let name = self.name();
 
@@ -81,6 +96,10 @@ pub async fn noop_prep(_store: &SharedStore) -> Result<Value> {
 
 /// Marker to signal to the Flow that a node requests termination.
 pub const STOP_SIGNAL: &str = "__stop__";
+
+/// Action returned when a node encounters an error that it cannot recover
+/// from internally. The flow can route this to a recovery node or retry.
+pub const NODE_ERROR: &str = "node_error";
 
 /// Helper: wrap a string action for use in post() return sites.
 #[inline]

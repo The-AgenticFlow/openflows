@@ -4,12 +4,12 @@ use agent_nexus::NexusNode;
 use agent_vessel::{VesselConfig, VesselNode};
 use anyhow::Result;
 use config::{
-    ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
-    ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
-    ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
+    ACTION_AWAITING_HUMAN, ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED,
+    ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK,
+    ACTION_PR_OPENED, ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
 use pair_harness::WorkspaceManager;
-use pocketflow_core::{Action, Flow, SharedStore};
+use pocketflow_core::{Action, Flow, SharedStore, NODE_ERROR};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -208,6 +208,12 @@ async fn main() -> Result<()> {
     };
 
     // 4. Setup Flow with Routing
+    //
+    // Error recovery routes:
+    // - "node_error": When a node's exec() fails, the flow routes to the
+    //   nexus node for retry instead of crashing. This enables self-healing.
+    // - "awaiting_human": When the LLM can't decide and needs human input,
+    //   the flow routes back to nexus which will pause and log the condition.
     let mut flow = Flow::new("nexus")
         .add_node(
             "nexus",
@@ -215,9 +221,11 @@ async fn main() -> Result<()> {
             vec![
                 (ACTION_WORK_ASSIGNED, "forge_pair"),
                 (ACTION_MERGE_PRS, "vessel"),
-                (ACTION_NO_WORK, "nexus"),
+                (ACTION_NO_WORK, "nexus"),           // loop back for next cycle
+                (ACTION_AWAITING_HUMAN, "nexus"),    // needs human input — log and pause
                 ("approve_command", "forge_pair"),
                 ("reject_command", "nexus"),
+                (NODE_ERROR, "nexus"),              // self-healing: retry on LLM/api failures
             ],
         )
         .add_node(
@@ -228,6 +236,7 @@ async fn main() -> Result<()> {
                 (ACTION_FAILED, "nexus"),
                 ("suspended", "nexus"),
                 (Action::NO_TICKETS, "nexus"),
+                (NODE_ERROR, "nexus"),  // self-healing: retry on LLM/api failures
             ],
         )
         .add_node("vessel", vessel, {
@@ -238,6 +247,7 @@ async fn main() -> Result<()> {
                 (ACTION_CONFLICTS_DETECTED, "forge_pair"),
                 (Action::AWAITING_HUMAN, "nexus"),
                 ("no_work", "nexus"),
+                (NODE_ERROR, "nexus"),  // self-healing: retry on merge/api failures
             ];
             if lore.is_some() {
                 routes.insert(0, (ACTION_DEPLOYED, "lore"));
