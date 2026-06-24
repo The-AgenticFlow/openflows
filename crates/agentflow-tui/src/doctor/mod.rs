@@ -48,7 +48,16 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
 
     checks.push(("── Configuration ──".to_string(), CheckState::Pending));
 
-    if std::path::Path::new(".env").exists() {
+    let home = std::env::var("OPENFLOWS_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.openflows",
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string())
+        )
+    });
+    let env_path = std::path::Path::new(&home).join(".env");
+    if env_path.exists() || std::path::Path::new(".env").exists() {
         checks.push((".env file exists".to_string(), CheckState::Pass));
     } else {
         checks.push((".env file missing".to_string(), CheckState::Fail));

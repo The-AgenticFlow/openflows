@@ -249,10 +249,20 @@ impl Registry {
     /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
     /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` for backward compatibility.
     /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
+    /// Returns an error if the agent exists but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
-        // Check if agent exists at all (active or inactive)
-        let entry_exists = self.team.iter().any(|e| e.id == base_id);
+        // Existence check must also consider inactive agents, including the
+        // suffix-stripped base (e.g. "lore-1" -> "lore"), since normalize_agent_id
+        // only strips suffixes for *active* agents.
+        let stripped = agent_id
+            .rsplit_once('-')
+            .map(|(b, _)| b)
+            .unwrap_or(agent_id);
+        let entry_exists = self
+            .team
+            .iter()
+            .any(|e| e.id == base_id || e.id == stripped);
         let token = match self.get(base_id) {
             Some(entry) => match &entry.github_token_env {
                 Some(env_var) => std::env::var(env_var)
@@ -261,13 +271,21 @@ impl Registry {
                     .context("GITHUB_PERSONAL_ACCESS_TOKEN not set (fallback for agent without github_token_env)")?,
             },
             None => {
-                let msg = if entry_exists {
-                    format!("Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow", base_id)
+                if entry_exists {
+                    // Agent exists but is inactive — this is an error, not a fallback case.
+                    // Silently returning the global PAT would mask misconfiguration.
+                    // Use the stripped id so the message matches the registry key
+                    // (e.g. "lore" rather than the instance id "lore-1").
+                    let display_id = if base_id == agent_id { stripped } else { base_id };
+                    anyhow::bail!(
+                        "Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow",
+                        display_id
+                    );
                 } else {
-                    format!("Agent '{}' not found in registry", base_id)
-                };
-                std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
-                    .context(msg)?
+                    // Agent not found at all — fall back to global PAT for backward compat
+                    std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
+                        .context(format!("Agent '{}' not found in registry", base_id))?
+                }
             }
         };
         Ok(token)

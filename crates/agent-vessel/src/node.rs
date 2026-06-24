@@ -65,14 +65,41 @@ impl VesselNode {
     }
 
     pub fn from_env() -> Self {
-        let registry_path = std::env::current_dir()
+        // Search for registry in OPENFLOWS_HOME first, then workspace root, then CWD
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .unwrap_or_else(|_| ".openflows".to_string());
+        let oh_path = std::path::PathBuf::from(&openflows_home)
+            .join("orchestration")
+            .join("agent")
+            .join("registry.json");
+        let workspace_root = std::env::var("AGENTFLOW_WORKSPACE_ROOT")
+            .map(std::path::PathBuf::from)
+            .ok();
+        let ws_path = workspace_root
+            .as_ref()
+            .map(|p| p.join("orchestration").join("agent").join("registry.json"));
+        let cwd_path = std::env::current_dir()
             .ok()
             .map(|p| p.join("orchestration").join("agent").join("registry.json"));
 
+        let registry_path = if oh_path.exists() {
+            Some(oh_path)
+        } else if let Some(ref p) = ws_path {
+            if p.exists() {
+                Some(p.clone())
+            } else {
+                cwd_path
+            }
+        } else {
+            cwd_path
+        };
+
         let config = match registry_path {
-            Some(path) if path.exists() => {
+            Some(ref path) if path.exists() => {
                 info!(registry_path = %path.display(), "VESSEL loading config from registry");
-                VesselConfig::from_registry(&path).unwrap_or_else(|e| {
+                VesselConfig::from_registry(path).unwrap_or_else(|e| {
                     warn!(error = %e, "VESSEL failed to load from registry, falling back to GITHUB_PERSONAL_ACCESS_TOKEN");
                     VesselConfig::from_env()
                 })

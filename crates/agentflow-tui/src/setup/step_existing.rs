@@ -42,7 +42,24 @@ impl ExistingConfigStep {
     }
 
     pub fn detect_existing_config(project_dir: &Path) -> Option<SetupConfig> {
-        let env_path = project_dir.join(".env");
+        let openflows_env = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .ok()
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join(".env"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    "{}/.openflows/.env",
+                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                ))
+            });
+        let local_env = project_dir.join(".env");
+        let env_path = if openflows_env.exists() {
+            openflows_env
+        } else {
+            local_env
+        };
         if !env_path.exists() {
             return None;
         }
@@ -95,10 +112,23 @@ impl ExistingConfigStep {
         }
 
         // Also load agents from registry.json
-        let registry_path = project_dir
+        // Search in OPENFLOWS_HOME first, then project_dir
+        let openflows_home = std::env::var("OPENFLOWS_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.openflows", h)))
+            .or_else(|_| std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h)))
+            .unwrap_or_else(|_| ".openflows".to_string());
+        let oh_registry = std::path::PathBuf::from(&openflows_home)
             .join("orchestration")
             .join("agent")
             .join("registry.json");
+        let registry_path = if oh_registry.exists() {
+            oh_registry
+        } else {
+            project_dir
+                .join("orchestration")
+                .join("agent")
+                .join("registry.json")
+        };
 
         if registry_path.exists() {
             if let Ok(registry) = config::Registry::load(&registry_path) {

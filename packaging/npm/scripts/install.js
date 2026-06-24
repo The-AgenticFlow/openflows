@@ -9,8 +9,9 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
-const REPO = 'The-AgenticFlow/AgentFlow';
+const REPO = 'The-AgenticFlow/openflows';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
+const PKG_DIR = path.join(__dirname, '..');
 
 function detectPlatform() {
     const platform = os.platform();
@@ -92,18 +93,13 @@ function extractTarGz(tarPath, destDir) {
     });
 }
 
-async function main() {
-    const platform = detectPlatform();
-    console.log(`[@the-agenticflow/openflows] Downloading binary for ${platform}...`);
+async function fetchLatestTag(includePrerelease = false) {
+    const url = includePrerelease
+        ? `https://api.github.com/repos/${REPO}/releases?per_page=10`
+        : `https://api.github.com/repos/${REPO}/releases/latest`;
 
-    // Ensure bin directory exists
-    if (!fs.existsSync(BIN_DIR)) {
-        fs.mkdirSync(BIN_DIR, { recursive: true });
-    }
-
-    // Get latest release tag
-    const tag = await new Promise((resolve, reject) => {
-        https.get(`https://api.github.com/repos/${REPO}/releases/latest`, {
+    return new Promise((resolve, reject) => {
+        https.get(url, {
             headers: { 'User-Agent': 'openflows-npm-installer' }
         }, (res) => {
             let data = '';
@@ -111,13 +107,45 @@ async function main() {
             res.on('end', () => {
                 try {
                     const json = JSON.parse(data);
-                    resolve(json.tag_name);
+                    if (includePrerelease) {
+                        const pre = json.find(r => r.prerelease);
+                        resolve(pre ? pre.tag_name : null);
+                    } else {
+                        resolve(json.tag_name);
+                    }
                 } catch {
                     reject(new Error('Failed to parse release info'));
                 }
             });
         }).on('error', reject);
     });
+}
+
+async function main() {
+    const platform = detectPlatform();
+    const channel = process.env.AGENTFLOW_CHANNEL || (process.env.npm_package_version?.includes('-dev.') ? 'edge' : 'stable');
+    console.log(`[@the-agenticflow/openflows] Downloading binary for ${platform} (${channel})...`);
+
+    // Ensure bin directory exists
+    if (!fs.existsSync(BIN_DIR)) {
+        fs.mkdirSync(BIN_DIR, { recursive: true });
+    }
+
+    // Get release tag based on channel
+    let tag;
+    try {
+        if (channel === 'edge') {
+            tag = await fetchLatestTag(true);
+            if (!tag) {
+                console.warn('[@the-agenticflow/openflows] No edge release found, falling back to latest stable');
+                tag = await fetchLatestTag(false);
+            }
+        } else {
+            tag = await fetchLatestTag(false);
+        }
+    } catch {
+        tag = await fetchLatestTag(false);
+    }
 
     const archiveName = `openflows-${tag}-${platform}.tar.gz`;
     const downloadUrl = `https://github.com/${REPO}/releases/download/${tag}/${archiveName}`;
@@ -150,6 +178,17 @@ async function main() {
             fs.renameSync(src, dst);
             fs.chmodSync(dst, 0o755);
         }
+    }
+
+    // Move orchestration config to package root so the binary can find it
+    const orchestrationSrc = path.join(BIN_DIR, 'orchestration');
+    const orchestrationDst = path.join(PKG_DIR, 'orchestration');
+    if (fs.existsSync(orchestrationSrc)) {
+        if (fs.existsSync(orchestrationDst)) {
+            fs.rmSync(orchestrationDst, { recursive: true });
+        }
+        fs.renameSync(orchestrationSrc, orchestrationDst);
+        console.log('[openflows] Installed orchestration config');
     }
 
     if (fs.existsSync(tmpFile)) {

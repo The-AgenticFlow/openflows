@@ -11,12 +11,36 @@ use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+fn load_env() -> anyhow::Result<std::path::PathBuf> {
+    let openflows_home = std::env::var("OPENFLOWS_HOME")
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        })
+        .or_else(|_| {
+            std::env::var("USERPROFILE").map(|h| format!("{}/.openflows", h.trim_end_matches('/')))
+        })
+        .unwrap_or_else(|_| ".openflows".to_string());
+    let env_paths = vec![
+        std::path::PathBuf::from(format!("{}/.env", openflows_home)),
+        std::env::current_dir().unwrap_or_default().join(".env"),
+    ];
+    for path in &env_paths {
+        if path.exists() {
+            match dotenvy::from_path(path) {
+                Ok(_) => return Ok(path.clone()),
+                Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+    Ok(std::path::PathBuf::new())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    match dotenvy::dotenv() {
-        Ok(path) => eprintln!("Loaded environment from {}", path.display()),
-        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
+    let env_path = load_env()?;
+    if !env_path.as_os_str().is_empty() {
+        eprintln!("Loaded environment from {}", env_path.display());
     }
     // 1. Setup logging
     let subscriber = FmtSubscriber::builder()

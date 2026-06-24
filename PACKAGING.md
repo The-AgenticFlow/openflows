@@ -2,12 +2,54 @@
 
 This document describes how OpenFlows is packaged and distributed across platforms.
 
+## Release Channels
+
+OpenFlows ships through two release channels:
+
+| Channel | Tag Pattern | Published When | Stability |
+|---------|------------|----------------|-----------|
+| **Stable** | `vX.Y.Z` | Version tag is pushed | Production-ready |
+| **Edge** | `vX.Y.Z-dev.N.SHA` | Every push to `main` | Bleeding-edge, may be unstable |
+
+### Stable Releases
+
+Triggered by pushing a version tag (e.g., `v0.2.0`):
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+This creates a full release with:
+- Pre-built binaries for all platforms (as GitHub Release assets)
+- Docker image tagged with the version + `latest`
+- npm package published under the `latest` dist-tag
+- Crates published to crates.io
+- Homebrew formula updated with the new version
+
+### Edge (Pre-release) Builds
+
+Every push to the `main` branch automatically creates a pre-release build:
+
+- GitHub Release marked as **prerelease** with a generated version like `v0.1.0-dev.42.abc1234`
+- Docker image tagged with the dev version (the `latest` tag is also updated)
+- npm package published under the `next` dist-tag
+
+Edge builds let you test the latest changes without waiting for a stable release.
+
 ## Installation Methods
 
 ### 1. One-Line Installer (All Platforms)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+# Stable release (default)
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
+
+# Edge (pre-release from main)
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
+
+# Custom install directory
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --dir /usr/local/bin
 ```
 
 **What it does:**
@@ -22,17 +64,37 @@ curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scri
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AGENTFLOW_INSTALL_DIR` | `~/.local/bin` | Installation directory |
+| `AGENTFLOW_CHANNEL` | `stable` | Release channel: `stable` or `edge` |
 
-### 2. Homebrew (macOS)
+**CLI flags:**
+| Flag | Description |
+|------|-------------|
+| `--edge` | Install the latest pre-release build from main |
+| `--stable` | Install the latest stable release (default) |
+| `--dir DIR` | Set installation directory |
+
+### 2. npm (Node.js Package Manager)
+
+```bash
+# Stable release
+npm install -g @the-agenticflow/openflows
+
+# Edge (pre-release)
+npm install -g @the-agenticflow/openflows@next
+```
+
+The npm package downloads the correct pre-built binary for your platform during installation (with a fallback to building from source if Rust is available). Supports Linux and macOS on x64 and arm64.
+
+### 3. Homebrew (macOS)
 
 ```bash
 brew tap The-AgenticFlow/openflows
 brew install openflows
 ```
 
-The Homebrew formula is maintained at `packaging/homebrew/openflows.rb`.
+The Homebrew formula is maintained at `packaging/homebrew/openflows.rb` and is automatically updated on stable releases.
 
-### 3. Docker
+### 4. Docker
 
 ```bash
 # Pull and run
@@ -50,27 +112,19 @@ docker compose up -d
 
 The Docker image is multi-stage, uses a non-root user, and includes a health check.
 
-### 4. Cargo (Rust Package Manager)
+### 5. Cargo (Rust Package Manager)
 
 ```bash
 cargo install openflows
 ```
 
-All crates are published to crates.io. The `openflows` package includes all binaries.
-
-### 5. npm (Node.js Package Manager)
-
-```bash
-npm install -g openflows
-```
-
-The npm package downloads the correct pre-built binary for your platform during installation (with a fallback to building from source if Rust is available). Supports Linux and macOS on x64 and arm64.
+All crates are published to crates.io. The `openflows` package includes all binaries. Crates are published only on stable releases (tag pushes).
 
 ### 6. Build from Source
 
 ```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 make release    # Builds all binaries in release mode
 make install    # Copies to ~/.local/bin
 ```
@@ -96,33 +150,35 @@ make install    # Copies to ~/.local/bin
 
 ### Automated Releases (GitHub Actions)
 
-Tagging a release triggers the full release pipeline:
+#### Every push to `main`
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
+Triggers `.github/workflows/release.yml` which:
 
-This triggers `.github/workflows/release.yml` which:
-
-1. **Builds binaries** for 4 platforms:
+1. **Resolves version** — auto-generates `v{last_version}-dev.{commit_count}.{short_sha}`
+2. **Builds binaries** for 4 platforms:
    - `x86_64-unknown-linux-musl` (Linux x86_64, static)
    - `aarch64-unknown-linux-gnu` (Linux ARM64)
    - `x86_64-apple-darwin` (macOS Intel)
    - `aarch64-apple-darwin` (macOS Apple Silicon)
+3. **Creates tarballs** with all binaries, orchestration config, and README
+4. **Generates SHA256 checksums** for each tarball
+5. **Builds and pushes Docker image** to GHCR (tagged with dev version + `latest`)
+6. **Creates GitHub Release** (marked as prerelease) with binaries and changelog
+7. **Publishes npm package** under `next` dist-tag
 
-2. **Creates tarballs** with all binaries, orchestration config, and README
+#### Version tag push (`v*`)
 
-3. **Generates SHA256 checksums** for each tarball
+Triggers `.github/workflows/release.yml` which:
 
-4. **Builds and pushes Docker image** to GHCR
-
-5. **Creates GitHub Release** with:
-   - Auto-generated changelog from git history
-   - All tarballs and checksums as assets
-   - Installation instructions in the release body
-
-6. **Publishes crates** to crates.io (for stable releases only)
+1. **Uses the tag as version** (e.g., `v0.2.0`)
+2. **Builds binaries** for all 4 platforms
+3. **Creates tarballs** with all binaries, orchestration config, and README
+4. **Generates SHA256 checksums** for each tarball
+5. **Builds and pushes Docker image** to GHCR
+6. **Creates GitHub Release** (stable, not prerelease) with binaries and changelog
+7. **Publishes npm package** under `latest` dist-tag
+8. **Publishes crates** to crates.io
+9. **Updates Homebrew formula** with new version and SHA
 
 ### Manual Release Dispatch
 
@@ -131,6 +187,14 @@ You can also trigger a release manually via GitHub Actions:
 1. Go to Actions → Release → Run workflow
 2. Enter version (e.g., `v0.2.0`)
 3. Click "Run workflow"
+
+### Version Scheme
+
+| Trigger | Version Format | Release Type | npm dist-tag |
+|---------|---------------|--------------|--------------|
+| Tag push (`v0.2.0`) | `v0.2.0` | Stable | `latest` |
+| Main push | `v0.1.0-dev.42.abc1234` | Pre-release | `next` |
+| Manual dispatch | User-specified | Depends on version string | Depends |
 
 ## Binary Contents
 

@@ -209,7 +209,7 @@ Total: 75 tests, all passing. Zero backend-specific conditional logic in tests. 
 
 ## Try It
 
-The full implementation is at [github.com/The-AgenticFlow/AgentFlow](https://github.com/The-AgenticFlow/AgentFlow). The pair harness is in `crates/pair-harness/`, with the `BackendConfig` abstraction in `src/process.rs` and the provisioning pipeline in `src/provision.rs`.
+The full implementation is at [github.com/The-AgenticFlow/openflows](https://github.com/The-AgenticFlow/openflows). The pair harness is in `crates/pair-harness/`, with the `BackendConfig` abstraction in `src/process.rs` and the provisioning pipeline in `src/provision.rs`.
 
 Claude:
 ```

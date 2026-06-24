@@ -8,29 +8,61 @@ Give it a GitHub repo and some issues, and OpenFlows handles everything — writ
 
 ## Quick Start
 
+### Binary Install (recommended)
+
 ```bash
-# Install
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/AgentFlow/main/scripts/install.sh | bash
+# Stable release
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
 
-# Set up your environment (interactive wizard)
+# Or edge (pre-release from main)
+curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
+```
+
+Then set up and run:
+
+```bash
+openflows-setup   # interactive wizard — configures repo, API keys, CLI backend
+openflows          # start the autonomous team
+```
+
+### npm Install
+
+```bash
+# Stable release
+npm install -g @the-agenticflow/openflows
+
+# Edge (pre-release)
+npm install -g @the-agenticflow/openflows@next
+```
+
+Then:
+
+```bash
 openflows-setup
-
-# Run
 openflows
 ```
 
-That's it. The setup wizard walks you through configuring your GitHub repo, API keys, and CLI backend.
+### Install from Source
 
-<details>
-<summary>Other install options</summary>
+```bash
+git clone https://github.com/The-AgenticFlow/openflows.git
+cd openflows
 
-- **Homebrew (macOS):** `brew tap The-AgenticFlow/openflows && brew install openflows`
-- **Cargo:** `cargo install openflows`
-- **Docker:** See [INSTALL.md](INSTALL.md#option-3-docker)
-- **npm:** `npm install -g @the-agenticflow/openflows`
-- **From source:** See [BUILD.md](BUILD.md)
+# Build and install release binaries
+make install   # installs to ~/.local/bin
 
-</details>
+openflows-setup
+openflows
+```
+
+Or build manually with Cargo:
+
+```bash
+cargo build --release -p openflows
+# Binaries at target/release/{openflows,openflows-setup,openflows-dashboard,openflows-doctor}
+# You also need the orchestration/ directory — copy it to ~/.local/bin/ or set OPENFLOWS_HOME
+cp -r orchestration ~/.local/bin/
+```
 
 ## How It Works
 
@@ -109,18 +141,6 @@ The `openflows-setup` wizard handles configuration interactively. See [.env.exam
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute to OpenFlows |
 | [BUILD.md](BUILD.md) | Building from source |
 | [DEMO.md](DEMO.md) | Quick demo (no API keys needed) |
-
-## For Contributors
-
-```bash
-git clone https://github.com/The-AgenticFlow/AgentFlow.git
-cd AgentFlow
-make install   # build release binaries & install to ~/.local/bin
-openflows-setup
-openflows
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow and [BUILD.md](BUILD.md) for build details.
 
 ## License
 
