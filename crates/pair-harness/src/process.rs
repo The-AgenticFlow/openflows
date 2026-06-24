@@ -1710,7 +1710,10 @@ trust_level = "trusted"
         // Only include the issue-linking tag when a valid issue number is provided.
         // When issue_number is 0 (unset/default), omit the tag to avoid "Resolves #0".
         let issue_link_step3 = if issue_number > 0 {
-            format!(", and the linking tag \"Resolves #{}\" to attach the issue to the PR", issue_number)
+            format!(
+                ", and the linking tag \"Resolves #{}\" to attach the issue to the PR",
+                issue_number
+            )
         } else {
             String::new()
         };
@@ -2217,6 +2220,9 @@ mod tests {
         std::fs::write(&worklog_path, "worklog").unwrap();
 
         let prompt = manager.build_forge_pr_prompt(0, &shared);
-        assert!(!prompt.contains("Resolves #"), "Prompt should not contain 'Resolves #' when issue_number is 0");
+        assert!(
+            !prompt.contains("Resolves #"),
+            "Prompt should not contain 'Resolves #' when issue_number is 0"
+        );
     }
 }
