@@ -89,8 +89,7 @@ impl SharedDirWatcher {
     }
 
     fn create_poll_watcher(tx: Sender<FsEvent>, shared_dir: &Path) -> Result<WatcherInner> {
-        let config = Config::default()
-            .with_poll_interval(Duration::from_millis(POLL_INTERVAL_MS));
+        let config = Config::default().with_poll_interval(Duration::from_millis(POLL_INTERVAL_MS));
 
         let mut watcher = PollWatcher::new(
             move |res: notify::Result<Event>| {

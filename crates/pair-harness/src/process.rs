@@ -1331,7 +1331,19 @@ trust_level = "trusted"
             cmd.arg("--sandbox");
             cmd.arg("workspace-write");
         } else {
+            // Claude base_flags includes `--output-format stream-json`, but sentinel
+            // needs `--output-format json` (from sentinel_flags). Skip the base value
+            // to avoid emitting the flag twice with conflicting values.
+            let mut skip_next = false;
             for arg in &config.base_flags {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg == "--output-format" {
+                    skip_next = true;
+                    continue;
+                }
                 cmd.arg(arg);
             }
         }
