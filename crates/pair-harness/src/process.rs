@@ -1320,14 +1320,33 @@ trust_level = "trusted"
         let config = self.get_backend(backend);
         let mut cmd = Command::new(&config.binary_path);
 
-        // SENTINEL uses workspace-write sandbox — it needs to write review files
-        // to the shared directory and needs GitHub API access for posting review
-        // comments, but should NOT have full filesystem access like FORGE.
-        // FORGE uses danger-full-access (set in base_flags) because it needs
-        // git push and full filesystem access for code changes.
-        cmd.arg("exec");
-        cmd.arg("--sandbox");
-        cmd.arg("workspace-write");
+        // Codex SENTINEL uses workspace-write sandbox — it needs to write review
+        // files to the shared directory and needs GitHub API access for posting
+        // review comments, but should NOT have full filesystem access like FORGE.
+        // Claude SENTINEL uses base_flags (--dangerously-skip-permissions, etc.)
+        // and sentinel_flags (--output-format json, --no-session-persistence).
+        // The --sandbox flag only exists in the Codex CLI.
+        if backend == CliBackend::Codex {
+            cmd.arg("exec");
+            cmd.arg("--sandbox");
+            cmd.arg("workspace-write");
+        } else {
+            // Claude base_flags includes `--output-format stream-json`, but sentinel
+            // needs `--output-format json` (from sentinel_flags). Skip the base value
+            // to avoid emitting the flag twice with conflicting values.
+            let mut skip_next = false;
+            for arg in &config.base_flags {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg == "--output-format" {
+                    skip_next = true;
+                    continue;
+                }
+                cmd.arg(arg);
+            }
+        }
 
         // Pass model from ProcessManager's model_backend override (from registry.json)
         // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)

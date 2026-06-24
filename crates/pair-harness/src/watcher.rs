@@ -2,22 +2,30 @@
 //! Filesystem watcher for event-driven harness.
 //!
 //! Uses notify crate for cross-platform inotify/FSEvents support.
+//! Falls back to polling when inotify watch limits are exhausted.
 
 use crate::types::FsEvent;
 use anyhow::{Context, Result};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 const DEBOUNCE_MS: u64 = 500;
+const POLL_INTERVAL_MS: u64 = 500;
+
+#[allow(dead_code)]
+enum WatcherInner {
+    Recommended(RecommendedWatcher),
+    Poll(PollWatcher),
+}
 
 /// Watches the shared directory for file changes.
 pub struct SharedDirWatcher {
     /// The underlying notify watcher (must be kept alive)
-    _watcher: RecommendedWatcher,
+    _watcher: WatcherInner,
     /// Receiver for filesystem events
     receiver: Receiver<FsEvent>,
     /// Last seen timestamps for debouncing
@@ -38,9 +46,20 @@ impl SharedDirWatcher {
         })
     }
 
-    /// Create and configure the notify watcher.
-    fn create_watcher(tx: Sender<FsEvent>, shared_dir: &Path) -> Result<RecommendedWatcher> {
-        // Create a watcher with a callback
+    /// Create and configure the notify watcher, falling back to PollWatcher
+    /// if the RecommendedWatcher (inotify/FSEvents) cannot be started due to
+    /// OS resource limits (e.g. inotify max_user_watches exhausted on Linux).
+    fn create_watcher(tx: Sender<FsEvent>, shared_dir: &Path) -> Result<WatcherInner> {
+        match Self::try_recommended_watcher(tx.clone(), shared_dir) {
+            Ok(w) => Ok(w),
+            Err(e) => {
+                warn!(error = %e, "RecommendedWatcher failed, falling back to PollWatcher");
+                Self::create_poll_watcher(tx, shared_dir)
+            }
+        }
+    }
+
+    fn try_recommended_watcher(tx: Sender<FsEvent>, shared_dir: &Path) -> Result<WatcherInner> {
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             match res {
                 Ok(event) => {
@@ -65,8 +84,36 @@ impl SharedDirWatcher {
             .watch(shared_dir, RecursiveMode::NonRecursive)
             .context("Failed to start watching shared directory")?;
 
-        debug!(path = %shared_dir.display(), "Started watching shared directory");
-        Ok(watcher)
+        debug!(path = %shared_dir.display(), "Started watching shared directory (inotify)");
+        Ok(WatcherInner::Recommended(watcher))
+    }
+
+    fn create_poll_watcher(tx: Sender<FsEvent>, shared_dir: &Path) -> Result<WatcherInner> {
+        let config = Config::default().with_poll_interval(Duration::from_millis(POLL_INTERVAL_MS));
+
+        let mut watcher = PollWatcher::new(
+            move |res: notify::Result<Event>| {
+                match res {
+                    Ok(event) => {
+                        if let Some(fs_event) = Self::classify_event(&event) {
+                            debug!(event = ?fs_event, paths = ?event.paths, "Filesystem event detected (poll)");
+                            let _ = tx.send(fs_event);
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Poll watch error");
+                    }
+                }
+            },
+            config,
+        ).context("Failed to create poll filesystem watcher")?;
+
+        watcher
+            .watch(shared_dir, RecursiveMode::NonRecursive)
+            .context("Failed to start polling shared directory")?;
+
+        debug!(path = %shared_dir.display(), "Started watching shared directory (polling fallback)");
+        Ok(WatcherInner::Poll(watcher))
     }
 
     /// Classify a filesystem event into our FsEvent type.
