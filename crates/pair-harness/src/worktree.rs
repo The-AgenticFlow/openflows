@@ -77,10 +77,12 @@ impl WorktreeManager {
 
     /// Detect the repository's default branch from origin/HEAD.
     ///
-    /// Uses `git symbolic-ref refs/remotes/origin/HEAD` to read the
-    /// remote HEAD symref, which GitHub sets to point at the default
-    /// branch (e.g., refs/remotes/origin/master). Falls back to
-    /// trying "main" then "master" via remote ref existence checks.
+    /// Uses multiple detection methods in order of reliability:
+    /// 1. Read origin/HEAD symref (most reliable when set)
+    /// 2. Query remote via `git ls-remote --symref` (works even without local refs)
+    /// 3. Check local remote-tracking refs
+    /// 4. Try git rev-parse for each candidate
+    /// 5. Final fallback to "main"
     pub fn detect_default_branch(project_root: &Path) -> String {
         // Method 1: Read origin/HEAD symref (most reliable)
         let output = Command::new("git")
@@ -100,7 +102,33 @@ impl WorktreeManager {
             }
         }
 
-        // Method 2: Check which remote branch ref exists
+        // Method 2: Query remote HEAD via ls-remote --symref (works without local refs)
+        // Only accept the result if it's a standard default branch name (main/master).
+        // Non-standard branches like forge-1/T-CI-001 should not be treated as
+        // the default branch — the system should create a proper main/master instead.
+        let ls_remote_output = Command::new("git")
+            .args(["ls-remote", "--symref", "origin", "HEAD"])
+            .current_dir(project_root)
+            .output();
+
+        if let Ok(o) = ls_remote_output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Output format: "ref: refs/heads/{branch}\tHEAD"
+            for line in stdout.lines() {
+                if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+                    if let Some(branch) = rest.split('\t').next() {
+                        if !branch.is_empty()
+                            && (branch == "main" || branch == "master")
+                        {
+                            info!(branch = %branch, "Detected default branch via ls-remote --symref");
+                            return branch.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Method 3: Check which remote branch ref exists
         for candidate in ["main", "master"] {
             let ref_path = format!("refs/remotes/origin/{candidate}");
             let git_dir = project_root.join(".git");
@@ -116,7 +144,7 @@ impl WorktreeManager {
             }
         }
 
-        // Method 3: Try git rev-parse for each candidate
+        // Method 4: Try git rev-parse for each candidate
         for candidate in ["main", "master"] {
             let output = Command::new("git")
                 .args(["rev-parse", "--verify", &format!("origin/{candidate}")])
@@ -129,9 +157,261 @@ impl WorktreeManager {
             }
         }
 
+        // Method 5: Use ls-remote to check which standard branches exist on the remote
+        // This works even without local refs (e.g., fresh clone with only feature branches)
+        for candidate in ["main", "master"] {
+            if Self::remote_branch_exists(project_root, candidate) {
+                info!(branch = %candidate, "Detected default branch via ls-remote");
+                return candidate.to_string();
+            }
+        }
+
         // Final fallback
         warn!("Could not detect default branch, falling back to 'main'");
         "main".to_string()
+    }
+
+    /// Check whether a remote branch exists on origin.
+    fn remote_branch_exists(project_root: &Path, branch: &str) -> bool {
+        let output = Command::new("git")
+            .args(["ls-remote", "--heads", "origin", branch])
+            .current_dir(project_root)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                // Non-empty output means the ref exists on the remote
+                !stdout.trim().is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// Ensure the default branch exists on the remote repository.
+    ///
+    /// New or empty repositories on GitHub may only have feature branches
+    /// (e.g., from prior worktree commits) with no `main` or `master` branch.
+    /// This creates an empty initial commit on the default branch and pushes
+    /// it so that worktree operations and push validation can succeed.
+    ///
+    /// Uses the safe `commit-tree` approach first (doesn't touch HEAD or index),
+    /// falling back to orphan checkout only if needed.
+    fn ensure_default_branch_on_remote(&self) -> Result<()> {
+        // First check if the default branch already exists on the remote
+        if Self::remote_branch_exists(&self.project_root, &self.default_branch) {
+            info!(branch = %self.default_branch, "Default branch already exists on remote");
+            return Ok(());
+        }
+
+        warn!(
+            branch = %self.default_branch,
+            "Default branch does not exist on remote — creating it with an initial commit"
+        );
+
+        // Prefer the safe commit-tree approach that doesn't touch HEAD or index.
+        // Only fall back to orphan checkout if commit-tree fails.
+        if let Err(e) = self.ensure_default_branch_via_commit_tree() {
+            warn!(error = %e, "commit-tree approach failed, trying orphan checkout fallback");
+            self.ensure_default_branch_via_orphan_checkout()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Safe approach: create default branch using git commit-tree.
+    /// This doesn't touch the working tree, HEAD, or index at all.
+    fn ensure_default_branch_via_commit_tree(&self) -> Result<()> {
+        // Create an empty tree using the well-known empty tree SHA-1 hash
+        let empty_tree = "4b825dc642cb6eb9a060e54bf899d15363d7b6ed";
+
+        // Create a commit from the empty tree
+        let commit_output = Command::new("git")
+            .args([
+                "commit-tree",
+                empty_tree,
+                "-m",
+                "Initial commit",
+            ])
+            .env("GIT_AUTHOR_NAME", "AgentFlow")
+            .env("GIT_AUTHOR_EMAIL", "agentflow@github.com")
+            .env("GIT_COMMITTER_NAME", "AgentFlow")
+            .env("GIT_COMMITTER_EMAIL", "agentflow@github.com")
+            .current_dir(&self.project_root)
+            .output();
+
+        let commit_hash = match commit_output {
+            Ok(o) if o.status.success() => {
+                let hash = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                info!(hash = %hash, "Created empty root commit for default branch");
+                hash
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return Err(anyhow!("Failed to create root commit: {}", stderr));
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to create root commit: {}", e));
+            }
+        };
+
+        // Push the commit as the default branch to origin
+        let push_output = Command::new("git")
+            .args([
+                "push",
+                "origin",
+                &format!("{}:refs/heads/{}", commit_hash, self.default_branch),
+            ])
+            .current_dir(&self.project_root)
+            .output();
+
+        match push_output {
+            Ok(o) if o.status.success() => {
+                info!(branch = %self.default_branch, "Default branch created on remote via commit-tree");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if stderr.contains("already exists") || stderr.contains("up-to-date") {
+                    info!(branch = %self.default_branch, "Default branch already exists on remote (concurrent creation)");
+                } else {
+                    return Err(anyhow!("Failed to push default branch: {}", stderr));
+                }
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to push default branch: {}", e));
+            }
+        }
+
+        // Fetch so the remote-tracking ref is available
+        let _ = self.run_git_in_main(&["fetch", "origin", &self.default_branch]);
+
+        Ok(())
+    }
+
+    /// Fallback: create default branch by checking out an orphan branch.
+    /// This modifies HEAD and the index in the project root, so it should only
+    /// be used when the safer commit-tree approach fails.
+    fn ensure_default_branch_via_orphan_checkout(&self) -> Result<()> {
+        // Save current HEAD so we can restore it after creating the branch
+        let saved_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.project_root)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+
+        // Create an orphan branch with an initial commit
+        let orphan_output = Command::new("git")
+            .args(["checkout", "--orphan", &self.default_branch])
+            .current_dir(&self.project_root)
+            .output();
+
+        let orphan_ok = match orphan_output {
+            Ok(o) => o.status.success(),
+            Err(e) => {
+                warn!(error = %e, "Failed to create orphan branch");
+                return Err(anyhow!("Failed to create orphan branch: {}", e));
+            }
+        };
+
+        if !orphan_ok {
+            return Err(anyhow!("Failed to checkout orphan branch {}", self.default_branch));
+        }
+
+        // Remove everything from index (we want an empty initial commit)
+        let _ = Command::new("git")
+            .args(["rm", "-rf", "--cached", "."])
+            .current_dir(&self.project_root)
+            .output();
+
+        // Create the initial commit
+        let commit_output = Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "Initial commit"])
+            .current_dir(&self.project_root)
+            .env("GIT_AUTHOR_NAME", "AgentFlow")
+            .env("GIT_AUTHOR_EMAIL", "agentflow@github.com")
+            .env("GIT_COMMITTER_NAME", "AgentFlow")
+            .env("GIT_COMMITTER_EMAIL", "agentflow@github.com")
+            .output();
+
+        let commit_ok = match commit_output {
+            Ok(o) => o.status.success(),
+            Err(e) => {
+                warn!(error = %e, "Failed to create initial commit");
+                false
+            }
+        };
+
+        if !commit_ok {
+            // Restore original HEAD before returning error
+            Self::restore_head(&self.project_root, saved_head);
+            return Err(anyhow!("Failed to create initial commit on orphan branch"));
+        }
+
+        // Push the default branch to origin
+        let push_output = Command::new("git")
+            .args(["push", "origin", &self.default_branch])
+            .current_dir(&self.project_root)
+            .output();
+
+        match push_output {
+            Ok(o) if o.status.success() => {
+                info!(branch = %self.default_branch, "Default branch created and pushed to remote");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // If push fails because the branch already exists (race), that's fine
+                if stderr.contains("already exists") || stderr.contains("up-to-date") {
+                    info!(branch = %self.default_branch, "Default branch already exists on remote (concurrent creation)");
+                } else {
+                    // Restore HEAD before returning error
+                    Self::restore_head(&self.project_root, saved_head);
+                    return Err(anyhow!("Failed to push default branch: {}", stderr));
+                }
+            }
+            Err(e) => {
+                // Restore HEAD before returning error
+                Self::restore_head(&self.project_root, saved_head);
+                return Err(anyhow!("Failed to push default branch: {}", e));
+            }
+        }
+
+        // Restore original HEAD
+        Self::restore_head(&self.project_root, saved_head);
+
+        // Fetch so the remote-tracking ref is available
+        let _ = self.run_git_in_main(&["fetch", "origin", &self.default_branch]);
+
+        // Try to clean up the local orphan branch ref
+        // (this may fail if we're on it, which is fine)
+        let _ = Command::new("git")
+            .args(["branch", "-d", &self.default_branch])
+            .current_dir(&self.project_root)
+            .output();
+
+        Ok(())
+    }
+
+    fn restore_head(project_root: &Path, saved_head: Option<String>) {
+        if let Some(ref head) = saved_head {
+            // Checkout the original branch/commit
+            let _ = Command::new("git")
+                .args(["checkout", head])
+                .current_dir(project_root)
+                .output();
+        } else {
+            // No saved HEAD, try to go back to whatever branch we were on
+            let _ = Command::new("git")
+                .args(["checkout", "-"])
+                .current_dir(project_root)
+                .output();
+        }
     }
 
     /// Returns the origin-qualified default branch ref (e.g., "origin/main" or "origin/master").
@@ -293,6 +573,18 @@ impl WorktreeManager {
 
         // Ensure worktrees/ is in .gitignore so git doesn't track the worktree dirs
         self.ensure_worktrees_gitignored();
+
+        // Ensure the default branch exists on the remote repository.
+        // New or empty repos may only have feature branches with no `main`/`master`,
+        // which causes fetch and push validation to fail.
+        if let Err(e) = self.ensure_default_branch_on_remote() {
+            warn!(error = %e, "Failed to ensure default branch exists on remote, continuing anyway");
+            warnings.push(SetupWarning {
+                phase: "ensure_default_branch".to_string(),
+                error: format!("Could not verify/create default branch on remote: {}", e),
+                affected_files: vec![],
+            });
+        }
 
         if let Err(e) = self.run_git_in_main(&["fetch", "origin", &self.default_branch]) {
             warn!(error = %e, default_branch = %self.default_branch, "git fetch origin/{} failed, continuing", self.default_branch);

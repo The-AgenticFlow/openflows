@@ -159,7 +159,7 @@ impl FallbackClient {
 
     fn build_fireworks_chain(model_override: Option<&str>) -> Result<Self> {
         let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
-        let model = model_override.unwrap_or("accounts/fireworks/models/llama-v3p1-8b-instruct");
+        let model = model_override.unwrap_or("accounts/fireworks/models/deepseek-v3p1");
 
         info!(
             model = model,

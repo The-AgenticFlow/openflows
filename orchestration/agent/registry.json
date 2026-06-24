@@ -1,50 +1,62 @@
 {
-  "default_cli": "claude",
+  "default_cli": "codex",
+  "allowed_domains": [
+    "api.github.com",
+    "*.github.com",
+    "pypi.org",
+    "registry.npmjs.org",
+    "crates.io"
+  ],
   "team": [
     {
       "id": "nexus",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "fireworks/accounts/fireworks/models/kimi-k2p6",
       "routing_key": "nexus-key",
-      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
+      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
+      "allowed_domains": null
     },
     {
       "id": "forge",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 2,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "fireworks/accounts/fireworks/models/kimi-k2p6",
       "routing_key": "forge-key",
-      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN"
+      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
+      "allowed_domains": null
     },
     {
       "id": "sentinel",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "fireworks/accounts/fireworks/models/kimi-k2p6",
       "routing_key": "sentinel-key",
-      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN"
+      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
+      "allowed_domains": null
     },
-    {                                                                                                           
+    {
       "id": "vessel",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "fireworks/accounts/fireworks/models/kimi-k2p6",
       "routing_key": "vessel-key",
-      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN"
+      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
+      "allowed_domains": null
     },
     {
       "id": "lore",
-      "cli": "claude",
+      "cli": "codex",
       "active": false,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "fireworks/accounts/fireworks/models/kimi-k2p6",
       "routing_key": "lore-key",
-      "github_token_env": "AGENT_LORE_GITHUB_TOKEN"
+      "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
+      "allowed_domains": null
     }
   ]
 }

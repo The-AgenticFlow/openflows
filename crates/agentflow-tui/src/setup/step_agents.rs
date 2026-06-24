@@ -59,11 +59,53 @@ impl AgentsStep {
                 .join("registry.json")
         };
 
+        // Show a loading screen while discovering models
+        let provider_name = config.selected_provider.as_deref().unwrap_or("unknown");
+        terminal.draw(|f| {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                ])
+                .split(area);
+
+            let title_block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::BOTTOM)
+                .border_style(Style::default().fg(theme.border()));
+            let inner_title = title_block.inner(chunks[0]);
+            title_block.render(chunks[0], f.buffer_mut());
+
+            let title = Line::styled(
+                "◇ CONFIGURE AGENTS",
+                Style::default().fg(theme.accent()).add_modifier(Modifier::BOLD),
+            );
+            let title_text = ratatui::widgets::Paragraph::new(vec![title]);
+            title_text.render(inner_title, f.buffer_mut());
+
+            let loading = Line::styled(
+                format!("  ⏳ Discovering available models from {}...", provider_name),
+                Style::default().fg(theme.fg()),
+            );
+            let hint = Line::styled(
+                "  This may take a few seconds on first run.",
+                Style::default().fg(theme.muted()),
+            );
+            let loading_text = ratatui::widgets::Paragraph::new(vec![loading, hint]);
+            loading_text.render(chunks[1], f.buffer_mut());
+        })?;
+
         // Discover models dynamically from the selected provider
+        tracing::info!(provider = %provider_name, "Starting model discovery");
         let discovered_models = match discover_models(config).await {
-            Ok(models) => models,
+            Ok(models) => {
+                tracing::info!(count = models.len(), provider = %provider_name, "Model discovery succeeded");
+                models
+            }
             Err(e) => {
-                // Fall back to default models if discovery fails
                 tracing::warn!("Failed to discover models: {}, using defaults", e);
                 vec![ModelInfo {
                     slug: default_model_for_provider(

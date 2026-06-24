@@ -1,11 +1,47 @@
 // crates/pair-harness/src/types.rs
 //! Core types for the pair-harness system.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 // Re-export CliBackend from the config crate — single source of truth.
 pub use config::registry::CliBackend;
+
+/// Custom deserializer that converts an empty string to `None` for `Option<u64>`.
+/// LLMs frequently write `"pr_number": ""` instead of `"pr_number": null` or
+/// `"pr_number": 42`, which causes serde to fail with "invalid type: string,
+/// expected u64". This deserializer gracefully handles that case.
+fn deserialize_opt_u64_from_maybe_string<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    // Use a helper enum that can accept a number, null, or a string
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeU64 {
+        Number(u64),
+        Null,
+        String(String),
+    }
+
+    match MaybeU64::deserialize(deserializer) {
+        Ok(MaybeU64::Number(n)) => Ok(Some(n)),
+        Ok(MaybeU64::Null) => Ok(None),
+        Ok(MaybeU64::String(s)) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                // Try parsing the string as a number
+                s.parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| de::Error::custom(format!("cannot parse \"{}\" as u64", s)))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Filesystem events detected by the watcher.
 /// These drive the event-driven harness state machine.
@@ -308,7 +344,11 @@ pub struct StatusJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
     /// PR number (if PR_OPENED)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_u64_from_maybe_string",
+        default
+    )]
     pub pr_number: Option<u64>,
     /// Branch name (optional - may not be present in all STATUS.json formats)
     #[serde(default)]
