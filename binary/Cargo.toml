@@ -42,6 +42,7 @@ coder-client    = { path = "../crates/coder-client" }
   tracing-subscriber = { workspace = true }
   dotenvy     = { workspace = true }
   which       = "7"
+  reqwest     = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"

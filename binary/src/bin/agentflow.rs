@@ -7,6 +7,7 @@ use config::{
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
     ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
     ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
+    WorkspaceProvider,
 };
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
@@ -139,6 +140,142 @@ async fn main() -> Result<()> {
     }
     info!("  CLI Binary: {} ({})", default_cli, cli_path);
 
+    // 1b. Determine workspace provider and bootstrap Coder if configured
+    let workspace_provider = if std::env::var("CODER_URL").is_ok() || std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder") {
+        let coder_url = std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
+
+        // Ensure CODER_URL is set (WORKSPACE_PROVIDER=coder without CODER_URL)
+        if std::env::var("CODER_URL").is_err() {
+            std::env::set_var("CODER_URL", &coder_url);
+        }
+
+        // Try to reach Coder — if unreachable, attempt to start via docker-compose
+        let mut coder_available = false;
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        match http_client.get(format!("{}/api/v2/buildinfo", coder_url.trim_end_matches('/'))).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Coder server already running at {}", coder_url);
+                coder_available = true;
+            }
+            Ok(resp) => {
+                eprintln!("⚠ Coder server at {} returned status {}", coder_url, resp.status());
+                eprintln!("  Attempting to start Coder services via docker-compose...");
+            }
+            Err(_) => {
+                eprintln!("∙ Coder server not reachable at {}", coder_url);
+                eprintln!("  Attempting to start Coder services via docker-compose...");
+            }
+        }
+
+        if !coder_available {
+            // Try to start Coder via docker-compose --profile coder
+            let compose_paths = vec![
+                std::path::PathBuf::from("docker-compose.yml"),
+                std::path::PathBuf::from(format!("{}/.openflows/docker-compose.yml",
+                    std::env::var("HOME").unwrap_or_default())),
+            ];
+
+            let compose_file = compose_paths.into_iter().find(|p| p.exists());
+
+            if let Some(compose_path) = compose_file {
+                eprintln!("  Found {} — starting coder and coder-db services...", compose_path.display());
+                let output = tokio::process::Command::new("docker")
+                    .args([
+                        "compose", "--profile", "coder",
+                        "-f", compose_path.to_str().unwrap_or("docker-compose.yml"),
+                        "up", "-d", "coder-db", "coder",
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await;
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        eprintln!("  ✓ Coder services starting (docker compose --profile coder up -d)");
+                        eprintln!("  Waiting for Coder server to become healthy...");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        eprintln!("  ✗ docker compose failed: {}", stderr.trim());
+                        eprintln!();
+                        eprintln!("  To start Coder manually:");
+                        eprintln!("    docker compose --profile coder up -d");
+                        eprintln!();
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ Could not run docker: {}", e);
+                        eprintln!("  Is Docker installed and running?");
+                        eprintln!();
+                    }
+                }
+            } else {
+                eprintln!("  docker-compose.yml not found — cannot auto-start Coder.");
+                eprintln!("  To use Coder mode, start the Coder server manually:");
+                eprintln!("    docker compose --profile coder up -d");
+                eprintln!();
+            }
+        }
+
+        // Bootstrap Coder (create admin user, push templates)
+        info!("Coder: bootstrapping...");
+        match coder_client::bootstrap::CoderBootstrapper::from_env() {
+            Ok(bootstrapper) => match bootstrapper.bootstrap().await {
+                Ok(client) => {
+                    let _coder_token = client.token().to_string();
+                    let _coder_url = client.base_url().to_string();
+                    info!("Coder: bootstrapped — using Coder workspaces");
+                    // Store token in env for downstream access
+                    std::env::set_var("CODER_API_TOKEN", client.token());
+                    WorkspaceProvider::Coder
+                }
+                Err(e) => {
+                    warn!("Coder: bootstrap failed ({}), falling back to local mode", e);
+                    eprintln!();
+                    eprintln!("⚠ Coder bootstrap failed: {}", e);
+                    eprintln!("  Check that:");
+                    eprintln!("  1. Docker is running: docker info");
+                    eprintln!("  2. Coder services are up: docker compose --profile coder ps");
+                    eprintln!("  3. CODER_ADMIN_PASSWORD matches (default: openflows)");
+                    eprintln!("  4. Coder health: curl http://localhost:7080/api/v2/buildinfo");
+                    eprintln!();
+                    WorkspaceProvider::Local
+                }
+            },
+            Err(e) => {
+                warn!("Coder: configuration error ({}), falling back to local mode", e);
+                eprintln!();
+                eprintln!("⚠ Coder configuration error: {}", e);
+                eprintln!("  Verify CODER_URL and CODER_ADMIN_PASSWORD are correct.");
+                eprintln!();
+                WorkspaceProvider::Local
+            }
+        }
+    } else {
+        info!("Coder: disabled (local mode)");
+        WorkspaceProvider::Local
+    };
+
+    eprintln!();
+    eprintln!("═══ OpenFlows Configuration ═══");
+    eprintln!("  Workspace Provider: {:?}", workspace_provider);
+    match workspace_provider {
+        WorkspaceProvider::Coder => {
+            if let Ok(url) = std::env::var("CODER_URL") {
+                eprintln!("  Coder URL: {}", url);
+            }
+            eprintln!("  Mode: Coder workspaces (isolated per pair)");
+        }
+        WorkspaceProvider::Local => {
+            eprintln!("  Mode: Local (git worktrees)");
+        }
+    }
+    eprintln!();
+
     info!("Starting REAL End-to-End Orchestration (Event-Driven FORGE-SENTINEL Pairs + VESSEL)");
 
     // 1. Resolve and ensure orchestration directory
@@ -261,6 +398,16 @@ async fn main() -> Result<()> {
     store.set(KEY_TICKETS, serde_json::json!([])).await;
     store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
     store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+
+    // Store Coder context so downstream nodes can reconstruct CoderClient
+    if matches!(workspace_provider, WorkspaceProvider::Coder) {
+        if let Ok(token) = std::env::var("CODER_API_TOKEN") {
+            store.set("coder_api_token", serde_json::json!(token)).await;
+        }
+        if let Ok(url) = std::env::var("CODER_URL") {
+            store.set("coder_url", serde_json::json!(url)).await;
+        }
+    }
 
     // 6. Run Flow
     info!("Running orchestration loop for repository: {}", repo);
