@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
 
   coder:
-    image: coder/coder:latest
+    image: ghcr.io/coder/coder:latest
     profiles:
       - coder
     ports:
