@@ -1,14 +1,16 @@
 // crates/agent-forge/src/lib.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use coder_client::CoderClient;
 use config::{
     state::{
         ACTION_EMPTY, ACTION_FAILED, ACTION_PR_OPENED, KEY_COMMAND_GATE, KEY_PENDING_PRS,
         KEY_TICKETS, KEY_WORKER_SLOTS,
     },
-    Ticket, TicketStatus, WorkerSlot, WorkerStatus,
+    Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider,
 };
 use pair_harness::{
+    transport::{CoderTransport, LocalTransport, WorkspaceTransport},
     worktree::WorktreeManager, ForgeSentinelPair, PairConfig, PairOutcome, Ticket as PairTicket,
 };
 use pocketflow_core::{Action, BatchNode, SharedStore};
@@ -18,6 +20,17 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{info, warn};
+
+const CODER_WORKSPACE_DIR: &str = "/home/coder/workspace";
+
+fn shell_quote(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn shell_quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeStatus {
@@ -154,35 +167,77 @@ impl BatchNode for ForgeNode {
             _ => return Ok(json!({"outcome": "idle", "worker_id": worker_id})),
         };
 
-        // Create worktree manager
-        let worktree_mgr = WorktreeManager::new(&self.workspace_root);
-
-        // Resolve token for this specific worker
-        let worker_token = self.resolve_token_for_worker(&worker_id)?;
-
-        // Create worktree for this worker
-        let setup_result = worktree_mgr
-            .create_worktree(&worker_id, &ticket_id, &worker_token)
-            .await
-            .map_err(|e| anyhow!("Failed to create worktree: {:#}", e))?;
-        let worktree_path = setup_result.path;
-
-        info!(worker = worker_id, ticket = ticket_id, path = ?worktree_path, "Worktree created");
-
-        // Create log directory to persist logs even after worktree cleanup
+        // Create log directory to persist logs for the worker lifecycle.
         let log_dir = self
             .workspace_root
             .join("forge")
             .join("workers")
             .join(&worker_id);
         tokio::fs::create_dir_all(&log_dir).await?;
-
-        let status_path = worktree_path.join("STATUS.json");
         let log_path = log_dir.join("worker.log");
-        let log_file = std::fs::File::create(&log_path)?;
-        let log_file_err = log_file.try_clone()?;
 
-        info!(worker = worker_id, ticket = ticket_id, issue_url = ?issue_url, "Spawning Claude Code...");
+        // Resolve token for this specific worker.
+        let worker_token = self.resolve_token_for_worker(&worker_id)?;
+
+        // Resolve CLI backend from registry (respects DEFAULT_CLI env var).
+        let cli_backend = if let Some(registry_path) = &self.registry_path {
+            let registry = config::Registry::load(registry_path)?;
+            registry.resolve_cli_backend(&worker_id)
+        } else {
+            std::env::var(config::DEFAULT_CLI_ENV_VAR)
+                .ok()
+                .map(|s| config::CliBackend::parse(&s))
+                .unwrap_or_default()
+        };
+
+        let cli_binary = match cli_backend.path_env_var() {
+            "CODEX_PATH" => std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
+            _ => std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+        };
+
+        let use_coder_workspace = matches!(slot.workspace_provider, WorkspaceProvider::Coder)
+            && slot.workspace_id.is_some()
+            && std::env::var("CODER_URL").is_ok()
+            && std::env::var("CODER_API_TOKEN").is_ok();
+
+        let (worktree_path, transport): (PathBuf, Box<dyn WorkspaceTransport>) = if use_coder_workspace {
+            let coder_client = CoderClient::new(
+                &std::env::var("CODER_URL").unwrap_or_default(),
+                &std::env::var("CODER_API_TOKEN").unwrap_or_default(),
+            );
+            let workspace_id = slot.workspace_id.clone().unwrap();
+            info!(
+                worker = worker_id,
+                ticket = ticket_id,
+                workspace_id = %workspace_id,
+                "Using Coder workspace for worker"
+            );
+            (
+                PathBuf::from(CODER_WORKSPACE_DIR),
+                Box::new(CoderTransport::new(coder_client, &workspace_id)),
+            )
+        } else {
+            // Create worktree manager for local mode.
+            let worktree_mgr = WorktreeManager::new(&self.workspace_root);
+            let setup_result = worktree_mgr
+                .create_worktree(&worker_id, &ticket_id, &worker_token)
+                .await
+                .map_err(|e| anyhow!("Failed to create worktree: {:#}", e))?;
+            let worktree_path = setup_result.path;
+            info!(
+                worker = worker_id,
+                ticket = ticket_id,
+                path = ?worktree_path,
+                "Worktree created"
+            );
+            (
+                worktree_path.clone(),
+                Box::new(LocalTransport::new(&worktree_path)),
+            )
+        };
+
+        let status_rel = "STATUS.json";
+        info!(worker = worker_id, ticket = ticket_id, issue_url = ?issue_url, "Spawning agent via transport...");
 
         // Load the persona from the agent definition file (source of truth)
         let persona_content = self.load_persona().await?;
@@ -202,122 +257,73 @@ impl BatchNode for ForgeNode {
             persona_content, worker_id, ticket_id, issue_context, branch_name
         );
 
-        // Resolve CLI backend from registry (respects DEFAULT_CLI env var)
-        let cli_backend = if let Some(registry_path) = &self.registry_path {
-            let registry = config::Registry::load(registry_path)?;
-            registry.resolve_cli_backend(&worker_id)
-        } else {
-            std::env::var(config::DEFAULT_CLI_ENV_VAR)
-                .ok()
-                .map(|s| config::CliBackend::parse(&s))
-                .unwrap_or_default()
+        let shell_command = match cli_backend {
+            config::CliBackend::Codex => format!(
+                "cd {} && OPENAI_API_KEY={} OPENAI_BASE_URL={} {} exec --full-auto -m {} <<'OPENFLOWS_PROMPT'\n{}\nOPENFLOWS_PROMPT",
+                shell_quote(&worktree_path),
+                shell_quote_str(&std::env::var("OPENAI_API_KEY").unwrap_or_default()),
+                shell_quote_str(&std::env::var("OPENAI_BASE_URL").unwrap_or_default()),
+                cli_binary,
+                shell_quote_str(
+                    &std::env::var("OPENAI_MODEL")
+                        .or_else(|_| std::env::var("FIREWORKS_MODEL"))
+                        .unwrap_or_else(|_| "gpt-4o-mini".to_string())
+                ),
+                prompt,
+            ),
+            config::CliBackend::Claude => format!(
+                "cd {} && ANTHROPIC_API_KEY={} {} --print --output-format json --dangerously-skip-permissions --allowedTools Read,Write,Edit,Bash,WebFetch <<'OPENFLOWS_PROMPT'\n{}\nOPENFLOWS_PROMPT",
+                shell_quote(&worktree_path),
+                shell_quote_str(&std::env::var("ANTHROPIC_API_KEY").unwrap_or_default()),
+                cli_binary,
+                prompt,
+            ),
         };
 
-        let cli_binary = match cli_backend.path_env_var() {
-            "CODEX_PATH" => std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string()),
-            _ => std::env::var("CLAUDE_PATH").unwrap_or_else(|_| "claude".to_string()),
+        let timeout_dur = std::time::Duration::from_secs(1800);
+        let result = tokio::time::timeout(timeout_dur, transport.execute(&shell_command)).await;
+        let output = match result {
+            Err(_) => {
+                warn!(worker = worker_id, "Agent timed out after 30m");
+                return Ok(json!({
+                    "worker_id": worker_id,
+                    "ticket_id": ticket_id,
+                    "outcome": "fuel_exhausted",
+                    "reason": "timeout"
+                }));
+            }
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                warn!(worker = worker_id, error = %e, "Agent execution failed");
+                return Ok(json!({
+                    "worker_id": worker_id,
+                    "ticket_id": ticket_id,
+                    "outcome": "failed",
+                    "reason": format!("{:#}", e)
+                }));
+            }
         };
 
-        match cli_backend {
-            config::CliBackend::Codex => {
-                let mut child = tokio::process::Command::new(&cli_binary)
-                    .args(["exec", "--full-auto"])
-                    .arg("-m")
-                    .arg(
-                        std::env::var("OPENAI_MODEL")
-                            .or_else(|_| std::env::var("FIREWORKS_MODEL"))
-                            .unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-                    )
-                    .current_dir(&worktree_path)
-                    .env(
-                        "OPENAI_API_KEY",
-                        std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                    )
-                    .env(
-                        "OPENAI_BASE_URL",
-                        std::env::var("OPENAI_BASE_URL").unwrap_or_default(),
-                    )
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(log_file)
-                    .stderr(log_file_err)
-                    .spawn()
-                    .map_err(|e| anyhow!("Failed to spawn Codex CLI: {:#}", e))?;
+        tokio::fs::write(
+            &log_path,
+            format!(
+                "=== stdout ===\n{}\n=== stderr ===\n{}\nexit_code={}\n",
+                output.stdout, output.stderr, output.exit_code
+            ),
+        )
+        .await
+        .ok();
 
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    stdin
-                        .write_all(prompt.as_bytes())
-                        .await
-                        .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
-                }
-
-                let timeout_dur = std::time::Duration::from_secs(1800);
-                let result = tokio::time::timeout(timeout_dur, child.wait()).await;
-
-                match result {
-                    Err(_) => {
-                        warn!(worker = worker_id, "Codex CLI timed out after 30m");
-                        return Ok(json!({
-                            "worker_id": worker_id,
-                            "ticket_id": ticket_id,
-                            "outcome": "fuel_exhausted",
-                            "reason": "timeout"
-                        }));
-                    }
-                    Ok(Ok(status)) if !status.success() => {
-                        warn!(worker = worker_id, exit = ?status.code(), "Codex CLI failed");
-                    }
-                    _ => {}
-                }
-            }
-            config::CliBackend::Claude => {
-                let mut child = tokio::process::Command::new(&cli_binary)
-                    .args(["--print", "--output-format", "json"])
-                    .arg("--dangerously-skip-permissions")
-                    .args(["--allowedTools", "Read,Write,Edit,Bash,WebFetch"])
-                    .current_dir(&worktree_path)
-                    .env(
-                        "ANTHROPIC_API_KEY",
-                        std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
-                    )
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(log_file)
-                    .stderr(log_file_err)
-                    .spawn()
-                    .map_err(|e| anyhow!("Failed to spawn Claude Code: {:#}", e))?;
-
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt;
-                    stdin
-                        .write_all(prompt.as_bytes())
-                        .await
-                        .map_err(|e| anyhow!("Failed to write prompt to stdin: {:#}", e))?;
-                }
-
-                let timeout_dur = std::time::Duration::from_secs(1800);
-                let result = tokio::time::timeout(timeout_dur, child.wait()).await;
-
-                match result {
-                    Err(_) => {
-                        warn!(worker = worker_id, "Claude Code timed out after 30m");
-                        return Ok(json!({
-                            "worker_id": worker_id,
-                            "ticket_id": ticket_id,
-                            "outcome": "fuel_exhausted",
-                            "reason": "timeout"
-                        }));
-                    }
-                    Ok(Ok(status)) if !status.success() => {
-                        warn!(worker = worker_id, exit = ?status.code(), "Claude Code failed");
-                    }
-                    _ => {}
-                }
-            }
+        if output.exit_code != 0 {
+            warn!(
+                worker = worker_id,
+                exit = output.exit_code,
+                "Agent command returned non-zero exit code"
+            );
         }
 
         // 3. Read STATUS.json
-        if tokio::fs::try_exists(&status_path).await? {
-            let content = tokio::fs::read_to_string(&status_path).await?;
+        if let Ok(content) = transport.read_file(status_rel).await {
             match serde_json::from_str::<ForgeStatus>(&content) {
                 Ok(forge_status) => {
                     let outcome = match forge_status.outcome.as_str() {

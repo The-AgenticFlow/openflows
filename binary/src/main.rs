@@ -3,6 +3,7 @@ mod nodes;
 mod state;
 
 use anyhow::Result;
+use config::WorkspaceProvider;
 use pocketflow_core::{Action, Flow, SharedStore};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,6 +122,74 @@ async fn main() -> Result<()> {
         SharedStore::new_in_memory()
     };
 
+    // 2b. Determine workspace provider and bootstrap Coder if configured
+    let workspace_provider = if std::env::var("CODER_URL").is_ok() {
+        info!("Coder: bootstrapping...");
+        match coder_client::CoderBootstrapper::from_env() {
+            Ok(bootstrapper) => match bootstrapper.bootstrap().await {
+                Ok(client) => {
+                    let coder_token = client.token().to_string();
+                    let coder_url = client.base_url().to_string();
+                    info!("Coder: bootstrapped — using Coder workspaces");
+                    // Store the authenticated token and URL so downstream nodes
+                    // can reconstruct a CoderClient when needed.
+                    store.set("coder_api_token", serde_json::json!(coder_token)).await;
+                    store.set("coder_url", serde_json::json!(coder_url)).await;
+                    std::env::set_var("CODER_API_TOKEN", client.token());
+                    std::env::set_var("CODER_URL", client.base_url());
+                    WorkspaceProvider::Coder
+                }
+                Err(e) => {
+                    warn!("Coder: bootstrap failed ({}), falling back to local mode", e);
+                    eprintln!();
+                    eprintln!("⚠ Coder bootstrap failed: {}", e);
+                    eprintln!("  Check that:");
+                    eprintln!("  1. Coder server is running at the configured URL");
+                    eprintln!("  2. Docker is available (for workspace containers)");
+                    eprintln!("  3. CODER_ADMIN_PASSWORD matches the server config");
+                    eprintln!();
+                    WorkspaceProvider::Local
+                }
+            },
+            Err(e) => {
+                warn!("Coder: configuration error ({}), falling back to local mode", e);
+                eprintln!();
+                eprintln!("⚠ Coder configuration error: {}", e);
+                eprintln!("  Verify CODER_URL and CODER_ADMIN_PASSWORD are correct.");
+                eprintln!();
+                WorkspaceProvider::Local
+            }
+        }
+    } else if std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder") {
+        eprintln!();
+        eprintln!("⚠ WORKSPACE_PROVIDER=coder but CODER_URL is not set.");
+        eprintln!("  Coder mode requires CODER_URL to point to a running Coder server.");
+        eprintln!("  Add CODER_URL=http://localhost:7080 to your .env file, or run");
+        eprintln!("  'openflows setup' to configure Coder mode.");
+        eprintln!();
+        info!("Coder: WORKSPACE_PROVIDER=coder but CODER_URL not set, falling back to local mode");
+        WorkspaceProvider::Local
+    } else {
+        info!("Coder: disabled (local mode)");
+        WorkspaceProvider::Local
+    };
+
+    eprintln!();
+    eprintln!("═══ OpenFlows Configuration ═══");
+    eprintln!("  Workspace Provider: {:?}", workspace_provider);
+    match workspace_provider {
+        WorkspaceProvider::Coder => {
+            if let Ok(url) = std::env::var("CODER_URL") {
+                eprintln!("  Coder URL: {}", url);
+            }
+            eprintln!("  Mode: Coder workspaces (isolated per pair)");
+        }
+        WorkspaceProvider::Local => {
+            eprintln!("  Mode: Local (git worktrees)");
+        }
+    }
+    eprintln!();
+
     // 3. Dry Run Setup: Inject a test ticket and 2 worker slots
     info!("Injecting dry-run data...");
     let test_ticket = Ticket {
@@ -140,6 +209,8 @@ async fn main() -> Result<()> {
             WorkerSlot {
                 id: "forge-1".to_string(),
                 status: WorkerStatus::Idle,
+                workspace_id: None,
+                workspace_provider: workspace_provider.clone(),
             },
         ),
         (
@@ -147,6 +218,8 @@ async fn main() -> Result<()> {
             WorkerSlot {
                 id: "forge-2".to_string(),
                 status: WorkerStatus::Idle,
+                workspace_id: None,
+                workspace_provider: workspace_provider.clone(),
             },
         ),
     ]);

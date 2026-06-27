@@ -9,9 +9,12 @@ use std::time::Instant;
 use crate::app::App;
 use crate::util::theme::Theme;
 use crate::widgets::table::WorkerTable;
+use config::state::KEY_WORKER_SLOTS;
+use config::WorkerSlot;
+use pocketflow_core::SharedStore;
 
 mod events;
-mod workers;
+pub(crate) mod workers;
 
 use events::LogEvent;
 use workers::WorkerInfo;
@@ -20,10 +23,12 @@ pub struct DashboardState {
     workers: Vec<WorkerInfo>,
     events: VecDeque<LogEvent>,
     repo: String,
-    status: String,
     last_refresh: Instant,
     selected_row: usize,
     show_log: bool,
+    coder_url: Option<String>,
+    store: Option<SharedStore>,
+    events_cursor: usize,
 }
 
 impl Default for DashboardState {
@@ -34,19 +39,58 @@ impl Default for DashboardState {
 
 impl DashboardState {
     pub fn new() -> Self {
+        let coder_url = std::env::var("CODER_URL").ok();
         Self {
             workers: Vec::new(),
             events: VecDeque::new(),
             repo: String::new(),
-            status: "Unknown".to_string(),
             last_refresh: Instant::now(),
             selected_row: 0,
             show_log: false,
+            coder_url,
+            store: None,
+            events_cursor: 0,
         }
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
         self.last_refresh = Instant::now();
+        if self.store.is_none() {
+            if let Ok(url) = std::env::var("REDIS_URL") {
+                self.store = SharedStore::new_redis(&url).await.ok();
+            }
+        }
+
+        if let Some(store) = &self.store {
+            if let Some(repo) = store.get_typed::<String>("repository").await {
+                self.repo = repo;
+            } else if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
+                self.repo = repo;
+            }
+
+            let slots: std::collections::HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            let mut workers: Vec<WorkerInfo> = slots
+                .values()
+                .map(|slot| WorkerInfo::from_slot(slot, self.coder_url.as_deref()))
+                .collect();
+            workers.sort_by(|a, b| a.id.cmp(&b.id));
+            self.workers = workers;
+
+            let events = store.get_events_since(self.events_cursor).await;
+            self.events_cursor += events.len();
+            for event in events {
+                self.events.push_back(LogEvent {
+                    timestamp: event.ts.to_string(),
+                    agent: event.agent,
+                    message: format!("{} {}", event.event_type, event.payload),
+                });
+            }
+            while self.events.len() > 200 {
+                self.events.pop_front();
+            }
+        }
+
         Ok(())
     }
 }
@@ -69,10 +113,17 @@ async fn run_dashboard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>
         terminal.draw(|f| {
             let area = f.area();
 
-            let header = format!(
-                "AgentFlow Dashboard  |  Repository: {}  |  Status: {}  |  [q:quit r:refresh]",
-                state.repo, state.status
-            );
+            let header = if let Some(ref url) = state.coder_url {
+                format!(
+                    "AgentFlow Dashboard  |  Repository: {}  |  Coder: {}  |  [q:quit r:refresh l:logs]",
+                    state.repo, url
+                )
+            } else {
+                format!(
+                    "AgentFlow Dashboard  |  Repository: {}  |  Mode: Local  |  [q:quit r:refresh l:logs]",
+                    state.repo
+                )
+            };
             let header_widget = ratatui::widgets::Paragraph::new(header).style(theme.title_style());
             let header_area = ratatui::layout::Rect {
                 x: 1,
@@ -82,19 +133,13 @@ async fn run_dashboard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>
             };
             header_widget.render(header_area, f.buffer_mut());
 
-            let worker_data: Vec<(String, String, String)> = state
-                .workers
-                .iter()
-                .map(|w| (w.id.clone(), w.status.clone(), w.detail.clone()))
-                .collect();
-
             let table_area = ratatui::layout::Rect {
                 x: 1,
                 y: 2,
                 width: area.width.saturating_sub(2),
                 height: area.height / 2,
             };
-            let table = WorkerTable::new(worker_data).selected(state.selected_row);
+            let table = WorkerTable::new(state.workers.clone()).selected(state.selected_row);
             table.render(table_area, f.buffer_mut());
 
             if state.show_log {

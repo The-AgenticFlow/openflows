@@ -11,7 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
+use crate::pair_state::{PairArtifact, PairStateStore};
 use crate::process::{get_backend_config, BackendConfig};
+use crate::transport::WorkspaceTransport;
 use crate::types::CliBackend;
 
 struct ExtrasContext<'a> {
@@ -79,6 +81,7 @@ impl Provisioner {
         pair_id: &str,
         worktree: &Path,
         shared: &Path,
+        transport: &dyn WorkspaceTransport,
         github_token: &str,
         redis_url: Option<&str>,
         cli_backend: CliBackend,
@@ -124,7 +127,7 @@ impl Provisioner {
         self.symlink_plugin(shared, "sentinel", &backend_config)?;
 
         // 7. Create shared directory structure
-        self.create_shared_structure(shared)?;
+        self.create_shared_structure(shared, transport).await?;
 
         // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
@@ -394,15 +397,24 @@ impl Provisioner {
     }
 
     /// Create the shared directory structure.
-    pub fn create_shared_structure(&self, shared: &Path) -> Result<()> {
+    pub async fn create_shared_structure(
+        &self,
+        shared: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let already_exists = shared.exists();
 
-        fs::create_dir_all(shared).context("Failed to create shared directory")?;
+        transport
+            .execute(&format!("mkdir -p {}", shell_quote(shared)))
+            .await
+            .context("Failed to create shared directory")?;
 
         // Clean up the legacy sentinel subdirectory from older runs.
         let legacy_dir = shared.join("sentinel");
         if legacy_dir.exists() {
-            fs::remove_dir_all(&legacy_dir)
+            transport
+                .execute(&format!("rm -rf {}", shell_quote(&legacy_dir)))
+                .await
                 .context("Failed to remove legacy sentinel directory")?;
         }
 
@@ -413,11 +425,13 @@ impl Provisioner {
         // `orchestration/pairs/` path.
         let gitignore = shared.join(".gitignore");
         if !gitignore.exists() {
-            fs::write(
-                &gitignore,
-                "# Shared artifacts are runtime state, not committed\n*\n!.gitignore\n",
-            )
-            .context("Failed to write .gitignore")?;
+            transport
+                .write_file(
+                    &gitignore.to_string_lossy(),
+                    "# Shared artifacts are runtime state, not committed\n*\n!.gitignore\n",
+                )
+                .await
+                .context("Failed to write .gitignore")?;
         }
 
         // On re-provision (e.g. CI fix, conflict rework), append a session
@@ -427,12 +441,20 @@ impl Provisioner {
         // will see the updated mtime and not declare the pair stalled.
         if already_exists {
             let worklog_path = shared.join("WORKLOG.md");
-            let existing = fs::read_to_string(&worklog_path).unwrap_or_default();
+            let existing = transport
+                .read_file(&worklog_path.to_string_lossy())
+                .await
+                .unwrap_or_default();
             let marker = format!(
                 "\n---\n\n## Session Restart ({})\n\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M")
             );
-            fs::write(&worklog_path, format!("{}{}", existing, marker))
+            transport
+                .write_file(
+                    &worklog_path.to_string_lossy(),
+                    &format!("{}{}", existing, marker),
+                )
+                .await
                 .context("Failed to append session marker to WORKLOG.md")?;
             debug!(path = %worklog_path.display(), "Appended session restart marker to WORKLOG.md");
         }
@@ -1681,7 +1703,14 @@ enabled = true
     }
 
     /// Write TICKET.md to shared directory.
-    pub fn write_ticket(&self, shared: &Path, ticket: &crate::types::Ticket) -> Result<()> {
+    pub async fn write_ticket(
+        &self,
+        pair_id: &str,
+        shared: &Path,
+        ticket: &crate::types::Ticket,
+        transport: &dyn WorkspaceTransport,
+        pair_state: Option<&dyn PairStateStore>,
+    ) -> Result<()> {
         let path = shared.join("TICKET.md");
 
         let content = format!(
@@ -1698,26 +1727,55 @@ enabled = true
                 .join("\n")
         );
 
-        fs::write(&path, content).context("Failed to write TICKET.md")?;
+        transport
+            .write_file(&path.to_string_lossy(), &content)
+            .await
+            .context("Failed to write TICKET.md")?;
+        if let Some(store) = pair_state {
+            store
+                .write_artifact(pair_id, PairArtifact::Ticket, &content)
+                .await?;
+        }
 
         info!(path = %path.display(), "TICKET.md written");
         Ok(())
     }
 
     /// Write TASK.md to shared directory.
-    pub fn write_task(&self, shared: &Path, task: &str) -> Result<()> {
+    pub async fn write_task(
+        &self,
+        pair_id: &str,
+        shared: &Path,
+        task: &str,
+        transport: &dyn WorkspaceTransport,
+        pair_state: Option<&dyn PairStateStore>,
+    ) -> Result<()> {
         let path = shared.join("TASK.md");
 
-        fs::write(&path, task).context("Failed to write TASK.md")?;
+        transport
+            .write_file(&path.to_string_lossy(), task)
+            .await
+            .context("Failed to write TASK.md")?;
+        if let Some(store) = pair_state {
+            store
+                .write_artifact(pair_id, PairArtifact::Task, task)
+                .await?;
+        }
 
         info!(path = %path.display(), "TASK.md written");
         Ok(())
     }
 }
 
+fn shell_quote(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::LocalTransport;
     use tempfile::tempdir;
 
     #[test]
@@ -1763,13 +1821,17 @@ mod tests {
         assert_eq!(settings["permissions"]["defaultMode"], "auto");
     }
 
-    #[test]
-    fn test_create_shared_structure() {
+    #[tokio::test]
+    async fn test_create_shared_structure() {
         let dir = tempdir().unwrap();
         let shared = dir.path().join("shared");
 
         let provisioner = Provisioner::new(dir.path());
-        provisioner.create_shared_structure(&shared).unwrap();
+        let transport = LocalTransport::new(dir.path());
+        provisioner
+            .create_shared_structure(&shared, &transport)
+            .await
+            .unwrap();
 
         assert!(shared.exists());
         assert!(!shared.join("sentinel").exists());

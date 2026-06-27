@@ -6,6 +6,7 @@ use std::io;
 pub mod model_discovery;
 pub mod step_agents;
 pub mod step_api;
+pub mod step_coder;
 pub mod step_domains;
 pub mod step_done;
 pub mod step_env;
@@ -20,6 +21,7 @@ pub mod step_welcome;
 
 use step_agents::AgentsStep;
 use step_api::ApiStep;
+use step_coder::CoderStep;
 use step_domains::DomainsStep;
 use step_done::DoneStep;
 use step_env::EnvStep;
@@ -68,6 +70,24 @@ pub struct SetupConfig {
     pub agents: Vec<AgentConfig>,
     pub domain_mode: DomainMode,
     pub allowed_domains: Vec<String>,
+    pub workspace_provider: WorkspaceProvider,
+    pub coder_url: Option<String>,
+    pub coder_admin_password: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceProvider {
+    Local,
+    Coder,
+}
+
+impl From<WorkspaceProvider> for config::state::WorkspaceProvider {
+    fn from(value: WorkspaceProvider) -> Self {
+        match value {
+            WorkspaceProvider::Local => config::state::WorkspaceProvider::Local,
+            WorkspaceProvider::Coder => config::state::WorkspaceProvider::Coder,
+        }
+    }
 }
 
 impl Default for SetupConfig {
@@ -94,6 +114,9 @@ impl Default for SetupConfig {
             agents: Vec::new(),
             domain_mode: DomainMode::Manual,
             allowed_domains: vec!["api.github.com".to_string(), "*.github.com".to_string()],
+            workspace_provider: WorkspaceProvider::Local,
+            coder_url: Some("http://localhost:7080".to_string()),
+            coder_admin_password: Some("openflows".to_string()),
         }
     }
 }
@@ -150,43 +173,49 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
         }
     }
 
-    // Step 4: Environment check
+    // Step 4: Workspace mode (Local vs Coder) — primary architecture decision
+    let mut coder_step = CoderStep::new();
+    coder_step
+        .render(&mut terminal, &theme, &mut config)
+        .await?;
+
+    // Step 5: Environment check
     let env_step = EnvStep::new();
     env_step.render(&mut terminal, &theme)?;
 
-    // Step 5: Provider selection (must come before agent config)
+    // Step 6: Provider selection (must come before agent config)
     let mut provider_step = ProviderStep::new();
     provider_step
         .render(&mut terminal, &theme, &mut config)
         .await?;
 
-    // Step 6: LLM API Key Input (based on selected provider)
+    // Step 7: LLM API Key Input (based on selected provider)
     let api_step = ApiStep::new();
     api_step.render(&mut terminal, &theme, &mut config).await?;
 
-    // Step 7: Agent Configuration (instances, model backend filtered by provider)
+    // Step 8: Agent Configuration (instances, model backend filtered by provider)
     let agents_step = AgentsStep::new();
     agents_step
         .render(&mut terminal, &theme, &mut config)
         .await?;
 
-    // Step 8: GitHub Authentication (uses agent config to determine token fields)
+    // Step 9: GitHub Authentication (uses agent config to determine token fields)
     let github_step = GitHubStep::new();
     github_step
         .render(&mut terminal, &theme, &mut config)
         .await?;
 
-    // Step 9: Repository Config
+    // Step 10: Repository Config
     let repo_step = RepoStep::new();
     repo_step.render(&mut terminal, &theme, &mut config).await?;
 
-    // Step 10: Domain Configuration
+    // Step 11: Domain Configuration
     let domains_step = DomainsStep::new();
     domains_step
         .render(&mut terminal, &theme, &mut config)
         .await?;
 
-    // Step 11: Proxy Config (advanced mode or optional)
+    // Step 12: Proxy Config (advanced mode only)
     if setup_mode == SetupMode::Advanced {
         let proxy_step = ProxyStep::new();
         proxy_step
@@ -194,7 +223,7 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
             .await?;
     }
 
-    // Step 12: Completion
+    // Step 13: Completion
     let done_step = DoneStep::new();
     done_step.render(&mut terminal, &theme, &config).await?;
 
@@ -293,6 +322,25 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
     ));
     content.push_str("RUST_LOG=info,agent_team=debug,pocketflow_core=debug\n");
 
+    // Coder workspace configuration
+    match config.workspace_provider {
+        WorkspaceProvider::Coder => {
+            content.push_str("WORKSPACE_PROVIDER=coder\n");
+            if let Some(ref url) = config.coder_url {
+                content.push_str(&format!("CODER_URL={}\n", url));
+            }
+            if let Some(ref password) = config.coder_admin_password {
+                content.push_str(&format!("CODER_ADMIN_PASSWORD={}\n", password));
+            }
+            content.push_str("CODER_ADMIN_USERNAME=admin\n");
+            content.push_str("CODER_ADMIN_EMAIL=admin@openflows.dev\n");
+            content.push_str("CODER_PG_PASSWORD=coder\n");
+        }
+        WorkspaceProvider::Local => {
+            content.push_str("WORKSPACE_PROVIDER=local\n");
+        }
+    }
+
     // Write domain configuration
     if config.domain_mode == DomainMode::All {
         content.push_str("AGENTFLOW_DOMAIN_MODE=all\n");
@@ -361,6 +409,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("nexus-key".to_string()),
                     github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                 },
                 config::RegistryEntry {
                     id: "forge".to_string(),
@@ -377,6 +426,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "registry.npmjs.org".to_string(),
                         "crates.io".to_string(),
                     ]),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                 },
                 config::RegistryEntry {
                     id: "sentinel".to_string(),
@@ -390,6 +440,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "api.github.com".to_string(),
                         "*.github.com".to_string(),
                     ]),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                 },
                 config::RegistryEntry {
                     id: "vessel".to_string(),
@@ -400,6 +451,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("vessel-key".to_string()),
                     github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                 },
                 config::RegistryEntry {
                     id: "lore".to_string(),
@@ -410,6 +462,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("lore-key".to_string()),
                     github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                 },
             ]
         } else {
@@ -435,6 +488,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         routing_key: agent.routing_key.clone(),
                         github_token_env: token_env,
                         allowed_domains: None,
+                        workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
                     }
                 })
                 .collect()

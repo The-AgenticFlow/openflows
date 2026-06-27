@@ -18,3 +18,4 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
+pocketflow-core = { path = "../pocketflow-core" }

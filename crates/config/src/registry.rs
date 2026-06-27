@@ -80,6 +80,8 @@ pub struct RegistryEntry {
     /// Examples: ["api.github.com", "*.github.com", "pypi.org", "crates.io"]
     #[serde(default)]
     pub allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub workspace_provider: Option<crate::state::WorkspaceProvider>,
 }
 
 /// The full registry — a thin wrapper around the team list.

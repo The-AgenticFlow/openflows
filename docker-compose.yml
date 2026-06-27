@@ -24,6 +24,47 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
+  coder-db:
+    image: postgres:16-alpine
+    profiles:
+      - coder
+    environment:
+      POSTGRES_USER: coder
+      POSTGRES_PASSWORD: ${CODER_PG_PASSWORD:-coder}
+      POSTGRES_DB: coder
+    volumes:
+      - coder_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coder"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  coder:
+    image: coder/coder:latest
+    profiles:
+      - coder
+    ports:
+      - "7080:7080"
+    environment:
+      CODER_PG_CONNECTION_URL: postgres://coder:${CODER_PG_PASSWORD:-coder}@coder-db:5432/coder?sslmode=disable
+      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://localhost:7080}
+      CODER_PROVISIONER_DAEMONS: "1"
+      CODER_PROVISIONER_DAEMON_TYPE: "docker"
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      coder-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7080/api/v2/buildinfo"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
   openflows:
     build:
       context: .
@@ -38,6 +79,8 @@ services:
     environment:
       PROXY_URL: http://proxy:4000
       REDIS_URL: redis://redis:6379
+      CODER_URL: ${CODER_URL:-}
+      CODER_ADMIN_PASSWORD: ${CODER_ADMIN_PASSWORD:-openflows}
     env_file:
       - .env
     depends_on:
@@ -50,3 +93,4 @@ services:
 volumes:
   redis_data:
   workspace:
+  coder_db_data:

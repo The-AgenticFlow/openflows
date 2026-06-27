@@ -14,6 +14,32 @@ use tracing::{debug, error};
 
 const DEBOUNCE_MS: u64 = 500;
 
+struct EventDebouncer {
+    last_seen: HashMap<String, Instant>,
+}
+
+impl EventDebouncer {
+    fn new() -> Self {
+        Self {
+            last_seen: HashMap::new(),
+        }
+    }
+
+    fn should_emit(&mut self, event: &FsEvent) -> bool {
+        let key = format!("{:?}", event);
+        let now = Instant::now();
+
+        if let Some(last) = self.last_seen.get(&key) {
+            if now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS) {
+                return false;
+            }
+        }
+
+        self.last_seen.insert(key, now);
+        true
+    }
+}
+
 /// Watches the shared directory for file changes.
 pub struct SharedDirWatcher {
     /// The underlying notify watcher (must be kept alive)
@@ -21,7 +47,7 @@ pub struct SharedDirWatcher {
     /// Receiver for filesystem events
     receiver: Receiver<FsEvent>,
     /// Last seen timestamps for debouncing
-    last_seen: HashMap<String, Instant>,
+    debouncer: EventDebouncer,
 }
 
 impl SharedDirWatcher {
@@ -34,7 +60,7 @@ impl SharedDirWatcher {
         Ok(Self {
             _watcher: watcher,
             receiver: rx,
-            last_seen: HashMap::new(),
+            debouncer: EventDebouncer::new(),
         })
     }
 
@@ -148,17 +174,7 @@ impl SharedDirWatcher {
 
     /// Check if an event should be emitted (debounce logic).
     fn should_emit(&mut self, event: &FsEvent) -> bool {
-        let key = format!("{:?}", event);
-        let now = Instant::now();
-
-        if let Some(last) = self.last_seen.get(&key) {
-            if now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS) {
-                return false;
-            }
-        }
-
-        self.last_seen.insert(key, now);
-        true
+        self.debouncer.should_emit(event)
     }
 
     /// Get a reference to the underlying receiver for use in async contexts.
@@ -195,65 +211,45 @@ impl AsyncWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
+
+    fn event_for(path: &std::path::Path) -> Event {
+        Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }
+    }
 
     #[test]
     fn test_classify_plan_event() {
         let dir = tempdir().unwrap();
-        let shared = dir.path();
-
-        let mut watcher = SharedDirWatcher::new(shared).unwrap();
-
-        // Write PLAN.md
-        let plan_path = shared.join("PLAN.md");
-        fs::write(&plan_path, "# Plan\n").unwrap();
-
-        // Give the watcher time to detect
-        std::thread::sleep(Duration::from_millis(200));
-
-        let event = watcher.try_recv();
-        assert!(matches!(event, Some(FsEvent::PlanWritten)));
+        let plan_path = dir.path().join("PLAN.md");
+        let event = event_for(&plan_path);
+        assert!(matches!(
+            SharedDirWatcher::classify_event(&event),
+            Some(FsEvent::PlanWritten)
+        ));
     }
 
     #[test]
     fn test_classify_segment_eval_event() {
         let dir = tempdir().unwrap();
-        let shared = dir.path();
-
-        let mut watcher = SharedDirWatcher::new(shared).unwrap();
-
-        // Write segment-3-eval.md
-        let eval_path = shared.join("segment-3-eval.md");
-        fs::write(&eval_path, "# Eval\n").unwrap();
-
-        // Give the watcher time to detect
-        std::thread::sleep(Duration::from_millis(200));
-
-        let event = watcher.try_recv();
-        assert!(matches!(event, Some(FsEvent::SegmentEvalWritten(3))));
+        let eval_path = dir.path().join("segment-3-eval.md");
+        let event = event_for(&eval_path);
+        assert!(matches!(
+            SharedDirWatcher::classify_event(&event),
+            Some(FsEvent::SegmentEvalWritten(3))
+        ));
     }
 
     #[test]
     fn test_debounce_duplicates() {
-        let dir = tempdir().unwrap();
-        let shared = dir.path();
-
-        let mut watcher = SharedDirWatcher::new(shared).unwrap();
-
-        // Write PLAN.md
-        let plan_path = shared.join("PLAN.md");
-        fs::write(&plan_path, "# Plan\n").unwrap();
-
-        // Give the watcher time to detect (might get multiple events)
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Should get one event
-        let event1 = watcher.try_recv();
-        assert!(matches!(event1, Some(FsEvent::PlanWritten)));
-
-        // Immediately check again - should be debounced
-        let event2 = watcher.try_recv();
-        assert!(event2.is_none());
+        let mut debouncer = EventDebouncer::new();
+        let event = FsEvent::PlanWritten;
+        assert!(debouncer.should_emit(&event));
+        assert!(!debouncer.should_emit(&event));
     }
 }

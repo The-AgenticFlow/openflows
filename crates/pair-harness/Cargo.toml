@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Event-driven harness for FORGE-SENTINEL pair lifecycle management"
 
+[features]
+default = []
+coder = ["coder-client"]
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -20,11 +24,14 @@ libc = "0.2"
 which = "7"
 regex = "1"
 config = { path = "../config" }
+pocketflow-core = { path = "../pocketflow-core" }
 agent-client = { path = "../agent-client" }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 axum = { version = "0.8", features = ["http2"] }
 uuid = { version = "1", features = ["v4"] }
 tokio-stream = "0.1"
+async-trait = { workspace = true }
+coder-client = { path = "../coder-client", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

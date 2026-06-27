@@ -1,0 +1,124 @@
+// crates/coder-client/src/bootstrap.rs
+//! Coder bootstrapper — idempotent setup on startup.
+//!
+//! Creates admin user, obtains API token, and pushes workspace templates.
+//! Safe to call on every restart.
+
+use crate::CoderClient;
+use anyhow::{Context, Result};
+use std::time::Duration;
+use tracing::info;
+
+/// Bootstrapper for Coder integration.
+pub struct CoderBootstrapper {
+    client: CoderClient,
+    admin_email: String,
+    admin_password: String,
+    admin_username: String,
+}
+
+impl CoderBootstrapper {
+    /// Create a bootstrapper from environment variables.
+    ///
+    /// Reads:
+    /// - `CODER_URL`: Coder server URL (required)
+    /// - `CODER_ADMIN_EMAIL`: Admin email (default: admin@openflows.dev)
+    /// - `CODER_ADMIN_PASSWORD`: Admin password (default: openflows)
+    /// - `CODER_ADMIN_USERNAME`: Admin username (default: admin)
+    pub fn from_env() -> Result<Self> {
+        let url = std::env::var("CODER_URL").context("CODER_URL not set")?;
+        let email = std::env::var("CODER_ADMIN_EMAIL")
+            .unwrap_or_else(|_| "admin@openflows.dev".to_string());
+        let password =
+            std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "openflows".to_string());
+        let username =
+            std::env::var("CODER_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
+
+        let client = CoderClient::new_unauthenticated(&url);
+
+        Ok(Self {
+            client,
+            admin_email: email,
+            admin_password: password,
+            admin_username: username,
+        })
+    }
+
+    /// Create a bootstrapper with explicit parameters.
+    pub fn new(url: &str, email: &str, username: &str, password: &str) -> Self {
+        let client = CoderClient::new_unauthenticated(url);
+        Self {
+            client,
+            admin_email: email.to_string(),
+            admin_password: password.to_string(),
+            admin_username: username.to_string(),
+        }
+    }
+
+    /// Bootstrap Coder: wait for healthy → create admin → get API token → push templates.
+    ///
+    /// Idempotent: safe to call on every startup.
+    pub async fn bootstrap(&self) -> Result<CoderClient> {
+        info!("Bootstrapping Coder...");
+
+        // 1. Wait for Coder server to be healthy
+        self.client
+            .wait_for_healthy(Duration::from_secs(120))
+            .await?;
+        info!("  ✓ Coder server healthy");
+
+        // 2. Create first user (idempotent)
+        let user = self
+            .client
+            .create_first_user(
+                &self.admin_email,
+                &self.admin_username,
+                &self.admin_password,
+            )
+            .await?;
+        info!(
+            "  ✓ Admin user created (id: {}, username: {})",
+            user.id, user.username
+        );
+
+        // 3. Login and get session token, then create API token
+        let session_token = self
+            .client
+            .login_with_password(&self.admin_email, &self.admin_password)
+            .await?;
+        let client_with_session = self.client.with_token(session_token);
+        let api_key = client_with_session
+            .create_api_token(&user.id, "openflows")
+            .await?;
+        let client = client_with_session.with_token(api_key.key.clone());
+        info!("  ✓ API token generated");
+
+        // 4. Push workspace templates (bundled in binary)
+        let forge_template = include_bytes!("../templates/openflows-forge.tar.gz");
+        let sentinel_template = include_bytes!("../templates/openflows-sentinel.tar.gz");
+
+        match client
+            .push_template("openflows-forge", forge_template)
+            .await
+        {
+            Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
+            Err(e) => {
+                // Template may already exist, try to update
+                info!("  ⚠ Template push failed (may already exist): {}", e);
+            }
+        }
+
+        match client
+            .push_template("openflows-sentinel", sentinel_template)
+            .await
+        {
+            Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
+            Err(e) => {
+                info!("  ⚠ Template push failed (may already exist): {}", e);
+            }
+        }
+
+        info!("  ✓ Coder bootstrapped");
+        Ok(client)
+    }
+}

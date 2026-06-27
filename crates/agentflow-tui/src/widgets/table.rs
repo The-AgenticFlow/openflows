@@ -1,14 +1,16 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Row, Table, Widget};
 
+use crate::dashboard::workers::WorkerInfo;
+
 pub struct WorkerTable {
-    workers: Vec<(String, String, String)>,
+    workers: Vec<WorkerInfo>,
     selected_row: Option<usize>,
 }
 
 impl WorkerTable {
-    pub fn new(workers: Vec<(String, String, String)>) -> Self {
+    pub fn new(workers: Vec<WorkerInfo>) -> Self {
         Self {
             workers,
             selected_row: None,
@@ -28,25 +30,48 @@ impl Widget for WorkerTable {
             .fg(theme.accent())
             .add_modifier(Modifier::BOLD);
 
+        let has_workspace = self.workers.iter().any(|w| w.workspace_name.is_some());
         let rows: Vec<Row> = self
             .workers
             .iter()
-            .map(|(id, status, detail)| {
-                let status_color = match status.as_str() {
+            .map(|worker| {
+                let status_color = match worker.status.as_str() {
                     "IDLE" | "Done" => theme.success(),
                     "WORKING" | "Assigned" | "Building" => theme.warning(),
                     "Suspended" | "Failed" => theme.error(),
                     _ => theme.fg(),
                 };
 
-                Row::new(vec![id.clone(), status.clone(), detail.clone()])
-                    .style(Style::default().fg(status_color))
+                let mut cells = vec![worker.id.clone(), worker.status.clone(), worker.detail.clone()];
+                if has_workspace {
+                    cells.push(worker.workspace_name.clone().unwrap_or_else(|| "-".to_string()));
+                }
+
+                Row::new(cells).style(Style::default().fg(status_color))
             })
             .collect();
 
-        let widths = [15, 15, 40];
+        let widths = if has_workspace {
+            vec![
+                Constraint::Length(15),
+                Constraint::Length(15),
+                Constraint::Length(40),
+                Constraint::Length(30),
+            ]
+        } else {
+            vec![
+                Constraint::Length(15),
+                Constraint::Length(15),
+                Constraint::Length(40),
+            ]
+        };
+        let headers = if has_workspace {
+            vec!["Worker", "Status", "Detail", "Workspace"]
+        } else {
+            vec!["Worker", "Status", "Detail"]
+        };
         let table = Table::new(rows, widths)
-            .header(Row::new(vec!["Worker", "Status", "Detail"]).style(header_style))
+            .header(Row::new(headers).style(header_style))
             .block(
                 Block::default()
                     .borders(Borders::ALL)

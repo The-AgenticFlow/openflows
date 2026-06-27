@@ -1,5 +1,12 @@
 {
   "default_cli": "claude",
+  "allowed_domains": [
+    "api.github.com",
+    "*.github.com",
+    "pypi.org",
+    "registry.npmjs.org",
+    "crates.io"
+  ],
   "team": [
     {
       "id": "nexus",
@@ -8,7 +15,9 @@
       "instances": 1,
       "model_backend": "anthropic/claude-haiku-4-5-20251001",
       "routing_key": "nexus-key",
-      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
+      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
+      "allowed_domains": null,
+      "workspace_provider": "coder"
     },
     {
       "id": "forge",
@@ -17,7 +26,9 @@
       "instances": 2,
       "model_backend": "anthropic/claude-haiku-4-5-20251001",
       "routing_key": "forge-key",
-      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN"
+      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
+      "allowed_domains": null,
+      "workspace_provider": "coder"
     },
     {
       "id": "sentinel",
@@ -26,16 +37,20 @@
       "instances": 1,
       "model_backend": "anthropic/claude-haiku-4-5-20251001",
       "routing_key": "sentinel-key",
-      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN"
+      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
+      "allowed_domains": null,
+      "workspace_provider": "coder"
     },
-    {                                                                                                           
+    {
       "id": "vessel",
       "cli": "claude",
       "active": true,
       "instances": 1,
       "model_backend": "anthropic/claude-haiku-4-5-20251001",
       "routing_key": "vessel-key",
-      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN"
+      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
+      "allowed_domains": null,
+      "workspace_provider": "coder"
     },
     {
       "id": "lore",
@@ -44,7 +59,9 @@
       "instances": 1,
       "model_backend": "anthropic/claude-haiku-4-5-20251001",
       "routing_key": "lore-key",
-      "github_token_env": "AGENT_LORE_GITHUB_TOKEN"
+      "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
+      "allowed_domains": null,
+      "workspace_provider": "coder"
     }
   ]
 }

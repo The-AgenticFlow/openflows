@@ -197,6 +197,104 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
 
     checks.push(("── Workspace ──".to_string(), CheckState::Pending));
 
+    // Coder health checks
+    checks.push(("── Coder ──".to_string(), CheckState::Pending));
+
+    if let Ok(url) = std::env::var("CODER_URL") {
+        match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => {
+                match client
+                    .get(format!("{}/api/v2/buildinfo", url.trim_end_matches('/')))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        checks.push(("Coder server reachable".to_string(), CheckState::Pass));
+                    }
+                    Ok(resp) => {
+                        checks.push((
+                            format!("Coder server returned {}", resp.status()),
+                            CheckState::Fail,
+                        ));
+                    }
+                    Err(e) => {
+                        checks.push((format!("Coder server unreachable: {}", e), CheckState::Fail));
+                    }
+                }
+
+                // Check if workspace templates have been pushed
+                if let Ok(token) = std::env::var("CODER_API_TOKEN") {
+                    match client
+                        .get(format!("{}/api/v2/templates", url.trim_end_matches('/')))
+                        .header("Authorization", format!("Bearer {}", token))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body) = resp.text().await {
+                                let has_forge = body.contains("openflows-forge");
+                                let has_sentinel = body.contains("openflows-sentinel");
+                                if has_forge && has_sentinel {
+                                    checks.push(("Coder templates pushed".to_string(), CheckState::Pass));
+                                } else if has_forge || has_sentinel {
+                                    checks.push((
+                                        "Coder templates partially pushed".to_string(),
+                                        CheckState::Warn,
+                                    ));
+                                } else {
+                                    checks.push((
+                                        "Coder templates not found".to_string(),
+                                        CheckState::Warn,
+                                    ));
+                                }
+                            } else {
+                                checks.push(("Coder templates: could not read response".to_string(), CheckState::Warn));
+                            }
+                        }
+                        Ok(resp) => {
+                            checks.push((
+                                format!("Coder templates check failed (HTTP {})", resp.status()),
+                                CheckState::Warn,
+                            ));
+                        }
+                        Err(e) => {
+                            checks.push((
+                                format!("Coder templates check failed: {}", e),
+                                CheckState::Warn,
+                            ));
+                        }
+                    }
+                } else {
+                    checks.push((
+                        "Coder templates: CODER_API_TOKEN not set".to_string(),
+                        CheckState::Warn,
+                    ));
+                }
+            }
+            Err(_) => {
+                checks.push(("Coder: HTTP client error".to_string(), CheckState::Fail));
+            }
+        }
+
+        // Check Docker socket availability
+        if std::path::Path::new("/var/run/docker.sock").exists() {
+            checks.push(("Docker socket available".to_string(), CheckState::Pass));
+        } else {
+            checks.push((
+                "Docker socket not found (workspace creation may fail)".to_string(),
+                CheckState::Warn,
+            ));
+        }
+    } else {
+        checks.push((
+            "Coder: not configured (local mode)".to_string(),
+            CheckState::Warn,
+        ));
+    }
+
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());

@@ -9,6 +9,7 @@ pocketflow-core = { path = "../pocketflow-core" }
 agent-client = { path = "../agent-client" }
 config = { path = "../config" }
 github = { path = "../github" }
+coder-client = { path = "../coder-client" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

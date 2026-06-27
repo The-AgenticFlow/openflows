@@ -1,0 +1,19 @@
+[package]
+name = "coder-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Client library for the Coder REST API"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

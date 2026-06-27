@@ -62,6 +62,18 @@ pub enum TicketStatus {
 pub struct WorkerSlot {
     pub id: String,
     pub status: WorkerStatus,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub workspace_provider: WorkspaceProvider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProvider {
+    #[default]
+    Local,
+    Coder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

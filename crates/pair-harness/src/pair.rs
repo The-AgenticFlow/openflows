@@ -8,20 +8,22 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tracing::{debug, error, info, warn};
 
 use crate::isolation::FileLockManager;
+use crate::pair_state::{FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, WatcherAdapter};
 use crate::process::{ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
+use crate::transport::LocalTransport;
 use crate::types::{
     Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
     Ticket, TimeoutProfile, VerificationResult, VerificationState,
 };
 use crate::watchdog::Watchdog;
-use crate::watcher::SharedDirWatcher;
 use crate::worktree::{MergeMainResult, SetupWarning, WorktreeManager};
 
 /// Default SENTINEL timeout in seconds. Can be overridden via SPRINTLESS_SENTINEL_TIMEOUT_SECS env var.
@@ -381,9 +383,8 @@ pub struct ForgeSentinelPair {
     contract_timeout: Option<TimeoutProfile>,
     error_feedback_attempts: u32,
     verification_state: VerificationState,
-    /// Counts consecutive rapid FORGE exits (<30s). Used to break infinite
-    /// respawn loops when progress files are stale from a previous lifecycle.
     rapid_exit_count: u32,
+    pair_state: Option<Arc<dyn PairStateStore>>,
 }
 
 /// Maximum consecutive rapid FORGE exits before giving up.
@@ -448,7 +449,14 @@ impl ForgeSentinelPair {
             contract_timeout: None,
             error_feedback_attempts: 0,
             rapid_exit_count: 0,
+            pair_state: None,
         }
+    }
+
+    /// Set the PairStateStore for dual-write support (filesystem + SharedStore).
+    pub fn with_pair_state(mut self, store: Arc<dyn PairStateStore>) -> Self {
+        self.pair_state = Some(store);
+        self
     }
 
     /// Run the pair lifecycle for a ticket.
@@ -635,7 +643,9 @@ impl ForgeSentinelPair {
         let mut forge = self.spawn_forge().await?;
 
         // 7. Start filesystem watcher
-        let mut watcher = SharedDirWatcher::new(&self.config.shared)?;
+        let mut watcher = PairWatcher::Local(
+            WatcherAdapter::new(&self.config.shared)?
+        );
 
         // 8. Event loop
         let outcome = self.event_loop(&mut forge, &mut watcher).await?;
@@ -657,7 +667,7 @@ impl ForgeSentinelPair {
     async fn event_loop(
         &mut self,
         forge: &mut Child,
-        watcher: &mut SharedDirWatcher,
+        watcher: &mut PairWatcher,
     ) -> Result<PairOutcome> {
         loop {
             // Check if a deferred SENTINEL spawn interval has elapsed.
@@ -1141,12 +1151,14 @@ impl ForgeSentinelPair {
     async fn provision_config(&self, _ticket: &Ticket) -> Result<()> {
         // Use project_root where orchestration/plugin exists
         let provisioner = Provisioner::new(&self.config.project_root);
+        let transport = LocalTransport::new(&self.config.project_root);
 
         provisioner
             .provision_pair(
                 &self.config.pair_id,
                 &self.config.worktree,
                 &self.config.shared,
+                &transport,
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
                 self.config.cli_backend,
@@ -1212,6 +1224,15 @@ impl ForgeSentinelPair {
             .await
             .context("Failed to write ERROR_FEEDBACK.md")?;
 
+        if let Some(ref store) = self.pair_state {
+            if let Err(e) = store
+                .write_artifact(&self.config.pair_id, PairArtifact::ErrorFeedback, &content)
+                .await
+            {
+                warn!(error = %e, "Failed to write ERROR_FEEDBACK to PairStateStore");
+            }
+        }
+
         info!(
             path = %path.display(),
             source,
@@ -1231,6 +1252,23 @@ impl ForgeSentinelPair {
                 .await
                 .context("Failed to remove ERROR_FEEDBACK.md")?;
             debug!("Removed ERROR_FEEDBACK.md — error resolved");
+        }
+        if let Some(ref store) = self.pair_state {
+            if let Ok(Some(content)) = store
+                .read_artifact(&self.config.pair_id, PairArtifact::ErrorFeedback)
+                .await
+            {
+                if !content.is_empty() {
+                    if let Err(e) = store
+                        .write_artifact(&self.config.pair_id, PairArtifact::ErrorFeedback, "")
+                        .await
+                    {
+                        warn!(error = %e, "Failed to clear ERROR_FEEDBACK in PairStateStore");
+                    } else {
+                        debug!("Cleared ERROR_FEEDBACK in PairStateStore");
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1361,13 +1399,30 @@ impl ForgeSentinelPair {
     /// Create shared directory structure.
     async fn create_shared_structure(&self) -> Result<()> {
         let provisioner = Provisioner::new(&self.config.project_root);
-        provisioner.create_shared_structure(&self.config.shared)
+        let transport = LocalTransport::new(&self.config.project_root);
+        provisioner
+            .create_shared_structure(&self.config.shared, &transport)
+            .await
     }
 
     /// Write TICKET.md and TASK.md to shared directory.
     async fn write_task_context(&self, ticket: &Ticket) -> Result<()> {
         let provisioner = Provisioner::new(&self.config.project_root);
-        provisioner.write_ticket(&self.config.shared, ticket)?;
+        let transport = LocalTransport::new(&self.config.project_root);
+        let fs_state = FilesystemPairState::new(&self.config.shared);
+        let pair_state: &dyn PairStateStore = match &self.pair_state {
+            Some(ps) => ps.as_ref(),
+            None => &fs_state,
+        };
+        provisioner
+            .write_ticket(
+                &self.config.pair_id,
+                &self.config.shared,
+                ticket,
+                &transport,
+                Some(pair_state),
+            )
+            .await?;
 
         let error_feedback_path = self.config.shared.join("ERROR_FEEDBACK.md");
         let conflict_path = self.config.shared.join("CONFLICT_RESOLUTION.md");
@@ -1487,7 +1542,15 @@ If a PR already exists for this branch, do NOT create a new one — just push an
                 WorktreeManager::branch_name(&self.config.pair_id, &ticket.id)
             )
         };
-        provisioner.write_task(&self.config.shared, &task)
+        provisioner
+            .write_task(
+                &self.config.pair_id,
+                &self.config.shared,
+                &task,
+                &transport,
+                Some(pair_state),
+            )
+            .await
     }
 
     /// Spawn FORGE process.

@@ -5,10 +5,14 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use coder_client::CoderClient;
 use config::{
     state::{KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_CI_FIX_NEEDED,
+    Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider, ACTION_CI_FIX_NEEDED,
     ACTION_CONFLICTS_DETECTED,
+};
+use pair_harness::{
+    transport::{CoderTransport, WorkspaceTransport},
 };
 use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
 use serde_json::{json, Value};
@@ -135,6 +139,317 @@ impl VesselNode {
                 .join("worktrees")
                 .join(pair_id),
         )
+    }
+
+    async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
+        let coder_url: Option<String> = store.get_typed("coder_url").await;
+        let coder_token: Option<String> = store.get_typed("coder_api_token").await;
+        match (coder_url, coder_token) {
+            (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                Some(CoderClient::new(&url, &token))
+            }
+            _ => None,
+        }
+    }
+
+    async fn worker_slot_for_pr(
+        &self,
+        store: &SharedStore,
+        pr_info: &PrInfo,
+    ) -> Option<(String, WorkerSlot)> {
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        let worker_id = pending_prs
+            .iter()
+            .find(|p| p["number"].as_u64() == Some(pr_info.number))
+            .and_then(|pr| {
+                let wid = pr["worker_id"].as_str().unwrap_or("");
+                if !wid.is_empty() {
+                    return Some(wid.to_string());
+                }
+                Self::derive_worker_id_from_branch(pr["head_branch"].as_str().unwrap_or(""))
+            })
+            .or_else(|| Self::derive_worker_id_from_branch(&pr_info.head_branch))?;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        slots.get(&worker_id).cloned().map(|slot| (worker_id, slot))
+    }
+
+    async fn coder_transport_for_pr(
+        &self,
+        store: &SharedStore,
+        pr_info: &PrInfo,
+    ) -> Option<(String, CoderTransport)> {
+        let (worker_id, slot) = self.worker_slot_for_pr(store, pr_info).await?;
+        if slot.workspace_provider != WorkspaceProvider::Coder {
+            return None;
+        }
+        let workspace_id = slot.workspace_id?;
+        let client = Self::coder_client_from_store(store).await?;
+        Some((worker_id, CoderTransport::new(client, &workspace_id)))
+    }
+
+    async fn stop_coder_workspace_for_worker(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        workspace_id: &str,
+    ) {
+        if let Some(client) = Self::coder_client_from_store(store).await {
+            if let Err(e) = client.stop_workspace(workspace_id).await {
+                warn!(
+                    worker_id,
+                    workspace_id,
+                    error = %e,
+                    "Failed to stop Coder workspace"
+                );
+            }
+        }
+
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get_mut(worker_id) {
+            if slot.workspace_id.as_deref() == Some(workspace_id) {
+                slot.workspace_id = None;
+                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+            }
+        }
+    }
+
+    /// Stop a Coder workspace for the worker associated with a merged PR.
+    async fn stop_coder_workspace_for_pr(
+        &self,
+        store: &SharedStore,
+        pending_prs: &[Value],
+        pr_number: u64,
+    ) {
+        let pr_entry = match pending_prs
+            .iter()
+            .find(|p| p["number"].as_u64() == Some(pr_number))
+        {
+            Some(e) => e,
+            None => return,
+        };
+        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
+        if worker_id.is_empty() {
+            return;
+        }
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get(worker_id) {
+            if let Some(ref ws_id) = slot.workspace_id {
+                self.stop_coder_workspace_for_worker(store, worker_id, ws_id).await;
+            }
+        }
+    }
+
+    fn build_conflict_resolution_content(
+        pr_info: &PrInfo,
+        conflicted_files: &[String],
+        fallback_ticket_id: Option<&str>,
+    ) -> String {
+        let branch = &pr_info.head_branch;
+        let _ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
+            fallback_ticket_id
+                .map(|fb| fb.to_string())
+                .unwrap_or_else(|| format!("T-{}", pr_info.number))
+        });
+
+        let files_list = if conflicted_files.is_empty() {
+            "No specific conflicted files detected — resolve all conflict markers.".to_string()
+        } else {
+            conflicted_files
+                .iter()
+                .map(|f| format!("- {}", f))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+             "# Conflict Resolution Required\n\n\
+              VESSEL detected merge conflicts between your branch and the default branch.\n\
+              `git merge origin/<default>` has been run in your worktree — conflict markers are present.\n\n\
+             ## Instructions\n\n\
+             1. Open each conflicted file listed below\n\
+             2. Resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)\n\
+             3. Choose the correct integration of both sides — do NOT just pick one\n\
+             4. Stage the resolved files: `git add -A`\n\
+             5. Commit: `git commit -m \"resolve merge conflicts\"`\n\
+             6. Push: `git push`\n\
+             7. Write STATUS.json with `\"status\": \"PR_OPENED\"` and your PR number\n\n\
+             ## Context\n\n\
+             Branch: {}\n\n\
+             ## Conflicted Files\n\n{}\n\n\
+             ## Important\n\n\
+             - Do NOT abort the merge — the conflict markers are there for you to resolve\n\
+             - Resolve ALL conflict markers before committing\n\
+             - After you push, VESSEL will re-monitor CI automatically",
+            branch,
+            files_list,
+        )
+    }
+
+    async fn write_conflict_resolution_md_to_transport<T: WorkspaceTransport + ?Sized>(
+        &self,
+        transport: &T,
+        pr_info: &PrInfo,
+        conflicted_files: &[String],
+        fallback_ticket_id: Option<&str>,
+    ) -> bool {
+        let content = Self::build_conflict_resolution_content(pr_info, conflicted_files, fallback_ticket_id);
+        match transport
+            .write_file(".pair-shared/CONFLICT_RESOLUTION.md", &content)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    pr_number = pr_info.number,
+                    "Wrote CONFLICT_RESOLUTION.md via workspace transport"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    pr_number = pr_info.number,
+                    error = %e,
+                    "Failed to write CONFLICT_RESOLUTION.md via workspace transport"
+                );
+                false
+            }
+        }
+    }
+
+    async fn detect_default_branch_via_transport<T: WorkspaceTransport + ?Sized>(
+        transport: &T,
+    ) -> String {
+        if let Ok(output) = transport
+            .execute("git symbolic-ref refs/remotes/origin/HEAD")
+            .await
+        {
+            if output.exit_code == 0 {
+                let refname = output.stdout.trim();
+                if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        for candidate in ["main", "master"] {
+            if let Ok(output) = transport
+                .execute(&format!("git rev-parse --verify origin/{}", candidate))
+                .await
+            {
+                if output.exit_code == 0 {
+                    return candidate.to_string();
+                }
+            }
+        }
+
+        warn!("Could not detect default branch via transport, falling back to 'main'");
+        "main".to_string()
+    }
+
+    async fn list_conflicted_files_via_transport<T: WorkspaceTransport + ?Sized>(
+        transport: &T,
+    ) -> Vec<String> {
+        match transport
+            .execute("git diff --name-only --diff-filter=U")
+            .await
+        {
+            Ok(output) if output.exit_code == 0 => output
+                .stdout
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    async fn merge_origin_main_via_transport<T: WorkspaceTransport + ?Sized>(
+        &self,
+        transport: &T,
+        branch: &str,
+    ) -> Vec<String> {
+        let _ = transport.execute("git rebase --abort || true").await;
+        let default_branch = Self::detect_default_branch_via_transport(transport).await;
+        let origin_ref = format!("origin/{}", default_branch);
+
+        let fetch = match transport
+            .execute(&format!("git fetch origin {}", default_branch))
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                warn!(branch, error = %e, "git fetch {} failed in workspace transport", origin_ref);
+                return vec!["unknown — fetch failed".to_string()];
+            }
+        };
+        if fetch.exit_code != 0 {
+            warn!(
+                branch,
+                stderr = %fetch.stderr,
+                "git fetch {} failed in workspace transport",
+                origin_ref
+            );
+            return vec!["unknown — fetch failed".to_string()];
+        }
+
+        let merge = match transport
+            .execute(&format!("git merge {} --no-edit", origin_ref))
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                warn!(branch, error = %e, "git merge {} failed in workspace transport", origin_ref);
+                return vec!["unknown — merge failed".to_string()];
+            }
+        };
+        if merge.exit_code == 0 {
+            info!(branch, "{} merged cleanly — no conflicts", origin_ref);
+            return vec![];
+        }
+
+        if merge.stderr.contains("refusing to merge unrelated histories") {
+            warn!(
+                branch,
+                "Unrelated histories — retrying with --allow-unrelated-histories"
+            );
+            let retry = match transport
+                .execute(&format!(
+                    "git merge {} --no-edit --allow-unrelated-histories",
+                    origin_ref
+                ))
+                .await
+            {
+                Ok(output) => output,
+                Err(_) => return vec!["unknown — merge failed".to_string()],
+            };
+            if retry.exit_code == 0 {
+                info!(
+                    branch,
+                    "{} merged cleanly with --allow-unrelated-histories", origin_ref
+                );
+                return vec![];
+            }
+            let files = Self::list_conflicted_files_via_transport(transport).await;
+            info!(
+                branch,
+                files = files.len(),
+                "Merge with --allow-unrelated-histories produced conflict markers"
+            );
+            return files;
+        }
+
+        let files = Self::list_conflicted_files_via_transport(transport).await;
+        info!(
+            branch,
+            files = files.len(),
+            "Merge produced conflict markers in workspace transport"
+        );
+        files
     }
 }
 
@@ -300,6 +615,9 @@ impl Node for VesselNode {
                     )
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, ticket_id).await;
+
+                    // Stop Coder workspace if this worker was using one
+                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
 
                     // Parallelize post-merge operations for reduced latency
                     // Run GitHub issue close concurrently with store updates
@@ -660,6 +978,9 @@ impl Node for VesselNode {
                     )
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, &tid).await;
+
+                    // Stop Coder workspace if this worker was using one
+                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
 
                     self.update_ticket_status(store, &tid, "merged_no_ci").await;
                     self.close_github_issue(store, &tid).await;
@@ -1582,12 +1903,23 @@ impl VesselNode {
     }
 
     /// Recycle a worker from Done back to Idle after its PR is merged.
+    /// Also stops the Coder workspace if one was assigned.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
         let worker_id = pr["worker_id"].as_str().unwrap_or("");
         if worker_id.is_empty() {
             return;
         }
 
+        // Stop Coder workspace if this worker was using one
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get(worker_id) {
+            if let Some(ref ws_id) = slot.workspace_id {
+                self.stop_coder_workspace_for_worker(store, worker_id, ws_id).await;
+            }
+        }
+
+        // Re-fetch slots after stop_coder_workspace_for_worker may have modified them
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
@@ -1596,6 +1928,7 @@ impl VesselNode {
                 WorkerStatus::Done { .. } => {
                     info!(worker_id, "Recycling worker from Done to Idle after merge");
                     slot.status = WorkerStatus::Idle;
+                    slot.workspace_id = None;
                     store.set(KEY_WORKER_SLOTS, json!(slots)).await;
                 }
                 other => {

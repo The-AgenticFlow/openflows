@@ -1,6 +1,6 @@
 use agent_forge::ForgeNode;
 use anyhow::Result;
-use config::{WorkerSlot, WorkerStatus};
+use config::{WorkerSlot, WorkerStatus, WorkspaceProvider};
 use pocketflow_core::{BatchNode, SharedStore};
 use serde_json::json;
 use std::collections::HashMap;
@@ -21,6 +21,8 @@ async fn test_forge_dangerous_command_suspends() -> Result<()> {
                 ticket_id: ticket_id.to_string(),
                 issue_url: None,
             },
+            workspace_id: None,
+            workspace_provider: WorkspaceProvider::Local,
         },
     )]);
     store.set("worker_slots", json!(slots)).await;

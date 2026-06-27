@@ -2,9 +2,11 @@
 use agent_client::{AgentDecision, AgentPersona, AgentRunner};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use coder_client::{CoderClient, CreateWorkspaceRequest};
 use config::{
     state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider,
+    ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
@@ -536,6 +538,14 @@ impl NexusNode {
                     WorkerSlot {
                         id: slot_id,
                         status: WorkerStatus::Idle,
+                        workspace_id: None,
+                        workspace_provider: if std::env::var("CODER_URL").is_ok() {
+                        config::WorkspaceProvider::Coder
+                    } else if std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder") {
+                        config::WorkspaceProvider::Coder
+                    } else {
+                        config::WorkspaceProvider::Local
+                    },
                     },
                 );
                 changed = true;
@@ -547,6 +557,90 @@ impl NexusNode {
         }
 
         Ok(())
+    }
+
+    async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
+        let coder_url: Option<String> = store.get_typed("coder_url").await;
+        let coder_token: Option<String> = store.get_typed("coder_api_token").await;
+        match (coder_url, coder_token) {
+            (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
+                Some(CoderClient::new(&url, &token))
+            }
+            _ => None,
+        }
+    }
+
+    async fn provision_coder_workspace(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let (workspace_provider, existing_workspace_id) = match slots.get(worker_id) {
+            Some(slot) => (slot.workspace_provider.clone(), slot.workspace_id.clone()),
+            None => return Ok(None),
+        };
+
+        if workspace_provider != WorkspaceProvider::Coder {
+            return Ok(existing_workspace_id);
+        }
+        if let Some(existing) = existing_workspace_id {
+            return Ok(Some(existing));
+        }
+
+        let client = match Self::coder_client_from_store(store).await {
+            Some(client) => client,
+            None => {
+                warn!(
+                    worker_id,
+                    "Coder workspace requested but CODER_URL/token are unavailable"
+                );
+                return Ok(None);
+            }
+        };
+
+        let repository: Option<String> = store.get_typed("repository").await;
+        let repo_url = repository
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|repo| format!("https://github.com/{}.git", repo))
+            .unwrap_or_default();
+        let template_name = std::env::var("CODER_FORGE_TEMPLATE")
+            .unwrap_or_else(|_| "openflows-forge".to_string());
+        let workspace_name = format!("{}-{}", worker_id, ticket_id);
+
+        info!(
+            worker_id,
+            ticket_id,
+            template_name,
+            "Provisioning Coder workspace for worker"
+        );
+
+        let workspace = client
+            .create_workspace(&CreateWorkspaceRequest {
+                template_name,
+                name: workspace_name,
+                parameters: json!({ "repo_url": repo_url }),
+            })
+            .await?;
+
+        client
+            .wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
+            .await?;
+
+        if let Some(slot) = slots.get_mut(worker_id) {
+            slot.workspace_id = Some(workspace.id.clone());
+        }
+        store.set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?).await;
+
+        info!(
+            worker_id,
+            workspace_id = %workspace.id,
+            "Coder workspace provisioned"
+        );
+        Ok(Some(workspace.id))
     }
 
     async fn check_ci_readiness(
@@ -1281,7 +1375,11 @@ impl Node for NexusNode {
 
                     let mut slots: HashMap<String, WorkerSlot> =
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    let mut should_provision_coder = false;
                     if let Some(slot) = slots.get_mut(worker_id) {
+                        should_provision_coder =
+                            matches!(slot.workspace_provider, WorkspaceProvider::Coder)
+                                && slot.workspace_id.is_none();
                         slot.status = WorkerStatus::Assigned {
                             ticket_id: ticket_id.clone(),
                             issue_url: decision.issue_url.clone(),
@@ -1290,6 +1388,20 @@ impl Node for NexusNode {
                             .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
                             .await;
                         info!(worker_id, ticket_id, issue_url = ?decision.issue_url, "Nexus: Store updated with NEW worker assignment");
+                    }
+
+                    if should_provision_coder {
+                        if let Err(e) = self
+                            .provision_coder_workspace(store, worker_id, ticket_id)
+                            .await
+                        {
+                        warn!(
+                            worker_id,
+                            ticket_id,
+                            error = %e,
+                            "Failed to provision Coder workspace"
+                        );
+                        }
                     }
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
