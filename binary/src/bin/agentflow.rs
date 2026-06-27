@@ -183,12 +183,26 @@ async fn main() -> Result<()> {
 
             if let Some(compose_path) = compose_file {
                 eprintln!("  Found {} — starting coder and coder-db services...", compose_path.display());
+
+                // Build environment variables for docker-compose.
+                // We use --env-file /dev/null to avoid loading the project .env
+                // which may contain API keys with characters that docker-compose can't parse.
+                // Instead, pass only the Coder-specific vars via -e flags.
+                let coder_url_val = std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
+                let coder_password = std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "openflows".to_string());
+                let pg_password = std::env::var("CODER_PG_PASSWORD").unwrap_or_else(|_| "coder".to_string());
+
                 let output = tokio::process::Command::new("docker")
                     .args([
-                        "compose", "--profile", "coder",
+                        "compose",
+                        "--profile", "coder",
                         "-f", compose_path.to_str().unwrap_or("docker-compose.yml"),
+                        "--env-file", "/dev/null",
                         "up", "-d", "coder-db", "coder",
                     ])
+                    .env("CODER_URL", &coder_url_val)
+                    .env("CODER_ADMIN_PASSWORD", &coder_password)
+                    .env("CODER_PG_PASSWORD", &pg_password)
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .output()
