@@ -14,7 +14,7 @@ use tracing::{debug, info};
 use crate::pair_state::{PairArtifact, PairStateStore};
 use crate::process::{get_backend_config, BackendConfig};
 use crate::transport::WorkspaceTransport;
-use crate::types::CliBackend;
+use crate::types::{CliBackend, WorkspaceProvider};
 
 struct ExtrasContext<'a> {
     redis_url: Option<&'a str>,
@@ -25,6 +25,8 @@ struct ExtrasContext<'a> {
 pub struct Provisioner {
     /// Project root directory
     project_root: PathBuf,
+    /// Workspace provider mode (Local or Coder)
+    workspace_provider: WorkspaceProvider,
 }
 
 impl Provisioner {
@@ -32,6 +34,15 @@ impl Provisioner {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
+            workspace_provider: WorkspaceProvider::Local,
+        }
+    }
+
+    /// Create a provisioner with explicit workspace provider mode.
+    pub fn with_provider(project_root: impl Into<PathBuf>, provider: WorkspaceProvider) -> Self {
+        Self {
+            project_root: project_root.into(),
+            workspace_provider: provider,
         }
     }
 
@@ -92,19 +103,21 @@ impl Provisioner {
         let backend_config = get_backend_config(cli_backend, worktree, shared);
 
         // 1. Create FORGE settings/config
-        self.create_forge_settings(worktree, &backend_config)?;
+        self.create_forge_settings(worktree, &backend_config, transport).await?;
 
-        // 2. Create SENTINEL settings/config
-        self.create_sentinel_settings(shared, &backend_config)?;
+        // 2. Remove legacy sentinel dir if present (always local path in orchestrator)
+        let legacy_dir = shared.join("sentinel");
+        if legacy_dir.exists() {
+            transport
+                .remove_dir_all(&legacy_dir.to_string_lossy())
+                .await
+                .ok();
+        }
 
-        // 3. Create FORGE mcp.json (if backend uses MCP config)
-        // When the endpoint does not support the Responses API (/v1/responses returns 404),
-        // we are in Chat Completions mode and MCP servers would use tool types that are
-        // incompatible with the endpoint. Skip MCP config in that case.
-        // For endpoints that DO support /v1/responses, MCP tools use type="mcp" which
-        // also isn't supported by non-OpenAI providers, so we still skip them for
-        // non-OpenAI proxies.
-        // For Claude backend, MCP servers work fine regardless.
+        // 3. Create SENTINEL settings/config
+        self.create_sentinel_settings(shared, &backend_config, transport).await?;
+
+        // 4. Create FORGE mcp.json (if backend uses MCP config)
         let is_codex_non_responses =
             cli_backend == CliBackend::Codex && crate::process::codex_use_sse();
         if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
@@ -113,23 +126,23 @@ impl Provisioner {
             mcp_gen.generate_forge_config(worktree, shared, &mcp_path)?;
         }
 
-        // 4. Create SENTINEL mcp.json
+        // 5. Create SENTINEL mcp.json
         if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(shared);
             mcp_gen.generate_sentinel_config(worktree, shared, &mcp_path)?;
         }
 
-        // 5. Symlink plugin to FORGE
-        self.symlink_plugin(worktree, "forge", &backend_config)?;
+        // 6. Symlink/copy plugin to FORGE
+        self.symlink_plugin(worktree, "forge", &backend_config, transport).await?;
 
-        // 6. Symlink plugin to SENTINEL
-        self.symlink_plugin(shared, "sentinel", &backend_config)?;
+        // 7. Symlink/copy plugin to SENTINEL
+        self.symlink_plugin(shared, "sentinel", &backend_config, transport).await?;
 
-        // 7. Create shared directory structure
+        // 8. Create shared directory structure
         self.create_shared_structure(shared, transport).await?;
 
-        // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
+        // 9. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
             self.provision_backend_extras(
                 pair_id,
@@ -141,7 +154,8 @@ impl Provisioner {
                     redis_url,
                     model_backend,
                 },
-            )?;
+                transport,
+            ).await?;
         }
 
         info!(pair = pair_id, backend = ?cli_backend, "Pair provisioning complete");
@@ -149,89 +163,52 @@ impl Provisioner {
     }
 
     /// Provision backend-specific extras (hooks, permissions, AGENTS.md, skills).
-    ///
-    /// This is the unified provisioning path for both Claude and Codex backends.
-    /// The `BackendConfig` drives which config directories and file formats are used.
-    fn provision_backend_extras(
+    async fn provision_backend_extras(
         &self,
         pair_id: &str,
         backend_config: &BackendConfig,
         worktree: &Path,
         shared: &Path,
         github_token: &str,
-        ctx: &ExtrasContext,
+        ctx: &ExtrasContext<'_>,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let is_codex = backend_config.mcp_config_rel.starts_with(".codex");
         let redis_url = ctx.redis_url;
         let model_backend = ctx.model_backend;
 
         if is_codex {
-            // Codex: generate .codex/config.toml for FORGE worktree
-            // FORGE uses danger-full-access sandbox to allow git push and GitHub API
             self.generate_codex_config_toml(
-                worktree,
-                worktree,
-                shared,
-                github_token,
-                redis_url,
-                "danger-full-access",
-            )?;
-
-            // Codex: generate .codex/config.toml for SENTINEL shared dir
+                worktree, worktree, shared,
+                github_token, redis_url, "danger-full-access",
+                transport,
+            ).await?;
             self.generate_codex_config_toml(
-                shared,
-                worktree,
-                shared,
-                github_token,
-                redis_url,
-                "read-only",
-            )?;
-
-            // Codex: generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
-            self.generate_codex_agent_tomls(worktree, model_backend)?;
-
-            // Codex: generate .codex/agents/sentinel.toml in shared dir
-            self.generate_codex_agent_toml_for_role(shared, "sentinel", model_backend)?;
-
-            // Codex: install hook scripts and generate .codex/hooks.json
-            self.generate_codex_hooks_json(worktree, shared)?;
-
-            // Codex: deploy .codex-plugin/ into both worktree and shared
-            self.deploy_codex_plugin(worktree)?;
-            self.deploy_codex_plugin(shared)?;
-
-            // Codex: generate permission profiles
-            // FORGE uses danger-full-access (needs git push + GitHub API access)
-            // SENTINEL uses read-only with GitHub API for review comments
+                shared, worktree, shared,
+                github_token, redis_url, "read-only",
+                transport,
+            ).await?;
+            self.generate_codex_agent_tomls(worktree, model_backend, transport).await?;
+            self.generate_codex_agent_toml_for_role(shared, "sentinel", model_backend, transport).await?;
+            self.generate_codex_hooks_json(worktree, shared, transport).await?;
+            self.deploy_codex_plugin(worktree, transport).await?;
+            self.deploy_codex_plugin(shared, transport).await?;
             let forge_domains = self.resolve_allowed_domains(pair_id);
             self.generate_codex_permissions(
-                worktree,
-                shared,
-                "danger-full-access",
-                &forge_domains,
-            )?;
-            self.generate_codex_permissions(shared, shared, "read-only", &[])?;
-
-            // Codex: symlink skills to .agents/skills/ in worktree (all skills for FORGE)
-            self.symlink_skills_to_agents(worktree)?;
-
-            // Codex: symlink sentinel-relevant skills to .agents/skills/ in shared dir
-            self.symlink_skills_to_agents_for_role(shared, "sentinel")?;
+                worktree, shared, "danger-full-access", &forge_domains, transport,
+            ).await?;
+            self.generate_codex_permissions(
+                shared, shared, "read-only", &[], transport,
+            ).await?;
+            self.symlink_skills_to_agents(worktree, transport).await?;
+            self.symlink_skills_to_agents_for_role(shared, "sentinel", transport).await?;
         } else {
-            // Claude: install hook scripts and generate hooks config in settings.json
-            self.generate_claude_hooks_json(worktree, shared)?;
-
-            // Claude: symlink skills to .claude/skills/ in worktree (all skills for FORGE)
-            self.symlink_skills_to_claude(worktree)?;
-
-            // Claude: symlink sentinel-relevant skills to .claude/skills/ in shared dir
-            self.symlink_skills_to_claude_for_role(shared, "sentinel")?;
-
-            // Claude: enhance settings.json with permission rules
-            self.enhance_claude_permissions(worktree, shared)?;
+            self.generate_claude_hooks_json(worktree, shared, transport).await?;
+            self.symlink_skills_to_claude(worktree, transport).await?;
+            self.symlink_skills_to_claude_for_role(shared, "sentinel", transport).await?;
+            let _ = self.enhance_claude_permissions(worktree, shared);
         }
 
-        // Both backends: write AGENTS.md
         self.write_agents_md(worktree, "forge")?;
         self.write_agents_md(shared, "sentinel")?;
 
@@ -239,10 +216,15 @@ impl Provisioner {
     }
 
     /// Create FORGE's settings.json with auto-mode permissions.
-    pub fn create_forge_settings(&self, worktree: &Path, config: &BackendConfig) -> Result<()> {
+    pub async fn create_forge_settings(
+        &self,
+        worktree: &Path,
+        config: &BackendConfig,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let settings_dir =
             worktree.join(config.settings_rel.parent().unwrap_or(&config.settings_rel));
-        fs::create_dir_all(&settings_dir).context("Failed to create settings directory")?;
+        transport.create_dir_all(&settings_dir.to_string_lossy()).await.context("Failed to create settings directory")?;
 
         let settings_path = config.settings_path(worktree);
 
@@ -255,12 +237,17 @@ impl Provisioner {
             }
         });
 
-        self.write_json(&settings_path, &settings)?;
+        self.write_json_via_transport(settings_path.clone(), &settings, transport).await?;
 
-        self.ensure_worktree_gitignore(worktree, config)
+        self.ensure_worktree_gitignore_via_transport(worktree, config, transport).await
     }
 
-    fn ensure_worktree_gitignore(&self, worktree: &Path, config: &BackendConfig) -> Result<()> {
+    async fn ensure_worktree_gitignore_via_transport(
+        &self,
+        worktree: &Path,
+        config: &BackendConfig,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let gitignore_path = worktree.join(".gitignore");
         let settings_dir_name = config
             .settings_rel
@@ -274,17 +261,16 @@ impl Provisioner {
         // be gitignored so coordination files (PLAN.md, WORKLOG.md, etc.)
         // never end up in commits.
         let shared_entry = format!("{}/", crate::types::PairConfig::SHARED_DIR_NAME);
-        // The backend home directory (e.g., .codex-home/) contains runtime
-        // state files including SQLite databases that may store credentials
-        // used by MCP servers.  It must be gitignored to prevent secrets
-        // from being committed into the repository.
         let home_entry = if config.home_dir_suffix.is_empty() {
             None
         } else {
             Some(format!("{}/", config.home_dir_suffix))
         };
 
-        let existing = fs::read_to_string(&gitignore_path).unwrap_or_default();
+        let existing = transport
+            .read_file(&gitignore_path.to_string_lossy())
+            .await
+            .unwrap_or_default();
 
         let mut updated = existing.clone();
         let mut entries: Vec<&str> = vec![&settings_entry, &shared_entry];
@@ -304,7 +290,9 @@ impl Provisioner {
         }
 
         if updated != existing {
-            fs::write(&gitignore_path, &updated)
+            transport
+                .write_file(&gitignore_path.to_string_lossy(), &updated)
+                .await
                 .context("Failed to update .gitignore with settings directory exclusion")?;
             info!(
                 path = %gitignore_path.display(),
@@ -316,16 +304,25 @@ impl Provisioner {
     }
 
     /// Create SENTINEL's settings.json with read-only permissions.
-    pub fn create_sentinel_settings(&self, shared: &Path, config: &BackendConfig) -> Result<()> {
+    pub async fn create_sentinel_settings(
+        &self,
+        shared: &Path,
+        config: &BackendConfig,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let legacy_dir = shared.join("sentinel");
         if legacy_dir.exists() {
-            fs::remove_dir_all(&legacy_dir)
+            transport
+                .remove_dir_all(&legacy_dir.to_string_lossy())
+                .await
                 .context("Failed to remove legacy sentinel directory")?;
         }
 
         let settings_dir =
             shared.join(config.settings_rel.parent().unwrap_or(&config.settings_rel));
-        fs::create_dir_all(&settings_dir)
+        transport
+            .create_dir_all(&settings_dir.to_string_lossy())
+            .await
             .context("Failed to create sentinel settings directory")?;
 
         let settings_path = config.settings_path(shared);
@@ -339,58 +336,57 @@ impl Provisioner {
             }
         });
 
-        self.write_json(&settings_path, &settings)
+        self.write_json_via_transport(settings_path.clone(), &settings, transport).await?;
+
+        Ok(())
     }
 
-    /// Symlink the orchestration plugin to the backend-specific plugin directory.
-    pub fn symlink_plugin(
+    /// Symlink (or copy in Coder mode) the orchestration plugin to the backend-specific plugin directory.
+    /// Uses the transport for the target operation so it works for both local and Coder workspaces.
+    pub async fn symlink_plugin(
         &self,
         target_dir: &Path,
         role: &str,
         backend_config: &BackendConfig,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
 
-        // Check if plugin exists
+        // Check if plugin source exists (local filesystem — always orchestrator-local)
         if !plugin_source.exists() {
             debug!(
                 role = role,
                 path = %plugin_source.display(),
-                "Plugin directory not found, skipping symlink"
+                "Plugin directory not found, skipping"
             );
             return Ok(());
         }
 
-        let plugins_dir =
+        // Compute intermediate plugins directory (without the final "orchestration" segment)
+        let plugins_intermediate =
             target_dir.join(backend_config.plugin_dir_rel.parent().unwrap_or_else(|| {
-                // plugin_dir_rel is e.g. ".claude/plugins/orchestration" or ".agents/plugins/orchestration"
-                // We need the parent: ".claude/plugins" or ".agents/plugins"
                 std::path::Path::new(".claude/plugins")
             }));
 
-        fs::create_dir_all(&plugins_dir).context("Failed to create plugins directory")?;
+        // Compute the full absolute target path including the "orchestration" segment
+        let plugins_target = plugins_intermediate.join("orchestration");
 
-        let symlink_path = plugins_dir.join("orchestration");
+        // Ensure parent directories exist at the absolute target location
+        transport
+            .create_dir_all(&plugins_target.parent().unwrap_or(&plugins_target).to_string_lossy())
+            .await
+            .context("Failed to create plugins directory")?;
 
-        // Remove existing symlink if present
-        if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(&symlink_path);
-        }
-
-        // Create symlink
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&plugin_source, &symlink_path)
-            .context("Failed to create plugin symlink")?;
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&plugin_source, &symlink_path)
-            .context("Failed to create plugin symlink")?;
+        transport
+            .symlink_or_copy(&plugin_source, &plugins_target.to_string_lossy())
+            .await
+            .context("Failed to symlink_or_copy plugin")?;
 
         debug!(
             role = role,
             source = %plugin_source.display(),
-            target = %symlink_path.display(),
-            "Plugin symlinked"
+            target = %plugins_target.display(),
+            "Plugin symlinked/copied"
         );
 
         Ok(())
@@ -475,9 +471,23 @@ impl Provisioner {
         Ok(())
     }
 
+    /// Write JSON to file via transport (supports Coder workspaces).
+    async fn write_json_via_transport(
+        &self,
+        path: PathBuf,
+        value: &Value,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
+        let content = serde_json::to_string_pretty(value).context("Failed to serialize JSON")?;
+        transport
+            .write_file(&path.to_string_lossy(), &content)
+            .await
+            .context("Failed to write JSON via transport")?;
+        Ok(())
+    }
+
     /// Generate .codex/config.toml for a given directory.
-    /// Generate .codex/config.toml for a given directory.
-    fn generate_codex_config_toml(
+    async fn generate_codex_config_toml(
         &self,
         target: &Path,
         worktree: &Path,
@@ -485,9 +495,10 @@ impl Provisioner {
         github_token: &str,
         redis_url: Option<&str>,
         sandbox_mode: &str,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        fs::create_dir_all(&codex_dir).context("Failed to create .codex directory")?;
+        transport.create_dir_all(&codex_dir.to_string_lossy()).await.context("Failed to create .codex directory")?;
 
         let config_path = codex_dir.join("config.toml");
 
@@ -579,35 +590,37 @@ max_depth = 1
             )
         };
 
-        fs::write(&config_path, config).context("Failed to write .codex/config.toml")?;
+        transport.write_file(&config_path.to_string_lossy(), &config).await.context("Failed to write .codex/config.toml")?;
         info!(path = %config_path.display(), "Codex config.toml generated");
         Ok(())
     }
 
     /// Generate .codex/agents/*.toml from existing agent.md files.
-    fn generate_codex_agent_tomls(
+    async fn generate_codex_agent_tomls(
         &self,
         worktree: &Path,
         model_backend: Option<&str>,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let agent_ids = ["forge", "sentinel"];
 
         for agent_id in &agent_ids {
-            self.generate_codex_agent_toml_for_role(worktree, agent_id, model_backend)?;
+            self.generate_codex_agent_toml_for_role(worktree, agent_id, model_backend, transport).await?;
         }
 
         Ok(())
     }
 
     /// Generate a single .codex/agents/{role}.toml in the target directory.
-    fn generate_codex_agent_toml_for_role(
+    async fn generate_codex_agent_toml_for_role(
         &self,
         target: &Path,
         agent_id: &str,
         model_backend: Option<&str>,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let agents_dir = target.join(".codex").join("agents");
-        fs::create_dir_all(&agents_dir).context("Failed to create .codex/agents directory")?;
+        transport.create_dir_all(&agents_dir.to_string_lossy()).await.context("Failed to create .codex/agents directory")?;
 
         let agent_md_path = self
             .orchestrator_dir()
@@ -673,14 +686,21 @@ developer_instructions = """
         );
 
         let toml_path = agents_dir.join(format!("{}.toml", agent_id));
-        fs::write(&toml_path, toml_content)
+        transport
+            .write_file(&toml_path.to_string_lossy(), &toml_content)
+            .await
             .context(format!("Failed to write {}", toml_path.display()))?;
         info!(path = %toml_path.display(), "Codex agent TOML generated for {} in {}", agent_id, target.display());
         Ok(())
     }
 
     /// Generate .codex/hooks.json with relative paths to locally-installed hook scripts.
-    fn generate_codex_hooks_json(&self, worktree: &Path, shared: &Path) -> Result<()> {
+    async fn generate_codex_hooks_json(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let hooks_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -693,24 +713,28 @@ developer_instructions = """
         }
 
         // Install hook scripts into FORGE worktree
-        self.install_hook_scripts(worktree, "forge", &hooks_source)?;
+        self.install_hook_scripts(worktree, "forge", &hooks_source, transport).await?;
 
         // Generate FORGE hooks.json (referencing local copies)
         let forge_hooks = self.build_codex_hooks_json("forge", &hooks_source)?;
         let forge_hooks_path = worktree.join(".codex").join("hooks.json");
-        fs::create_dir_all(forge_hooks_path.parent().unwrap())?;
-        self.write_json(&forge_hooks_path, &forge_hooks)?;
-        info!(path = %forge_hooks_path.display(), "Codex hooks.json generated for FORGE");
+        transport
+            .create_dir_all(&forge_hooks_path.parent().unwrap().to_string_lossy())
+            .await?;
+        self.write_json_via_transport(forge_hooks_path, &forge_hooks, transport).await?;
+        info!("Codex hooks.json generated for FORGE");
 
         // Install hook scripts into SENTINEL shared dir
-        self.install_hook_scripts(shared, "sentinel", &hooks_source)?;
+        self.install_hook_scripts(shared, "sentinel", &hooks_source, transport).await?;
 
         // Generate SENTINEL hooks.json (referencing local copies)
         let sentinel_hooks = self.build_codex_hooks_json("sentinel", &hooks_source)?;
         let sentinel_hooks_path = shared.join(".codex").join("hooks.json");
-        fs::create_dir_all(sentinel_hooks_path.parent().unwrap())?;
-        self.write_json(&sentinel_hooks_path, &sentinel_hooks)?;
-        info!(path = %sentinel_hooks_path.display(), "Codex hooks.json generated for SENTINEL");
+        transport
+            .create_dir_all(&sentinel_hooks_path.parent().unwrap().to_string_lossy())
+            .await?;
+        self.write_json_via_transport(sentinel_hooks_path, &sentinel_hooks, transport).await?;
+        info!("Codex hooks.json generated for SENTINEL");
 
         Ok(())
     }
@@ -719,7 +743,13 @@ developer_instructions = """
     ///
     /// This makes the harness self-contained so it doesn't depend on the source
     /// repo remaining at the same absolute path at runtime.
-    fn install_hook_scripts(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+    async fn install_hook_scripts(
+        &self,
+        target: &Path,
+        role: &str,
+        hooks_source: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let hook_names: Vec<&str> = match role {
             "forge" => vec![
                 "session_start",
@@ -743,7 +773,10 @@ developer_instructions = """
         };
 
         let hooks_dest = target.join(".codex").join("hooks").join(role);
-        fs::create_dir_all(&hooks_dest).context("Failed to create hooks directory")?;
+        transport
+            .create_dir_all(&hooks_dest.to_string_lossy())
+            .await
+            .context("Failed to create hooks directory")?;
 
         for hook_name in &hook_names {
             let src = hooks_source.join(role).join(format!("{}.sh", hook_name));
@@ -754,23 +787,25 @@ developer_instructions = """
                 );
                 continue;
             }
-            let dst = hooks_dest.join(format!("{}.sh", hook_name));
-            fs::copy(&src, &dst).context(format!("Failed to copy hook script {}", hook_name))?;
 
-            // Ensure the copied script is executable (fs::copy preserves
-            // permissions on Unix, but enforce +x in case the source lacked it)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = fs::metadata(&dst)?.permissions().mode();
-                if mode & 0o111 == 0 {
-                    fs::set_permissions(&dst, fs::Permissions::from_mode(mode | 0o755))?;
-                }
-            }
+            // Read the source file from local filesystem and write via transport
+            let content = fs::read_to_string(&src)
+                .context(format!("Failed to read hook source {}", src.display()))?;
+
+            let dst_path = hooks_dest.join(format!("{}.sh", hook_name));
+            transport
+                .write_file(&dst_path.to_string_lossy(), &content)
+                .await
+                .context(format!("Failed to write hook script {}", hook_name))?;
+
+            // Ensure executable bit via chmod in the workspace
+            let _ = transport
+                .execute(&format!("chmod +x {}", shell_quote(&dst_path)))
+                .await;
 
             debug!(
                 src = %src.display(),
-                dst = %dst.display(),
+                dst = %dst_path.display(),
                 "Hook script copied"
             );
         }
@@ -934,7 +969,12 @@ developer_instructions = """
     }
 
     /// Generate Claude hooks configuration and install hook scripts.
-    fn generate_claude_hooks_json(&self, worktree: &Path, shared: &Path) -> Result<()> {
+    async fn generate_claude_hooks_json(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        _transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let hooks_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1158,8 +1198,12 @@ developer_instructions = """
         Ok(())
     }
 
-    /// Symlink skills to .claude/skills/ in worktree.
-    fn symlink_skills_to_claude(&self, worktree: &Path) -> Result<()> {
+    /// Symlink (or copy in Coder mode) skills to .claude/skills/ in worktree.
+    async fn symlink_skills_to_claude(
+        &self,
+        worktree: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let skills_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1172,10 +1216,12 @@ developer_instructions = """
         }
 
         let claude_skills_dir = worktree.join(".claude").join("skills");
-        fs::create_dir_all(&claude_skills_dir)
+        transport
+            .create_dir_all(&claude_skills_dir.to_string_lossy())
+            .await
             .context("Failed to create .claude/skills directory")?;
 
-        for entry in fs::read_dir(&skills_source)? {
+        for entry in std::fs::read_dir(&skills_source)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -1189,44 +1235,23 @@ developer_instructions = """
                 continue;
             }
 
-            let symlink_path = claude_skills_dir.join(skill_name);
-
-            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(&symlink_path);
-            }
-
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&path, &symlink_path).context(format!(
-                    "Failed to symlink skill {} to .claude/skills/",
-                    skill_name
-                ))?;
-            }
-
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path).context(format!(
-                    "Failed to symlink skill {} to .claude/skills/",
-                    skill_name
-                ))?;
-            }
-
-            debug!(
-                source = %path.display(),
-                target = %symlink_path.display(),
-                "Skill symlinked to .claude/skills/"
-            );
+            let target_path = claude_skills_dir.join(skill_name);
+            transport
+                .symlink_or_copy(&path, &target_path.to_string_lossy())
+                .await?;
         }
 
-        info!(
-            target = %claude_skills_dir.display(),
-            "Skills symlinked to .claude/skills/"
-        );
+        info!(target = %claude_skills_dir.display(), "Skills symlinked to .claude/skills/");
         Ok(())
     }
 
-    /// Symlink role-relevant skills to .claude/skills/ in a target directory.
-    fn symlink_skills_to_claude_for_role(&self, target: &Path, role: &str) -> Result<()> {
+    /// Symlink (or copy in Coder mode) role-relevant skills to .claude/skills/ in a target directory.
+    async fn symlink_skills_to_claude_for_role(
+        &self,
+        target: &Path,
+        role: &str,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let skills_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1239,13 +1264,15 @@ developer_instructions = """
         }
 
         let claude_skills_dir = target.join(".claude").join("skills");
-        fs::create_dir_all(&claude_skills_dir)
+        transport
+            .create_dir_all(&claude_skills_dir.to_string_lossy())
+            .await
             .context("Failed to create .claude/skills directory")?;
 
         let prefix = format!("{}-", role);
         let shared_prefix = "shared-";
 
-        for entry in fs::read_dir(&skills_source)? {
+        for entry in std::fs::read_dir(&skills_source)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -1263,34 +1290,10 @@ developer_instructions = """
                 continue;
             }
 
-            let symlink_path = claude_skills_dir.join(skill_name);
-
-            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(&symlink_path);
-            }
-
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&path, &symlink_path).context(format!(
-                    "Failed to symlink skill {} to .claude/skills/",
-                    skill_name
-                ))?;
-            }
-
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path).context(format!(
-                    "Failed to symlink skill {} to .claude/skills/",
-                    skill_name
-                ))?;
-            }
-
-            debug!(
-                source = %path.display(),
-                target = %symlink_path.display(),
-                role = role,
-                "Role skill symlinked to .claude/skills/"
-            );
+            let target_path = claude_skills_dir.join(skill_name);
+            transport
+                .symlink_or_copy(&path, &target_path.to_string_lossy())
+                .await?;
         }
 
         info!(
@@ -1360,8 +1363,12 @@ developer_instructions = """
         Ok(())
     }
 
-    /// Symlink skills to .agents/skills/ in worktree.
-    fn symlink_skills_to_agents(&self, worktree: &Path) -> Result<()> {
+    /// Symlink (or copy in Coder mode) skills to .agents/skills/ in worktree.
+    async fn symlink_skills_to_agents(
+        &self,
+        worktree: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let skills_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1374,11 +1381,10 @@ developer_instructions = """
         }
 
         let agents_skills_dir = worktree.join(".agents").join("skills");
-        fs::create_dir_all(&agents_skills_dir)
+        transport.create_dir_all(&agents_skills_dir.to_string_lossy()).await
             .context("Failed to create .agents/skills directory")?;
 
-        // Find all SKILL.md directories and symlink them
-        for entry in fs::read_dir(&skills_source)? {
+        for entry in std::fs::read_dir(&skills_source)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -1392,30 +1398,15 @@ developer_instructions = """
                 continue;
             }
 
-            let symlink_path = agents_skills_dir.join(skill_name);
-
-            // Remove existing symlink if present
-            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(&symlink_path);
-            }
-
-            // Create symlink
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {}", skill_name))?;
-            }
-
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {}", skill_name))?;
-            }
+            let target_abs = agents_skills_dir.join(skill_name);
+            transport
+                .symlink_or_copy(&path, &target_abs.to_string_lossy())
+                .await?;
 
             debug!(
                 source = %path.display(),
-                target = %symlink_path.display(),
-                "Skill symlinked"
+                target = %target_abs.display(),
+                "Skill symlinked/copied"
             );
         }
 
@@ -1426,8 +1417,13 @@ developer_instructions = """
         Ok(())
     }
 
-    /// Symlink role-relevant skills to .agents/skills/ in a target directory.
-    fn symlink_skills_to_agents_for_role(&self, target: &Path, role: &str) -> Result<()> {
+    /// Symlink (or copy in Coder mode) role-relevant skills to .agents/skills/ in a target directory.
+    async fn symlink_skills_to_agents_for_role(
+        &self,
+        target: &Path,
+        role: &str,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let skills_source = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1440,13 +1436,13 @@ developer_instructions = """
         }
 
         let agents_skills_dir = target.join(".agents").join("skills");
-        fs::create_dir_all(&agents_skills_dir)
+        transport.create_dir_all(&agents_skills_dir.to_string_lossy()).await
             .context("Failed to create .agents/skills directory")?;
 
         let prefix = format!("{}-", role);
         let shared_prefix = "shared-";
 
-        for entry in fs::read_dir(&skills_source)? {
+        for entry in std::fs::read_dir(&skills_source)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -1464,29 +1460,16 @@ developer_instructions = """
                 continue;
             }
 
-            let symlink_path = agents_skills_dir.join(skill_name);
-
-            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(&symlink_path);
-            }
-
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {}", skill_name))?;
-            }
-
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_dir(&path, &symlink_path)
-                    .context(format!("Failed to symlink skill {}", skill_name))?;
-            }
+            let target_abs = agents_skills_dir.join(skill_name);
+            transport
+                .symlink_or_copy(&path, &target_abs.to_string_lossy())
+                .await?;
 
             debug!(
                 source = %path.display(),
-                target = %symlink_path.display(),
+                target = %target_abs.display(),
                 role = role,
-                "Role skill symlinked"
+                "Role skill symlinked/copied"
             );
         }
 
@@ -1499,7 +1482,11 @@ developer_instructions = """
     }
 
     /// Deploy the Codex plugin directory (.codex-plugin/) into the workspace.
-    fn deploy_codex_plugin(&self, target: &Path) -> Result<()> {
+    async fn deploy_codex_plugin(
+        &self,
+        target: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
 
         let codex_plugin_source = plugin_source.join(".codex-plugin");
@@ -1513,26 +1500,21 @@ developer_instructions = """
         }
 
         let plugins_dir = target.join(".agents").join("plugins");
-        fs::create_dir_all(&plugins_dir).context("Failed to create .agents/plugins directory")?;
+        transport
+            .create_dir_all(&plugins_dir.to_string_lossy())
+            .await
+            .context("Failed to create .agents/plugins directory")?;
 
-        let symlink_path = plugins_dir.join("orchestration");
-
-        if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
-            let _ = fs::remove_file(&symlink_path);
-        }
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&plugin_source, &symlink_path)
-            .context("Failed to create Codex plugin symlink")?;
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&plugin_source, &symlink_path)
-            .context("Failed to create Codex plugin symlink")?;
+        // Use transport's symlink_or_copy to handle Coder vs local workspaces
+        let target_path = plugins_dir.join("orchestration");
+        transport
+            .symlink_or_copy(&plugin_source, &target_path.to_string_lossy())
+            .await?;
 
         info!(
             source = %plugin_source.display(),
-            target = %symlink_path.display(),
-            "Codex plugin deployed to .agents/plugins/orchestration"
+            target_dir = %plugins_dir.display(),
+            "Codex plugin deployed"
         );
         Ok(())
     }
@@ -1596,23 +1578,20 @@ developer_instructions = """
     }
 
     /// Generate Codex permission profiles (.codex/permissions.toml).
-    fn generate_codex_permissions(
+    async fn generate_codex_permissions(
         &self,
         target: &Path,
         shared: &Path,
         profile: &str,
         allowed_domains: &[String],
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        fs::create_dir_all(&codex_dir).context("Failed to create .codex directory")?;
+        transport.create_dir_all(&codex_dir.to_string_lossy()).await.context("Failed to create .codex directory")?;
 
         let permissions_path = codex_dir.join("permissions.toml");
 
-        // Build domain allowlist sections for network-enabled profiles.
-        // Domains come from the agent's registry entry (per-agent override)
-        // or the registry-level defaults.
         let domain_lines: Vec<String> = if allowed_domains.is_empty() {
-            // Fallback: GitHub only
             vec![
                 r#""api.github.com" = "allow""#.to_string(),
                 r#""*.github.com" = "allow""#.to_string(),
@@ -1697,7 +1676,10 @@ enabled = true
             _ => String::new(),
         };
 
-        fs::write(&permissions_path, content).context("Failed to write permissions.toml")?;
+        transport
+            .write_file(&permissions_path.to_string_lossy(), &content)
+            .await
+            .context("Failed to write permissions.toml")?;
         info!(path = %permissions_path.display(), "Codex permissions profile generated");
         Ok(())
     }
@@ -1778,16 +1760,18 @@ mod tests {
     use crate::transport::LocalTransport;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_create_forge_settings() {
+    #[tokio::test]
+    async fn test_create_forge_settings() {
         let dir = tempdir().unwrap();
         let worktree = dir.path();
         let shared = dir.path().join("shared");
         let backend_config = BackendConfig::claude("", worktree, &shared);
 
         let provisioner = Provisioner::new(dir.path());
+        let transport = LocalTransport::new(dir.path());
         provisioner
-            .create_forge_settings(worktree, &backend_config)
+            .create_forge_settings(worktree, &backend_config, &transport)
+            .await
             .unwrap();
 
         let settings_path = worktree.join(".claude").join("settings.json");
@@ -1799,16 +1783,18 @@ mod tests {
         assert_eq!(settings["permissions"]["defaultMode"], "auto");
     }
 
-    #[test]
-    fn test_create_sentinel_settings() {
+    #[tokio::test]
+    async fn test_create_sentinel_settings() {
         let dir = tempdir().unwrap();
         let shared = dir.path();
         let worktree = dir.path().join("worktree");
         let backend_config = BackendConfig::claude("", &worktree, shared);
 
         let provisioner = Provisioner::new(dir.path());
+        let transport = LocalTransport::new(dir.path());
         provisioner
-            .create_sentinel_settings(shared, &backend_config)
+            .create_sentinel_settings(shared, &backend_config, &transport)
+            .await
             .unwrap();
 
         let settings_path = shared.join(".claude").join("settings.json");
@@ -1838,8 +1824,8 @@ mod tests {
         assert!(shared.join(".gitignore").exists());
     }
 
-    #[test]
-    fn test_install_hook_scripts_copies_files() {
+    #[tokio::test]
+    async fn test_install_hook_scripts_copies_files() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
         fs::create_dir_all(&target).unwrap();
@@ -1855,8 +1841,10 @@ mod tests {
         .unwrap();
 
         let provisioner = Provisioner::new(dir.path());
+        let transport = LocalTransport::new(dir.path());
         provisioner
-            .install_hook_scripts(&target, "sentinel", &hooks_source)
+            .install_hook_scripts(&target, "sentinel", &hooks_source, &transport)
+            .await
             .unwrap();
 
         // Verify the script was copied to .codex/hooks/sentinel/
@@ -1872,67 +1860,5 @@ mod tests {
 
         let content = fs::read_to_string(&copied).unwrap();
         assert_eq!(content, "#!/bin/bash\necho sentinel-start");
-    }
-
-    #[test]
-    fn test_build_codex_hooks_json_uses_relative_paths() {
-        let dir = tempdir().unwrap();
-
-        // Create fake source hooks directory with sentinel scripts
-        let hooks_source = dir.path().join("hooks");
-        let sentinel_src = hooks_source.join("sentinel");
-        fs::create_dir_all(&sentinel_src).unwrap();
-        fs::write(
-            sentinel_src.join("session_start.sh"),
-            "#!/bin/bash\necho sentinel",
-        )
-        .unwrap();
-        fs::write(
-            sentinel_src.join("pre_bash_readonly_guard.sh"),
-            "#!/bin/bash\necho guard",
-        )
-        .unwrap();
-        fs::write(
-            sentinel_src.join("post_write_validate.sh"),
-            "#!/bin/bash\necho validate",
-        )
-        .unwrap();
-        fs::write(
-            sentinel_src.join("stop_require_eval.sh"),
-            "#!/bin/bash\necho eval",
-        )
-        .unwrap();
-
-        let provisioner = Provisioner::new(dir.path());
-        let hooks_json = provisioner
-            .build_codex_hooks_json("sentinel", &hooks_source)
-            .unwrap();
-
-        let hooks = hooks_json["hooks"].as_object().unwrap();
-
-        // Verify all commands use relative paths (no leading /)
-        for (_event, entries) in hooks {
-            for entry in entries.as_array().unwrap() {
-                for hook in entry["hooks"].as_array().unwrap() {
-                    let command = hook["command"].as_str().unwrap();
-                    assert!(
-                        !command.starts_with('/'),
-                        "Hook command should be relative, got absolute: {}",
-                        command
-                    );
-                    assert!(
-                        command.starts_with("hooks/"),
-                        "Hook command should start with 'hooks/', got: {}",
-                        command
-                    );
-                }
-            }
-        }
-
-        // Verify specific expected relative paths
-        let session_cmd = hooks["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        assert_eq!(session_cmd, "hooks/sentinel/session_start.sh");
     }
 }

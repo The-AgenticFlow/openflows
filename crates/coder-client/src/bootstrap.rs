@@ -23,14 +23,14 @@ impl CoderBootstrapper {
     /// Reads:
     /// - `CODER_URL`: Coder server URL (required)
     /// - `CODER_ADMIN_EMAIL`: Admin email (default: admin@openflows.dev)
-    /// - `CODER_ADMIN_PASSWORD`: Admin password (default: openflows)
+    /// - `CODER_ADMIN_PASSWORD`: Admin password (default: Op3nFl0ws!)
     /// - `CODER_ADMIN_USERNAME`: Admin username (default: admin)
     pub fn from_env() -> Result<Self> {
         let url = std::env::var("CODER_URL").context("CODER_URL not set")?;
         let email = std::env::var("CODER_ADMIN_EMAIL")
             .unwrap_or_else(|_| "admin@openflows.dev".to_string());
         let password =
-            std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "openflows".to_string());
+            std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "Op3nFl0ws!".to_string());
         let username =
             std::env::var("CODER_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
 
@@ -77,7 +77,7 @@ impl CoderBootstrapper {
             )
             .await?;
         info!(
-            "  ✓ Admin user created (id: {}, username: {})",
+            "  ✓ Admin user resolved (id: {}, username: {})",
             user.id, user.username
         );
 
@@ -86,11 +86,39 @@ impl CoderBootstrapper {
             .client
             .login_with_password(&self.admin_email, &self.admin_password)
             .await?;
-        let client_with_session = self.client.with_token(session_token);
+
+        // Persist session token so coder ssh can authenticate later.
+        // 1. Set as environment variable for the current process and children
+        // 2. Save to file for subsequent process restarts
+        std::env::set_var("CODER_SESSION_TOKEN", &session_token);
+
+        if let Ok(home) = std::env::var("HOME") {
+            let session_file = format!("{}/.openflows/coder-session-token", home);
+            if std::fs::create_dir_all(format!("{}/.openflows", home)).is_ok() {
+                let _ = std::fs::write(&session_file, &session_token);
+                info!(session_file = %session_file, "Session token persisted to file");
+            }
+        }
+
+        let client_with_session = self.client
+            .with_token(session_token.clone())
+            .with_session_token(&session_token);
+
+        // Resolve the real user ID (needed when create_first_user returned a stub)
+        let user_id = if !user.id.is_empty() {
+            user.id.clone()
+        } else {
+            let me = client_with_session.get_me().await?;
+            info!("  ✓ Resolved admin user from /users/me (id: {})", me.id);
+            me.id
+        };
+
         let api_key = client_with_session
-            .create_api_token(&user.id, "openflows")
+            .create_api_token(&user_id, "openflows")
             .await?;
-        let client = client_with_session.with_token(api_key.key.clone());
+        let client = client_with_session
+            .with_token(api_key.key.clone())
+            .with_session_token(&session_token);
         info!("  ✓ API token generated");
 
         // 4. Push workspace templates (bundled in binary)

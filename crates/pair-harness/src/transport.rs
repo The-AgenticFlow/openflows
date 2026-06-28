@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
 use tracing::debug;
@@ -34,6 +35,18 @@ pub trait WorkspaceTransport: Send + Sync {
     async fn write_file(&self, path: &str, content: &str) -> Result<()>;
     async fn execute(&self, command: &str) -> Result<CommandOutput>;
     async fn list_directory(&self, path: &str) -> Result<Vec<DirEntry>>;
+
+    /// Create a symlink (local) or copy contents (Coder) from source to target.
+    /// source is always a local filesystem path; target is a workspace path.
+    async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()>;
+    /// Create a directory and all parent directories.
+    async fn create_dir_all(&self, path: &str) -> Result<()>;
+    /// Check if a path exists (file or directory).
+    async fn path_exists(&self, path: &str) -> bool;
+    /// Recursively remove a directory.
+    async fn remove_dir_all(&self, path: &str) -> Result<()>;
+    /// Copy a local file to the workspace.
+    async fn copy_file(&self, source_local: &Path, target: &str) -> Result<()>;
 }
 
 /// Local filesystem transport — wraps existing file and process operations
@@ -110,6 +123,42 @@ impl WorkspaceTransport for LocalTransport {
         }
         Ok(entries)
     }
+
+    async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()> {
+        let full_target = self.resolve_path(target);
+        if source.is_dir() {
+            std::os::unix::fs::symlink(source, &full_target)?;
+        } else {
+            std::os::unix::fs::symlink(source, &full_target)?;
+        }
+        Ok(())
+    }
+
+    async fn create_dir_all(&self, path: &str) -> Result<()> {
+        let full_path = self.resolve_path(path);
+        fs::create_dir_all(&full_path).await?;
+        Ok(())
+    }
+
+    async fn path_exists(&self, path: &str) -> bool {
+        let full_path = self.resolve_path(path);
+        full_path.exists()
+    }
+
+    async fn remove_dir_all(&self, path: &str) -> Result<()> {
+        let full_path = self.resolve_path(path);
+        fs::remove_dir_all(&full_path).await?;
+        Ok(())
+    }
+
+    async fn copy_file(&self, source_local: &Path, target: &str) -> Result<()> {
+        let full_target = self.resolve_path(target);
+        if let Some(parent) = full_target.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(source_local, &full_target).await?;
+        Ok(())
+    }
 }
 
 /// Coder workspace transport — executes commands and reads/writes files
@@ -129,6 +178,28 @@ impl CoderTransport {
             client,
             workspace_id: workspace_id.to_string(),
         }
+    }
+
+    fn copy_dir_recursive<'a>(
+        &'a self,
+        source_dir: &'a Path,
+        target_dir: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_dir_all(target_dir).await?;
+            for entry in std::fs::read_dir(source_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let target_path = format!("{}/{}", target_dir.trim_end_matches('/'), name);
+                let source_path = entry.path();
+                if source_path.is_dir() {
+                    self.copy_dir_recursive(&source_path, &target_path).await?;
+                } else if source_path.is_file() {
+                    self.copy_file(&source_path, &target_path).await?;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -154,7 +225,7 @@ impl WorkspaceTransport for CoderTransport {
     async fn execute(&self, command: &str) -> Result<CommandOutput> {
         let output = self
             .client
-            .workspace_exec(&self.workspace_id, command)
+            .workspace_exec_with_timeout(&self.workspace_id, command, 3600)
             .await
             .map_err(|e| anyhow::anyhow!("CoderTransport execute failed: {}", e))?;
         Ok(CommandOutput {
@@ -175,6 +246,60 @@ impl WorkspaceTransport for CoderTransport {
             anyhow::bail!("list_directory failed: {}", output.stderr);
         }
         Ok(parse_ls_output(&output.stdout))
+    }
+
+    async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()> {
+        if source.is_dir() {
+            self.copy_dir_recursive(source, target).await
+        } else if source.is_file() {
+            self.copy_file(source, target).await
+        } else {
+            anyhow::bail!("symlink_or_copy: source does not exist: {}", source.display());
+        }
+    }
+
+    async fn create_dir_all(&self, path: &str) -> Result<()> {
+        let escaped_path = shell_escape(path);
+        let output = self
+            .client
+            .workspace_exec(&self.workspace_id, &format!("mkdir -p {}", escaped_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("CoderTransport create_dir_all failed: {}", e))?;
+        if output.exit_code != 0 {
+            anyhow::bail!("create_dir_all failed: {}", output.stderr);
+        }
+        Ok(())
+    }
+
+    async fn path_exists(&self, path: &str) -> bool {
+        let escaped_path = shell_escape(path);
+        self.client
+            .workspace_exec(&self.workspace_id, &format!("test -e {}", escaped_path))
+            .await
+            .map(|o| o.exit_code == 0)
+            .unwrap_or(false)
+    }
+
+    async fn remove_dir_all(&self, path: &str) -> Result<()> {
+        let escaped_path = shell_escape(path);
+        let output = self
+            .client
+            .workspace_exec(&self.workspace_id, &format!("rm -rf {}", escaped_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("CoderTransport remove_dir_all failed: {}", e))?;
+        if output.exit_code != 0 {
+            anyhow::bail!("remove_dir_all failed: {}", output.stderr);
+        }
+        Ok(())
+    }
+
+    async fn copy_file(&self, source_local: &Path, target: &str) -> Result<()> {
+        let content = std::fs::read_to_string(source_local)
+            .map_err(|e| anyhow::anyhow!("copy_file: failed to read local file: {}", e))?;
+        self.client
+            .workspace_write_file(&self.workspace_id, target, &content)
+            .await
+            .map_err(|e| anyhow::anyhow!("copy_file: workspace_write_file failed: {}", e))
     }
 }
 

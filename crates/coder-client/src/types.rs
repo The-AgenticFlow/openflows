@@ -3,6 +3,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Paginated response for the Coder /api/v2/users endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsersResponse {
+    #[serde(default)]
+    pub users: Vec<CoderUser>,
+    #[serde(default)]
+    pub total_count: u64,
+}
+
 /// Output from a command executed in a Coder workspace.
 #[derive(Debug, Clone)]
 pub struct CommandOutput {
@@ -43,6 +52,8 @@ pub struct CoderWorkspace {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub owner_name: String,
     #[serde(default)]
     pub status: String,
     #[serde(default)]

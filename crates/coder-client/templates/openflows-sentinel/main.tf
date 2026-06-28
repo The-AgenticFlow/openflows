@@ -6,9 +6,10 @@ terraform {
 }
 
 resource "coder_agent" "main" {
-  os   = "linux"
-  arch = "amd64"
-  dir  = "/home/coder/workspace"
+  os         = "linux"
+  arch       = "amd64"
+  dir        = "/home/coder/workspace"
+  access_url = "http://coder:7080"
 }
 
 variable "repo_url" {
@@ -22,7 +23,7 @@ resource "docker_volume" "workspace" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-sentinel-${data.coder_workspace.me.id}"
-  image = "coder/openflows-sentinel:latest"
+  image = "codercom/enterprise-base:ubuntu"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -30,9 +31,22 @@ resource "docker_container" "workspace" {
   }
 
   env = [
-    "CODER_AGENT_TOKEN=${coder_agent.main.token}",
     "REPO_URL=${var.repo_url}",
   ]
+
+  # Connect to the openflows_default compose network so the init_script
+  # can download the agent binary from the Coder server by service name.
+  networks_advanced {
+    name = "openflows_default"
+  }
+
+  # Run the Coder agent init script which downloads the agent binary and
+  # starts it as a foreground process. This keeps the container alive and
+  # enables SSH/workspace exec operations.
+  entrypoint = ["sh", "-c"]
+  command = [coder_agent.main.init_script]
 }
 
 data "coder_workspace" "me" {}
+
+data "coder_workspace_owner" "me" {}

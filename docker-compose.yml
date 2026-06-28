@@ -43,13 +43,15 @@ services:
 
   coder:
     image: ghcr.io/coder/coder:latest
+    user: "0:0"
     profiles:
       - coder
     ports:
-      - "7080:7080"
+      - "${CODER_PORT:-7080}:${CODER_INTERNAL_PORT:-7080}"
     environment:
       CODER_PG_CONNECTION_URL: postgres://coder:${CODER_PG_PASSWORD:-coder}@coder-db:5432/coder?sslmode=disable
-      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://localhost:7080}
+      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://localhost:${CODER_PORT:-7080}}
+      CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
       DOCKER_HOST: unix:///var/run/docker.sock
@@ -80,7 +82,7 @@ services:
       PROXY_URL: http://proxy:4000
       REDIS_URL: redis://redis:6379
       CODER_URL: ${CODER_URL:-}
-      CODER_ADMIN_PASSWORD: ${CODER_ADMIN_PASSWORD:-openflows}
+      CODER_ADMIN_PASSWORD: ${CODER_ADMIN_PASSWORD:-Op3nFl0ws!}
     env_file:
       - .env
     depends_on:
