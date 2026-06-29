@@ -100,7 +100,8 @@ The `registry.json` `cli` field maps to Coder Registry modules. A new `coder_mod
     "version": "5.2.0",
     "params": {
       "workdir": "/home/coder/workspace",
-      "permission_mode": "acceptEdits"
+      "permission_mode": "acceptEdits",
+      "enable_ai_gateway": true
     }
   }
 }
@@ -121,7 +122,7 @@ This mapping is stored in the Provisioner config and can be extended without cod
 
 All agent modules share these patterns that OpenFlows leverages:
 
-1. **`coder_env` for environment injection** — `PROXY_URL`, `REDIS_URL`, `ORCHESTRATOR_DIR`, `CODER_URL`, `CODER_SESSION_TOKEN` are set as env vars either via the module's `managed_settings.env` or directly as `coder_env` resources.
+1. **`coder_env` for environment injection** — `REDIS_URL`, `ORCHESTRATOR_DIR`, `CODER_URL`, `CODER_SESSION_TOKEN` are set as env vars. `PROXY_URL`/`LITELLM_PROXY_URL` set only for LiteLLM fallback. When AI Gateway is enabled, no LLM API keys are injected — the session token authenticates through AI Gateway.
 
 2. **`workdir` for project directory** — Set to `/home/coder/workspace` to match our persistent volume mount point. Also pre-accepts the agent's trust/onboarding dialog.
 
@@ -129,7 +130,7 @@ All agent modules share these patterns that OpenFlows leverages:
 
 4. **`managed_settings` for permissions** — Role-specific: `acceptEdits` for forge, `plan` for sentinel, `plan` for nexus, `acceptEdits` for vessel.
 
-5. **`enable_ai_gateway`** — When Coder Premium is available, agents route through Coder's AI Gateway instead of LiteLLM.
+5. **`enable_ai_gateway`** — Enabled by default (Premium license available). Agents route through Coder's AI Gateway. LLM credentials stay in the Coder control plane, never injected into workspace env.
 
 6. **`pre_install_script` / `post_install_script`** — Used for git pull, SharedStore registration, and heartbeat writer.
 
@@ -141,9 +142,16 @@ Coder's AI Gateway (Premium, v2.30+) provides centralized LLM proxy management:
 - Sets `ANTHROPIC_BASE_URL` to `${data.coder_workspace.me.access_url}/api/v2/aibridge/anthropic`
 - Authenticates via the workspace owner's Coder session token
 - Provides audit logging, token tracking, and cost management
-- **Requires AI Governance Add-On** (Premium license)
+- ✅ **We have a Premium license** — AI Gateway is the primary model routing mechanism
 
-**Decision**: Keep LiteLLM as the default model routing mechanism for Community/Free Coder. If AI Gateway is available (Premium), templates should support `enable_ai_gateway = true` as an alternative. The `claude-code` module handles both modes natively.
+**Decision**: Use **AI Gateway as the primary** model routing mechanism. `enable_ai_gateway = true` is the default for all `claude-code` modules. LLM credentials stay in the Coder control plane — no `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` env vars leak into workspaces.
+
+Non-Anthropic providers (Codex requires `OPENAI_API_KEY`, etc.) are routed through AI Gateway's multi-provider support. For any provider not yet supported by AI Gateway, LiteLLM remains available as a fallback proxy at `http://proxy:4000`.
+
+Templates default to AI Gateway. LiteLLM is retained for:
+- Local mode (`WorkspaceProvider::Local`) where there's no Coder server
+- Non-Anthropic providers that AI Gateway doesn't yet proxy
+- Development/testing without a Coder Premium license
 
 ## Current Implementation State
 
@@ -192,7 +200,7 @@ The `registry.json` already has `"workspace_provider": "coder"` for all 5 agents
 2. **Template bootstrapping must be idempotent** — `CoderBootstrapper::bootstrap()` runs on every start; all 5 templates must be pushed.
 3. **Nexus must be Coder-aware for all roles** — `provision_coder_workspace()` currently hardcodes `"openflows-forge"`. Must route to the correct template per role.
 4. **Vessel must delete (not just stop) workspaces** on merge.
-5. **Templates must use Coder Registry modules** — `claude-code` for agent installation, `slackme` for notifications (plus our NotificationService).
+5. **Templates must use Coder Registry modules** — `claude-code` for agent installation with `enable_ai_gateway = true`, `slackme` for notifications (plus our NotificationService).
 6. **The `coder` feature flag on `pair-harness` must be enabled** in Coder-mode deployments.
 7. **Chats API replaces Tasks API** — all programmatic agent orchestration uses `/api/experimental/chats`, not the deprecated Tasks API (`/api/v2/tasks`).
 
@@ -257,15 +265,13 @@ module "agent" {
   version           = "5.2.0"
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  anthropic_api_key  = var.anthropic_api_key
-  claude_code_version = "1.0.82"
+  enable_ai_gateway = var.use_ai_gateway  # defaults to true
   
   mcp = var.mcp_config
   managed_settings = var.managed_settings
   post_install_script = local.init_script
   
-  # When AI Gateway is available (Premium):
-  # enable_ai_gateway = var.use_ai_gateway
+  # No anthropic_api_key needed — AI Gateway authenticates via Coder session token
 }
 ```
 
@@ -277,11 +283,15 @@ module "agent" {
   version           = "VERIFY_ON_REGISTRY"  // verify against live registry before applying
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  openai_api_key    = var.openai_api_key
+  # openai_api_key not needed if routing through AI Gateway
+  # For AI Gateway fallback to LiteLLM for non-Anthropic providers:
+  # openai_api_key = var.openai_api_key  # only needed if AI Gateway doesn't proxy this provider
   
   post_install_script = local.init_script
 }
 ```
+
+> **Note on non-Anthropic providers**: The `codex`, `aider`, and `goose` modules may require `openai_api_key` or equivalent even with AI Gateway enabled, depending on whether AI Gateway supports their provider. Check Coder's AI Gateway documentation for the current provider support matrix. If AI Gateway proxies the provider, the API key stays in the Coder control plane. If not, the key passes through LiteLLM as a fallback.
 
 **Shared template infrastructure** (common to all role templates):
 
@@ -351,12 +361,18 @@ Unchanged from previous plan — init scripts in `post_install_script` handle gi
 
 ### Model Routing
 
-**Two modes supported**:
+**Primary: Coder AI Gateway** (Premium license available)
 
-1. **LiteLLM proxy** (Community/free): `PROXY_URL` env var routes all LLM calls through LiteLLM. `model_backend` in registry becomes a LiteLLM alias.
-2. **Coder AI Gateway** (Premium): `enable_ai_gateway = true` in the `claude-code` module. Sets `ANTHROPIC_BASE_URL` to `${data.coder_workspace.me.access_url}/api/v2/aibridge/anthropic`. LLM credentials stay in the Coder control plane.
+All Anthropic model calls route through AI Gateway by default:
+- `ANTHROPIC_BASE_URL` is set to `${data.coder_workspace.me.access_url}/api/v2/aibridge/anthropic` by the `claude-code` module when `enable_ai_gateway = true`
+- Authentication uses the workspace owner's Coder session token — no API keys in workspace env
+- Audit logging, token tracking, and cost management are built-in
 
-Templates should default to LiteLLM but support AI Gateway when the `use_ai_gateway` parameter is true.
+**Fallback: LiteLLM proxy** (for non-Anthropic providers and Local mode)
+
+Non-Anthropic providers (Codex/`OPENAI_API_KEY`, etc.) are routed through AI Gateway if supported, otherwise through LiteLLM at `http://proxy:4000`. In Local mode (`WorkspaceProvider::Local`), all LLM calls go through LiteLLM since there's no Coder server.
+
+Templates default to AI Gateway enabled. The `USE_AI_GATEWAY` template parameter defaults to `true`.
 
 ### Chats API Endpoints (Replacing Tasks API)
 
@@ -441,8 +457,8 @@ Unchanged — three layers (Nexus reconciliation, workspace crash recovery, Shar
 - Add `managed_settings` with role-specific permissions
 - Add `mcp` variable for MCP server config (GitHub, Redis)
 - Add `redis_url`, `litellm_proxy_url`, `ticket_id`, `role` variables
+- Add `enable_ai_gateway = true` as default for `claude-code` module
 - Add heartbeat writer in `post_install_script`
-- Add `enable_ai_gateway` parameter
 
 **1.7** Package all templates as `.tar.gz` archives
 - Verify/update existing forge/sentinel archives
@@ -460,32 +476,47 @@ Unchanged — three layers (Nexus reconciliation, workspace crash recovery, Shar
 
 **1.10** Update init scripts to download orchestration config from SharedStore when `ORCHESTRATOR_DIR` is not set
 
-### Phase 2: LiteLLM Proxy Integration + AI Gateway Awareness
+### Phase 2: AI Gateway Primary + LiteLLM Fallback
 
-**2.1** Update `litellm_config.yaml` to use per-role model aliases
+**2.1** Enable AI Gateway by default in all `claude-code` module configurations
+- `enable_ai_gateway = true` is the default in all templates
+- Remove `anthropic_api_key` from template variables — AI Gateway authenticates via Coder session token
+- Keep `anthropic_api_key` as an可选 override for Local mode or when AI Gateway is unavailable
+
+**2.2** Update `litellm_config.yaml` to use per-role model aliases (fallback role)
 - Change `model_name` to role-specific: `"openflows-nexus"`, `"openflows-forge"`, etc.
 - Keep `routing_key` dispatch
+- LiteLLM is now fallback-only: used in Local mode and for providers AI Gateway doesn't proxy
 
-**2.2** Update `registry.json` `model_backend` fields
-- When `workspace_provider` is `"coder"`, use LiteLLM aliases
-- When `workspace_provider` is `"local"`, keep direct provider names
-- Dynamic switch in `NexusNode::sync_registry()` based on provider
+**2.3** Update `registry.json` `model_backend` fields
+- When `workspace_provider` is `"coder"` and AI Gateway is enabled: model routing goes through AI Gateway, `model_backend` references AI Gateway model config IDs
+- When `workspace_provider` is `"coder"` and AI Gateway is disabled: fall back to LiteLLM aliases
+- When `workspace_provider` is `"local"`: keep direct provider names
 
-**2.3** Verify `FallbackClient` proxy mode works end-to-end
+**2.4** Verify `FallbackClient` proxy mode works end-to-end (still needed for Local-mode)
 - When `PROXY_URL=http://proxy:4000`, all LLM calls route through LiteLLM
+- This path is only used in Local mode or when AI Gateway is unavailable
 
-**2.4** Add `LITELLM_PROXY_URL` and `USE_AI_GATEWAY` parameters to all workspace templates
-- `LITELLM_PROXY_URL` defaults to `"http://proxy:4000"`
-- `USE_AI_GATEWAY` defaults to `false`
-- When `USE_AI_GATEWAY` is true, the agent module gets `enable_ai_gateway = true` (for `claude-code`), or equivalent for other modules
+**2.5** Add `USE_AI_GATEWAY` (default `true`) and `LITELLM_PROXY_URL` parameters to all workspace templates
+- `USE_AI_GATEWAY` defaults to `"true"` — AI Gateway is the primary path
+- `LITELLM_PROXY_URL` defaults to `"http://proxy:4000"` — fallback for non-Anthropic providers
+- When `USE_AI_GATEWAY` is `true`, the `claude-code` module gets `enable_ai_gateway = true`; no `anthropic_api_key` is passed
+- When `USE_AI_GATEWAY` is `false` (fallback), templates fall back to LiteLLM proxy mode with direct API keys
 
-**2.5** Add `LITELLM_PROXY_URL` fallback in `FallbackClient`
+**2.6** Add `LITELLM_PROXY_URL` fallback in `FallbackClient`
 - When `PROXY_URL` not set but `LITELLM_PROXY_URL` is, use `LITELLM_PROXY_URL`
 
-**2.6** Template-level AI Gateway integration
-- When `USE_AI_GATEWAY = true`, the `claude-code` module sets `ANTHROPIC_BASE_URL` to Coder AI Gateway
-- Other agent modules handle their own `BASE_URL` env vars (e.g., `OPENAI_BASE_URL` for Codex)
-- LiteLLM still handles non-Anthropic model routing as fallback
+**2.7** Template-level AI Gateway integration for non-Anthropic providers
+- When `USE_AI_GATEWAY = true` and the provider is Anthropic: AI Gateway handles routing, no API key in workspace
+- When `USE_AI_GATEWAY = true` and the provider is OpenAI/etc.: check if AI Gateway supports that provider
+  - If yes: route through AI Gateway (e.g., OpenAI models via AI Gateway's multi-provider support)
+  - If no: fall back to LiteLLM proxy for that provider, passing the API key through template variables
+- The `aibridge-proxy` module can be used alongside `claude-code` to route all providers through AI Gateway
+
+**2.8** Configure Coder AI Gateway model access
+- In Coder server config, enable AI Gateway and configure model access per provider
+- Ensure Anthropic models are available through AI Gateway for all 5 agent workspace owners
+- Verify that `GET /api/experimental/chats/models` returns available models with correct `model_config_id` values
 
 ### Phase 3: Chats API Client (Replacing Tasks API)
 
@@ -706,7 +737,7 @@ Unchanged — three layers (Nexus reconciliation, workspace crash recovery, Shar
 
 **9.1** Add automatic `WorkspaceProvider::Coder` when `CODER_URL` is set
 
-**9.2** Ensure `REDIS_URL`, `PROXY_URL`/`LITELLM_PROXY_URL`, `USE_AI_GATEWAY` are propagated to all workspaces
+**9.2** Ensure `REDIS_URL`, `LITELLM_PROXY_URL` (fallback), `USE_AI_GATEWAY=true` are propagated to all workspaces
 
 **9.3** Verify LiteLLM config aliases match registry `model_backend` values
 
@@ -725,7 +756,13 @@ Unchanged — three layers (Nexus reconciliation, workspace crash recovery, Shar
   - Document the pinned version and required minimum version in a new `docs/coder-compatibility.md`
   - Bump only after testing Chats API changes against the pinned version
 
-**9.9** Add Coder workspace network policy exception for Redis
+**9.9** Configure Coder AI Gateway model access per provider
+  - In Coder server config, enable AI Governance Add-On with model access per provider
+  - Ensure Anthropic models (claude-sonnet-4-5, etc.) are available through AI Gateway for all workspace owners
+  - Verify `GET /api/experimental/chats/models` returns available models with `model_config_id` values
+  - For non-Anthropic providers (OpenAI, Google): configure AI Gateway multi-provider support or document LiteLLM fallback path
+
+**9.10** Add Coder workspace network policy exception for Redis
   - In all `openflows-*` templates, add a `coder_env` or security group rule allowing egress to `REDIS_URL`
   - Document this as an intentional exception to Coder's recommended network lockdown (control-plane + git provider only)
 
@@ -779,9 +816,9 @@ pub enum NotificationChannel {
 
 **10.4** Extend `step_coder.rs` — Add AI Gateway and Slackme toggles
 - When Coder mode is selected, show additional options:
-  - "Enable Coder AI Gateway" (requires Premium license)
-  - "Enable Slack command notifications (requires Coder external auth for Slack)"
-- Store in `SetupConfig.enable_ai_gateway` and a boolean for slackme
+   - "Enable Coder AI Gateway" (selected by default — Premium license available)
+   - "Enable Slack command notifications (requires Coder external auth for Slack)"
+- Store in `SetupConfig.enable_ai_gateway` (defaults to `true`) and a boolean for slackme
 
 **10.5** Extend `step_agents.rs` — Pass module config through
 - After the user configures agent instances and model backends, the module resolution happens
@@ -804,7 +841,8 @@ pub enum NotificationChannel {
 - Only write `coder_module` when `workspace_provider == Coder`
 
 **10.7** Update `write_env_file()` in `crates/agentflow-tui/src/setup/mod.rs`
-- When Coder mode: write `CODER_URL`, `CODER_ADMIN_PASSWORD`, `USE_AI_GATEWAY=true/false`
+- When Coder mode: write `CODER_URL`, `CODER_ADMIN_PASSWORD`, `USE_AI_GATEWAY=true` (default)
+- Write `LITELLM_PROXY_URL` as fallback (always present for Local mode compatibility)
 - Write `SLACK_WEBHOOK_URL` and `DISCORD_WEBHOOK_URL` if provided
 - Write `ENABLE_SLACKME=true/false` based on Coder module selection
 
@@ -823,13 +861,13 @@ pub enum NotificationChannel {
 | Risk | Mitigation |
 |---|---|
 | Chats API is experimental | Wrap all Chats API calls in feature-flagged code; fall back to direct workspace exec mode if unavailable. The Chats API is the supported path going forward per Coder's migration guide. |
-| AI Gateway requires Premium license | LiteLLM is the default; `enable_ai_gateway` is opt-in. `FallbackClient` already has proxy support. Templates support both modes. |
+| AI Gateway is Premium — now our primary | We have a Premium license and are using AI Gateway as primary model routing. LiteLLM is retained as fallback for Local mode and providers not yet supported by AI Gateway. `FallbackClient` has proxy support for both paths. Templates default to `USE_AI_GATEWAY = true`. |
 | TUI configuration complexity | The setup wizard gains 2 new steps (module selection, notifications). Keep steps incremental and skippable. Module selection only appears in Coder mode. Notifications are optional. |
 | Coder Registry module compatibility | Pin module versions in `registry.json` `coder_module.version`; test new versions before upgrading. Module interface changes could break template composition. |
 | Agent CLI module availability | If a registry module is unavailable, fall back to direct CLI installation via `post_install_script`. The module mapping is decoupled from core orchestration logic. |
 | Multiple agent modules have different parameters | Each module has its own parameters (e.g., `claude-code` has `enable_ai_gateway`, Codex has `openai_api_key`). The Provisioner must handle per-module parameter generation. This is addressed by the `coder_module.params` field in `registry.json`. |
 | `slackme` requires Coder external auth for Slack | `slackme` is optional (conditional `count`); NotificationService provides webhook-based Slack alerts without OAuth. |
-| LiteLLM proxy becomes SPOF | Deploy LiteLLM with health checks; `FallbackClient` has retry logic; fall back to direct provider calls if proxy unreachable. |
+| LiteLLM proxy as fallback | LiteLLM is fallback-only (Local mode and non-Anthropic providers). If LiteLLM is down, AI Gateway still handles Anthropic traffic. Deploy LiteLLM with health checks for when it's needed. |
 | Workspace creation latency | Persistent volumes + git pull (~1-3s) vs fresh clone (~10-30s). `claude-code` module pre-accepts trust dialog. |
 | SharedStore key conflicts | Ticket-scoped key prefixes; Redis keyspace isolation. |
 | Coder API rate limits | Batch workspace operations; stagger creation across roles. |
@@ -845,7 +883,7 @@ pub enum NotificationChannel {
 ## Validation Plan
 
 1. **Phase 1**: Run `openflows-setup` → verify all 5 templates appear in Coder UI with the correct agent module (claude-code, codex, etc.) → verify persistent volumes and git pull work → verify `git-config` and `slackme` modules load correctly → test switching `cli` field in `registry.json` from `claude` to `codex` and verify the codex module loads
-2. **Phase 2**: Send LLM requests through LiteLLM with role aliases → verify routing. Verify AI Gateway mode when `enable_ai_gateway = true`. Test with Codex + OPENAI_API_KEY routing.
+2. **Phase 2**: Send LLM requests through AI Gateway → verify Anthropic routing via `enable_ai_gateway`. Verify AI Gateway dashboard shows token tracking and cost. Test fallback to LiteLLM for non-Anthropic providers. Verify Local mode works without AI Gateway (no Coder server).
 3. **Phase 3**: Use `CoderClient.create_chat()` → verify it appears in Coder Agents dashboard → send follow-up message → verify WebSocket streaming
 4. **Phase 4**: Create GitHub issue → verify Coder Chats + workspaces provision → archive chat → verify workspace destroyed on merge
 5. **Phase 5**: Verify SharedStore keys appear in Redis → verify agents read/write cross-agent keys
