@@ -1972,9 +1972,34 @@ impl BatchNode for ForgePairNode {
             None
         };
 
-        let config = PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)
+        let use_coder_workspace = matches!(slot.workspace_provider, WorkspaceProvider::Coder)
+            && slot.workspace_id.is_some()
+            && std::env::var("CODER_URL").is_ok()
+            && std::env::var("CODER_API_TOKEN").is_ok();
+
+        let config = if use_coder_workspace {
+            let coder_workspace_id = slot.workspace_id.clone();
+            info!(
+                worker = worker_id,
+                ticket = ticket_id,
+                coder_workspace_id = %coder_workspace_id.as_ref().unwrap(),
+                "Using Coder workspace — skipping local worktree provisioning"
+            );
+            PairConfig::with_provider(
+                &worker_id,
+                &ticket_id,
+                &self.workspace_root,
+                &worker_token,
+                config::state::WorkspaceProvider::Coder,
+                coder_workspace_id,
+            )
             .with_cli_backend(cli_backend)
-            .with_model_backend(model_backend);
+            .with_model_backend(model_backend)
+        } else {
+            PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)
+                .with_cli_backend(cli_backend)
+                .with_model_backend(model_backend)
+        };
 
         let mut pair = ForgeSentinelPair::new(config);
         let outcome = pair

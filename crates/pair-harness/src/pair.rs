@@ -15,13 +15,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::isolation::FileLockManager;
 use crate::pair_state::{FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, WatcherAdapter};
+#[cfg(feature = "coder")]
+use crate::pair_state::CoderWatcherAdapter;
 use crate::process::{ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
-use crate::transport::LocalTransport;
+use crate::transport::{LocalTransport, WorkspaceTransport};
+#[cfg(feature = "coder")]
+use crate::transport::CoderTransport;
 use crate::types::{
     Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
-    Ticket, TimeoutProfile, VerificationResult, VerificationState,
+    Ticket, TimeoutProfile, VerificationResult, VerificationState, WorkspaceProvider,
 };
 use crate::watchdog::Watchdog;
 use crate::worktree::{MergeMainResult, SetupWarning, WorktreeManager};
@@ -434,7 +438,12 @@ impl ForgeSentinelPair {
                 }
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
-            watchdog: Watchdog::new(config.shared.clone(), config.watchdog_timeout_secs),
+            watchdog: match config.workspace_provider {
+                WorkspaceProvider::Coder => Watchdog::new_coder(config.watchdog_timeout_secs),
+                WorkspaceProvider::Local => {
+                    Watchdog::new(config.shared.clone(), config.watchdog_timeout_secs)
+                }
+            },
             verification_state: VerificationState::new(config.max_verify_attempts),
             config,
             start_time: Instant::now(),
@@ -545,7 +554,16 @@ impl ForgeSentinelPair {
         }
 
         // 1. Provision worktree (reuses existing if on correct branch)
-        self.provision_worktree(ticket).await?;
+        //    Skip when using Coder — workspace was already provisioned by Nexus.
+        if self.config.workspace_provider == WorkspaceProvider::Local {
+            self.provision_worktree(ticket).await?;
+        } else {
+            info!(
+                pair = %self.config.pair_id,
+                workspace_id = ?self.config.coder_workspace_id,
+                "Skipping local worktree provisioning — using Coder workspace"
+            );
+        }
 
         // 1b. If conflict rework: merge origin/main into worktree so conflicts are visible to FORGE
         if conflict_resolution_path.exists() {
@@ -642,10 +660,28 @@ impl ForgeSentinelPair {
         // 6. Spawn FORGE process
         let mut forge = self.spawn_forge().await?;
 
-        // 7. Start filesystem watcher
-        let mut watcher = PairWatcher::Local(
-            WatcherAdapter::new(&self.config.shared)?
-        );
+        // 7. Start event watcher (filesystem for local, SharedStore polling for Coder)
+        let mut watcher = match &self.config.workspace_provider {
+            WorkspaceProvider::Local => PairWatcher::Local(
+                WatcherAdapter::new(&self.config.shared)?
+            ),
+            #[cfg(feature = "coder")]
+            WorkspaceProvider::Coder => {
+                let redis_url = self.config.redis_url.as_ref()
+                    .expect("redis_url required for Coder mode (SharedStore-backed event detection)");
+                let store = pocketflow_core::SharedStore::new_redis(redis_url)
+                    .await
+                    .expect("Failed to create Redis SharedStore for Coder mode");
+                PairWatcher::Coder(CoderWatcherAdapter::new(store, &self.config.pair_id))
+            }
+            #[cfg(not(feature = "coder"))]
+            WorkspaceProvider::Coder => {
+                warn!("workspace_provider is Coder but 'coder' feature is not enabled; falling back to local watcher");
+                PairWatcher::Local(
+                    WatcherAdapter::new(&self.config.shared)?
+                )
+            }
+        };
 
         // 8. Event loop
         let outcome = self.event_loop(&mut forge, &mut watcher).await?;
@@ -1147,18 +1183,70 @@ impl ForgeSentinelPair {
         Ok(())
     }
 
+    /// Create a transport appropriate for the configured workspace provider.
+    async fn create_transport(&self) -> Box<dyn WorkspaceTransport> {
+        match self.config.workspace_provider {
+            WorkspaceProvider::Local => {
+                Box::new(LocalTransport::new(&self.config.project_root))
+            }
+            #[cfg(feature = "coder")]
+            WorkspaceProvider::Coder => {
+                let coder_url = self.config.coder_url.as_deref()
+                    .unwrap_or_else(|| {
+                        std::env::var("CODER_URL")
+                            .expect("CODER_URL env var required when workspace_provider is Coder")
+                            .leak()
+                    });
+                let coder_token = self.config.coder_api_token.as_deref()
+                    .unwrap_or_else(|| {
+                        std::env::var("CODER_API_TOKEN")
+                            .expect("CODER_API_TOKEN env var required when workspace_provider is Coder")
+                            .leak()
+                    });
+                let workspace_id = self.config.coder_workspace_id.as_deref()
+                    .expect("coder_workspace_id required when workspace_provider is Coder");
+
+                let session_token = Self::resolve_session_token();
+                let mut client = coder_client::CoderClient::new(coder_url, coder_token)
+                    .with_workspace_name(workspace_id);
+                if let Some(ref token) = session_token {
+                    client = client.with_session_token(token);
+                }
+                // Try to resolve owner/workspace_name for unambiguous coder ssh targeting.
+                let _ = client.set_workspace_name_from_id(workspace_id).await;
+                Box::new(CoderTransport::new(client, workspace_id))
+            }
+            #[cfg(not(feature = "coder"))]
+            WorkspaceProvider::Coder => {
+                warn!("workspace_provider is Coder but 'coder' feature is not enabled; falling back to LocalTransport");
+                Box::new(LocalTransport::new(&self.config.project_root))
+            }
+        }
+    }
+
+    /// Resolve the Coder session token from environment or SharedStore.
+    #[cfg(feature = "coder")]
+    fn resolve_session_token() -> Option<String> {
+        std::env::var("CODER_SESSION_TOKEN").ok()
+    }
+
     /// Provision configuration files.
     async fn provision_config(&self, _ticket: &Ticket) -> Result<()> {
-        // Use project_root where orchestration/plugin exists
-        let provisioner = Provisioner::new(&self.config.project_root);
-        let transport = LocalTransport::new(&self.config.project_root);
+        let transport = self.create_transport().await;
+
+        let provisioner = match self.config.workspace_provider {
+            WorkspaceProvider::Local => Provisioner::new(&self.config.project_root),
+            WorkspaceProvider::Coder => {
+                Provisioner::with_provider(&self.config.project_root, WorkspaceProvider::Coder)
+            }
+        };
 
         provisioner
             .provision_pair(
                 &self.config.pair_id,
                 &self.config.worktree,
                 &self.config.shared,
-                &transport,
+                transport.as_ref(),
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
                 self.config.cli_backend,
@@ -1398,17 +1486,25 @@ impl ForgeSentinelPair {
 
     /// Create shared directory structure.
     async fn create_shared_structure(&self) -> Result<()> {
-        let provisioner = Provisioner::new(&self.config.project_root);
-        let transport = LocalTransport::new(&self.config.project_root);
+        let transport = self.create_transport().await;
+
+        let provisioner = match self.config.workspace_provider {
+            WorkspaceProvider::Local => Provisioner::new(&self.config.project_root),
+            WorkspaceProvider::Coder => {
+                Provisioner::with_provider(&self.config.project_root, WorkspaceProvider::Coder)
+            }
+        };
+
         provisioner
-            .create_shared_structure(&self.config.shared, &transport)
+            .create_shared_structure(&self.config.shared, transport.as_ref())
             .await
     }
 
     /// Write TICKET.md and TASK.md to shared directory.
     async fn write_task_context(&self, ticket: &Ticket) -> Result<()> {
+        let transport = self.create_transport().await;
+
         let provisioner = Provisioner::new(&self.config.project_root);
-        let transport = LocalTransport::new(&self.config.project_root);
         let fs_state = FilesystemPairState::new(&self.config.shared);
         let pair_state: &dyn PairStateStore = match &self.pair_state {
             Some(ps) => ps.as_ref(),
@@ -1419,7 +1515,7 @@ impl ForgeSentinelPair {
                 &self.config.pair_id,
                 &self.config.shared,
                 ticket,
-                &transport,
+                transport.as_ref(),
                 Some(pair_state),
             )
             .await?;
@@ -1453,9 +1549,7 @@ impl ForgeSentinelPair {
                 WorktreeManager::branch_name(&self.config.pair_id, &ticket.id)
             )
         } else if ci_fix_path.exists() {
-            let ci_fix_content = tokio::fs::read_to_string(&ci_fix_path)
-                .await
-                .unwrap_or_default();
+            let ci_fix_content = self.read_file_or_empty(&ci_fix_path).await;
             let failure_summary = ci_fix_content
                 .lines()
                 .find(|l| l.starts_with("## Failed Checks"))
@@ -1547,10 +1641,14 @@ If a PR already exists for this branch, do NOT create a new one — just push an
                 &self.config.pair_id,
                 &self.config.shared,
                 &task,
-                &transport,
+                transport.as_ref(),
                 Some(pair_state),
             )
             .await
+    }
+
+    async fn read_file_or_empty(&self, path: &std::path::Path) -> String {
+        tokio::fs::read_to_string(path).await.unwrap_or_default()
     }
 
     /// Spawn FORGE process.

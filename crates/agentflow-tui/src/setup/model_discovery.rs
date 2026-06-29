@@ -45,15 +45,7 @@ pub async fn discover_models(config: &SetupConfig) -> Result<Vec<ModelInfo>> {
             }
             Err(anyhow::anyhow!("No Fireworks API key configured"))
         }
-        _ => discover_backend_models(&config.selected_cli_backend),
-    }
-}
-
-fn discover_backend_models(cli_backend: &str) -> Result<Vec<ModelInfo>> {
-    match cli_backend {
-        "codex" => discover_codex_models(),
-        "claude" => discover_claude_models(),
-        other => Err(anyhow::anyhow!("Unknown CLI backend: {}", other)),
+        _ => discover_codex_models(),
     }
 }
 

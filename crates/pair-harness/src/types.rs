@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 // Re-export CliBackend from the config crate — single source of truth.
 pub use config::registry::CliBackend;
+// Re-export WorkspaceProvider for Coder-aware configuration.
+pub use config::state::WorkspaceProvider;
 
 /// Filesystem events detected by the watcher.
 /// These drive the event-driven harness state machine.
@@ -67,6 +69,18 @@ pub struct PairConfig {
     pub model_backend: Option<String>,
     pub verify_command: Option<String>,
     pub max_verify_attempts: u32,
+    /// Workspace provider mode: Coder or Local.
+    /// When Coder, worktree provisioning is skipped — a Coder workspace
+    /// has already been provisioned by Nexus.
+    pub workspace_provider: crate::WorkspaceProvider,
+    /// Coder workspace ID, if the workspace provider is Coder.
+    pub coder_workspace_id: Option<String>,
+    /// Coder deployment base URL (e.g., "https://coder.example.com").
+    /// Only used when workspace_provider is Coder.
+    pub coder_url: Option<String>,
+    /// Coder API token for authentication.
+    /// Only used when workspace_provider is Coder.
+    pub coder_api_token: Option<String>,
 }
 
 impl PairConfig {
@@ -89,12 +103,55 @@ impl PairConfig {
             .join(Self::SHARED_DIR_NAME)
     }
 
-    /// Create a new pair configuration with filesystem-based state.
+    /// Create a new pair configuration with filesystem-based state (local mode).
     pub fn new(
         pair_id: impl Into<String>,
         ticket_id: impl Into<String>,
         project_root: &std::path::Path,
         github_token: impl Into<String>,
+    ) -> Self {
+        Self::with_provider(
+            pair_id,
+            ticket_id,
+            project_root,
+            github_token,
+            WorkspaceProvider::Local,
+            None,
+        )
+    }
+
+    /// Create a pair configuration with Redis backend (local mode).
+    pub fn with_redis(
+        pair_id: impl Into<String>,
+        ticket_id: impl Into<String>,
+        project_root: &std::path::Path,
+        redis_url: impl Into<String>,
+        github_token: impl Into<String>,
+    ) -> Self {
+        let mut this = Self::with_provider(
+            pair_id,
+            ticket_id,
+            project_root,
+            github_token,
+            WorkspaceProvider::Local,
+            None,
+        );
+        this.redis_url = Some(redis_url.into());
+        this
+    }
+
+    /// Create a pair configuration with workspace provider awareness.
+    ///
+    /// When `workspace_provider` is `Coder` and `coder_workspace_id` is set,
+    /// the harness skips local worktree provisioning — the Coder workspace
+    /// was already provisioned by Nexus.
+    pub fn with_provider(
+        pair_id: impl Into<String>,
+        ticket_id: impl Into<String>,
+        project_root: &std::path::Path,
+        github_token: impl Into<String>,
+        workspace_provider: WorkspaceProvider,
+        coder_workspace_id: Option<String>,
     ) -> Self {
         let pair_id = pair_id.into();
         let ticket_id = ticket_id.into();
@@ -113,34 +170,49 @@ impl PairConfig {
             model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
+            workspace_provider,
+            coder_workspace_id,
+            coder_url: None,
+            coder_api_token: None,
         }
     }
 
-    /// Create a pair configuration with Redis backend.
-    pub fn with_redis(
+    /// Create a pair configuration configured for a Coder workspace.
+    ///
+    /// Automatically sets `workspace_provider` to `Coder` and uses SharedStore
+    /// (Redis) as the primary coordination backend. Requires Redis for event
+    /// detection.
+    pub fn with_coder(
         pair_id: impl Into<String>,
         ticket_id: impl Into<String>,
         project_root: &std::path::Path,
-        redis_url: impl Into<String>,
         github_token: impl Into<String>,
+        coder_url: impl Into<String>,
+        coder_api_token: impl Into<String>,
+        coder_workspace_id: String,
+        redis_url: String,
     ) -> Self {
         let pair_id = pair_id.into();
         let ticket_id = ticket_id.into();
         Self {
             project_root: project_root.to_path_buf(),
-            worktree: project_root.join("worktrees").join(&pair_id),
+            worktree: PathBuf::from("/workspace"), // Coder workspace root
             shared: Self::shared_path(project_root, &pair_id, &ticket_id),
             pair_id,
             ticket_id,
-            redis_url: Some(redis_url.into()),
+            redis_url: Some(redis_url),
             proxy_url: None,
             github_token: github_token.into(),
             max_resets: 10,
-            watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
+            watchdog_timeout_secs: 3600,
             cli_backend: CliBackend::default(),
             model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
+            workspace_provider: WorkspaceProvider::Coder,
+            coder_workspace_id: Some(coder_workspace_id),
+            coder_url: Some(coder_url.into()),
+            coder_api_token: Some(coder_api_token.into()),
         }
     }
 
@@ -169,17 +241,45 @@ impl PairConfig {
             model_backend: None,
             verify_command: None,
             max_verify_attempts: 3,
+            workspace_provider: WorkspaceProvider::Local,
+            coder_workspace_id: None,
+            coder_url: None,
+            coder_api_token: None,
         }
     }
 
-    /// Set the CLI backend for this pair.
+    /// Set the workspace provider (Coder or Local) and optional Coder workspace ID.
+    pub fn with_workspace_provider(
+        mut self,
+        provider: WorkspaceProvider,
+        coder_workspace_id: Option<String>,
+    ) -> Self {
+        self.workspace_provider = provider;
+        self.coder_workspace_id = coder_workspace_id;
+        self
+    }
+
+    /// Set Coder connection details for workspace integration.
+    pub fn with_coder_details(
+        mut self,
+        coder_url: String,
+        coder_api_token: String,
+        coder_workspace_id: String,
+    ) -> Self {
+        self.workspace_provider = WorkspaceProvider::Coder;
+        self.coder_url = Some(coder_url);
+        self.coder_api_token = Some(coder_api_token);
+        self.coder_workspace_id = Some(coder_workspace_id);
+        self
+    }
+
+    /// Set the CLI backend for this pair (e.g., Claude or Codex).
     pub fn with_cli_backend(mut self, backend: CliBackend) -> Self {
         self.cli_backend = backend;
         self
     }
 
-    /// Set the model backend for this pair (e.g., "deepseek-v4-flash" from registry.json).
-    /// This overrides the model passed to the CLI process via environment variable.
+    /// Set the model backend override.
     pub fn with_model_backend(mut self, model: Option<String>) -> Self {
         self.model_backend = model.filter(|m| !m.is_empty());
         self

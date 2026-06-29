@@ -15,6 +15,8 @@ pub mod process;
 pub mod provision;
 pub mod reset;
 pub mod responses_proxy;
+#[cfg(feature = "coder")]
+pub mod coder_process;
 pub mod transport;
 pub mod types;
 pub mod watchdog;
@@ -36,7 +38,7 @@ pub use responses_proxy::start_responses_proxy;
 pub use transport::{CommandOutput, DirEntry, LocalTransport, WorkspaceTransport};
 pub use types::{
     CliBackend, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, Ticket,
-    VerificationResult, VerificationState,
+    VerificationResult, VerificationState, WorkspaceProvider,
 };
 pub use watchdog::Watchdog;
 pub use watcher::SharedDirWatcher;

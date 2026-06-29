@@ -1,8 +1,9 @@
 // crates/pair-harness/src/watchdog.rs
 //! Watchdog for detecting stalled pairs.
 //!
-//! Monitors WORKLOG.md updates and alerts if no progress is made
-//! within the configured timeout.
+//! In local mode, monitors WORKLOG.md file mtime.
+//! In Coder mode, stall detection is delegated to the SharedStore-based
+//! event watcher — the watchdog simply treats the pair as always active.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -11,32 +12,51 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+/// Watchdog mode determines how stall detection is performed.
+#[derive(Debug, Clone)]
+pub enum WatchdogMode {
+    /// Monitor local filesystem WORKLOG.md mtime
+    Local { worklog_path: PathBuf },
+    /// In Coder mode, WORKLOG.md is in the remote workspace.
+    /// Stall detection is delegated to the SharedStore-based event watcher.
+    Coder,
+}
+
 /// Watchdog for detecting stalled pairs.
 pub struct Watchdog {
-    /// Path to WORKLOG.md
-    worklog_path: PathBuf,
-    /// Timeout for no updates
+    mode: WatchdogMode,
     timeout: Duration,
-    /// Last known update time
     last_update: Option<DateTime<Utc>>,
-    /// When we last checked
     last_check: Instant,
 }
 
 impl Watchdog {
-    /// Create a new watchdog.
+    /// Create a new watchdog for local filesystem monitoring.
     pub fn new(shared_dir: PathBuf, timeout_secs: u64) -> Self {
         Self {
-            worklog_path: shared_dir.join("WORKLOG.md"),
+            mode: WatchdogMode::Local {
+                worklog_path: shared_dir.join("WORKLOG.md"),
+            },
             timeout: Duration::from_secs(timeout_secs),
             last_update: None,
             last_check: Instant::now(),
         }
     }
 
+    /// Create a new watchdog for Coder mode. In Coder mode, WORKLOG.md is
+    /// written inside the remote workspace so local mtime checks are ineffective.
+    /// Stall detection is delegated to the SharedStore-based event watcher.
+    pub fn new_coder(timeout_secs: u64) -> Self {
+        Self {
+            mode: WatchdogMode::Coder,
+            timeout: Duration::from_secs(timeout_secs),
+            last_update: Some(Utc::now()),
+            last_check: Instant::now(),
+        }
+    }
+
     /// Check if the pair is stalled (no WORKLOG update for too long).
     pub fn check_stalled(&mut self) -> Result<WatchdogStatus> {
-        // Update our knowledge of the last update time
         self.refresh_last_update()?;
 
         let now = Utc::now();
@@ -45,7 +65,6 @@ impl Watchdog {
             .map(|last| (now - last).num_seconds() as u64)
             .unwrap_or(0);
 
-        // Check if we've exceeded the timeout
         if elapsed > self.timeout.as_secs() {
             warn!(
                 elapsed_secs = elapsed,
@@ -58,7 +77,6 @@ impl Watchdog {
             });
         }
 
-        // Check if we're approaching the timeout
         let warning_threshold = self.timeout.as_secs() / 2;
         if elapsed > warning_threshold {
             debug!(
@@ -79,31 +97,38 @@ impl Watchdog {
 
     /// Refresh our knowledge of the last update time.
     fn refresh_last_update(&mut self) -> Result<()> {
-        if !self.worklog_path.exists() {
-            // No worklog yet - this is normal for a new pair
-            return Ok(());
-        }
+        match &self.mode {
+            WatchdogMode::Local { worklog_path } => {
+                if !worklog_path.exists() {
+                    return Ok(());
+                }
 
-        let metadata =
-            fs::metadata(&self.worklog_path).context("Failed to read WORKLOG.md metadata")?;
+                let metadata =
+                    fs::metadata(worklog_path).context("Failed to read WORKLOG.md metadata")?;
 
-        let modified: std::time::SystemTime = metadata
-            .modified()
-            .context("Failed to get WORKLOG.md modification time")?;
+                let modified: std::time::SystemTime = metadata
+                    .modified()
+                    .context("Failed to get WORKLOG.md modification time")?;
 
-        let modified_datetime: DateTime<Utc> = modified.into();
+                let modified_datetime: DateTime<Utc> = modified.into();
 
-        // Only update if it's newer than what we know
-        if self
-            .last_update
-            .map(|l| modified_datetime > l)
-            .unwrap_or(true)
-        {
-            self.last_update = Some(modified_datetime);
-            debug!(
-                last_update = %modified_datetime.to_rfc3339(),
-                "Updated last known WORKLOG modification time"
-            );
+                if self
+                    .last_update
+                    .map(|l| modified_datetime > l)
+                    .unwrap_or(true)
+                {
+                    self.last_update = Some(modified_datetime);
+                    debug!(
+                        last_update = %modified_datetime.to_rfc3339(),
+                        "Updated last known WORKLOG modification time"
+                    );
+                }
+            }
+            WatchdogMode::Coder => {
+                // In Coder mode, WORKLOG.md is in the remote workspace.
+                // Stall detection is delegated to the SharedStore event watcher.
+                // Keep last_update as-is (set on init/reset).
+            }
         }
 
         Ok(())
@@ -122,37 +147,44 @@ impl Watchdog {
     }
 
     /// Check for segment loop (same segment evaluated too many times).
+    /// Only effective in Local mode; Coder mode delegates to SharedStore watchers.
     pub fn check_segment_loop(
         &self,
         shared_dir: &PathBuf,
         segment: u32,
         max_iterations: u32,
     ) -> Result<bool> {
-        let mut eval_count = 0;
+        match &self.mode {
+            WatchdogMode::Local { .. } => {
+                let mut eval_count = 0;
 
-        // Count how many eval files exist for this segment
-        // (segment-N-eval.md files with CHANGES_REQUESTED)
-        for entry in fs::read_dir(shared_dir).context("Failed to read shared directory")? {
-            let entry = entry?;
-            let filename = entry.file_name().to_string_lossy().to_string();
+                for entry in fs::read_dir(shared_dir).context("Failed to read shared directory")? {
+                    let entry = entry?;
+                    let filename = entry.file_name().to_string_lossy().to_string();
 
-            if filename == format!("segment-{}-eval.md", segment) {
-                // Read the file to check verdict
-                let content = fs::read_to_string(entry.path())?;
-                if content.contains("CHANGES_REQUESTED") {
-                    eval_count += 1;
+                    if filename == format!("segment-{}-eval.md", segment) {
+                        let content = fs::read_to_string(entry.path())?;
+                        if content.contains("CHANGES_REQUESTED") {
+                            eval_count += 1;
+                        }
+                    }
+                }
+
+                if eval_count > max_iterations {
+                    warn!(
+                        segment = segment,
+                        iterations = eval_count,
+                        max_iterations = max_iterations,
+                        "Segment loop detected"
+                    );
+                    return Ok(true);
                 }
             }
-        }
-
-        if eval_count > max_iterations {
-            warn!(
-                segment = segment,
-                iterations = eval_count,
-                max_iterations = max_iterations,
-                "Segment loop detected"
-            );
-            return Ok(true);
+            WatchdogMode::Coder => {
+                debug!(
+                    "Segment loop check skipped in Coder mode — handled by SharedStore watcher"
+                );
+            }
         }
 
         Ok(false)
@@ -200,7 +232,6 @@ impl WatchdogStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::thread;
     use tempfile::tempdir;
 
@@ -222,9 +253,6 @@ mod tests {
     fn test_watchdog_stalled() {
         let dir = tempdir().unwrap();
         let shared = dir.path().to_path_buf();
-
-        // Create WORKLOG.md with old timestamp (simulated by not creating it)
-        // Actually, we need to create it and then wait, or mock the time
 
         let mut watchdog = Watchdog::new(shared.clone(), 1); // 1 second timeout
 
@@ -275,6 +303,15 @@ mod tests {
         watchdog.reset();
 
         // Should be active — reset guarantees the watchdog treats "now" as last update
+        let status = watchdog.check_stalled().unwrap();
+        assert!(!status.is_stalled());
+    }
+
+    #[test]
+    fn test_watchdog_coder_mode_always_active() {
+        let mut watchdog = Watchdog::new_coder(1); // 1 second timeout
+
+        // Coder mode always treats last_update as current
         let status = watchdog.check_stalled().unwrap();
         assert!(!status.is_stalled());
     }

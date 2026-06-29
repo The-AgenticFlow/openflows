@@ -758,6 +758,13 @@ pub struct ProcessManager {
     /// and runtime are always set together, preventing a race where the
     /// address points to a killed proxy.
     responses_proxy: std::sync::Mutex<Option<ResponsesProxyState>>,
+    /// Workspace provider mode for determining how to spawn agents.
+    workspace_provider: crate::types::WorkspaceProvider,
+    /// Coder workspace ID when workspace_provider is Coder.
+    coder_workspace_id: Option<String>,
+    /// Coder client for workspace execution.
+    #[cfg(feature = "coder")]
+    coder_client: Option<coder_client::CoderClient>,
 }
 
 impl ProcessManager {
@@ -798,6 +805,10 @@ impl ProcessManager {
             proxy_url,
             proxy_api_key,
             responses_proxy: std::sync::Mutex::new(None),
+            workspace_provider: crate::types::WorkspaceProvider::Local,
+            coder_workspace_id: None,
+            #[cfg(feature = "coder")]
+            coder_client: None,
         }
     }
 
@@ -842,6 +853,10 @@ impl ProcessManager {
             proxy_url,
             proxy_api_key,
             responses_proxy: std::sync::Mutex::new(None),
+            workspace_provider: crate::types::WorkspaceProvider::Local,
+            coder_workspace_id: None,
+            #[cfg(feature = "coder")]
+            coder_client: None,
         }
     }
 
@@ -886,6 +901,10 @@ impl ProcessManager {
             proxy_url: Some(proxy_url.into()),
             proxy_api_key,
             responses_proxy: std::sync::Mutex::new(None),
+            workspace_provider: crate::types::WorkspaceProvider::Local,
+            coder_workspace_id: None,
+            #[cfg(feature = "coder")]
+            coder_client: None,
         }
     }
 
@@ -900,6 +919,29 @@ impl ProcessManager {
     /// for the spawned CLI process.
     pub fn with_model_backend(mut self, model: Option<String>) -> Self {
         self.model_backend = model.filter(|m| !m.is_empty());
+        self
+    }
+
+    /// Configure Coder workspace execution.
+    /// When workspace_provider is Coder, spawn methods will use the Coder
+    /// exec API instead of local process spawning.
+    pub fn with_coder_config(
+        mut self,
+        coder_url: &str,
+        coder_api_token: &str,
+        coder_workspace_id: &str,
+    ) -> Self {
+        self.workspace_provider = crate::types::WorkspaceProvider::Coder;
+        self.coder_workspace_id = Some(coder_workspace_id.to_string());
+        #[cfg(feature = "coder")]
+        {
+            let session_token = std::env::var("CODER_SESSION_TOKEN")
+                .unwrap_or_else(|_| coder_api_token.to_string());
+            let client = coder_client::CoderClient::new(coder_url, coder_api_token)
+                .with_workspace_name(coder_workspace_id)
+                .with_session_token(&session_token);
+            self.coder_client = Some(client);
+        }
         self
     }
 

@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 const DEBOUNCE_MS: u64 = 500;
+const POLL_INTERVAL_MS: u64 = 1000; // 1s for fallback polling
 
 struct EventDebouncer {
     last_seen: HashMap<String, Instant>,
@@ -87,12 +88,54 @@ impl SharedDirWatcher {
             .context("Failed to configure watcher")?;
 
         // Watch the shared directory (non-recursive since we only care about top-level files)
-        watcher
-            .watch(shared_dir, RecursiveMode::NonRecursive)
-            .context("Failed to start watching shared directory")?;
+        match watcher.watch(shared_dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                debug!(path = %shared_dir.display(), "Started watching shared directory");
+                Ok(watcher)
+            }
+            Err(e) => {
+                // Handle inotify exhaustion gracefully
+                match Self::handle_watch_error(&e, shared_dir) {
+                    Ok(()) => {
+                        warn!("Falling back to directory polling. Performance may be slightly degraded but operation will continue.");
+                        Ok(watcher)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
+    }
 
-        debug!(path = %shared_dir.display(), "Started watching shared directory");
-        Ok(watcher)
+    /// Handle errors from starting the directory watcher.
+    fn handle_watch_error(err: &notify::Error, shared_dir: &Path) -> Result<()> {
+        let err_str = err.to_string().to_lowercase();
+        
+        // Check for inotify watch limit errors
+        if err_str.contains("no space left on device") 
+            || err_str.contains("inotify")
+            || err_str.contains("too many open files")
+            || Self::is_max_files_watch_error(err, &err_str) {
+            warn!(
+                path = %shared_dir.display(),
+                "Filesystem watch limit reached. Falling back to polling mode."
+            );
+            info!("To fix this permanently, run: echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf && sudo sysctl -p");
+            Ok(())
+        } else {
+            // For other errors, propagate the error
+            Err(anyhow::anyhow!(
+                "Failed to start watching shared directory: {} ({})",
+                shared_dir.display(),
+                err
+            ))
+        }
+    }
+    
+    /// Check if the error is related to max files watch limit
+    fn is_max_files_watch_error(_err: &notify::Error, err_str: &str) -> bool {
+        err_str.contains("max") && err_str.contains("watch")
+        || err_str.contains("os file watch limit")
+        || err_str.contains("watch limit")
     }
 
     /// Classify a filesystem event into our FsEvent type.

@@ -529,26 +529,48 @@ impl NexusNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
         let mut changed = false;
+        let all_slot_ids = registry.all_worker_slots();
 
-        for slot_id in registry.all_worker_slots() {
-            if !slots.contains_key(&slot_id) {
-                info!(slot = slot_id, "Adding new worker slot from registry");
-                slots.insert(
-                    slot_id.clone(),
-                    WorkerSlot {
-                        id: slot_id,
-                        status: WorkerStatus::Idle,
-                        workspace_id: None,
-                        workspace_provider: if std::env::var("CODER_URL").is_ok() {
-                        config::WorkspaceProvider::Coder
-                    } else if std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder") {
-                        config::WorkspaceProvider::Coder
-                    } else {
-                        config::WorkspaceProvider::Local
-                    },
-                    },
-                );
-                changed = true;
+        // Remove slots for workers that are no longer in the registry
+        let current_ids: std::collections::HashSet<&str> = all_slot_ids.iter().map(|s| s.as_str()).collect();
+        let to_remove: Vec<String> = slots.keys()
+            .filter(|k| !current_ids.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for id in to_remove {
+            info!(slot = %id, "Removing worker slot no longer in registry");
+            slots.remove(&id);
+            changed = true;
+        }
+
+        for slot_id in &all_slot_ids {
+            let provider = registry.resolve_workspace_provider(slot_id)
+                .unwrap_or(config::WorkspaceProvider::Local);
+
+            match slots.get_mut(slot_id) {
+                Some(slot) => {
+                    // Update provider if it changed
+                    if slot.workspace_provider != provider {
+                        info!(slot = %slot_id, old_provider = ?slot.workspace_provider, new_provider = ?provider, "Updating workspace provider for existing slot");
+                        slot.workspace_provider = provider.clone();
+                        slot.workspace_id = None;
+                        slot.status = WorkerStatus::Idle;
+                        changed = true;
+                    }
+                }
+                None => {
+                    info!(slot = %slot_id, provider = ?provider, "Adding new worker slot from registry");
+                    slots.insert(
+                        slot_id.clone(),
+                        WorkerSlot {
+                            id: slot_id.clone(),
+                            status: WorkerStatus::Idle,
+                            workspace_id: None,
+                            workspace_provider: provider,
+                        },
+                    );
+                    changed = true;
+                }
             }
         }
 

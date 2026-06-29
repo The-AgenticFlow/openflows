@@ -41,7 +41,6 @@ coder-client    = { path = "../crates/coder-client" }
   tracing     = { workspace = true }
   tracing-subscriber = { workspace = true }
   dotenvy     = { workspace = true }
-  which       = "7"
   reqwest     = { workspace = true }
 
 [dev-dependencies]

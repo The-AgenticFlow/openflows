@@ -248,6 +248,17 @@ impl Registry {
         slots
     }
 
+    /// Resolve the workspace provider for a given slot ID.
+    ///
+    /// Strips the instance suffix (e.g., "forge-3" -> "forge") to find the
+    /// base agent entry and returns the configured workspace provider.
+    pub fn resolve_workspace_provider(&self, slot_id: &str) -> Option<crate::state::WorkspaceProvider> {
+        let base_id = self.normalize_agent_id(slot_id);
+        self.team.iter()
+            .find(|e| e.id == base_id)
+            .and_then(|e| e.workspace_provider.clone())
+    }
+
     /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
     /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` for backward compatibility.
     /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
