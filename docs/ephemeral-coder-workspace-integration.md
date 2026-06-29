@@ -22,10 +22,12 @@ Key architectural differences:
 
 | Aspect | Tasks API (deprecated) | Chats API (replacement) |
 |---|---|---|
-| Agent execution | Runs **inside workspace** (AgentAPI) | Runs in **control plane** |
+| Agent execution | Runs **inside workspace** (AgentAPI) | Runs in **control plane** (autonomous) or **inside workspace** (CLI) |
 | LLM credentials | Injected into workspace env | Stored in control plane only |
-| Template requirements | `coder_ai_task`, `coder_task`, agent modules | Just needs a clear description |
-| Workspace provisioning | You specify `template_version_id` | Agent auto-selects template |
+| Template requirements | `coder_ai_task`, `coder_task`, agent modules | Autonomous: just a description. CLI: agent module + harness. |
+| Workspace provisioning | You specify `template_version_id` | Autonomous: agent auto-selects. CLI: Nexus specifies template. |
+
+**OpenFlows uses CLI mode only** — agents run inside workspaces with the harness binary. The Chats API's autonomous capabilities (control-plane agent, auto-template-selection) are not used.
 | Chat state | Stored in workspace | Persisted in Coder database |
 | Conversation model | Single prompt + follow-ups | Multi-turn chat with queuing |
 | Real-time updates | HTTP polling | WebSocket streaming |
@@ -40,17 +42,22 @@ Key architectural differences:
 
 The Coder ecosystem has two agent-control interfaces that must not be conflated:
 
-- **Chats API** (`/api/experimental/chats`) — The **control-plane interface**. Nexus uses this to create, message, and monitor agent chats. The agent loop runs in Coder's control plane. This is what OpenFlows uses for orchestration.
+- **Chats API** (`/api/experimental/chats`) — The **control-plane interface**. Nexus uses this to create, message, and monitor agent chats. The Chats API manages chat lifecycle and state persistence. The agent itself runs inside the workspace (CLI mode), not in the control plane. OpenFlows uses only the Chats API for orchestration — it never calls AgentAPI.
 
 - **AgentAPI** (`coder/agentapi`) — An **in-workspace interface**. The Coder Registry modules (claude-code, aider, etc.) use AgentAPI internally to communicate with the agent process running inside a workspace. OpenFlows does **not** call AgentAPI directly.
 
-**Decision**: OpenFlows uses the Chats API as the sole orchestration interface. AgentAPI is used internally by Registry modules but is never called directly by OpenFlows code. In CLI mode (fallback), agents run inside workspaces and communicate via SharedStore, not via AgentAPI.
+**Decision**: OpenFlows uses the Chats API as the sole orchestration interface. AgentAPI is used internally by Registry modules but is never called directly by OpenFlows code. All agents run inside workspaces in CLI mode, communicating via SharedStore (not via AgentAPI).
 
-### Architectural Decision: Autonomous Mode vs CLI Mode
+### Architectural Decision: CLI Mode Only (No Autonomous Mode)
 
-In Coder Agents' **Autonomous mode**, the agent loop runs in the control plane as a generic prompt-driven tool-user — it doesn't know about OpenFlows typed SharedStore contracts. In **CLI mode**, the OpenFlows harness binary runs inside the workspace and enforces typed contracts.
+OpenFlows uses **CLI mode exclusively** — the agent binary (installed by the Coder Registry module) runs inside the workspace. The OpenFlows harness binary coordinates via SharedStore with typed, enforced Redis schemas. Nexus creates Coder Chats bound to role-specific workspaces, and the agent processes prompts inside those workspaces.
 
-**Decision**: CLI mode is **mandatory** for any workflow that requires SharedStore coordination (forge, sentinel, vessel, lore). The harness binary writes structured keys to Redis with enforced schemas. Autonomous mode is suitable only for exploratory or non-coordinated tasks. Nexus must create CLI-mode workspaces (with the OpenFlows harness installed via `post_install_script`) for all production ticket orchestration. If a workflow doesn't need SharedStore, Autonomous mode can be used for ad-hoc tasks.
+**Autonomous mode** (where Coder's built-in Go agent processes prompts in the control plane without a workspace-local binary) is **not used** because:
+1. Autonomous agents have no knowledge of OpenFlows SharedStore contracts — they would need to redis-cli with hand-crafted commands, which is unreliable.
+2. The OpenFlows architecture thesis is "architecture is the product" — typed contracts enforced by harness binaries are core to how agents coordinate.
+3. The `post_install_script` in each template sets up the harness environment, ensuring deterministic behavior regardless of which agent CLI is installed.
+
+All production orchestration goes through CLI mode. There is no exploratory/non-coordinated path in the current design.
 
 ### Coder Registry Modules: Extensible Agent Module System
 
@@ -212,44 +219,47 @@ Instead of the deprecated Tasks API, Nexus orchestrates agents through the **Cha
 
 ```
 Nexus workspace (long-lived, Coder-managed)
-  │
-  ├── Detects new GitHub issue
-  │
-  ├── Option A: Create workspace + send chat prompt (deterministic)
-  │   POST /api/v2/users/{user}/workspaces  → create workspace from template
-  │   POST /api/experimental/chats          → create chat with workspace_id
-  │
-  ├── Option B: Let Coder Agents auto-select template (exploratory)
-  │   POST /api/experimental/chats          → agent picks template, creates workspace
-  │
-  ├── Follow-up messages via:
-  │   POST /api/experimental/chats/{chat_id}/messages
-  │
-  ├── Stream events via:
-  │   GET wss://.../{chat_id}/stream          → WebSocket for real-time status
-  │
-  ├── Archive completed chats:
-  │   PATCH /api/experimental/chats/{chat_id}  {"archived": true}
-  │
-  ▼
-Workspaces boot → git pull → claude-code module installs agent → agent executes via Chats API
-  │
-  ├── Nexus polls chat status or receives streaming events
-  │
-  ▼
+   │
+   ├── Detects new GitHub issue
+   │
+   ├── Create workspace + send chat prompt (CLI mode):
+   │   POST /api/v2/users/{user}/workspaces  → create workspace from role template
+   │   POST /api/experimental/chats          → create chat with workspace_id
+   │
+   ├── Follow-up messages via:
+   │   POST /api/experimental/chats/{chat_id}/messages
+   │
+   ├── Stream events via:
+   │   GET wss://.../{chat_id}/stream          → WebSocket for real-time status
+   │
+   ├── Archive completed chats:
+   │   PATCH /api/experimental/chats/{chat_id}  {"archived": true}
+   │
+   ▼
+Workspaces boot → git pull → agent module installs CLI → harness binary + agent execute
+   │
+   ├── Nexus polls chat status or receives streaming events
+   │
+   ▼
 Agents coordinate via SharedStore (Redis):
-  nexus creates chats in Coder      →  forge reads dispatch from SharedStore
-  forge writes PR/status keys       →  sentinel reads and reviews
-  sentinel writes review keys       →  nexus reads and routes
-  vessel monitors CI & merges       →  nexus updates ticket status
+   nexus creates chats in Coder      →  forge reads dispatch from SharedStore
+   forge writes PR/status keys       →  sentinel reads and reviews
+   sentinel writes review keys       →  nexus reads and routes
+   vessel monitors CI & merges       →  nexus updates ticket status
 ```
 
-**Two-mode approach**:
-- **Autonomous mode** (default): Nexus creates a Coder Chat for each agent. The Coder Agent (built-in Go agent in the control plane) processes the prompt and uses workspace tools. No agent binary in the workspace needed.
-- **CLI mode** (fallback): The `claude-code` module installs Claude Code in the workspace. The agent runs inside the workspace for cases where direct CLI access is preferred.
-- **Production orchestration uses CLI mode**: For any workflow requiring SharedStore coordination (forge→sentinel handoffs, vessel CI monitoring), the OpenFlows harness binary must run inside the workspace to enforce typed Redis contracts. Autonomous mode is for exploratory/non-coordinated work only.
+### Orchestration Mode: CLI Mode Only
 
-**Chat sub-agents (parent/child)**: The Chats API supports `parent_chat_id` and `children` for delegation. OpenFlows does **not** use this feature. All cross-agent orchestration goes through SharedStore. A forge chat may create sub-activities, but these are tracked as SharedStore keys, not child chats. This avoids coupling OpenFlows coordination to Coder's chat hierarchy.
+OpenFlows uses **CLI mode exclusively** — the OpenFlows harness binary runs inside each workspace and enforces typed SharedStore contracts. The Coder Registry agent module (e.g., `claude-code`) installs the agent CLI in the workspace. Nexus creates a Coder Chat bound to that workspace, and the agent processes the prompt inside the workspace with access to the repo, Redis, and the full tool chain.
+
+**Why CLI mode only**:
+- The OpenFlows harness writes structured keys to Redis with enforced schemas (forge→sentinel handoffs, vessel CI monitoring, nexus state coordination).
+- Autonomous mode agents (control-plane prompt-driven) have no knowledge of SharedStore contracts — they would need to shell out to `redis-cli` with hand-crafted commands, which trades a typed, enforced contract for "hope the LLM remembers the right key format."
+- CLI mode gives deterministic behavior: the harness binary, not the LLM, controls what gets written to SharedStore and when.
+
+**No autonomous mode**: The "Option B: let Coder Agents auto-select template" path is not used. Nexus always creates a workspace from a specific template (`openflows-{role}`) bound to a specific role, then sends a Chat prompt to that workspace. Template auto-selection by Coder Agents is not part of the OpenFlows architecture.
+
+**Chat sub-agents (parent/child)**: The Chats API supports `parent_chat_id` and `children` for delegation. OpenFlows does **not** use this feature. All cross-agent orchestration goes through SharedStore. This avoids coupling OpenFlows coordination to Coder's chat hierarchy.
 
 **Standards file provisioning**: OpenFlows provisions `CODING.md`, `SECURITY.md`, and `REVIEW.md` via the Provisioner (Task 1.9) writing them into the workspace via `CoderTransport`. The Chats API's `context.resources` field for instruction files is not used — the agent prompt references these files by path.
 
@@ -875,7 +885,7 @@ pub enum NotificationChannel {
 | Tasks API deprecation (v2.37+) | Use Chats API exclusively. No implementation of Tasks API endpoints. |
 | `agentflow-coder-bridge` design is obsolete | The prior `rmcp`-based bridge crate (AgentAPI/Tasks reporting) is superseded by the Chats API. Any existing `agentflow-coder-bridge` code must be deleted or repurposed. No new work on the Tasks/AgentAPI path. |
 | `waiting` status ambiguity in self-healing | Coder's `waiting` state fires on both completion and interruption. Nexus must track its own `last_action` side-channel in SharedStore (not just rely on chat status) to distinguish "agent finished" from "workspace crashed." See Task 4.5. |
-| Autonomous mode vs typed SharedStore contracts | Autonomous mode agents don't enforce typed Redis schemas. CLI mode (with harness binary) is mandatory for all production orchestration. Autonomous mode is for exploratory ad-hoc tasks only. |
+| CLI mode enforces SharedStore contracts | All agents run in CLI mode inside workspaces. The harness binary enforces typed Redis schemas. Chats API provides lifecycle management (create, monitor, archive); SharedStore provides coordination state. This two-surface architecture is explicit and deterministic. |
 | Who heals Nexus? | Nexus is long-lived; `reconcile()` doesn't apply to it. Coder workspace auto-start restarts crashed Nexus. The `openflows-setup` binary (outside Coder) handles full re-creation. Nexus state lives in SharedStore (Redis), so a fresh workspace resumes where it left off. |
 | Network lockdown vs Redis dependency | Coder templates recommend restricting workspace network access to control-plane + git provider. OpenFlows requires all workspaces to reach Redis directly. This must be documented as an intentional exception in the network/governance config: allow egress to `REDIS_URL` from all `openflows-*` workspaces. |
 | Coder server version pinning | The Chats API is experimental and "may change without notice until GA." Running `ghcr.io/coder/coder:latest` is risky. Pin the Coder server image to a specific version in `docker-compose.yml` and bump deliberately after testing each new release. |
