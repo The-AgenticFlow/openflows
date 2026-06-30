@@ -43,11 +43,7 @@ impl ModuleStep {
 
         // Initialize CLI selections from agent config, defaulting to "claude"
         if self.cli_selections.is_empty() {
-            self.cli_selections = config
-                .agents
-                .iter()
-                .map(|a| a.cli.to_string())
-                .collect();
+            self.cli_selections = config.agents.iter().map(|a| a.cli.to_string()).collect();
         }
 
         let available_clis = ["claude", "codex", "aider", "goose"];
@@ -173,7 +169,11 @@ impl ModuleStep {
                                 .iter()
                                 .position(|c| c == &current.as_str())
                                 .unwrap_or(0);
-                            let new_pos = if pos > 0 { pos - 1 } else { available_clis.len() - 1 };
+                            let new_pos = if pos > 0 {
+                                pos - 1
+                            } else {
+                                available_clis.len() - 1
+                            };
                             *current = available_clis[new_pos].to_string();
                         }
                         KeyCode::Right if !config.agents.is_empty() => {

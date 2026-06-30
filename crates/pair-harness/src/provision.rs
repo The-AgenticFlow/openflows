@@ -47,15 +47,23 @@ fn resolve_coder_module_for_role(
         .iter()
         .find(|(key, _, _)| *key == cli_str)
         .map(|(_, source, version)| (source.to_string(), version.to_string()))
-        .unwrap_or_else(|| (
-            "registry.coder.com/coder/claude-code/coder".to_string(),
-            "5.2.0".to_string(),
-        ));
+        .unwrap_or_else(|| {
+            (
+                "registry.coder.com/coder/claude-code/coder".to_string(),
+                "5.2.0".to_string(),
+            )
+        });
 
     let permission_mode = config::registry::default_permission_mode_for_role(role);
     let mut params = serde_json::Map::new();
-    params.insert("workdir".to_string(), serde_json::Value::String("/home/coder/workspace".to_string()));
-    params.insert("permission_mode".to_string(), serde_json::Value::String(permission_mode.to_string()));
+    params.insert(
+        "workdir".to_string(),
+        serde_json::Value::String("/home/coder/workspace".to_string()),
+    );
+    params.insert(
+        "permission_mode".to_string(),
+        serde_json::Value::String(permission_mode.to_string()),
+    );
     Some(config::registry::CoderModule::with_params(
         source,
         version,
@@ -150,7 +158,8 @@ impl Provisioner {
         let backend_config = get_backend_config(cli_backend, worktree, shared);
 
         // 1. Create FORGE settings/config
-        self.create_forge_settings(worktree, &backend_config, transport).await?;
+        self.create_forge_settings(worktree, &backend_config, transport)
+            .await?;
 
         // 2. Remove legacy sentinel dir if present (always local path in orchestrator)
         let legacy_dir = shared.join("sentinel");
@@ -162,7 +171,8 @@ impl Provisioner {
         }
 
         // 3. Create SENTINEL settings/config
-        self.create_sentinel_settings(shared, &backend_config, transport).await?;
+        self.create_sentinel_settings(shared, &backend_config, transport)
+            .await?;
 
         // 4. Create FORGE mcp.json (if backend uses MCP config)
         let is_codex_non_responses =
@@ -181,10 +191,12 @@ impl Provisioner {
         }
 
         // 6. Symlink/copy plugin to FORGE
-        self.symlink_plugin(worktree, "forge", &backend_config, transport).await?;
+        self.symlink_plugin(worktree, "forge", &backend_config, transport)
+            .await?;
 
         // 7. Symlink/copy plugin to SENTINEL
-        self.symlink_plugin(shared, "sentinel", &backend_config, transport).await?;
+        self.symlink_plugin(shared, "sentinel", &backend_config, transport)
+            .await?;
 
         // 8. Create shared directory structure
         self.create_shared_structure(shared, transport).await?;
@@ -202,12 +214,21 @@ impl Provisioner {
                     model_backend,
                 },
                 transport,
-            ).await?;
+            )
+            .await?;
         }
 
         // 10. In Coder mode, resolve coder_module and generate Terraform variables
         if self.workspace_provider == WorkspaceProvider::Coder {
-            self.provision_coder_terraform_vars(pair_id, worktree, shared, cli_backend, model_backend, transport).await?;
+            self.provision_coder_terraform_vars(
+                pair_id,
+                worktree,
+                shared,
+                cli_backend,
+                model_backend,
+                transport,
+            )
+            .await?;
             self.write_standards_files(worktree, transport).await?;
         }
 
@@ -291,33 +312,53 @@ coder_ai_gateway      = {}
 
         if is_codex {
             self.generate_codex_config_toml(
-                worktree, worktree, shared,
-                github_token, redis_url, "danger-full-access",
+                worktree,
+                worktree,
+                shared,
+                github_token,
+                redis_url,
+                "danger-full-access",
                 transport,
-            ).await?;
+            )
+            .await?;
             self.generate_codex_config_toml(
-                shared, worktree, shared,
-                github_token, redis_url, "read-only",
+                shared,
+                worktree,
+                shared,
+                github_token,
+                redis_url,
+                "read-only",
                 transport,
-            ).await?;
-            self.generate_codex_agent_tomls(worktree, model_backend, transport).await?;
-            self.generate_codex_agent_toml_for_role(shared, "sentinel", model_backend, transport).await?;
-            self.generate_codex_hooks_json(worktree, shared, transport).await?;
+            )
+            .await?;
+            self.generate_codex_agent_tomls(worktree, model_backend, transport)
+                .await?;
+            self.generate_codex_agent_toml_for_role(shared, "sentinel", model_backend, transport)
+                .await?;
+            self.generate_codex_hooks_json(worktree, shared, transport)
+                .await?;
             self.deploy_codex_plugin(worktree, transport).await?;
             self.deploy_codex_plugin(shared, transport).await?;
             let forge_domains = self.resolve_allowed_domains(pair_id);
             self.generate_codex_permissions(
-                worktree, shared, "danger-full-access", &forge_domains, transport,
-            ).await?;
-            self.generate_codex_permissions(
-                shared, shared, "read-only", &[], transport,
-            ).await?;
+                worktree,
+                shared,
+                "danger-full-access",
+                &forge_domains,
+                transport,
+            )
+            .await?;
+            self.generate_codex_permissions(shared, shared, "read-only", &[], transport)
+                .await?;
             self.symlink_skills_to_agents(worktree, transport).await?;
-            self.symlink_skills_to_agents_for_role(shared, "sentinel", transport).await?;
+            self.symlink_skills_to_agents_for_role(shared, "sentinel", transport)
+                .await?;
         } else {
-            self.generate_claude_hooks_json(worktree, shared, transport).await?;
+            self.generate_claude_hooks_json(worktree, shared, transport)
+                .await?;
             self.symlink_skills_to_claude(worktree, transport).await?;
-            self.symlink_skills_to_claude_for_role(shared, "sentinel", transport).await?;
+            self.symlink_skills_to_claude_for_role(shared, "sentinel", transport)
+                .await?;
             let _ = self.enhance_claude_permissions(worktree, shared);
         }
 
@@ -336,7 +377,10 @@ coder_ai_gateway      = {}
     ) -> Result<()> {
         let settings_dir =
             worktree.join(config.settings_rel.parent().unwrap_or(&config.settings_rel));
-        transport.create_dir_all(&settings_dir.to_string_lossy()).await.context("Failed to create settings directory")?;
+        transport
+            .create_dir_all(&settings_dir.to_string_lossy())
+            .await
+            .context("Failed to create settings directory")?;
 
         let settings_path = config.settings_path(worktree);
 
@@ -349,9 +393,11 @@ coder_ai_gateway      = {}
             }
         });
 
-        self.write_json_via_transport(settings_path.clone(), &settings, transport).await?;
+        self.write_json_via_transport(settings_path.clone(), &settings, transport)
+            .await?;
 
-        self.ensure_worktree_gitignore_via_transport(worktree, config, transport).await
+        self.ensure_worktree_gitignore_via_transport(worktree, config, transport)
+            .await
     }
 
     async fn ensure_worktree_gitignore_via_transport(
@@ -448,7 +494,8 @@ coder_ai_gateway      = {}
             }
         });
 
-        self.write_json_via_transport(settings_path.clone(), &settings, transport).await?;
+        self.write_json_via_transport(settings_path.clone(), &settings, transport)
+            .await?;
 
         Ok(())
     }
@@ -475,17 +522,24 @@ coder_ai_gateway      = {}
         }
 
         // Compute intermediate plugins directory (without the final "orchestration" segment)
-        let plugins_intermediate =
-            target_dir.join(backend_config.plugin_dir_rel.parent().unwrap_or_else(|| {
-                std::path::Path::new(".claude/plugins")
-            }));
+        let plugins_intermediate = target_dir.join(
+            backend_config
+                .plugin_dir_rel
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".claude/plugins")),
+        );
 
         // Compute the full absolute target path including the "orchestration" segment
         let plugins_target = plugins_intermediate.join("orchestration");
 
         // Ensure parent directories exist at the absolute target location
         transport
-            .create_dir_all(&plugins_target.parent().unwrap_or(&plugins_target).to_string_lossy())
+            .create_dir_all(
+                &plugins_target
+                    .parent()
+                    .unwrap_or(&plugins_target)
+                    .to_string_lossy(),
+            )
             .await
             .context("Failed to create plugins directory")?;
 
@@ -610,7 +664,10 @@ coder_ai_gateway      = {}
         transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        transport.create_dir_all(&codex_dir.to_string_lossy()).await.context("Failed to create .codex directory")?;
+        transport
+            .create_dir_all(&codex_dir.to_string_lossy())
+            .await
+            .context("Failed to create .codex directory")?;
 
         let config_path = codex_dir.join("config.toml");
 
@@ -702,7 +759,10 @@ max_depth = 1
             )
         };
 
-        transport.write_file(&config_path.to_string_lossy(), &config).await.context("Failed to write .codex/config.toml")?;
+        transport
+            .write_file(&config_path.to_string_lossy(), &config)
+            .await
+            .context("Failed to write .codex/config.toml")?;
         info!(path = %config_path.display(), "Codex config.toml generated");
         Ok(())
     }
@@ -717,7 +777,8 @@ max_depth = 1
         let agent_ids = ["forge", "sentinel"];
 
         for agent_id in &agent_ids {
-            self.generate_codex_agent_toml_for_role(worktree, agent_id, model_backend, transport).await?;
+            self.generate_codex_agent_toml_for_role(worktree, agent_id, model_backend, transport)
+                .await?;
         }
 
         Ok(())
@@ -732,7 +793,10 @@ max_depth = 1
         transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let agents_dir = target.join(".codex").join("agents");
-        transport.create_dir_all(&agents_dir.to_string_lossy()).await.context("Failed to create .codex/agents directory")?;
+        transport
+            .create_dir_all(&agents_dir.to_string_lossy())
+            .await
+            .context("Failed to create .codex/agents directory")?;
 
         let agent_md_path = self
             .orchestrator_dir()
@@ -825,7 +889,8 @@ developer_instructions = """
         }
 
         // Install hook scripts into FORGE worktree
-        self.install_hook_scripts(worktree, "forge", &hooks_source, transport).await?;
+        self.install_hook_scripts(worktree, "forge", &hooks_source, transport)
+            .await?;
 
         // Generate FORGE hooks.json (referencing local copies)
         let forge_hooks = self.build_codex_hooks_json("forge", &hooks_source)?;
@@ -833,11 +898,13 @@ developer_instructions = """
         transport
             .create_dir_all(&forge_hooks_path.parent().unwrap().to_string_lossy())
             .await?;
-        self.write_json_via_transport(forge_hooks_path, &forge_hooks, transport).await?;
+        self.write_json_via_transport(forge_hooks_path, &forge_hooks, transport)
+            .await?;
         info!("Codex hooks.json generated for FORGE");
 
         // Install hook scripts into SENTINEL shared dir
-        self.install_hook_scripts(shared, "sentinel", &hooks_source, transport).await?;
+        self.install_hook_scripts(shared, "sentinel", &hooks_source, transport)
+            .await?;
 
         // Generate SENTINEL hooks.json (referencing local copies)
         let sentinel_hooks = self.build_codex_hooks_json("sentinel", &hooks_source)?;
@@ -845,7 +912,8 @@ developer_instructions = """
         transport
             .create_dir_all(&sentinel_hooks_path.parent().unwrap().to_string_lossy())
             .await?;
-        self.write_json_via_transport(sentinel_hooks_path, &sentinel_hooks, transport).await?;
+        self.write_json_via_transport(sentinel_hooks_path, &sentinel_hooks, transport)
+            .await?;
         info!("Codex hooks.json generated for SENTINEL");
 
         Ok(())
@@ -1493,7 +1561,9 @@ developer_instructions = """
         }
 
         let agents_skills_dir = worktree.join(".agents").join("skills");
-        transport.create_dir_all(&agents_skills_dir.to_string_lossy()).await
+        transport
+            .create_dir_all(&agents_skills_dir.to_string_lossy())
+            .await
             .context("Failed to create .agents/skills directory")?;
 
         for entry in std::fs::read_dir(&skills_source)? {
@@ -1548,7 +1618,9 @@ developer_instructions = """
         }
 
         let agents_skills_dir = target.join(".agents").join("skills");
-        transport.create_dir_all(&agents_skills_dir.to_string_lossy()).await
+        transport
+            .create_dir_all(&agents_skills_dir.to_string_lossy())
+            .await
             .context("Failed to create .agents/skills directory")?;
 
         let prefix = format!("{}-", role);
@@ -1699,7 +1771,10 @@ developer_instructions = """
         transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let codex_dir = target.join(".codex");
-        transport.create_dir_all(&codex_dir.to_string_lossy()).await.context("Failed to create .codex directory")?;
+        transport
+            .create_dir_all(&codex_dir.to_string_lossy())
+            .await
+            .context("Failed to create .codex directory")?;
 
         let permissions_path = codex_dir.join("permissions.toml");
 
@@ -1873,7 +1948,10 @@ enabled = true
         worktree: &Path,
         transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
-        let standards_dir = self.orchestrator_dir().join("orchestration").join("standards");
+        let standards_dir = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("standards");
         let standard_files = ["CODING.md", "SECURITY.md", "REVIEW.md"];
 
         for file_name in &standard_files {
@@ -1886,8 +1964,10 @@ enabled = true
                 continue;
             }
 
-            let content = fs::read_to_string(&source_path)
-                .context(format!("Failed to read standards file {}", source_path.display()))?;
+            let content = fs::read_to_string(&source_path).context(format!(
+                "Failed to read standards file {}",
+                source_path.display()
+            ))?;
 
             let target_path = worktree.join(file_name);
             transport

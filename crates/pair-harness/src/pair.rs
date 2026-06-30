@@ -14,15 +14,17 @@ use tokio::process::Child;
 use tracing::{debug, error, info, warn};
 
 use crate::isolation::FileLockManager;
-use crate::pair_state::{FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, WatcherAdapter};
 #[cfg(feature = "coder")]
 use crate::pair_state::CoderWatcherAdapter;
+use crate::pair_state::{
+    FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, WatcherAdapter,
+};
 use crate::process::{ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
-use crate::transport::{LocalTransport, WorkspaceTransport};
 #[cfg(feature = "coder")]
 use crate::transport::CoderTransport;
+use crate::transport::{LocalTransport, WorkspaceTransport};
 use crate::types::{
     Complexity, ErrorHistory, ErrorHistoryEntry, FsEvent, PairConfig, PairOutcome, StatusJson,
     Ticket, TimeoutProfile, VerificationResult, VerificationState, WorkspaceProvider,
@@ -662,13 +664,14 @@ impl ForgeSentinelPair {
 
         // 7. Start event watcher (filesystem for local, SharedStore polling for Coder)
         let mut watcher = match &self.config.workspace_provider {
-            WorkspaceProvider::Local => PairWatcher::Local(
-                WatcherAdapter::new(&self.config.shared)?
-            ),
+            WorkspaceProvider::Local => {
+                PairWatcher::Local(WatcherAdapter::new(&self.config.shared)?)
+            }
             #[cfg(feature = "coder")]
             WorkspaceProvider::Coder => {
-                let redis_url = self.config.redis_url.as_ref()
-                    .expect("redis_url required for Coder mode (SharedStore-backed event detection)");
+                let redis_url = self.config.redis_url.as_ref().expect(
+                    "redis_url required for Coder mode (SharedStore-backed event detection)",
+                );
                 let store = pocketflow_core::SharedStore::new_redis(redis_url)
                     .await
                     .expect("Failed to create Redis SharedStore for Coder mode");
@@ -677,9 +680,7 @@ impl ForgeSentinelPair {
             #[cfg(not(feature = "coder"))]
             WorkspaceProvider::Coder => {
                 warn!("workspace_provider is Coder but 'coder' feature is not enabled; falling back to local watcher");
-                PairWatcher::Local(
-                    WatcherAdapter::new(&self.config.shared)?
-                )
+                PairWatcher::Local(WatcherAdapter::new(&self.config.shared)?)
             }
         };
 
@@ -1186,24 +1187,23 @@ impl ForgeSentinelPair {
     /// Create a transport appropriate for the configured workspace provider.
     async fn create_transport(&self) -> Box<dyn WorkspaceTransport> {
         match self.config.workspace_provider {
-            WorkspaceProvider::Local => {
-                Box::new(LocalTransport::new(&self.config.project_root))
-            }
+            WorkspaceProvider::Local => Box::new(LocalTransport::new(&self.config.project_root)),
             #[cfg(feature = "coder")]
             WorkspaceProvider::Coder => {
-                let coder_url = self.config.coder_url.as_deref()
-                    .unwrap_or_else(|| {
-                        std::env::var("CODER_URL")
-                            .expect("CODER_URL env var required when workspace_provider is Coder")
-                            .leak()
-                    });
-                let coder_token = self.config.coder_api_token.as_deref()
-                    .unwrap_or_else(|| {
-                        std::env::var("CODER_API_TOKEN")
-                            .expect("CODER_API_TOKEN env var required when workspace_provider is Coder")
-                            .leak()
-                    });
-                let workspace_id = self.config.coder_workspace_id.as_deref()
+                let coder_url = self.config.coder_url.as_deref().unwrap_or_else(|| {
+                    std::env::var("CODER_URL")
+                        .expect("CODER_URL env var required when workspace_provider is Coder")
+                        .leak()
+                });
+                let coder_token = self.config.coder_api_token.as_deref().unwrap_or_else(|| {
+                    std::env::var("CODER_API_TOKEN")
+                        .expect("CODER_API_TOKEN env var required when workspace_provider is Coder")
+                        .leak()
+                });
+                let workspace_id = self
+                    .config
+                    .coder_workspace_id
+                    .as_deref()
                     .expect("coder_workspace_id required when workspace_provider is Coder");
 
                 let session_token = Self::resolve_session_token();

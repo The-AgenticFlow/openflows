@@ -23,6 +23,24 @@ variable "enable_ai_gateway" {
   description = "Enable Coder AI Gateway for model routing"
 }
 
+variable "coder_url" {
+  type        = string
+  default     = ""
+  description = "Coder server URL exposed to the Nexus workspace"
+}
+
+variable "coder_api_token" {
+  type        = string
+  default     = ""
+  description = "Coder API token exposed to the Nexus workspace"
+}
+
+variable "registry_json" {
+  type        = string
+  default     = ""
+  description = "Registry JSON injected into the Nexus workspace"
+}
+
 variable "use_ai_gateway" {
   type    = string
   default = "true"
@@ -60,8 +78,6 @@ resource "coder_agent" "main" {
   os         = "linux"
   arch       = "amd64"
   dir        = "/home/coder/workspace"
-  access_url = "http://coder:7080"
-  startup_script_timeout = 300
 
   startup_script = <<-EOT
     #!/bin/bash
@@ -76,10 +92,9 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} HSET "heartbeat:nexus" \
-        "ts" "$(date +%s)" \
-        "ws_id" "${data.coder_workspace.me.id}" \
-        "status" "running" 2>/dev/null || true
+      redis-cli -u ${var.redis_url} SET "heartbeat:nexus" \
+        "{\"ts\":$(date +%s),\"ws_id\":\"${data.coder_workspace.me.id}\",\"status\":\"running\"}" \
+        2>/dev/null || true
       sleep 30
     done' >/dev/null 2>&1 &
   EOT
@@ -103,6 +118,9 @@ resource "docker_container" "workspace" {
     "REDIS_URL=${var.redis_url}",
     "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
     "USE_AI_GATEWAY=${var.use_ai_gateway}",
+    "CODER_URL=${var.coder_url}",
+    "CODER_API_TOKEN=${var.coder_api_token}",
+    "OPENFLOWS_REGISTRY_JSON=${var.registry_json}",
     "ROLE=nexus",
   ]
 
@@ -120,24 +138,15 @@ data "coder_workspace_owner" "me" {}
 
 # Agent module (configurable CLI backend)
 module "agent" {
-  source  = var.agent_module_source
-  version = var.agent_module_version
+  source  = "registry.coder.com/coder/claude-code/coder"
+  version = "5.2.0"
 
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  permission_mode   = "plan"
   enable_ai_gateway = var.enable_ai_gateway
 
-  mcp = var.mcp_config != "" ? var.mcp_config : null
 }
 
-# Git configuration module
-module "git_config" {
-  source  = "registry.coder.com/coder/git-config/coder"
-  version = "1.0.0"
-
-  agent_id = coder_agent.main.id
-}
 
 # Slack notification module (conditional)
 module "slackme" {

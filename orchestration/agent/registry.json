@@ -17,7 +17,16 @@
       "routing_key": "nexus-key",
       "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
       "allowed_domains": null,
-      "workspace_provider": "coder"
+      "workspace_provider": "coder",
+      "coder_module": {
+        "source": "registry.coder.com/coder/claude-code/coder",
+        "version": "5.2.0",
+        "params": {
+          "enable_ai_gateway": true,
+          "permission_mode": "plan",
+          "workdir": "/home/coder/workspace"
+        }
+      }
     },
     {
       "id": "forge",
@@ -28,7 +37,16 @@
       "routing_key": "forge-key",
       "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
       "allowed_domains": null,
-      "workspace_provider": "coder"
+      "workspace_provider": "coder",
+      "coder_module": {
+        "source": "registry.coder.com/coder/claude-code/coder",
+        "version": "5.2.0",
+        "params": {
+          "enable_ai_gateway": true,
+          "permission_mode": "acceptEdits",
+          "workdir": "/home/coder/workspace"
+        }
+      }
     },
     {
       "id": "sentinel",
@@ -39,7 +57,16 @@
       "routing_key": "sentinel-key",
       "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
       "allowed_domains": null,
-      "workspace_provider": "coder"
+      "workspace_provider": "coder",
+      "coder_module": {
+        "source": "registry.coder.com/coder/claude-code/coder",
+        "version": "5.2.0",
+        "params": {
+          "enable_ai_gateway": true,
+          "permission_mode": "plan",
+          "workdir": "/home/coder/workspace"
+        }
+      }
     },
     {
       "id": "vessel",
@@ -50,7 +77,16 @@
       "routing_key": "vessel-key",
       "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
       "allowed_domains": null,
-      "workspace_provider": "coder"
+      "workspace_provider": "coder",
+      "coder_module": {
+        "source": "registry.coder.com/coder/claude-code/coder",
+        "version": "5.2.0",
+        "params": {
+          "enable_ai_gateway": true,
+          "permission_mode": "acceptEdits",
+          "workdir": "/home/coder/workspace"
+        }
+      }
     },
     {
       "id": "lore",
@@ -61,7 +97,16 @@
       "routing_key": "lore-key",
       "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
       "allowed_domains": null,
-      "workspace_provider": "coder"
+      "workspace_provider": "coder",
+      "coder_module": {
+        "source": "registry.coder.com/coder/claude-code/coder",
+        "version": "5.2.0",
+        "params": {
+          "enable_ai_gateway": true,
+          "permission_mode": "acceptEdits",
+          "workdir": "/home/coder/workspace"
+        }
+      }
     }
   ]
 }

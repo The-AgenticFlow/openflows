@@ -238,7 +238,10 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
                                 let has_forge = body.contains("openflows-forge");
                                 let has_sentinel = body.contains("openflows-sentinel");
                                 if has_forge && has_sentinel {
-                                    checks.push(("Coder templates pushed".to_string(), CheckState::Pass));
+                                    checks.push((
+                                        "Coder templates pushed".to_string(),
+                                        CheckState::Pass,
+                                    ));
                                 } else if has_forge || has_sentinel {
                                     checks.push((
                                         "Coder templates partially pushed".to_string(),
@@ -251,7 +254,10 @@ async fn run_doctor_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
                                     ));
                                 }
                             } else {
-                                checks.push(("Coder templates: could not read response".to_string(), CheckState::Warn));
+                                checks.push((
+                                    "Coder templates: could not read response".to_string(),
+                                    CheckState::Warn,
+                                ));
                             }
                         }
                         Ok(resp) => {

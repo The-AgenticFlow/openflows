@@ -11,9 +11,8 @@ use config::{
     Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider, ACTION_CI_FIX_NEEDED,
     ACTION_CONFLICTS_DETECTED,
 };
-use pair_harness::{
-    transport::{CoderTransport, WorkspaceTransport},
-};
+use openflows_notifier::{NotificationMessage, NotificationService};
+use pair_harness::transport::{CoderTransport, WorkspaceTransport};
 use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -139,6 +138,13 @@ impl VesselNode {
                 .join("worktrees")
                 .join(pair_id),
         )
+    }
+
+    fn worker_role(worker_id: &str) -> &str {
+        worker_id
+            .rsplit_once('-')
+            .map(|(base, _)| base)
+            .unwrap_or(worker_id)
     }
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
@@ -293,7 +299,8 @@ impl VesselNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         if let Some(slot) = slots.get(worker_id) {
             if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id).await;
+                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
+                    .await;
             }
         }
     }
@@ -379,7 +386,8 @@ impl VesselNode {
         conflicted_files: &[String],
         fallback_ticket_id: Option<&str>,
     ) -> bool {
-        let content = Self::build_conflict_resolution_content(pr_info, conflicted_files, fallback_ticket_id);
+        let content =
+            Self::build_conflict_resolution_content(pr_info, conflicted_files, fallback_ticket_id);
         match transport
             .write_file(".pair-shared/CONFLICT_RESOLUTION.md", &content)
             .await
@@ -495,7 +503,10 @@ impl VesselNode {
             return vec![];
         }
 
-        if merge.stderr.contains("refusing to merge unrelated histories") {
+        if merge
+            .stderr
+            .contains("refusing to merge unrelated histories")
+        {
             warn!(
                 branch,
                 "Unrelated histories — retrying with --allow-unrelated-histories"
@@ -700,7 +711,8 @@ impl Node for VesselNode {
                     VesselNotifier::set_ticket_status_merged(store, ticket_id).await;
 
                     // Destroy Coder workspace (archive chats + delete) for this worker
-                    self.destroy_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
+                    self.destroy_coder_workspace_for_pr(store, &pending_prs, *pr_number)
+                        .await;
 
                     // Parallelize post-merge operations for reduced latency
                     // Run GitHub issue close concurrently with store updates
@@ -1063,7 +1075,8 @@ impl Node for VesselNode {
                     VesselNotifier::set_ticket_status_merged(store, &tid).await;
 
                     // Stop Coder workspace if this worker was using one
-                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
+                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number)
+                        .await;
 
                     self.update_ticket_status(store, &tid, "merged_no_ci").await;
                     self.close_github_issue(store, &tid).await;
@@ -1884,15 +1897,81 @@ impl VesselNode {
         store.set(KEY_TICKETS, json!(tickets)).await;
     }
 
+    async fn workspace_link_for_worker(
+        &self,
+        store: &SharedStore,
+        worker_id: Option<&str>,
+    ) -> String {
+        let Some(worker_id) = worker_id else {
+            return String::new();
+        };
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let Some(slot) = slots.get(worker_id) else {
+            return String::new();
+        };
+        let Some(workspace_id) = slot.workspace_id.as_deref() else {
+            return String::new();
+        };
+
+        let coder_url: Option<String> = store.get_typed("coder_url").await;
+        let Some(coder_url) = coder_url else {
+            return String::new();
+        };
+
+        format!(
+            "{}/workspaces/{}",
+            coder_url.trim_end_matches('/'),
+            workspace_id
+        )
+    }
+
+    async fn notify_awaiting_human(
+        &self,
+        store: &SharedStore,
+        ticket_id: &str,
+        worker_id: Option<&str>,
+        reason: &str,
+        github_link: Option<String>,
+    ) {
+        let service = NotificationService::from_env();
+        let role = worker_id.map(Self::worker_role).unwrap_or("vessel");
+        let workspace_link = self.workspace_link_for_worker(store, worker_id).await;
+        let msg = NotificationMessage {
+            ticket_id: ticket_id.to_string(),
+            role: role.to_string(),
+            reason: reason.to_string(),
+            workspace_link,
+            github_link: github_link.unwrap_or_default(),
+        };
+        service.notify(&msg).await;
+    }
+
     async fn mark_ticket_awaiting_human(&self, store: &SharedStore, ticket_id: &str, reason: &str) {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let mut worker_id_for_notification: Option<String> = None;
+        let mut github_link: Option<String> = None;
 
         for ticket in tickets.iter_mut() {
             if ticket.id == ticket_id {
+                worker_id_for_notification = match &ticket.status {
+                    TicketStatus::Assigned { worker_id }
+                    | TicketStatus::InProgress { worker_id }
+                    | TicketStatus::Merged { worker_id, .. }
+                    | TicketStatus::Failed { worker_id, .. }
+                    | TicketStatus::Completed { worker_id, .. }
+                    | TicketStatus::Exhausted { worker_id, .. }
+                    | TicketStatus::AwaitingHuman { worker_id, .. } => Some(worker_id.clone()),
+                    TicketStatus::Open => None,
+                };
+                github_link = ticket.issue_url.clone();
                 let attempts = ticket.attempts + 1;
                 ticket.attempts = attempts;
                 ticket.status = TicketStatus::AwaitingHuman {
-                    worker_id: String::from("vessel"),
+                    worker_id: worker_id_for_notification
+                        .clone()
+                        .unwrap_or_else(|| String::from("vessel")),
                     reason: reason.to_string(),
                     attempts,
                 };
@@ -1901,6 +1980,14 @@ impl VesselNode {
         }
 
         store.set(KEY_TICKETS, json!(tickets)).await;
+        self.notify_awaiting_human(
+            store,
+            ticket_id,
+            worker_id_for_notification.as_deref(),
+            reason,
+            github_link,
+        )
+        .await;
     }
 
     /// Remove PR from pending_prs list.
@@ -1998,7 +2085,8 @@ impl VesselNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         if let Some(slot) = slots.get(worker_id) {
             if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id).await;
+                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
+                    .await;
             }
         }
 

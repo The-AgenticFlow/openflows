@@ -19,14 +19,16 @@ pub mod chat_stream;
 #[cfg(feature = "chats-api")]
 pub use chat_stream::{ChatEvent, ChatStream};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "chats-api"))]
 pub mod mock_chat_server;
 
 pub use types::*;
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "chats-api")]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "chats-api")]
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -126,6 +128,8 @@ impl CoderClient {
             http: self.http.clone(),
             workspace_name: self.workspace_name.clone(),
             session_token: self.session_token.clone(),
+            #[cfg(feature = "chats-api")]
+            cached_models: self.cached_models.clone(),
         }
     }
 
@@ -220,7 +224,10 @@ impl CoderClient {
             .context("Failed to send create_first_user request")?;
 
         if resp.status().is_success() {
-            let user: CoderUser = resp.json().await?;
+            let body = resp.text().await.context("Failed to read create_first_user response body")?;
+            let user: CoderUser = serde_json::from_str(&body).with_context(|| {
+                format!("Failed to deserialize create_first_user response as CoderUser: {}", body)
+            })?;
             info!(user_id = %user.id, username = %user.username, "Created first user");
             Ok(user)
         } else {
@@ -334,7 +341,11 @@ impl CoderClient {
                             if item_name == name {
                                 if let Some(item_key) = item.get("key").and_then(|v| v.as_str()) {
                                     let api_key = CoderApiKey {
-                                        id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        id: item
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
                                         name: item_name.to_string(),
                                         key: item_key.to_string(),
                                     };
@@ -364,13 +375,19 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await?;
-            let key_value = body.get("key").and_then(|v| v.as_str())
+            let key_value = body
+                .get("key")
+                .and_then(|v| v.as_str())
                 .context("No 'key' field in API token response")?
                 .to_string();
-            let key_id = body.get("id").and_then(|v| v.as_str())
+            let key_id = body
+                .get("id")
+                .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let name_value = body.get("name").and_then(|v| v.as_str())
+            let name_value = body
+                .get("name")
+                .and_then(|v| v.as_str())
                 .unwrap_or(name)
                 .to_string();
             let api_key = CoderApiKey {
@@ -415,7 +432,12 @@ impl CoderClient {
 
         // Extract the tar.gz
         let status = std::process::Command::new("tar")
-            .args(["xzf", archive_path.to_str().unwrap(), "-C", temp_dir.to_str().unwrap()])
+            .args([
+                "xzf",
+                archive_path.to_str().unwrap(),
+                "-C",
+                temp_dir.to_str().unwrap(),
+            ])
             .status()
             .context("Failed to run tar to extract template")?;
 
@@ -426,7 +448,14 @@ impl CoderClient {
         // Push the template via coder CLI
         // The CLI reads the directory and pushes it to the Coder server
         let output = tokio::process::Command::new("coder")
-            .args(["templates", "push", "--yes", name, "-d", temp_dir.to_str().unwrap()])
+            .args([
+                "templates",
+                "push",
+                "--yes",
+                name,
+                "-d",
+                temp_dir.to_str().unwrap(),
+            ])
             .env("CODER_URL", &self.base_url)
             .env("CODER_SESSION_TOKEN", self.session_token())
             .stdout(Stdio::piped())
@@ -454,7 +483,9 @@ impl CoderClient {
 
         // Return the template info by listing again
         let templates = self.list_templates().await?;
-        templates.into_iter().find(|t| t.name == name)
+        templates
+            .into_iter()
+            .find(|t| t.name == name)
             .ok_or_else(|| anyhow::anyhow!("Template '{}' not found after push", name))
     }
 
@@ -492,7 +523,10 @@ impl CoderClient {
     /// ID by name, then creates the workspace at `/api/v2/users/{user_id}/workspaces`.
     pub async fn create_workspace(&self, req: &CreateWorkspaceRequest) -> Result<CoderWorkspace> {
         // Resolve the current user ID
-        let user_id = self.get_me().await.map(|u| u.id)
+        let user_id = self
+            .get_me()
+            .await
+            .map(|u| u.id)
             .context("Failed to resolve current user ID for workspace creation")?;
         info!(%user_id, "Resolved user ID for workspace creation");
 
@@ -504,9 +538,7 @@ impl CoderClient {
             let obj = req.parameters.as_object().unwrap();
             serde_json::Value::Array(
                 obj.iter()
-                    .map(|(k, v)| {
-                        serde_json::json!({"name": k, "value": v.as_str().unwrap_or("")})
-                    })
+                    .map(|(k, v)| serde_json::json!({"name": k, "value": v.as_str().unwrap_or("")}))
                     .collect(),
             )
         } else {
@@ -593,17 +625,23 @@ impl CoderClient {
                             Some(CoderWorkspace {
                                 id: v.get("id")?.as_str()?.to_string(),
                                 name: v.get("name")?.as_str()?.to_string(),
-                                owner_name: v.get("owner_name")
+                                owner_name: v
+                                    .get("owner_name")
                                     .and_then(|n| n.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                status: v.get("latest_build")
+                                status: v
+                                    .get("latest_build")
                                     .and_then(|b| b.get("status"))
                                     .and_then(|s| s.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                latest_build: v.get("latest_build")
-                                    .map(|b| serde_json::from_value(b.clone())).transpose().ok().flatten(),
+                                latest_build: v
+                                    .get("latest_build")
+                                    .map(|b| serde_json::from_value(b.clone()))
+                                    .transpose()
+                                    .ok()
+                                    .flatten(),
                             })
                         })
                         .collect()
@@ -755,7 +793,8 @@ impl CoderClient {
         workspace_id: &str,
         command: &str,
     ) -> Result<crate::types::CommandOutput> {
-        self.workspace_exec_with_timeout(workspace_id, command, 60).await
+        self.workspace_exec_with_timeout(workspace_id, command, 60)
+            .await
     }
 
     /// Read a file from a workspace via exec (cat).
@@ -811,7 +850,10 @@ impl CoderClient {
 
     /// Create a new Chat session bound to a workspace.
     /// POST /api/experimental/chats
-    pub async fn create_chat(&self, req: &crate::types::CreateChatRequest) -> Result<crate::types::Chat> {
+    pub async fn create_chat(
+        &self,
+        req: &crate::types::CreateChatRequest,
+    ) -> Result<crate::types::Chat> {
         let resp = self
             .authenticated_request(reqwest::Method::POST, "/api/experimental/chats")
             .json(req)
@@ -834,7 +876,10 @@ impl CoderClient {
     /// GET /api/experimental/chats/{chat}
     pub async fn get_chat(&self, chat_id: &str) -> Result<crate::types::Chat> {
         let resp = self
-            .authenticated_request(reqwest::Method::GET, &format!("/api/experimental/chats/{}", chat_id))
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/experimental/chats/{}", chat_id),
+            )
             .send()
             .await
             .context("Failed to get chat")?;
@@ -976,23 +1021,23 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await?;
-        let models: Vec<crate::types::ModelInfo> = body
-            .get("models")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-            
-        // Update cache
-        {
-            let mut cached = self.cached_models.write().await;
-            *cached = Some(models.clone());
-        }
-        
-        Ok(models)
+            let models: Vec<crate::types::ModelInfo> = body
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Update cache
+            {
+                let mut cached = self.cached_models.write().await;
+                *cached = Some(models.clone());
+            }
+
+            Ok(models)
         } else {
             bail!("Failed to list chat models: {}", resp.status())
         }
@@ -1058,8 +1103,8 @@ impl CoderClient {
             .or_else(|_| std::env::var("AGENTFLOW_REPOSITORY"))
             .unwrap_or_else(|_| "openflows/target".to_string());
         let repo_url = format!("https://github.com/{}.git", repository);
-        let template_name = std::env::var("CODER_FORGE_TEMPLATE")
-            .unwrap_or_else(|_| "openflows-forge".to_string());
+        let template_name =
+            std::env::var("CODER_FORGE_TEMPLATE").unwrap_or_else(|_| "openflows-forge".to_string());
 
         // Create (or find existing) workspace
         info!(
@@ -1139,7 +1184,12 @@ impl CoderClient {
             }
         }
 
-        info!(ticket_id, archived = archived_count, total = matching.len(), "Archived ticket chats");
+        info!(
+            ticket_id,
+            archived = archived_count,
+            total = matching.len(),
+            "Archived ticket chats"
+        );
         Ok(archived_count)
     }
 }

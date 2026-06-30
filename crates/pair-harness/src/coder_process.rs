@@ -34,7 +34,11 @@ impl CoderTaskHandle {
     /// Check if the task is still running by examining the process list.
     pub async fn is_running(&self) -> bool {
         let check_cmd = format!("ps aux | grep -v grep | grep {}", self.task_id);
-        match self.client.workspace_exec_with_timeout(&self.workspace_id, &check_cmd, 10).await {
+        match self
+            .client
+            .workspace_exec_with_timeout(&self.workspace_id, &check_cmd, 10)
+            .await
+        {
             Ok(output) => output.exit_code == 0 && !output.stdout.trim().is_empty(),
             Err(_) => false,
         }
@@ -48,7 +52,8 @@ impl CoderTaskHandle {
             return Ok(());
         }
         let pid = parts[0];
-        let _ = self.client
+        let _ = self
+            .client
             .workspace_exec_with_timeout(&self.workspace_id, &format!("kill -9 {}", pid), 10)
             .await;
         info!(task_id = %self.task_id, pid, "Killed Coder workspace task");
@@ -82,11 +87,24 @@ fn build_cli_command_string(
         CliBackend::Codex => {
             // Add Codex-specific disable flags for non-function tool types.
             // These are the same flags appended by process.rs::append_sse_disable_flags.
-            for flag in &["computer_use", "browser_use", "browser_use_external",
-                         "image_generation", "tool_call_mcp_elicitation", "in_app_browser",
-                         "tool_suggest", "apps", "multi_agent", "plugins", "plugin_hooks",
-                         "plugin_sharing", "skill_mcp_dependency_install", "goals",
-                         "guardian_approval", "workspace_dependencies"] {
+            for flag in &[
+                "computer_use",
+                "browser_use",
+                "browser_use_external",
+                "image_generation",
+                "tool_call_mcp_elicitation",
+                "in_app_browser",
+                "tool_suggest",
+                "apps",
+                "multi_agent",
+                "plugins",
+                "plugin_hooks",
+                "plugin_sharing",
+                "skill_mcp_dependency_install",
+                "goals",
+                "guardian_approval",
+                "workspace_dependencies",
+            ] {
                 parts.push("--disable".to_string());
                 parts.push(quote_arg(flag));
             }
@@ -97,7 +115,10 @@ fn build_cli_command_string(
     if let Some(rd) = redis_url {
         parts.push(format!("SPRINTLESS_REDIS_URL={}", quote_arg(rd)));
     } else if let Some(sp) = shared_path {
-        parts.push(format!("SPRINTLESS_STATE_FILE={}", quote_arg(&sp.to_string_lossy())));
+        parts.push(format!(
+            "SPRINTLESS_STATE_FILE={}",
+            quote_arg(&sp.to_string_lossy())
+        ));
     }
 
     // Set environment for model routing
@@ -141,8 +162,8 @@ pub async fn spawn_forge_coder(
         "Spawning FORGE via Coder workspace exec"
     );
 
-    let cmd_string = build_cli_command_string(
-        backend, config, model_backend, redis_url, Some(shared_path));
+    let cmd_string =
+        build_cli_command_string(backend, config, model_backend, redis_url, Some(shared_path));
 
     // Run FORGE in a detached shell so it persists beyond the exec timeout.
     // The CLI reads the prompt from a file instead of stdin.
@@ -160,7 +181,8 @@ pub async fn spawn_forge_coder(
     if output.exit_code != 0 {
         bail!(
             "FORGE spawn command failed (exit {}): {}",
-            output.exit_code, output.stderr
+            output.exit_code,
+            output.stderr
         );
     }
 
@@ -202,8 +224,8 @@ pub async fn spawn_sentinel_coder(
         "Spawning SENTINEL via Coder workspace exec"
     );
 
-    let cmd_string = build_cli_command_string(
-        backend, config, model_backend, redis_url, Some(shared_path));
+    let cmd_string =
+        build_cli_command_string(backend, config, model_backend, redis_url, Some(shared_path));
 
     let segment = mode.segment_value();
 

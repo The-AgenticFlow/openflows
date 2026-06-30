@@ -281,8 +281,10 @@ impl CoderWatcherAdapter {
         ];
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for watcher");
-            let mut last_values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let rt =
+                tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for watcher");
+            let mut last_values: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             loop {
                 for artifact in &artifacts {

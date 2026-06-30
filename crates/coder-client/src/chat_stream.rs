@@ -46,13 +46,24 @@ impl ChatEvent {
         if let Some(t) = value.get("type").and_then(|v| v.as_str()) {
             match t {
                 "finished" => ChatEvent::Finished {
-                    final_output: value.get("final_output").and_then(|v| v.as_str()).map(String::from),
+                    final_output: value
+                        .get("final_output")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                 },
                 "status_update" => ChatEvent::StatusUpdate {
-                    status: value.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                    status: value
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
                 },
                 "error" => ChatEvent::Error {
-                    message: value.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error").to_string(),
+                    message: value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error")
+                        .to_string(),
                 },
                 "ping" => ChatEvent::Ping,
                 other => {
@@ -91,7 +102,7 @@ impl ChatStream {
     /// * `chat_id` - ID of the chat session to stream
     pub async fn connect(coder_url: &str, token: &str, chat_id: &str) -> Result<Self> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        
+
         let ws_url = if coder_url.starts_with("ws") {
             format!("{}/api/experimental/chats/{}/events", coder_url, chat_id)
         } else {
@@ -103,14 +114,22 @@ impl ChatStream {
 
         debug!(url = %ws_url, chat_id, "Connecting to chat WebSocket stream");
 
-        let mut request = ws_url.clone().into_client_request()
+        let mut request = ws_url
+            .clone()
+            .into_client_request()
             .context("Failed to build WebSocket request")?;
-        request
-            .headers_mut()
-            .insert("Authorization", format!("Bearer {}", token).parse().context("Invalid token")?);
-        request
-            .headers_mut()
-            .insert("Sec-WebSocket-Protocol", "chat-stream-v1".parse().context("Invalid protocol header")?);
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", token)
+                .parse()
+                .context("Invalid token")?,
+        );
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            "chat-stream-v1"
+                .parse()
+                .context("Invalid protocol header")?,
+        );
 
         let (ws, _resp) = connect_async(request)
             .await
@@ -148,15 +167,13 @@ impl ChatStream {
                     }
                 }
             }
-            Message::Binary(data) => {
-                match serde_json::from_slice::<serde_json::Value>(&data) {
-                    Ok(json) => Some(ChatEvent::from_json(json)),
-                    Err(_) => {
-                        warn!("Received binary WebSocket message, skipping");
-                        None
-                    }
+            Message::Binary(data) => match serde_json::from_slice::<serde_json::Value>(&data) {
+                Ok(json) => Some(ChatEvent::from_json(json)),
+                Err(_) => {
+                    warn!("Received binary WebSocket message, skipping");
+                    None
                 }
-            }
+            },
             Message::Close(_) => {
                 debug!("WebSocket connection closed");
                 None
@@ -165,9 +182,7 @@ impl ChatStream {
                 debug!(?payload, "Received WebSocket ping");
                 Some(ChatEvent::Ping)
             }
-            Message::Pong(_payload) => {
-                Some(ChatEvent::Ping)
-            }
+            Message::Pong(_payload) => Some(ChatEvent::Ping),
             Message::Frame(_) => None,
         }
     }
@@ -182,18 +197,16 @@ impl Stream for ChatStream {
         }
 
         match Pin::new(&mut self.ws).poll_next(cx) {
-            Poll::Ready(Some(Ok(msg))) => {
-                match ChatStream::process_message(msg) {
-                    Some(ChatEvent::Finished { .. }) => {
-                        self.finished = true;
-                        Poll::Ready(Some(Ok(ChatEvent::Finished {
-                            final_output: Some("Chat session completed".into()),
-                        })))
-                    }
-                    Some(event) => Poll::Ready(Some(Ok(event))),
-                    None => Poll::Pending,
+            Poll::Ready(Some(Ok(msg))) => match ChatStream::process_message(msg) {
+                Some(ChatEvent::Finished { .. }) => {
+                    self.finished = true;
+                    Poll::Ready(Some(Ok(ChatEvent::Finished {
+                        final_output: Some("Chat session completed".into()),
+                    })))
                 }
-            }
+                Some(event) => Poll::Ready(Some(Ok(event))),
+                None => Poll::Pending,
+            },
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
                 self.finished = true;
@@ -227,7 +240,9 @@ mod tests {
             "final_output": "Done"
         });
         match ChatEvent::from_json(json) {
-            ChatEvent::Finished { final_output } => assert_eq!(final_output, Some("Done".to_string())),
+            ChatEvent::Finished { final_output } => {
+                assert_eq!(final_output, Some("Done".to_string()))
+            }
             other => panic!("Expected Finished, got: {:?}", other),
         }
     }

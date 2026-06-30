@@ -254,7 +254,10 @@ impl WorkspaceTransport for CoderTransport {
         } else if source.is_file() {
             self.copy_file(source, target).await
         } else {
-            anyhow::bail!("symlink_or_copy: source does not exist: {}", source.display());
+            anyhow::bail!(
+                "symlink_or_copy: source does not exist: {}",
+                source.display()
+            );
         }
     }
 

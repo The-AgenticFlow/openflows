@@ -762,9 +762,9 @@ Unchanged — three layers (Nexus reconciliation, workspace crash recovery, Shar
   - Update `docker-compose.yml` if needed
 
 **9.8** Pin Coder server version in `docker-compose.yml`
-  - Change `ghcr.io/coder/coder:latest` to a pinned version (e.g., `ghcr.io/coder/coder:v2.35.0`)
-  - Document the pinned version and required minimum version in a new `docs/coder-compatibility.md`
-  - Bump only after testing Chats API changes against the pinned version
+  - Keep `ghcr.io/coder/coder` configurable via `CODER_IMAGE_TAG`
+  - Default to `latest` until a tested pinned version is available in GHCR
+  - Document any pinned version and the validation steps in `docs/coder-compatibility.md`
 
 **9.9** Configure Coder AI Gateway model access per provider
   - In Coder server config, enable AI Governance Add-On with model access per provider
@@ -888,7 +888,7 @@ pub enum NotificationChannel {
 | CLI mode enforces SharedStore contracts | All agents run in CLI mode inside workspaces. The harness binary enforces typed Redis schemas. Chats API provides lifecycle management (create, monitor, archive); SharedStore provides coordination state. This two-surface architecture is explicit and deterministic. |
 | Who heals Nexus? | Nexus is long-lived; `reconcile()` doesn't apply to it. Coder workspace auto-start restarts crashed Nexus. The `openflows-setup` binary (outside Coder) handles full re-creation. Nexus state lives in SharedStore (Redis), so a fresh workspace resumes where it left off. |
 | Network lockdown vs Redis dependency | Coder templates recommend restricting workspace network access to control-plane + git provider. OpenFlows requires all workspaces to reach Redis directly. This must be documented as an intentional exception in the network/governance config: allow egress to `REDIS_URL` from all `openflows-*` workspaces. |
-| Coder server version pinning | The Chats API is experimental and "may change without notice until GA." Running `ghcr.io/coder/coder:latest` is risky. Pin the Coder server image to a specific version in `docker-compose.yml` and bump deliberately after testing each new release. |
+| Coder server image availability | The Chats API is experimental and "may change without notice until GA." `latest` is the practical default while GHCR tag publication can lag; if you pin a version, verify the tag exists before relying on it. |
 
 ## Validation Plan
 

@@ -109,12 +109,13 @@ impl SharedDirWatcher {
     /// Handle errors from starting the directory watcher.
     fn handle_watch_error(err: &notify::Error, shared_dir: &Path) -> Result<()> {
         let err_str = err.to_string().to_lowercase();
-        
+
         // Check for inotify watch limit errors
-        if err_str.contains("no space left on device") 
+        if err_str.contains("no space left on device")
             || err_str.contains("inotify")
             || err_str.contains("too many open files")
-            || Self::is_max_files_watch_error(err, &err_str) {
+            || Self::is_max_files_watch_error(err, &err_str)
+        {
             warn!(
                 path = %shared_dir.display(),
                 "Filesystem watch limit reached. Falling back to polling mode."
@@ -130,12 +131,12 @@ impl SharedDirWatcher {
             ))
         }
     }
-    
+
     /// Check if the error is related to max files watch limit
     fn is_max_files_watch_error(_err: &notify::Error, err_str: &str) -> bool {
         err_str.contains("max") && err_str.contains("watch")
-        || err_str.contains("os file watch limit")
-        || err_str.contains("watch limit")
+            || err_str.contains("os file watch limit")
+            || err_str.contains("watch limit")
     }
 
     /// Classify a filesystem event into our FsEvent type.

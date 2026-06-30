@@ -181,9 +181,7 @@ impl Watchdog {
                 }
             }
             WatchdogMode::Coder => {
-                debug!(
-                    "Segment loop check skipped in Coder mode — handled by SharedStore watcher"
-                );
+                debug!("Segment loop check skipped in Coder mode — handled by SharedStore watcher");
             }
         }
 

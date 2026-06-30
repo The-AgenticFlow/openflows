@@ -2,23 +2,33 @@
 use agent_client::{AgentDecision, AgentPersona, AgentRunner};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use coder_client::{CoderClient, CreateWorkspaceRequest};
-use config::{
-    state::{full_ticket_key, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_WORKSPACE, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider,
-    ACTION_MERGE_PRS, ACTION_NO_WORK,
+use coder_client::{
+    AgentStatus, ChatStatus, CoderClient, CreateWorkspaceRequest, WorkspaceStatus, CHAT_LABEL_FLOW,
+    CHAT_LABEL_ROLE, CHAT_LABEL_TICKET,
 };
+use config::{
+    state::{
+        full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord, KEY_COMMAND_GATE,
+        KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
+        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+    },
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider, ACTION_MERGE_PRS,
+    ACTION_NO_WORK,
+};
+use openflows_notifier::{NotificationMessage, NotificationService};
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
 const KEY_CI_READINESS: &str = "ci_readiness";
 const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
+const HEARTBEAT_STALE_AFTER_SECS: u64 = 90;
 /// Maximum CI fix attempts before refusing to re-add a PR.
 /// Must match vessel::node::MAX_CI_FIX_ATTEMPTS to stay in sync.
 const MAX_CI_FIX_ATTEMPTS_NEXUS: u32 = 3;
@@ -223,8 +233,29 @@ impl NexusNode {
     }
 
     fn resolve_github_token(&self) -> Result<String> {
-        let registry = Registry::load(&self.registry_path)?;
+        let registry = self.load_registry()?;
         registry.resolve_github_token("nexus")
+    }
+
+    fn load_registry(&self) -> Result<Registry> {
+        if self.registry_path.exists() {
+            return Registry::load(&self.registry_path);
+        }
+
+        if let Ok(path) = std::env::var("OPENFLOWS_REGISTRY_PATH") {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Registry::load(path);
+            }
+        }
+
+        if let Ok(content) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
+            let registry: Registry = serde_json::from_str(&content)
+                .context("Failed to parse OPENFLOWS_REGISTRY_JSON")?;
+            return Ok(registry);
+        }
+
+        Registry::load(&self.registry_path)
     }
 
     async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
@@ -541,11 +572,13 @@ impl NexusNode {
     }
 
     async fn sync_registry(&self, store: &SharedStore) -> Result<()> {
-        if !self.registry_path.exists() {
-            return Ok(());
-        }
-
-        let registry = Registry::load(&self.registry_path)?;
+        let registry = match self.load_registry() {
+            Ok(registry) => registry,
+            Err(e) => {
+                warn!(error = %e, "Unable to load registry for sync");
+                return Ok(());
+            }
+        };
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
@@ -553,8 +586,10 @@ impl NexusNode {
         let all_slot_ids = registry.all_worker_slots();
 
         // Remove slots for workers that are no longer in the registry
-        let current_ids: std::collections::HashSet<&str> = all_slot_ids.iter().map(|s| s.as_str()).collect();
-        let to_remove: Vec<String> = slots.keys()
+        let current_ids: std::collections::HashSet<&str> =
+            all_slot_ids.iter().map(|s| s.as_str()).collect();
+        let to_remove: Vec<String> = slots
+            .keys()
             .filter(|k| !current_ids.contains(k.as_str()))
             .cloned()
             .collect();
@@ -565,7 +600,8 @@ impl NexusNode {
         }
 
         for slot_id in &all_slot_ids {
-            let provider = registry.resolve_workspace_provider(slot_id)
+            let provider = registry
+                .resolve_workspace_provider(slot_id)
                 .unwrap_or(config::WorkspaceProvider::Local);
 
             match slots.get_mut(slot_id) {
@@ -603,8 +639,14 @@ impl NexusNode {
     }
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
-        let coder_url: Option<String> = store.get_typed("coder_url").await;
-        let coder_token: Option<String> = store.get_typed("coder_api_token").await;
+        let coder_url: Option<String> = store
+            .get_typed("coder_url")
+            .await
+            .or_else(|| std::env::var("CODER_URL").ok());
+        let coder_token: Option<String> = store
+            .get_typed("coder_api_token")
+            .await
+            .or_else(|| std::env::var("CODER_API_TOKEN").ok());
         match (coder_url, coder_token) {
             (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
                 Some(CoderClient::new(&url, &token))
@@ -650,15 +692,12 @@ impl NexusNode {
             .filter(|s| !s.is_empty())
             .map(|repo| format!("https://github.com/{}.git", repo))
             .unwrap_or_default();
-        let template_name = std::env::var("CODER_FORGE_TEMPLATE")
-            .unwrap_or_else(|_| "openflows-forge".to_string());
+        let template_name = Self::template_name_for_worker(worker_id);
         let workspace_name = Self::workspace_name_for_ticket(worker_id, ticket_id);
 
         info!(
             worker_id,
-            ticket_id,
-            template_name,
-            "Provisioning Coder workspace for worker"
+            ticket_id, template_name, "Provisioning Coder workspace for worker"
         );
 
         let workspace = client
@@ -676,7 +715,9 @@ impl NexusNode {
         if let Some(slot) = slots.get_mut(worker_id) {
             slot.workspace_id = Some(workspace.id.clone());
         }
-        store.set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?).await;
+        store
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+            .await;
 
         info!(
             worker_id,
@@ -694,7 +735,10 @@ impl NexusNode {
         let client = match Self::coder_client_from_store(store).await {
             Some(client) => client,
             None => {
-                warn!(workspace_id, "No Coder client available to destroy workspace");
+                warn!(
+                    workspace_id,
+                    "No Coder client available to destroy workspace"
+                );
                 return Ok(());
             }
         };
@@ -736,7 +780,9 @@ impl NexusNode {
                 slot.workspace_id = None;
             }
         }
-        store.set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?).await;
+        store
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+            .await;
 
         info!(workspace_id, "Destroyed Coder workspace");
         Ok(())
@@ -744,12 +790,18 @@ impl NexusNode {
 
     /// Build a workspace name following the `{role}-T-{ticket_id}` convention.
     fn workspace_name_for_ticket(worker_id: &str, ticket_id: &str) -> String {
-        // Extract role from worker_id (e.g., "forge-1" -> "forge")
-        let role = worker_id
-            .rsplit_once('-')
-            .map(|(base, _)| base)
-            .unwrap_or(worker_id);
+        let role = Self::worker_role(worker_id);
         format!("{}-T-{}", role, ticket_id)
+    }
+
+    /// Resolve the template name for a worker role.
+    fn template_name_for_worker(worker_id: &str) -> String {
+        let role = Self::worker_role(worker_id);
+        let env_key = format!(
+            "CODER_{}_TEMPLATE",
+            role.to_ascii_uppercase().replace('-', "_")
+        );
+        std::env::var(&env_key).unwrap_or_else(|_| format!("openflows-{}", role))
     }
 
     /// Create a Coder Chat for a ticket assignment and store the chat ID in SharedStore.
@@ -766,16 +818,18 @@ impl NexusNode {
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
-                debug!(worker_id, ticket_id, "No Coder client available, skipping chat creation");
+                debug!(
+                    worker_id,
+                    ticket_id, "No Coder client available, skipping chat creation"
+                );
                 return;
             }
         };
 
-        let slots: HashMap<String, WorkerSlot> =
-            match store.get_typed(KEY_WORKER_SLOTS).await {
-                Some(s) => s,
-                None => return,
-            };
+        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
+            Some(s) => s,
+            None => return,
+        };
 
         let slot = match slots.get(worker_id) {
             Some(s) => s,
@@ -789,7 +843,10 @@ impl NexusNode {
         let workspace_id = match &slot.workspace_id {
             Some(ws) => ws.clone(),
             None => {
-                warn!(worker_id, ticket_id, "Workspace not yet provisioned, skipping chat creation");
+                warn!(
+                    worker_id,
+                    ticket_id, "Workspace not yet provisioned, skipping chat creation"
+                );
                 return;
             }
         };
@@ -810,9 +867,70 @@ impl NexusNode {
             "role": role,
         });
 
+        let chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
+        let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+
+        let existing_chat_id: Option<String> = store.get_typed(&chat_key).await;
+        if let Some(existing_chat_id) = existing_chat_id {
+            match client.get_chat(&existing_chat_id).await {
+                Ok(chat) => {
+                    if chat.status() == ChatStatus::Waiting {
+                        let last_action: Option<String> = store.get_typed(&action_key).await;
+                        if matches!(last_action.as_deref(), None | Some("completed")) {
+                            let follow_up_prompt = format!(
+                                "Continue work on ticket {} from the latest repository state. \
+                                 Review the current branch, the dispatch payload, and pick up where the previous pass left off.",
+                                ticket_id
+                            );
+                            if let Ok(message) = client
+                                .send_chat_message(
+                                    &chat.id,
+                                    vec![coder_client::types::ChatInputPart::text(
+                                        follow_up_prompt,
+                                    )],
+                                )
+                                .await
+                            {
+                                info!(
+                                    chat_id = %chat.id,
+                                    worker_id,
+                                    ticket_id,
+                                    message_id = %message.id,
+                                    "Sent follow-up message to running Coder chat"
+                                );
+                                store.set(&action_key, json!("follow_up_sent")).await;
+                                return;
+                            }
+                        }
+                    }
+
+                    debug!(
+                        chat_id = %chat.id,
+                        worker_id,
+                        ticket_id,
+                        status = ?chat.status(),
+                        "Existing Coder chat is already active; no new message needed"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        chat_id = %existing_chat_id,
+                        worker_id,
+                        ticket_id,
+                        error = %e,
+                        "Existing chat lookup failed; recreating assignment chat"
+                    );
+                }
+            }
+        }
+
         // Create the chat with an initial prompt
-        let prompt = format!("Work on ticket {}: Review the dispatch payload and begin implementation.", ticket_id);
-        
+        let prompt = format!(
+            "Work on ticket {}: Review the dispatch payload and begin implementation.",
+            ticket_id
+        );
+
         // Get model config ID - try cache first, then fetch
         let model_config_id = "default"; // For now, use default. Can be enhanced later with caching.
 
@@ -835,11 +953,9 @@ impl NexusNode {
                 );
 
                 // Store chat ID in SharedStore
-                let chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
                 store.set(&chat_key, json!(chat.id)).await;
 
                 // Store chat_action as "created" for tracking
-                let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
                 store.set(&action_key, json!("created")).await;
 
                 // Update dispatch payload with actual chat ID
@@ -1367,12 +1483,497 @@ impl NexusNode {
         recovery.has_orphaned_tickets = !recovery.orphaned_tickets.is_empty();
         recovery.has_stale_workers = !recovery.stale_workers.is_empty();
         recovery.has_completed_without_pr = !recovery.completed_without_pr.is_empty();
+        recovery.has_crashed_workspaces = !recovery.crashed_workspaces.is_empty();
+        recovery.has_crashed_chats = !recovery.crashed_chats.is_empty();
         recovery.needs_recovery = recovery.has_unmerged_prs
             || recovery.has_orphaned_tickets
             || recovery.has_stale_workers
-            || recovery.has_completed_without_pr;
+            || recovery.has_completed_without_pr
+            || recovery.has_crashed_workspaces
+            || recovery.has_crashed_chats;
 
         recovery
+    }
+
+    fn ticket_worker_id(ticket: &Ticket) -> Option<&str> {
+        match &ticket.status {
+            TicketStatus::Assigned { worker_id }
+            | TicketStatus::InProgress { worker_id }
+            | TicketStatus::Merged { worker_id, .. }
+            | TicketStatus::Failed { worker_id, .. }
+            | TicketStatus::Completed { worker_id, .. }
+            | TicketStatus::Exhausted { worker_id, .. }
+            | TicketStatus::AwaitingHuman { worker_id, .. } => Some(worker_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn worker_role(worker_id: &str) -> &str {
+        worker_id
+            .rsplit_once('-')
+            .map(|(base, _)| base)
+            .unwrap_or(worker_id)
+    }
+
+    async fn workspace_link_for_worker(
+        &self,
+        store: &SharedStore,
+        worker_id: Option<&str>,
+    ) -> String {
+        let Some(worker_id) = worker_id else {
+            return String::new();
+        };
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let Some(slot) = slots.get(worker_id) else {
+            return String::new();
+        };
+        let Some(workspace_id) = slot.workspace_id.as_deref() else {
+            return String::new();
+        };
+
+        let coder_url: Option<String> = store.get_typed("coder_url").await;
+        let Some(coder_url) = coder_url else {
+            return String::new();
+        };
+
+        format!(
+            "{}/workspaces/{}",
+            coder_url.trim_end_matches('/'),
+            workspace_id
+        )
+    }
+
+    async fn notify_awaiting_human(
+        &self,
+        store: &SharedStore,
+        ticket_id: &str,
+        worker_id: Option<&str>,
+        reason: &str,
+        github_link: Option<String>,
+    ) {
+        let service = NotificationService::from_env();
+        let role = worker_id.map(Self::worker_role).unwrap_or("nexus");
+        let workspace_link = self.workspace_link_for_worker(store, worker_id).await;
+        let msg = NotificationMessage {
+            ticket_id: ticket_id.to_string(),
+            role: role.to_string(),
+            reason: reason.to_string(),
+            workspace_link,
+            github_link: github_link.unwrap_or_default(),
+        };
+        service.notify(&msg).await;
+    }
+
+    async fn mark_ticket_awaiting_human(
+        &self,
+        store: &SharedStore,
+        ticket_id: &str,
+        worker_id: &str,
+        reason: &str,
+    ) {
+        let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let mut github_link: Option<String> = None;
+
+        for ticket in tickets.iter_mut() {
+            if ticket.id == ticket_id {
+                github_link = ticket.issue_url.clone();
+                let attempts = ticket.attempts + 1;
+                ticket.attempts = attempts;
+                ticket.status = TicketStatus::AwaitingHuman {
+                    worker_id: worker_id.to_string(),
+                    reason: reason.to_string(),
+                    attempts,
+                };
+                break;
+            }
+        }
+
+        store.set(KEY_TICKETS, json!(tickets)).await;
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
+                json!("awaiting_human"),
+            )
+            .await;
+        self.notify_awaiting_human(store, ticket_id, Some(worker_id), reason, github_link)
+            .await;
+    }
+
+    async fn inspect_coder_recovery(
+        &self,
+        store: &SharedStore,
+        tickets: &[Ticket],
+        worker_slots: &HashMap<String, WorkerSlot>,
+        recovery: &mut FlowRecovery,
+    ) -> Result<()> {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        let chats = match client.list_chats().await {
+            Ok(chats) => chats,
+            Err(e) => {
+                warn!(error = %e, "Failed to list Coder chats for recovery inspection");
+                return Ok(());
+            }
+        };
+
+        for chat in chats {
+            let flow = chat.labels.get(CHAT_LABEL_FLOW).and_then(|v| v.as_str());
+            if flow != Some("openflows") {
+                continue;
+            }
+
+            let Some(ticket_id) = chat.labels.get(CHAT_LABEL_TICKET).and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let role = chat
+                .labels
+                .get(CHAT_LABEL_ROLE)
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            store
+                .set(
+                    &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
+                    json!(chat.status().as_str()),
+                )
+                .await;
+
+            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+            let last_action: Option<String> = store.get_typed(&action_key).await;
+            let worker_id = tickets
+                .iter()
+                .find(|ticket| ticket.id == ticket_id)
+                .and_then(Self::ticket_worker_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| role.to_string());
+
+            match chat.status() {
+                ChatStatus::Error => {
+                    recovery.crashed_chats.push(CrashedChat {
+                        chat_id: chat.id.clone(),
+                        worker_id,
+                        ticket_id: ticket_id.to_string(),
+                        reason: "chat entered error status".to_string(),
+                    });
+                }
+                ChatStatus::Waiting => {
+                    if last_action.as_deref() == Some("interrupted") {
+                        recovery.crashed_chats.push(CrashedChat {
+                            chat_id: chat.id.clone(),
+                            worker_id,
+                            ticket_id: ticket_id.to_string(),
+                            reason: "chat was interrupted after a workspace crash".to_string(),
+                        });
+                    } else if !matches!(
+                        last_action.as_deref(),
+                        Some("follow_up_sent") | Some("completed")
+                    ) {
+                        store.set(&action_key, json!("completed")).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for slot in worker_slots.values() {
+            let Some(workspace_id) = slot.workspace_id.as_deref() else {
+                continue;
+            };
+            if slot.workspace_provider != WorkspaceProvider::Coder {
+                continue;
+            }
+
+            let ticket_id = match &slot.status {
+                WorkerStatus::Assigned { ticket_id, .. }
+                | WorkerStatus::Working { ticket_id, .. }
+                | WorkerStatus::Done { ticket_id, .. }
+                | WorkerStatus::Suspended { ticket_id, .. } => ticket_id.clone(),
+                WorkerStatus::Idle => String::new(),
+            };
+            if ticket_id.is_empty() {
+                continue;
+            }
+
+            let role = Self::worker_role(&slot.id);
+            let heartbeat_reason = match store
+                .get_typed::<HeartbeatRecord>(&heartbeat_key(role, &ticket_id))
+                .await
+            {
+                Some(heartbeat) => {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let age_secs = now_ms.saturating_sub(heartbeat.ts) / 1_000;
+                    if heartbeat.status != "running" {
+                        Some(format!(
+                            "heartbeat status is {} for ws {}",
+                            heartbeat.status, heartbeat.ws_id
+                        ))
+                    } else if age_secs > HEARTBEAT_STALE_AFTER_SECS {
+                        Some(format!(
+                            "heartbeat stale after {}s for ws {}",
+                            age_secs, heartbeat.ws_id
+                        ))
+                    } else if heartbeat.ws_id != workspace_id {
+                        Some(format!(
+                            "heartbeat ws mismatch (heartbeat={}, slot={})",
+                            heartbeat.ws_id, workspace_id
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(reason) = heartbeat_reason {
+                let recovery_attempts = store
+                    .get_typed::<u32>(&full_ticket_key_flat(
+                        &ticket_id,
+                        KEY_TICKET_RECOVERY_ATTEMPTS,
+                    ))
+                    .await
+                    .unwrap_or(0);
+                recovery.crashed_workspaces.push(CrashedWorkspace {
+                    workspace_id: workspace_id.to_string(),
+                    worker_id: slot.id.clone(),
+                    ticket_id: ticket_id.clone(),
+                    reason,
+                    recovery_attempts,
+                });
+                continue;
+            }
+
+            let recovery_attempts = if ticket_id.is_empty() {
+                0
+            } else {
+                store
+                    .get_typed::<u32>(&full_ticket_key_flat(
+                        &ticket_id,
+                        KEY_TICKET_RECOVERY_ATTEMPTS,
+                    ))
+                    .await
+                    .unwrap_or(0)
+            };
+
+            let reason = match client.get_workspace(workspace_id).await {
+                Ok(workspace) => {
+                    let workspace_status = workspace.workspace_status();
+                    let agent_status = workspace.agent_status();
+                    match workspace_status {
+                        WorkspaceStatus::Running if agent_status == AgentStatus::Connected => None,
+                        WorkspaceStatus::Running => {
+                            Some(format!("workspace agent status is {:?}", agent_status))
+                        }
+                        WorkspaceStatus::Pending => Some("workspace is pending".to_string()),
+                        WorkspaceStatus::Starting => Some("workspace is starting".to_string()),
+                        WorkspaceStatus::Stopping => Some("workspace is stopping".to_string()),
+                        WorkspaceStatus::Stopped => Some("workspace is stopped".to_string()),
+                        WorkspaceStatus::Failed => Some("workspace failed".to_string()),
+                        WorkspaceStatus::Deleting => Some("workspace is deleting".to_string()),
+                        WorkspaceStatus::Deleted => Some("workspace is deleted".to_string()),
+                        WorkspaceStatus::Unknown(raw) => {
+                            Some(format!("workspace status is {}", raw))
+                        }
+                    }
+                }
+                Err(e) => Some(format!("workspace lookup failed: {}", e)),
+            };
+
+            if let Some(reason) = reason {
+                recovery.crashed_workspaces.push(CrashedWorkspace {
+                    workspace_id: workspace_id.to_string(),
+                    worker_id: slot.id.clone(),
+                    ticket_id,
+                    reason,
+                    recovery_attempts,
+                });
+            }
+        }
+
+        recovery.has_crashed_workspaces = !recovery.crashed_workspaces.is_empty();
+        recovery.has_crashed_chats = !recovery.crashed_chats.is_empty();
+        recovery.needs_recovery = recovery.needs_recovery
+            || recovery.has_crashed_workspaces
+            || recovery.has_crashed_chats;
+
+        Ok(())
+    }
+
+    async fn increment_recovery_attempts(&self, store: &SharedStore, ticket_id: &str) -> u32 {
+        let key = full_ticket_key_flat(ticket_id, KEY_TICKET_RECOVERY_ATTEMPTS);
+        let current: u32 = store.get_typed(&key).await.unwrap_or(0);
+        let next = current + 1;
+        store.set(&key, json!(next)).await;
+        next
+    }
+
+    async fn repair_coder_recovery(
+        &self,
+        store: &SharedStore,
+        recovery: &FlowRecovery,
+    ) -> Result<()> {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        for crashed_chat in &recovery.crashed_chats {
+            let action_key = full_ticket_key(
+                &crashed_chat.ticket_id,
+                KEY_TICKET_CHAT_ACTION,
+                Self::worker_role(&crashed_chat.worker_id),
+            );
+            store.set(&action_key, json!("interrupted")).await;
+
+            if let Err(e) = client.interrupt_chat(&crashed_chat.chat_id).await {
+                warn!(
+                    chat_id = %crashed_chat.chat_id,
+                    ticket_id = %crashed_chat.ticket_id,
+                    error = %e,
+                    "Failed to interrupt crashed chat"
+                );
+            }
+        }
+
+        for crashed_workspace in &recovery.crashed_workspaces {
+            if crashed_workspace.ticket_id.is_empty() {
+                continue;
+            }
+
+            let attempts = self
+                .increment_recovery_attempts(store, &crashed_workspace.ticket_id)
+                .await;
+
+            if attempts >= Ticket::MAX_ATTEMPTS {
+                let reason = format!(
+                    "workspace {} crashed {} times and requires human intervention",
+                    crashed_workspace.workspace_id, attempts
+                );
+                self.mark_ticket_awaiting_human(
+                    store,
+                    &crashed_workspace.ticket_id,
+                    &crashed_workspace.worker_id,
+                    &reason,
+                )
+                .await;
+                warn!(
+                    workspace_id = %crashed_workspace.workspace_id,
+                    ticket_id = %crashed_workspace.ticket_id,
+                    attempts,
+                    "Recovery limit reached — escalating to human intervention"
+                );
+                continue;
+            }
+
+            match client.get_workspace(&crashed_workspace.workspace_id).await {
+                Ok(workspace) => match workspace.workspace_status() {
+                    WorkspaceStatus::Stopped | WorkspaceStatus::Stopping => {
+                        info!(
+                            workspace_id = %crashed_workspace.workspace_id,
+                            ticket_id = %crashed_workspace.ticket_id,
+                            "Restarting stopped Coder workspace"
+                        );
+                        if let Err(e) = client
+                            .start_workspace(&crashed_workspace.workspace_id)
+                            .await
+                        {
+                            warn!(
+                                workspace_id = %crashed_workspace.workspace_id,
+                                ticket_id = %crashed_workspace.ticket_id,
+                                error = %e,
+                                "Failed to restart Coder workspace"
+                            );
+                        }
+                    }
+                    WorkspaceStatus::Running => {
+                        let heartbeat_stale = crashed_workspace.reason.contains("heartbeat");
+                        if workspace.agent_status() != AgentStatus::Connected || heartbeat_stale {
+                            warn!(
+                                workspace_id = %crashed_workspace.workspace_id,
+                                ticket_id = %crashed_workspace.ticket_id,
+                                agent_status = ?workspace.agent_status(),
+                                reason = %crashed_workspace.reason,
+                                "Restarting running Coder workspace to recover stale agent/heartbeat"
+                            );
+                            let _ = client.stop_workspace(&crashed_workspace.workspace_id).await;
+                            if let Err(e) = client
+                                .start_workspace(&crashed_workspace.workspace_id)
+                                .await
+                            {
+                                warn!(
+                                    workspace_id = %crashed_workspace.workspace_id,
+                                    ticket_id = %crashed_workspace.ticket_id,
+                                    error = %e,
+                                    "Failed to restart running Coder workspace"
+                                );
+                            }
+                        }
+                    }
+                    WorkspaceStatus::Pending
+                    | WorkspaceStatus::Starting
+                    | WorkspaceStatus::Failed
+                    | WorkspaceStatus::Deleting
+                    | WorkspaceStatus::Deleted
+                    | WorkspaceStatus::Unknown(_) => {
+                        info!(
+                            workspace_id = %crashed_workspace.workspace_id,
+                            ticket_id = %crashed_workspace.ticket_id,
+                            status = ?workspace.workspace_status(),
+                            "Recreating Coder workspace after crash"
+                        );
+
+                        let mut slots: HashMap<String, WorkerSlot> =
+                            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                        if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
+                            slot.workspace_id = None;
+                            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                        }
+
+                        if let Err(e) = self
+                            .provision_coder_workspace(
+                                store,
+                                &crashed_workspace.worker_id,
+                                &crashed_workspace.ticket_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                worker_id = %crashed_workspace.worker_id,
+                                ticket_id = %crashed_workspace.ticket_id,
+                                error = %e,
+                                "Failed to recreate Coder workspace"
+                            );
+                            continue;
+                        }
+
+                        self.create_chat_for_assignment(
+                            store,
+                            &crashed_workspace.worker_id,
+                            &crashed_workspace.ticket_id,
+                        )
+                        .await;
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        workspace_id = %crashed_workspace.workspace_id,
+                        ticket_id = %crashed_workspace.ticket_id,
+                        error = %e,
+                        "Could not inspect crashed workspace"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1459,7 +2060,35 @@ impl Node for NexusNode {
         let pending_prs_vec: Vec<Value> = open_prs.as_array().cloned().unwrap_or_default();
         let worker_slots_map: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let recovery = Self::reconcile(&tickets, &worker_slots_map, &pending_prs_vec);
+        let mut recovery = Self::reconcile(&tickets, &worker_slots_map, &pending_prs_vec);
+        if let Err(e) = self
+            .inspect_coder_recovery(store, &tickets, &worker_slots_map, &mut recovery)
+            .await
+        {
+            warn!(error = %e, "Failed to inspect Coder recovery state");
+        }
+        if recovery.has_crashed_workspaces || recovery.has_crashed_chats {
+            if let Err(e) = self.repair_coder_recovery(store, &recovery).await {
+                warn!(error = %e, "Failed to apply Coder recovery actions");
+            }
+        }
+
+        for (worker_id, slot) in &worker_slots_map {
+            if slot.workspace_provider != WorkspaceProvider::Coder {
+                continue;
+            }
+            let ticket_id = match &slot.status {
+                WorkerStatus::Assigned { ticket_id, .. }
+                | WorkerStatus::Working { ticket_id, .. }
+                | WorkerStatus::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
+                _ => None,
+            };
+
+            if let Some(ticket_id) = ticket_id {
+                self.create_chat_for_assignment(store, worker_id, ticket_id)
+                    .await;
+            }
+        }
 
         if recovery.needs_recovery {
             info!(
@@ -1467,6 +2096,8 @@ impl Node for NexusNode {
                 orphaned_tickets = recovery.orphaned_tickets.len(),
                 stale_workers = recovery.stale_workers.len(),
                 completed_without_pr = recovery.completed_without_pr.len(),
+                crashed_workspaces = recovery.crashed_workspaces.len(),
+                crashed_chats = recovery.crashed_chats.len(),
                 "Flow recovery: inconsistencies detected"
             );
         }
@@ -1502,7 +2133,7 @@ impl Node for NexusNode {
     async fn exec(&self, context: Value) -> Result<Value> {
         info!("Nexus calling AgentRunner for orchestration...");
 
-        let registry = Registry::load(&self.registry_path)?;
+        let registry = self.load_registry()?;
         let model_backend = registry.get("nexus").and_then(|e| e.model_backend.clone());
 
         let github_token = self.resolve_github_token()?;
@@ -1614,17 +2245,18 @@ impl Node for NexusNode {
                             .provision_coder_workspace(store, worker_id, ticket_id)
                             .await
                         {
-                        warn!(
-                            worker_id,
-                            ticket_id,
-                            error = %e,
-                            "Failed to provision Coder workspace"
-                        );
+                            warn!(
+                                worker_id,
+                                ticket_id,
+                                error = %e,
+                                "Failed to provision Coder workspace"
+                            );
                         }
                     }
 
                     // Create a Coder Chat for this assignment and record it in SharedStore
-                    self.create_chat_for_assignment(store, worker_id, ticket_id).await;
+                    self.create_chat_for_assignment(store, worker_id, ticket_id)
+                        .await;
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
                     if let Some(issue_url) = &decision.issue_url {

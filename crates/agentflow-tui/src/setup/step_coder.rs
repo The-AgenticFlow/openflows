@@ -83,7 +83,10 @@ impl CoderStep {
                 if self.selected == 1 {
                     lines.push("── Coder Settings ──".to_string());
                     lines.push(format!("  URL:     {}", self.coder_url));
-                    lines.push(format!("  Password: {}", "*".repeat(self.admin_password.len() + 1)));
+                    lines.push(format!(
+                        "  Password: {}",
+                        "*".repeat(self.admin_password.len() + 1)
+                    ));
                     lines.push(String::new());
                     if self.advanced_open {
                         lines.push("── Advanced Options ──".to_string());
@@ -93,9 +96,15 @@ impl CoderStep {
                             lines.push("  [ ] Enable AI Gateway (Premium)".to_string());
                         }
                         if self.slackme_toggle {
-                            lines.push("  [x] Enable Slack Notifications (requires Coder external auth)".to_string());
+                            lines.push(
+                                "  [x] Enable Slack Notifications (requires Coder external auth)"
+                                    .to_string(),
+                            );
                         } else {
-                            lines.push("  [ ] Enable Slack Notifications (requires Coder external auth)".to_string());
+                            lines.push(
+                                "  [ ] Enable Slack Notifications (requires Coder external auth)"
+                                    .to_string(),
+                            );
                         }
                     } else {
                         lines.push("  [Tab] Show Advanced Options (AI Gateway, Slack)".to_string());
@@ -110,7 +119,9 @@ impl CoderStep {
                 }
 
                 lines.push(String::new());
-                lines.push("[↑/↓] Select  [←/→ or Tab] Toggle  [Enter] Confirm  [q] Quit".to_string());
+                lines.push(
+                    "[↑/↓] Select  [←/→ or Tab] Toggle  [Enter] Confirm  [q] Quit".to_string(),
+                );
 
                 let content = lines.join("\n");
                 let paragraph = ratatui::widgets::Paragraph::new(content).style(theme.text_style());

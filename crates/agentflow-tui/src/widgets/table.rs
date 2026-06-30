@@ -42,9 +42,18 @@ impl Widget for WorkerTable {
                     _ => theme.fg(),
                 };
 
-                let mut cells = vec![worker.id.clone(), worker.status.clone(), worker.detail.clone()];
+                let mut cells = vec![
+                    worker.id.clone(),
+                    worker.status.clone(),
+                    worker.detail.clone(),
+                ];
                 if has_workspace {
-                    cells.push(worker.workspace_name.clone().unwrap_or_else(|| "-".to_string()));
+                    cells.push(
+                        worker
+                            .workspace_name
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
                 }
 
                 Row::new(cells).style(Style::default().fg(status_color))

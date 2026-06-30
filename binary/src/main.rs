@@ -268,7 +268,21 @@ async fn main() -> Result<()> {
                     } else {
                     eprintln!("  Using {}", compose_path.display());
 
-                    let coder_password = std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "Op3nFl0ws!".to_string());
+                    let raw_coder_password = std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "Op3nFl0ws!".to_string());
+                    // Validate password meets Coder's security requirements.
+                    let coder_password = if raw_coder_password.len() >= 8
+                        && raw_coder_password.chars().any(|c| c.is_uppercase())
+                        && raw_coder_password.chars().any(|c| c.is_lowercase())
+                        && raw_coder_password.chars().any(|c| c.is_ascii_digit())
+                        && raw_coder_password.chars().any(|c| !c.is_alphanumeric())
+                    {
+                        raw_coder_password
+                    } else {
+                        eprintln!("  ⚠ CODER_ADMIN_PASSWORD does not meet Coder security requirements");
+                        eprintln!("    (needs uppercase, lowercase, digit, special char, min 8 chars).");
+                        eprintln!("    Using default secure password instead.");
+                        "Op3nFl0ws!".to_string()
+                    };
                     let pg_password = std::env::var("CODER_PG_PASSWORD").unwrap_or_else(|_| "coder".to_string());
 
                     let output = tokio::process::Command::new("docker")
@@ -602,6 +616,12 @@ async fn main() -> Result<()> {
 
     let registry_path = resolver.registry_path();
     let registry = config::Registry::load(&registry_path)?;
+    let registry_json = serde_json::to_string_pretty(&registry)?;
+    std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
+    std::env::set_var("OPENFLOWS_REGISTRY_JSON", &registry_json);
+    store
+        .set("registry_json", serde_json::json!(registry_json))
+        .await;
 
     std::env::set_var("ORCHESTRATOR_DIR", resolver.orchestrator_dir());
 

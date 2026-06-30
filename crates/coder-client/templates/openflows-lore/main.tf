@@ -44,6 +44,12 @@ variable "repo_url" {
   description = "Git repository URL to clone into the workspace"
 }
 
+variable "ticket_id" {
+  type        = string
+  default     = ""
+  description = "Ticket ID for heartbeat tracking"
+}
+
 variable "enable_slackme" {
   type        = bool
   default     = false
@@ -60,8 +66,6 @@ resource "coder_agent" "main" {
   os         = "linux"
   arch       = "amd64"
   dir        = "/home/coder/workspace"
-  access_url = "http://coder:7080"
-  startup_script_timeout = 300
 
   startup_script = <<-EOT
     #!/bin/bash
@@ -90,10 +94,9 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} HSET "heartbeat:lore-T-${var.ticket_id}" \
-        "ts" "$(date +%s)" \
-        "ws_id" "${data.coder_workspace.me.id}" \
-        "status" "running" 2>/dev/null || true
+      redis-cli -u ${var.redis_url} SET "heartbeat:lore-T-${var.ticket_id}" \
+        "{\"ts\":$(date +%s),\"ws_id\":\"${data.coder_workspace.me.id}\",\"status\":\"running\"}" \
+        2>/dev/null || true
       sleep 30
     done' >/dev/null 2>&1 &
   EOT
@@ -134,24 +137,15 @@ data "coder_workspace_owner" "me" {}
 
 # Lore agent module (CLI backend installer)
 module "agent" {
-  source  = var.agent_module_source
-  version = var.agent_module_version
+  source  = "registry.coder.com/coder/claude-code/coder"
+  version = "5.2.0"
 
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  permission_mode   = "acceptEdits"
   enable_ai_gateway = var.enable_ai_gateway
 
-  mcp = var.mcp_config != "" ? var.mcp_config : null
 }
 
-# Git configuration module
-module "git_config" {
-  source  = "registry.coder.com/coder/git-config/coder"
-  version = "1.0.0"
-
-  agent_id = coder_agent.main.id
-}
 
 # Slack notification module (conditional)
 module "slackme" {

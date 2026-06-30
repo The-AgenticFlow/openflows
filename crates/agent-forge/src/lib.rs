@@ -11,7 +11,8 @@ use config::{
 };
 use pair_harness::{
     transport::{CoderTransport, LocalTransport, WorkspaceTransport},
-    worktree::WorktreeManager, ForgeSentinelPair, PairConfig, PairOutcome, Ticket as PairTicket,
+    worktree::WorktreeManager,
+    ForgeSentinelPair, PairConfig, PairOutcome, Ticket as PairTicket,
 };
 use pocketflow_core::{Action, BatchNode, SharedStore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -200,41 +201,42 @@ impl BatchNode for ForgeNode {
             && std::env::var("CODER_URL").is_ok()
             && std::env::var("CODER_API_TOKEN").is_ok();
 
-        let (worktree_path, transport): (PathBuf, Box<dyn WorkspaceTransport>) = if use_coder_workspace {
-            let coder_client = CoderClient::new(
-                &std::env::var("CODER_URL").unwrap_or_default(),
-                &std::env::var("CODER_API_TOKEN").unwrap_or_default(),
-            );
-            let workspace_id = slot.workspace_id.clone().unwrap();
-            info!(
-                worker = worker_id,
-                ticket = ticket_id,
-                workspace_id = %workspace_id,
-                "Using Coder workspace for worker"
-            );
-            (
-                PathBuf::from(CODER_WORKSPACE_DIR),
-                Box::new(CoderTransport::new(coder_client, &workspace_id)),
-            )
-        } else {
-            // Create worktree manager for local mode.
-            let worktree_mgr = WorktreeManager::new(&self.workspace_root);
-            let setup_result = worktree_mgr
-                .create_worktree(&worker_id, &ticket_id, &worker_token)
-                .await
-                .map_err(|e| anyhow!("Failed to create worktree: {:#}", e))?;
-            let worktree_path = setup_result.path;
-            info!(
-                worker = worker_id,
-                ticket = ticket_id,
-                path = ?worktree_path,
-                "Worktree created"
-            );
-            (
-                worktree_path.clone(),
-                Box::new(LocalTransport::new(&worktree_path)),
-            )
-        };
+        let (worktree_path, transport): (PathBuf, Box<dyn WorkspaceTransport>) =
+            if use_coder_workspace {
+                let coder_client = CoderClient::new(
+                    &std::env::var("CODER_URL").unwrap_or_default(),
+                    &std::env::var("CODER_API_TOKEN").unwrap_or_default(),
+                );
+                let workspace_id = slot.workspace_id.clone().unwrap();
+                info!(
+                    worker = worker_id,
+                    ticket = ticket_id,
+                    workspace_id = %workspace_id,
+                    "Using Coder workspace for worker"
+                );
+                (
+                    PathBuf::from(CODER_WORKSPACE_DIR),
+                    Box::new(CoderTransport::new(coder_client, &workspace_id)),
+                )
+            } else {
+                // Create worktree manager for local mode.
+                let worktree_mgr = WorktreeManager::new(&self.workspace_root);
+                let setup_result = worktree_mgr
+                    .create_worktree(&worker_id, &ticket_id, &worker_token)
+                    .await
+                    .map_err(|e| anyhow!("Failed to create worktree: {:#}", e))?;
+                let worktree_path = setup_result.path;
+                info!(
+                    worker = worker_id,
+                    ticket = ticket_id,
+                    path = ?worktree_path,
+                    "Worktree created"
+                );
+                (
+                    worktree_path.clone(),
+                    Box::new(LocalTransport::new(&worktree_path)),
+                )
+            };
 
         let status_rel = "STATUS.json";
         info!(worker = worker_id, ticket = ticket_id, issue_url = ?issue_url, "Spawning agent via transport...");

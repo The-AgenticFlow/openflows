@@ -94,8 +94,7 @@ impl NotificationsStep {
                     "  Webhook URLs for awaiting_human escalation alerts",
                     Style::default().fg(theme.muted()),
                 );
-                let title_para =
-                    ratatui::widgets::Paragraph::new(vec![title, subtitle]);
+                let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
                 title_para.render(inner_title, f.buffer_mut());
 
                 let info = Line::styled(
@@ -117,7 +116,11 @@ impl NotificationsStep {
                 } else {
                     Style::default().fg(theme.fg())
                 };
-                let slack_prefix = if self.focused_field == 0 { "  ▶ " } else { "    " };
+                let slack_prefix = if self.focused_field == 0 {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 let display_slack = if input_mode && self.focused_field == 0 {
                     format!("{}{}", &self.slack_url[..self.cursor_pos], "█")
                 } else {
@@ -138,7 +141,11 @@ impl NotificationsStep {
                 } else {
                     Style::default().fg(theme.fg())
                 };
-                let discord_prefix = if self.focused_field == 1 { "  ▶ " } else { "    " };
+                let discord_prefix = if self.focused_field == 1 {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 let display_discord = if input_mode && self.focused_field == 1 {
                     format!("{}{}", &self.discord_url[..self.cursor_pos], "█")
                 } else {
@@ -174,7 +181,11 @@ impl NotificationsStep {
                 } else {
                     Style::default().fg(theme.fg())
                 };
-                let done_prefix = if self.focused_field == 2 { "  ▶ " } else { "    " };
+                let done_prefix = if self.focused_field == 2 {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 let done_line = Line::styled(
                     format!("{}Done — Save and Continue", done_prefix),
                     done_label,
@@ -182,12 +193,10 @@ impl NotificationsStep {
                 let done_para = Paragraph::new(done_line);
                 done_para.render(chunks[4], f.buffer_mut());
 
-                let help_lines = vec![
-                    Line::styled(
-                        "  ↑↓ navigate  │  Enter: edit field / save  │  Esc: cancel",
-                        Style::default().fg(theme.muted()),
-                    ),
-                ];
+                let help_lines = vec![Line::styled(
+                    "  ↑↓ navigate  │  Enter: edit field / save  │  Esc: cancel",
+                    Style::default().fg(theme.muted()),
+                )];
                 let help_para = Paragraph::new(help_lines);
                 help_para.render(chunks[7], f.buffer_mut());
             })?;

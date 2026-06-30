@@ -203,11 +203,27 @@ pub const DEFAULT_CLI_ENV_VAR: &str = "DEFAULT_CLI";
 /// Default agent module mapping: cli -> (source, version).
 /// Used when an agent entry has no explicit `coder_module` field.
 pub const DEFAULT_AGENT_MODULES: &[(&str, &str, &str)] = &[
-    ("claude", "registry.coder.com/coder/claude-code/coder", "5.2.0"),
+    (
+        "claude",
+        "registry.coder.com/coder/claude-code/coder",
+        "5.2.0",
+    ),
     // codex/aider/goose versions must be verified against live registry
-    ("codex", "registry.coder.com/coder-labs/codex/coder", "VERIFY_ON_REGISTRY"),
-    ("aider", "registry.coder.com/coder/aider/coder", "VERIFY_ON_REGISTRY"),
-    ("goose", "registry.coder.com/coder/goose/coder", "VERIFY_ON_REGISTRY"),
+    (
+        "codex",
+        "registry.coder.com/coder-labs/codex/coder",
+        "VERIFY_ON_REGISTRY",
+    ),
+    (
+        "aider",
+        "registry.coder.com/coder/aider/coder",
+        "VERIFY_ON_REGISTRY",
+    ),
+    (
+        "goose",
+        "registry.coder.com/coder/goose/coder",
+        "VERIFY_ON_REGISTRY",
+    ),
 ];
 
 /// Resolve the coder module for a given CLI backend name.
@@ -223,10 +239,7 @@ pub fn resolve_coder_module(cli: &str, entry_module: Option<&CoderModule>) -> Co
         }
     }
     // Hardcoded fallback for unknown CLI names
-    CoderModule::new(
-        "registry.coder.com/coder/claude-code/coder",
-        "5.2.0",
-    )
+    CoderModule::new("registry.coder.com/coder/claude-code/coder", "5.2.0")
 }
 
 impl RegistryEntry {
@@ -376,9 +389,13 @@ impl Registry {
     ///
     /// Strips the instance suffix (e.g., "forge-3" -> "forge") to find the
     /// base agent entry and returns the configured workspace provider.
-    pub fn resolve_workspace_provider(&self, slot_id: &str) -> Option<crate::state::WorkspaceProvider> {
+    pub fn resolve_workspace_provider(
+        &self,
+        slot_id: &str,
+    ) -> Option<crate::state::WorkspaceProvider> {
         let base_id = self.normalize_agent_id(slot_id);
-        self.team.iter()
+        self.team
+            .iter()
             .find(|e| e.id == base_id)
             .and_then(|e| e.workspace_provider.clone())
     }

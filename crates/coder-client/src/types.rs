@@ -23,6 +23,7 @@ pub struct CommandOutput {
 /// A Coder user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoderUser {
+    #[serde(default, alias = "user_id")]
     pub id: String,
     #[serde(default)]
     pub username: String,
@@ -205,7 +206,9 @@ pub enum ChatInputPart {
 impl ChatInputPart {
     /// Convenience constructor for plain text content.
     pub fn text(content: impl Into<String>) -> Self {
-        ChatInputPart::Text { text: content.into() }
+        ChatInputPart::Text {
+            text: content.into(),
+        }
     }
 }
 
@@ -312,10 +315,23 @@ pub const CHAT_LABEL_ROLE: &str = "role";
 pub const CHAT_LABEL_FLOW: &str = "flow";
 
 /// Build a labels map for a ticket-scoped chat.
-pub fn build_chat_labels(ticket_id: &str, role: &str, flow: &str) -> serde_json::Map<String, serde_json::Value> {
+pub fn build_chat_labels(
+    ticket_id: &str,
+    role: &str,
+    flow: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    map.insert(CHAT_LABEL_TICKET.to_string(), serde_json::Value::String(ticket_id.to_string()));
-    map.insert(CHAT_LABEL_ROLE.to_string(), serde_json::Value::String(role.to_string()));
-    map.insert(CHAT_LABEL_FLOW.to_string(), serde_json::Value::String(flow.to_string()));
+    map.insert(
+        CHAT_LABEL_TICKET.to_string(),
+        serde_json::Value::String(ticket_id.to_string()),
+    );
+    map.insert(
+        CHAT_LABEL_ROLE.to_string(),
+        serde_json::Value::String(role.to_string()),
+    );
+    map.insert(
+        CHAT_LABEL_FLOW.to_string(),
+        serde_json::Value::String(flow.to_string()),
+    );
     map
 }

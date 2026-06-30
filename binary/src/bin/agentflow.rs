@@ -4,10 +4,9 @@ use agent_nexus::NexusNode;
 use agent_vessel::{VesselConfig, VesselNode};
 use anyhow::Result;
 use config::{
-    ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
-    ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
-    ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
-    WorkspaceProvider,
+    WorkspaceProvider, ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED,
+    ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK,
+    ACTION_PR_OPENED, ACTION_WORK_ASSIGNED, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS,
 };
 use pair_harness::WorkspaceManager;
 use pocketflow_core::{Action, Flow, SharedStore};
@@ -37,6 +36,120 @@ fn load_env() -> anyhow::Result<std::path::PathBuf> {
         }
     }
     Ok(std::path::PathBuf::new())
+}
+
+const DEFAULT_CODER_PORT: u16 = 7080;
+const CODER_PORT_SCAN_LIMIT: u16 = 12;
+const DEFAULT_CODER_IMAGE_TAG: &str = "latest";
+const CODER_IMAGE_TAG_FALLBACKS: &[&str] = &["preview"];
+
+fn parse_coder_url(coder_url: &str) -> (String, u16) {
+    let parsed = reqwest::Url::parse(coder_url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .unwrap_or("localhost")
+        .to_string();
+    let port = parsed
+        .as_ref()
+        .and_then(|u| u.port())
+        .unwrap_or(DEFAULT_CODER_PORT);
+    (host, port)
+}
+
+fn coder_url_from_host_port(host: &str, port: u16) -> String {
+    format!("http://{}:{}", host, port)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn coder_image_pull_failed(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("failed to resolve reference")
+        || stderr.contains("manifest unknown")
+        || stderr.contains("pull access denied")
+        || stderr.contains("repository does not exist")
+        || (stderr.contains("ghcr.io/coder/coder") && stderr.contains("not found"))
+}
+
+fn coder_image_tag_candidates_from_env(coder_image_tag: Option<&str>) -> Vec<String> {
+    let mut tags = Vec::new();
+
+    if let Some(tag) = coder_image_tag.map(str::trim).filter(|tag| !tag.is_empty()) {
+        tags.push(tag.to_string());
+    }
+
+    for candidate in
+        std::iter::once(DEFAULT_CODER_IMAGE_TAG).chain(CODER_IMAGE_TAG_FALLBACKS.iter().copied())
+    {
+        if !tags.iter().any(|tag| tag == candidate) {
+            tags.push(candidate.to_string());
+        }
+    }
+
+    tags
+}
+
+fn coder_image_tag_candidates() -> Vec<String> {
+    coder_image_tag_candidates_from_env(std::env::var("CODER_IMAGE_TAG").ok().as_deref())
+}
+
+async fn coder_port_is_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .is_ok()
+}
+
+async fn find_healthy_coder_endpoint(
+    http_client: &reqwest::Client,
+    host: &str,
+    start_port: u16,
+    scan_limit: u16,
+) -> Option<(String, u16)> {
+    let probe_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .unwrap_or_else(|_| http_client.clone());
+
+    for offset in 0..=scan_limit {
+        let port = start_port.saturating_add(offset);
+        if port == 0 {
+            continue;
+        }
+
+        let candidate_url = coder_url_from_host_port(host, port);
+        let request = probe_client
+            .get(format!(
+                "{}/api/v2/buildinfo",
+                candidate_url.trim_end_matches('/')
+            ))
+            .send()
+            .await;
+
+        if let Ok(resp) = request {
+            if resp.status().is_success() {
+                return Some((candidate_url, port));
+            }
+        }
+    }
+
+    None
+}
+
+async fn find_free_coder_port(start_port: u16, scan_limit: u16) -> Option<u16> {
+    for offset in 0..=scan_limit {
+        let port = start_port.saturating_add(offset);
+        if port == 0 {
+            continue;
+        }
+        if coder_port_is_free(port).await {
+            return Some(port);
+        }
+    }
+
+    None
 }
 
 #[tokio::main]
@@ -95,8 +208,11 @@ async fn main() -> Result<()> {
         .init();
 
     // 1b. Determine workspace provider and bootstrap Coder if configured
-    let workspace_provider = if std::env::var("CODER_URL").is_ok() || std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder") {
-        let coder_url = std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
+    let workspace_provider = if std::env::var("CODER_URL").is_ok()
+        || std::env::var("WORKSPACE_PROVIDER").as_deref() == Ok("coder")
+    {
+        let mut coder_url =
+            std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
 
         // Ensure CODER_URL is set (WORKSPACE_PROVIDER=coder without CODER_URL)
         if std::env::var("CODER_URL").is_err() {
@@ -104,14 +220,8 @@ async fn main() -> Result<()> {
         }
 
         // Parse host and port from CODER_URL for consistent use
-        let coder_port = reqwest::Url::parse(&coder_url)
-            .ok()
-            .and_then(|u| u.port())
-            .unwrap_or(7080);
-        let coder_host = reqwest::Url::parse(&coder_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or_else(|| "localhost".to_string());
+        let (mut coder_host, mut coder_port) = parse_coder_url(&coder_url);
+        let local_coder_host = is_loopback_host(&coder_host);
 
         eprintln!();
         eprintln!("═══ Coder Workspace Setup ═══");
@@ -119,8 +229,10 @@ async fn main() -> Result<()> {
         // Save compose_path for use in diagnostics later
         let compose_paths = vec![
             std::path::PathBuf::from("docker-compose.yml"),
-            std::path::PathBuf::from(format!("{}/.openflows/docker-compose.yml",
-                std::env::var("HOME").unwrap_or_default())),
+            std::path::PathBuf::from(format!(
+                "{}/.openflows/docker-compose.yml",
+                std::env::var("HOME").unwrap_or_default()
+            )),
         ];
         let compose_path = compose_paths.iter().find(|p| p.exists()).cloned();
 
@@ -131,19 +243,32 @@ async fn main() -> Result<()> {
             .unwrap_or_default();
 
         let mut coder_available = false;
-        match http_client.get(format!("{}/api/v2/buildinfo", coder_url.trim_end_matches('/'))).send().await {
+        match http_client
+            .get(format!(
+                "{}/api/v2/buildinfo",
+                coder_url.trim_end_matches('/')
+            ))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 eprintln!("  ✓ Coder server already running at {}", coder_url);
                 info!("Coder server already running at {}", coder_url);
                 coder_available = true;
             }
             Ok(resp) => {
-                eprintln!("  ⚠ Coder server at {} returned status {} — may still be starting", coder_url, resp.status());
+                eprintln!(
+                    "  ⚠ Coder server at {} returned status {} — may still be starting",
+                    coder_url,
+                    resp.status()
+                );
             }
             Err(e) => {
                 eprintln!("  • Coder server not reachable at {}", coder_url);
                 if e.is_connect() {
-                    eprintln!("    Reason: Connection refused — no service listening on that port.");
+                    eprintln!(
+                        "    Reason: Connection refused — no service listening on that port."
+                    );
                 } else if e.is_timeout() {
                     eprintln!("    Reason: Connection timed out — service may be starting or a firewall is blocking.");
                 } else {
@@ -157,6 +282,85 @@ async fn main() -> Result<()> {
         if !coder_available {
             eprintln!();
             eprintln!("  Attempting to start Coder services...");
+
+            // Self-heal local Coder port conflicts before we give up.
+            // If another healthy Coder endpoint already exists nearby, reuse it.
+            // Otherwise, move the local instance to the next free port.
+            if local_coder_host {
+                if let Some((healthy_url, _healthy_port)) = find_healthy_coder_endpoint(
+                    &http_client,
+                    &coder_host,
+                    coder_port,
+                    CODER_PORT_SCAN_LIMIT,
+                )
+                .await
+                {
+                    eprintln!(
+                        "  ✓ Found an existing healthy Coder instance at {}",
+                        healthy_url
+                    );
+                    info!(
+                        current_url = %coder_url,
+                        recovered_url = %healthy_url,
+                        "Reusing nearby healthy Coder instance"
+                    );
+                    coder_url = healthy_url;
+                    let (host, port) = parse_coder_url(&coder_url);
+                    coder_host = host;
+                    coder_port = port;
+                    std::env::set_var("CODER_URL", &coder_url);
+                    std::env::set_var("CODER_PORT", coder_port.to_string());
+                    coder_available = true;
+                } else if tokio::net::TcpStream::connect(format!("{}:{}", coder_host, coder_port))
+                    .await
+                    .is_ok()
+                {
+                    if let Some(free_port) =
+                        find_free_coder_port(coder_port.saturating_add(1), CODER_PORT_SCAN_LIMIT)
+                            .await
+                    {
+                        let old_port = coder_port;
+                        coder_port = free_port;
+                        coder_url = coder_url_from_host_port(&coder_host, coder_port);
+                        std::env::set_var("CODER_URL", &coder_url);
+                        std::env::set_var("CODER_PORT", coder_port.to_string());
+                        std::env::set_var(
+                            "CODER_ACCESS_URL",
+                            format!("http://localhost:{}", coder_port),
+                        );
+                        std::env::set_var("CODER_HTTP_ADDRESS", format!("0.0.0.0:{}", coder_port));
+                        eprintln!("  ⚠ Port {} is already in use on {}", old_port, coder_host);
+                        eprintln!(
+                            "    Automatically switching Coder to the next free port: {}",
+                            coder_port
+                        );
+                        eprintln!("    Updated CODER_URL to {}", coder_url);
+                        eprintln!();
+                        info!(
+                            old_port = old_port,
+                            new_port = coder_port,
+                            new_url = %coder_url,
+                            "Recovered from local Coder port conflict by moving to a free port"
+                        );
+                    } else {
+                        eprintln!(
+                            "  ⚠ Port {} is already in use on {}",
+                            coder_port, coder_host
+                        );
+                        eprintln!("    Another service is listening on that port.");
+                        eprintln!();
+                        eprintln!("  Falling back to local mode (git worktrees).");
+                        eprintln!();
+                        warn!(
+                            "Port {} already in use, falling back to local mode",
+                            coder_port
+                        );
+                        std::env::set_var("WORKSPACE_PROVIDER", "local");
+                        std::env::remove_var("CODER_URL");
+                        skip_coder = true;
+                    }
+                }
+            }
 
             // Check Docker availability first
             let docker_check = tokio::process::Command::new("docker")
@@ -210,127 +414,278 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if !skip_coder {
+            if !skip_coder && !coder_available {
                 // Use the compose_path found earlier
                 if let Some(ref compose_path) = compose_path {
                     // Check if the port is already in use before starting containers
-                    if tokio::net::TcpStream::connect(format!("{}:{}", coder_host, coder_port)).await.is_ok()
+                    if tokio::net::TcpStream::connect(format!("{}:{}", coder_host, coder_port))
+                        .await
+                        .is_ok()
                         && !coder_available
                     {
-                        eprintln!("  ⚠ Port {} is already in use on {}", coder_port, coder_host);
+                        eprintln!(
+                            "  ⚠ Port {} is already in use on {}",
+                            coder_port, coder_host
+                        );
                         eprintln!("    Another service is listening on that port.");
-                        eprintln!("    To use a different port, set CODER_URL in your .env file, e.g.:");
+                        eprintln!(
+                            "    To use a different port, set CODER_URL in your .env file, e.g.:"
+                        );
                         eprintln!("      CODER_URL=http://localhost:7081");
                         eprintln!();
                         eprintln!("  Falling back to local mode (git worktrees).");
                         eprintln!();
-                        warn!("Port {} already in use, falling back to local mode", coder_port);
+                        warn!(
+                            "Port {} already in use, falling back to local mode",
+                            coder_port
+                        );
                         std::env::set_var("WORKSPACE_PROVIDER", "local");
                         std::env::remove_var("CODER_URL");
                         skip_coder = true;
                     } else {
-                    eprintln!("  Using {}", compose_path.display());
+                        let raw_coder_password = std::env::var("CODER_ADMIN_PASSWORD")
+                            .unwrap_or_else(|_| "Op3nFl0ws!".to_string());
+                        // Validate password meets Coder's security requirements.
+                        // If it doesn't, fall back to the secure default to avoid
+                        // a 400 error at bootstrap time.
+                        let coder_password = if raw_coder_password.len() >= 8
+                            && raw_coder_password.chars().any(|c| c.is_uppercase())
+                            && raw_coder_password.chars().any(|c| c.is_lowercase())
+                            && raw_coder_password.chars().any(|c| c.is_ascii_digit())
+                            && raw_coder_password.chars().any(|c| !c.is_alphanumeric())
+                        {
+                            raw_coder_password
+                        } else {
+                            eprintln!(
+                                "  ⚠ CODER_ADMIN_PASSWORD does not meet Coder security requirements"
+                            );
+                            eprintln!(
+                                "    (needs uppercase, lowercase, digit, special char, min 8 chars)."
+                            );
+                            eprintln!("    Using default secure password instead.");
+                            warn!("CODER_ADMIN_PASSWORD too weak, falling back to default");
+                            "Op3nFl0ws!".to_string()
+                        };
+                        let pg_password = std::env::var("CODER_PG_PASSWORD")
+                            .unwrap_or_else(|_| "coder".to_string());
+                        let image_tags = coder_image_tag_candidates();
 
-                    let coder_password = std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| "Op3nFl0ws!".to_string());
-                    let pg_password = std::env::var("CODER_PG_PASSWORD").unwrap_or_else(|_| "coder".to_string());
+                        for (attempt_idx, image_tag) in image_tags.iter().enumerate() {
+                            eprintln!(
+                                "  Using {} (Coder image tag {})",
+                                compose_path.display(),
+                                image_tag
+                            );
 
-                    let output = tokio::process::Command::new("docker")
-                        .args([
-                            "compose",
-                            "--profile", "coder",
-                            "-f", compose_path.to_str().unwrap_or("docker-compose.yml"),
-                            "--env-file", "/dev/null",
-                            "up", "-d", "coder-db", "coder",
-                        ])
-                        .env("CODER_URL", &coder_url)
-                        .env("CODER_PORT", format!("{}", coder_port))
-                        .env("CODER_ADMIN_PASSWORD", &coder_password)
-                        .env("CODER_PG_PASSWORD", &pg_password)
-                        .env("CODER_HTTP_ADDRESS", format!("0.0.0.0:{}", coder_port))
-                        .env("CODER_ACCESS_URL", format!("http://localhost:{}", coder_port))
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output()
-                        .await;
-
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            eprintln!("  ✓ Coder services starting");
-                        }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            eprintln!("  ✗ docker compose failed:");
-                            for line in stderr.lines().take(5) {
-                                eprintln!("    {}", line);
+                            let mut cmd = tokio::process::Command::new("docker");
+                            cmd.args([
+                                "compose",
+                                "--profile",
+                                "coder",
+                                "-f",
+                                compose_path.to_str().unwrap_or("docker-compose.yml"),
+                                "--env-file",
+                                "/dev/null",
+                                "up",
+                                "-d",
+                                "coder-db",
+                                "coder",
+                            ]);
+                            cmd.env("CODER_URL", &coder_url)
+                                .env("CODER_PORT", format!("{}", coder_port))
+                                .env("CODER_IMAGE_TAG", image_tag)
+                                .env("CODER_ADMIN_PASSWORD", &coder_password)
+                                .env("CODER_PG_PASSWORD", &pg_password)
+                                // Internal port is always 7080; the host-side port (CODER_PORT)
+                                // maps to this via Docker port forwarding.
+                                .env("CODER_INTERNAL_PORT", "7080")
+                                .env("CODER_HTTP_ADDRESS", "0.0.0.0:7080")
+                                .env(
+                                    "CODER_ACCESS_URL",
+                                    format!("http://localhost:{}", coder_port),
+                                );
+                            // Conditionally pass external auth vars — only when non-empty.
+                            // Empty values crash Coder: "read external auth providers from
+                            // env: provider num 0 skipped: 1_CLIENT_ID"
+                            if let Ok(val) = std::env::var("CODER_EXTERNAL_AUTH_1_TYPE") {
+                                if !val.is_empty() {
+                                    cmd.env("CODER_EXTERNAL_AUTH_1_TYPE", &val);
+                                }
                             }
-                            eprintln!();
-                            eprintln!("  Falling back to local mode (git worktrees).");
-                            eprintln!();
-                            warn!("docker compose failed, falling back to local mode");
-                            std::env::set_var("WORKSPACE_PROVIDER", "local");
-                            std::env::remove_var("CODER_URL");
-                            skip_coder = true;
-                        }
-                        Err(e) => {
-                            eprintln!("  ✗ Could not run docker compose: {}", e);
-                            eprintln!();
-                            eprintln!("  Falling back to local mode (git worktrees).");
-                            eprintln!();
-                            warn!("docker compose command failed: {}, falling back to local mode", e);
-                            std::env::set_var("WORKSPACE_PROVIDER", "local");
-                            std::env::remove_var("CODER_URL");
-                            skip_coder = true;
-                        }
-                    }
-
-                    if !skip_coder {
-                        // Give containers a moment to start, then verify
-                        eprintln!("  Waiting for Coder containers to start...");
-                        for i in 1..=6 {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            let ps_output = tokio::process::Command::new("docker")
-                                .args(["compose", "--profile", "coder", "-f", compose_path.to_str().unwrap_or("docker-compose.yml"), "ps"])
+                            if let Ok(val) = std::env::var("CODER_EXTERNAL_AUTH_1_CLIENT_ID") {
+                                if !val.is_empty() {
+                                    cmd.env("CODER_EXTERNAL_AUTH_1_CLIENT_ID", &val);
+                                }
+                            }
+                            if let Ok(val) = std::env::var("CODER_EXTERNAL_AUTH_1_CLIENT_SECRET") {
+                                if !val.is_empty() {
+                                    cmd.env("CODER_EXTERNAL_AUTH_1_CLIENT_SECRET", &val);
+                                }
+                            }
+                            let output = cmd
                                 .stdout(std::process::Stdio::piped())
                                 .stderr(std::process::Stdio::piped())
                                 .output()
                                 .await;
 
-                            if let Ok(ps_out) = ps_output {
-                                let ps_text = String::from_utf8_lossy(&ps_out.stdout);
-                                let running = ps_text.lines().skip(1)
-                                    .filter(|l| l.to_lowercase().contains("running") || l.to_lowercase().contains("up"))
-                                    .count();
-                                if running >= 2 {
-                                    eprintln!("  ✓ Coder containers are up (2/2 running)");
+                            match output {
+                                Ok(out) if out.status.success() => {
+                                    if attempt_idx > 0 {
+                                        eprintln!(
+                                            "  ✓ Coder services starting with fallback image tag {}",
+                                            image_tag
+                                        );
+                                        info!(
+                                            image_tag = %image_tag,
+                                            "Coder compose started successfully after image fallback"
+                                        );
+                                    } else {
+                                        eprintln!("  ✓ Coder services starting");
+                                    }
+                                    std::env::set_var("CODER_IMAGE_TAG", image_tag);
                                     break;
                                 }
-                                if i < 6 {
-                                    eprintln!("  ⚳ Containers starting ({}/2)... attempt {}/6", running.min(2), i);
+                                Ok(out) => {
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    if coder_image_pull_failed(&stderr)
+                                        && attempt_idx + 1 < image_tags.len()
+                                    {
+                                        eprintln!(
+                                            "  ✗ docker compose could not pull Coder image tag {}:",
+                                            image_tag
+                                        );
+                                        for line in stderr.lines().take(5) {
+                                            eprintln!("    {}", line);
+                                        }
+                                        eprintln!();
+                                        eprintln!(
+                                            "  Self-healing: retrying with fallback image tag {}",
+                                            image_tags[attempt_idx + 1]
+                                        );
+                                        eprintln!();
+                                        warn!(
+                                            image_tag = %image_tag,
+                                            next_image_tag = %image_tags[attempt_idx + 1],
+                                            "Coder image unavailable, trying fallback tag"
+                                        );
+                                        continue;
+                                    }
+
+                                    eprintln!("  ✗ docker compose failed:");
+                                    for line in stderr.lines().take(5) {
+                                        eprintln!("    {}", line);
+                                    }
+                                    eprintln!();
+                                    eprintln!("  Falling back to local mode (git worktrees).");
+                                    eprintln!();
+                                    warn!("docker compose failed, falling back to local mode");
+                                    std::env::set_var("WORKSPACE_PROVIDER", "local");
+                                    std::env::remove_var("CODER_URL");
+                                    skip_coder = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ Could not run docker compose: {}", e);
+                                    eprintln!();
+                                    eprintln!("  Falling back to local mode (git worktrees).");
+                                    eprintln!();
+                                    warn!(
+                                        "docker compose command failed: {}, falling back to local mode",
+                                        e
+                                    );
+                                    std::env::set_var("WORKSPACE_PROVIDER", "local");
+                                    std::env::remove_var("CODER_URL");
+                                    skip_coder = true;
+                                    break;
                                 }
                             }
                         }
 
-                        // Check logs for common startup issues
-                        let logs_output = tokio::process::Command::new("docker")
-                            .args(["compose", "--profile", "coder", "-f", compose_path.to_str().unwrap_or("docker-compose.yml"), "logs", "coder", "--tail", "5"])
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .output()
-                            .await;
+                        if !skip_coder {
+                            // Give containers a moment to start, then verify
+                            eprintln!("  Waiting for Coder containers to start...");
+                            for i in 1..=6 {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                let ps_output = tokio::process::Command::new("docker")
+                                    .args([
+                                        "compose",
+                                        "--profile",
+                                        "coder",
+                                        "-f",
+                                        compose_path.to_str().unwrap_or("docker-compose.yml"),
+                                        "ps",
+                                    ])
+                                    .stdout(std::process::Stdio::piped())
+                                    .stderr(std::process::Stdio::piped())
+                                    .output()
+                                    .await;
 
-                        if let Ok(log_out) = logs_output {
-                            let logs = String::from_utf8_lossy(&log_out.stdout);
-                            if logs.contains("permission denied") || logs.contains("Cannot connect to the Docker daemon") {
-                                eprintln!("  ✗ Docker permission issue detected in container logs");
-                                eprintln!("    Try: sudo usermod -aG docker $USER && newgrp docker");
-                            } else if logs.contains("port") && logs.contains("already in use") {
-                                eprintln!("  ✗ Port conflict detected — another service may be using port {}", coder_port);
-                                eprintln!("    Check: lsof -i :{}", coder_port);
-                            } else if logs.contains("database") && (logs.contains("connection refused") || logs.contains("connect: connection refused")) {
-                                eprintln!("  ⚳ Coder is waiting for its database to become ready...");
+                                if let Ok(ps_out) = ps_output {
+                                    let ps_text = String::from_utf8_lossy(&ps_out.stdout);
+                                    let running = ps_text
+                                        .lines()
+                                        .skip(1)
+                                        .filter(|l| {
+                                            l.to_lowercase().contains("running")
+                                                || l.to_lowercase().contains("up")
+                                        })
+                                        .count();
+                                    if running >= 2 {
+                                        eprintln!("  ✓ Coder containers are up (2/2 running)");
+                                        break;
+                                    }
+                                    if i < 6 {
+                                        eprintln!(
+                                            "  ⚳ Containers starting ({}/2)... attempt {}/6",
+                                            running.min(2),
+                                            i
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Check logs for common startup issues
+                            let logs_output = tokio::process::Command::new("docker")
+                                .args([
+                                    "compose",
+                                    "--profile",
+                                    "coder",
+                                    "-f",
+                                    compose_path.to_str().unwrap_or("docker-compose.yml"),
+                                    "logs",
+                                    "coder",
+                                    "--tail",
+                                    "5",
+                                ])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped())
+                                .output()
+                                .await;
+
+                            if let Ok(log_out) = logs_output {
+                                let logs = String::from_utf8_lossy(&log_out.stdout);
+                                if logs.contains("permission denied")
+                                    || logs.contains("Cannot connect to the Docker daemon")
+                                {
+                                    eprintln!(
+                                        "  ✗ Docker permission issue detected in container logs"
+                                    );
+                                    eprintln!(
+                                        "    Try: sudo usermod -aG docker $USER && newgrp docker"
+                                    );
+                                } else if logs.contains("port") && logs.contains("already in use") {
+                                    eprintln!("  ✗ Port conflict detected — another service may be using port {}", coder_port);
+                                    eprintln!("    Check: lsof -i :{}", coder_port);
+                                } else if logs.contains("database")
+                                    && (logs.contains("connection refused")
+                                        || logs.contains("connect: connection refused"))
+                                {
+                                    eprintln!(
+                                        "  ⚳ Coder is waiting for its database to become ready..."
+                                    );
+                                }
                             }
                         }
-                    }
                     } // end else (port available, compose ran)
                 } else {
                     eprintln!("  ✗ docker-compose.yml not found in any of:");
@@ -356,174 +711,237 @@ async fn main() -> Result<()> {
         if skip_coder {
             WorkspaceProvider::Local
         } else {
-        eprintln!("  Bootstrapping Coder (creating admin user, pushing workspace templates)...");
-        info!("Coder: bootstrapping...");
+            eprintln!(
+                "  Bootstrapping Coder (creating admin user, pushing workspace templates)..."
+            );
+            info!("Coder: bootstrapping...");
 
-        // Wait for health with progress output
-        let healthy_client = {
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_secs(120);
-            let mut attempts = 0u32;
-            loop {
-                if start.elapsed() >= timeout {
-                    break None;
-                }
-                attempts += 1;
-                match http_client.get(format!("{}/api/v2/buildinfo", coder_url.trim_end_matches('/'))).timeout(std::time::Duration::from_secs(5)).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        eprintln!("  ✓ Coder server is healthy (after {}s)", start.elapsed().as_secs());
-                        break Some(http_client.clone());
+            // Wait for health with progress output
+            let healthy_client = {
+                let start = std::time::Instant::now();
+                let timeout = std::time::Duration::from_secs(120);
+                let mut attempts = 0u32;
+                loop {
+                    if start.elapsed() >= timeout {
+                        break None;
                     }
-                    Ok(resp) => {
-                        if attempts % 5 == 1 {
-                            eprintln!("  ⏳ Coder not healthy yet (HTTP {}), retrying... [{}s elapsed]", resp.status(), start.elapsed().as_secs());
+                    attempts += 1;
+                    match http_client
+                        .get(format!(
+                            "{}/api/v2/buildinfo",
+                            coder_url.trim_end_matches('/')
+                        ))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            eprintln!(
+                                "  ✓ Coder server is healthy (after {}s)",
+                                start.elapsed().as_secs()
+                            );
+                            break Some(http_client.clone());
                         }
-                    }
-                    Err(e) => {
-                        if attempts % 5 == 1 {
-                            eprintln!("  ⏳ Coder not reachable yet ({}), retrying... [{}s elapsed]", 
-                                if e.is_connect() { "connection refused" } else { "timeout" },
-                                start.elapsed().as_secs());
-                        }
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
-        };
-
-        match healthy_client {
-            Some(_) => {
-                // Server is healthy — proceed with bootstrap (create admin, get token, push templates)
-                match coder_client::bootstrap::CoderBootstrapper::from_env() {
-                    Ok(bootstrapper) => match bootstrapper.bootstrap().await {
-                        Ok(client) => {
-                            std::env::set_var("CODER_API_TOKEN", client.token());
-                            eprintln!("  ✓ Coder bootstrapped successfully");
-                            eprintln!("    Admin user created, API token obtained, workspace templates pushed");
-                            info!("Coder: bootstrapped — using Coder workspaces");
-                            WorkspaceProvider::Coder
+                        Ok(resp) => {
+                            if attempts % 5 == 1 {
+                                eprintln!("  ⏳ Coder not healthy yet (HTTP {}), retrying... [{}s elapsed]", resp.status(), start.elapsed().as_secs());
+                            }
                         }
                         Err(e) => {
+                            if attempts % 5 == 1 {
+                                eprintln!(
+                                    "  ⏳ Coder not reachable yet ({}), retrying... [{}s elapsed]",
+                                    if e.is_connect() {
+                                        "connection refused"
+                                    } else {
+                                        "timeout"
+                                    },
+                                    start.elapsed().as_secs()
+                                );
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            };
+
+            match healthy_client {
+                Some(_) => {
+                    // Server is healthy — proceed with bootstrap (create admin, get token, push templates)
+                    match coder_client::bootstrap::CoderBootstrapper::from_env() {
+                        Ok(bootstrapper) => match bootstrapper.bootstrap().await {
+                            Ok(client) => {
+                                std::env::set_var("CODER_API_TOKEN", client.token());
+                                eprintln!("  ✓ Coder bootstrapped successfully");
+                                eprintln!("    Admin user created, API token obtained, workspace templates pushed");
+                                info!("Coder: bootstrapped — using Coder workspaces");
+                                WorkspaceProvider::Coder
+                            }
+                            Err(e) => {
+                                eprintln!();
+                                eprintln!("  ✗ Coder user/token setup failed:");
+                                eprintln!("    {}", e);
+                                eprintln!();
+                                eprintln!("  Falling back to local mode (git worktrees).");
+                                eprintln!();
+                                warn!(
+                                    "Coder: bootstrap failed ({}), falling back to local mode",
+                                    e
+                                );
+                                std::env::set_var("WORKSPACE_PROVIDER", "local");
+                                std::env::remove_var("CODER_URL");
+                                WorkspaceProvider::Local
+                            }
+                        },
+                        Err(e) => {
                             eprintln!();
-                            eprintln!("  ✗ Coder user/token setup failed:");
-                            eprintln!("    {}", e);
+                            eprintln!("  ✗ Coder configuration error: {}", e);
                             eprintln!();
                             eprintln!("  Falling back to local mode (git worktrees).");
                             eprintln!();
-                            warn!("Coder: bootstrap failed ({}), falling back to local mode", e);
+                            warn!(
+                                "Coder: configuration error ({}), falling back to local mode",
+                                e
+                            );
                             std::env::set_var("WORKSPACE_PROVIDER", "local");
                             std::env::remove_var("CODER_URL");
                             WorkspaceProvider::Local
                         }
                     }
-                    Err(e) => {
-                        eprintln!();
-                        eprintln!("  ✗ Coder configuration error: {}", e);
-                        eprintln!();
-                        eprintln!("  Falling back to local mode (git worktrees).");
-                        eprintln!();
-                        warn!("Coder: configuration error ({}), falling back to local mode", e);
-                        std::env::set_var("WORKSPACE_PROVIDER", "local");
-                        std::env::remove_var("CODER_URL");
-                        WorkspaceProvider::Local
+                }
+                None => {
+                    // Health check timed out — provide diagnostics
+                    eprintln!();
+                    eprintln!("  ✗ Coder server did not become healthy within 120s");
+                    eprintln!();
+                    eprintln!("  Diagnostics:");
+
+                    // Port check — use the same host/port as CODER_URL
+                    let check_addr = format!("{}:{}", coder_host, coder_port);
+                    let port_check = tokio::net::TcpStream::connect(&check_addr).await;
+                    match port_check {
+                        Ok(_) => eprintln!(
+                            "    • Port {} is open — Coder process is listening but not healthy",
+                            coder_port
+                        ),
+                        Err(_) => eprintln!(
+                            "    • Port {} is not open — Coder is not listening",
+                            coder_port
+                        ),
                     }
-                }
-            }
-            None => {
-                // Health check timed out — provide diagnostics
-                eprintln!();
-                eprintln!("  ✗ Coder server did not become healthy within 120s");
-                eprintln!();
-                eprintln!("  Diagnostics:");
 
-                // Port check — use the same host/port as CODER_URL
-                let check_addr = {
-                    let url = reqwest::Url::parse(&coder_url).unwrap_or_else(|_| reqwest::Url::parse("http://localhost:7080").unwrap());
-                    let host = url.host_str().unwrap_or("localhost");
-                    let port = url.port().unwrap_or(7080);
-                    format!("{}:{}", host, port)
-                };
-                let port_check = tokio::net::TcpStream::connect(&check_addr).await;
-                match port_check {
-                    Ok(_) => eprintln!("    • Port 7080 is open — Coder process is listening but not healthy"),
-                    Err(_) => eprintln!("    • Port 7080 is not open — Coder is not listening"),
-                }
+                    // Container status
+                    if let Some(ref cp) = compose_path {
+                        let ps_output = tokio::process::Command::new("docker")
+                            .args([
+                                "compose",
+                                "--profile",
+                                "coder",
+                                "-f",
+                                cp.to_str().unwrap_or("docker-compose.yml"),
+                                "ps",
+                            ])
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                            .await;
 
-                // Container status
-                if let Some(ref cp) = compose_path {
-                    let ps_output = tokio::process::Command::new("docker")
-                        .args(["compose", "--profile", "coder", "-f", cp.to_str().unwrap_or("docker-compose.yml"), "ps"])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output()
-                        .await;
-
-                    if let Ok(out) = ps_output {
-                        let table = String::from_utf8_lossy(&out.stdout);
-                        let running = table.lines().skip(1)
-                            .filter(|l| l.to_lowercase().contains("running") || l.to_lowercase().contains("up"))
-                            .count();
-                        if running >= 2 {
-                            eprintln!("    • Containers are running ({}/2 up)", running);
+                        if let Ok(out) = ps_output {
+                            let table = String::from_utf8_lossy(&out.stdout);
+                            let running = table
+                                .lines()
+                                .skip(1)
+                                .filter(|l| {
+                                    l.to_lowercase().contains("running")
+                                        || l.to_lowercase().contains("up")
+                                })
+                                .count();
+                            if running >= 2 {
+                                eprintln!("    • Containers are running ({}/2 up)", running);
+                            } else {
+                                eprintln!("    • Not all containers running ({}/2 up)", running);
+                                eprintln!("      Check: docker compose --profile coder ps");
+                            }
                         } else {
-                            eprintln!("    • Not all containers running ({}/2 up)", running);
-                            eprintln!("      Check: docker compose --profile coder ps");
+                            eprintln!("    • Could not check container status");
                         }
-                    } else {
-                        eprintln!("    • Could not check container status");
-                    }
 
-                    // Container logs
-                    let logs_output = tokio::process::Command::new("docker")
-                        .args(["compose", "--profile", "coder", "-f", cp.to_str().unwrap_or("docker-compose.yml"), "logs", "coder", "--tail", "15"])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output()
-                        .await;
+                        // Container logs
+                        let logs_output = tokio::process::Command::new("docker")
+                            .args([
+                                "compose",
+                                "--profile",
+                                "coder",
+                                "-f",
+                                cp.to_str().unwrap_or("docker-compose.yml"),
+                                "logs",
+                                "coder",
+                                "--tail",
+                                "15",
+                            ])
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                            .await;
 
-                    if let Ok(log_out) = logs_output {
-                        let logs = String::from_utf8_lossy(&log_out.stdout);
-                        let lines: Vec<&str> = logs.lines().rev().take(8).collect();
-                        if !lines.is_empty() {
-                            eprintln!("    Recent Coder logs:");
-                            for line in lines.into_iter().rev() {
-                                eprintln!("      {}", line);
+                        if let Ok(log_out) = logs_output {
+                            let logs = String::from_utf8_lossy(&log_out.stdout);
+                            let lines: Vec<&str> = logs.lines().rev().take(8).collect();
+                            if !lines.is_empty() {
+                                eprintln!("    Recent Coder logs:");
+                                for line in lines.into_iter().rev() {
+                                    eprintln!("      {}", line);
+                                }
+                            }
+                            if logs.contains("permission denied") {
+                                eprintln!("    • Docker socket permission issue detected");
+                                eprintln!(
+                                    "      Fix: sudo usermod -aG docker $USER && newgrp docker"
+                                );
+                            }
+                            if logs.contains("database") && logs.contains("connection refused") {
+                                eprintln!("    • Coder cannot reach its database (coder-db may still be starting)");
+                                eprintln!(
+                                    "      Try: docker compose --profile coder restart coder"
+                                );
                             }
                         }
-                        if logs.contains("permission denied") {
-                            eprintln!("    • Docker socket permission issue detected");
-                            eprintln!("      Fix: sudo usermod -aG docker $USER && newgrp docker");
+                    } else {
+                        eprintln!("    • No docker-compose.yml found for further diagnostics");
+                    }
+
+                    // Try a direct health check one more time to show what's happening
+                    match http_client
+                        .get(format!(
+                            "{}/api/v2/buildinfo",
+                            coder_url.trim_end_matches('/')
+                        ))
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            eprintln!(
+                                "    • Coder health endpoint returned HTTP {} (expected 200)",
+                                resp.status()
+                            );
                         }
-                        if logs.contains("database") && logs.contains("connection refused") {
-                            eprintln!("    • Coder cannot reach its database (coder-db may still be starting)");
-                            eprintln!("      Try: docker compose --profile coder restart coder");
+                        Err(e) => {
+                            eprintln!("    • Coder health endpoint unreachable: {}", e);
                         }
                     }
-                } else {
-                    eprintln!("    • No docker-compose.yml found for further diagnostics");
+
+                    eprintln!();
+                    eprintln!("  Falling back to local mode (git worktrees).");
+                    eprintln!("  To retry with Coder, fix the issue above and re-run.");
+                    eprintln!();
+                    warn!("Coder: health check timed out, falling back to local mode");
+
+                    std::env::set_var("WORKSPACE_PROVIDER", "local");
+                    std::env::remove_var("CODER_URL");
+                    WorkspaceProvider::Local
                 }
-
-                // Try a direct health check one more time to show what's happening
-                match http_client.get(format!("{}/api/v2/buildinfo", coder_url.trim_end_matches('/'))).timeout(std::time::Duration::from_secs(5)).send().await {
-                    Ok(resp) => {
-                        eprintln!("    • Coder health endpoint returned HTTP {} (expected 200)", resp.status());
-                    }
-                    Err(e) => {
-                        eprintln!("    • Coder health endpoint unreachable: {}", e);
-                    }
-                }
-
-                eprintln!();
-                eprintln!("  Falling back to local mode (git worktrees).");
-                eprintln!("  To retry with Coder, fix the issue above and re-run.");
-                eprintln!();
-                warn!("Coder: health check timed out, falling back to local mode");
-
-                std::env::set_var("WORKSPACE_PROVIDER", "local");
-                std::env::remove_var("CODER_URL");
-                WorkspaceProvider::Local
             }
-        }
         }
     } else {
         info!("Coder: disabled (local mode)");
@@ -558,6 +976,9 @@ async fn main() -> Result<()> {
 
     let registry_path = resolver.registry_path();
     let registry = config::Registry::load(&registry_path)?;
+    let registry_json = serde_json::to_string_pretty(&registry)?;
+    std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
+    std::env::set_var("OPENFLOWS_REGISTRY_JSON", &registry_json);
     let github_token = registry
         .resolve_github_token("forge")
         .expect("AGENT_FORGE_GITHUB_TOKEN or GITHUB_PERSONAL_ACCESS_TOKEN must be set");
@@ -668,6 +1089,9 @@ async fn main() -> Result<()> {
     store.set(KEY_TICKETS, serde_json::json!([])).await;
     store.set(KEY_WORKER_SLOTS, serde_json::json!({})).await;
     store.set(KEY_PENDING_PRS, serde_json::json!([])).await;
+    store
+        .set("registry_json", serde_json::json!(registry_json))
+        .await;
 
     // Store Coder context so downstream nodes can reconstruct CoderClient
     if matches!(workspace_provider, WorkspaceProvider::Coder) {
@@ -696,4 +1120,37 @@ async fn main() -> Result<()> {
     info!("Orchestration flow halted with action: {}", final_action);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coder_image_tag_candidates_from_env;
+
+    #[test]
+    fn defaults_to_latest_then_preview() {
+        assert_eq!(
+            coder_image_tag_candidates_from_env(None),
+            vec!["latest".to_string(), "preview".to_string()]
+        );
+    }
+
+    #[test]
+    fn explicit_pin_keeps_safe_fallbacks() {
+        assert_eq!(
+            coder_image_tag_candidates_from_env(Some("2.34.5")),
+            vec![
+                "2.34.5".to_string(),
+                "latest".to_string(),
+                "preview".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_latest_deduplicates() {
+        assert_eq!(
+            coder_image_tag_candidates_from_env(Some("latest")),
+            vec!["latest".to_string(), "preview".to_string()]
+        );
+    }
 }

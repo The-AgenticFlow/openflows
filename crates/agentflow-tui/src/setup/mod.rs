@@ -334,8 +334,22 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
             content.push_str("CODER_ADMIN_USERNAME=admin\n");
             content.push_str("CODER_ADMIN_EMAIL=admin@openflows.dev\n");
             content.push_str("CODER_PG_PASSWORD=coder\n");
-            content.push_str(&format!("USE_AI_GATEWAY={}\n", if config.enable_ai_gateway { "true" } else { "false" }));
-            content.push_str(&format!("ENABLE_SLACKME={}\n", if config.enable_slackme { "true" } else { "false" }));
+            content.push_str(&format!(
+                "USE_AI_GATEWAY={}\n",
+                if config.enable_ai_gateway {
+                    "true"
+                } else {
+                    "false"
+                }
+            ));
+            content.push_str(&format!(
+                "ENABLE_SLACKME={}\n",
+                if config.enable_slackme {
+                    "true"
+                } else {
+                    "false"
+                }
+            ));
 
             // Coder external auth for slackme (Slack DM notifications)
             if config.enable_slackme {
@@ -343,7 +357,8 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
                 // Client ID and secret would come from Slack app configuration
                 // These are placeholders — user must fill in their real values
                 content.push_str("# CODER_EXTERNAL_AUTH_1_CLIENT_ID=<your-slack-client-id>\n");
-                content.push_str("# CODER_EXTERNAL_AUTH_1_CLIENT_SECRET=<your-slack-client-secret>\n");
+                content
+                    .push_str("# CODER_EXTERNAL_AUTH_1_CLIENT_SECRET=<your-slack-client-secret>\n");
             }
         }
         WorkspaceProvider::Local => {
@@ -416,15 +431,26 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
             .iter()
             .find(|(key, _, _)| *key == cli)
             .map(|(_, source, version)| (source.to_string(), version.to_string()))
-            .unwrap_or_else(|| (
-                "registry.coder.com/coder/claude-code/coder".to_string(),
-                "5.2.0".to_string(),
-            ));
+            .unwrap_or_else(|| {
+                (
+                    "registry.coder.com/coder/claude-code/coder".to_string(),
+                    "5.2.0".to_string(),
+                )
+            });
         let permission_mode = config::registry::default_permission_mode_for_role(role);
         let mut params = serde_json::Map::new();
-        params.insert("workdir".to_string(), serde_json::Value::String("/home/coder/workspace".to_string()));
-        params.insert("permission_mode".to_string(), serde_json::Value::String(permission_mode.to_string()));
-        params.insert("enable_ai_gateway".to_string(), serde_json::Value::Bool(config.enable_ai_gateway));
+        params.insert(
+            "workdir".to_string(),
+            serde_json::Value::String("/home/coder/workspace".to_string()),
+        );
+        params.insert(
+            "permission_mode".to_string(),
+            serde_json::Value::String(permission_mode.to_string()),
+        );
+        params.insert(
+            "enable_ai_gateway".to_string(),
+            serde_json::Value::Bool(config.enable_ai_gateway),
+        );
         Some(config::registry::CoderModule::with_params(
             source,
             version,
@@ -453,7 +479,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("nexus-key".to_string()),
                     github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
-                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(
+                        config.workspace_provider.clone(),
+                    )),
                     coder_module: resolve_coder_module(&default_cli, "nexus"),
                 },
                 config::RegistryEntry {
@@ -471,7 +499,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "registry.npmjs.org".to_string(),
                         "crates.io".to_string(),
                     ]),
-                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(
+                        config.workspace_provider.clone(),
+                    )),
                     coder_module: resolve_coder_module(&default_cli, "forge"),
                 },
                 config::RegistryEntry {
@@ -486,7 +516,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "api.github.com".to_string(),
                         "*.github.com".to_string(),
                     ]),
-                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(
+                        config.workspace_provider.clone(),
+                    )),
                     coder_module: resolve_coder_module(&default_cli, "sentinel"),
                 },
                 config::RegistryEntry {
@@ -498,7 +530,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("vessel-key".to_string()),
                     github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
-                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(
+                        config.workspace_provider.clone(),
+                    )),
                     coder_module: resolve_coder_module(&default_cli, "vessel"),
                 },
                 config::RegistryEntry {
@@ -510,7 +544,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     routing_key: Some("lore-key".to_string()),
                     github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
-                    workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    workspace_provider: Some(config::state::WorkspaceProvider::from(
+                        config.workspace_provider.clone(),
+                    )),
                     coder_module: resolve_coder_module(&default_cli, "lore"),
                 },
             ]
@@ -527,7 +563,11 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                             None
                         }
                     });
-                    let cli = if agent.cli.is_empty() { default_cli.clone() } else { agent.cli.clone() };
+                    let cli = if agent.cli.is_empty() {
+                        default_cli.clone()
+                    } else {
+                        agent.cli.clone()
+                    };
                     config::RegistryEntry {
                         id: agent.id.clone(),
                         cli: cli.clone(),
@@ -537,7 +577,9 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         routing_key: agent.routing_key.clone(),
                         github_token_env: token_env,
                         allowed_domains: None,
-                        workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                        workspace_provider: Some(config::state::WorkspaceProvider::from(
+                            config.workspace_provider.clone(),
+                        )),
                         coder_module: resolve_coder_module(&cli, &agent.id),
                     }
                 })

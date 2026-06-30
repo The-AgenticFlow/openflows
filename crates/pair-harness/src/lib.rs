@@ -7,6 +7,8 @@
 //! - File locking uses flock for atomic acquisition
 //! - Both FORGE and SENTINEL run with auto-mode permissions
 
+#[cfg(feature = "coder")]
+pub mod coder_process;
 pub mod isolation;
 pub mod mcp_config;
 pub mod pair;
@@ -15,8 +17,6 @@ pub mod process;
 pub mod provision;
 pub mod reset;
 pub mod responses_proxy;
-#[cfg(feature = "coder")]
-pub mod coder_process;
 pub mod transport;
 pub mod types;
 pub mod watchdog;

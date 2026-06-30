@@ -170,6 +170,15 @@ pub fn heartbeat_key(role: &str, ticket_id: &str) -> String {
     format!("heartbeat:{}-T-{}", role, ticket_id)
 }
 
+/// Heartbeat payload written by each workspace.
+/// Stored as JSON under the `heartbeat:{role}-T-{ticket_id}` key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRecord {
+    pub ts: u64,
+    pub ws_id: String,
+    pub status: String,
+}
+
 /// Build a full ticket-scoped shared store key path.
 /// e.g. `ticket:T-42:chat:forge`
 pub fn full_ticket_key(ticket_id: &str, subkey: &str, role: &str) -> String {

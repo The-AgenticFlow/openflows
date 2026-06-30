@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -68,9 +69,18 @@ impl Cooldown {
 /// Notification channel webhook configuration.
 #[derive(Debug, Clone)]
 pub enum NotificationChannel {
-    SlackWebhook { url: String },
-    DiscordWebhook { url: String },
-    WhatsApp { account_sid: String, auth_token: String, from_phone: String, to_phone: String },
+    SlackWebhook {
+        url: String,
+    },
+    DiscordWebhook {
+        url: String,
+    },
+    WhatsApp {
+        account_sid: String,
+        auth_token: String,
+        from_phone: String,
+        to_phone: String,
+    },
 }
 
 /// The notification service that dispatches messages to configured channels.
@@ -81,6 +91,59 @@ pub struct NotificationService {
 }
 
 impl NotificationService {
+    /// Build a service from environment variables.
+    ///
+    /// Supported variables:
+    /// - `SLACK_WEBHOOK_URL`
+    /// - `DISCORD_WEBHOOK_URL`
+    /// - `WHATSAPP_ACCOUNT_SID` / `WHATSAPP_API_KEY`
+    /// - `WHATSAPP_AUTH_TOKEN`
+    /// - `WHATSAPP_FROM_PHONE`
+    /// - `WHATSAPP_TO_PHONE` / `WHATSAPP_PHONE_NUMBER`
+    pub fn from_env() -> Self {
+        let mut channels = Vec::new();
+
+        if let Ok(url) = env::var("SLACK_WEBHOOK_URL") {
+            if !url.is_empty() {
+                channels.push(NotificationChannel::SlackWebhook { url });
+            }
+        }
+
+        if let Ok(url) = env::var("DISCORD_WEBHOOK_URL") {
+            if !url.is_empty() {
+                channels.push(NotificationChannel::DiscordWebhook { url });
+            }
+        }
+
+        let account_sid = env::var("WHATSAPP_ACCOUNT_SID")
+            .or_else(|_| env::var("WHATSAPP_API_KEY"))
+            .ok()
+            .filter(|v| !v.is_empty());
+        let auth_token = env::var("WHATSAPP_AUTH_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let from_phone = env::var("WHATSAPP_FROM_PHONE")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let to_phone = env::var("WHATSAPP_TO_PHONE")
+            .or_else(|_| env::var("WHATSAPP_PHONE_NUMBER"))
+            .ok()
+            .filter(|v| !v.is_empty());
+
+        if let (Some(account_sid), Some(auth_token), Some(from_phone), Some(to_phone)) =
+            (account_sid, auth_token, from_phone, to_phone)
+        {
+            channels.push(NotificationChannel::WhatsApp {
+                account_sid,
+                auth_token,
+                from_phone,
+                to_phone,
+            });
+        }
+
+        Self::new(channels)
+    }
+
     /// Create a new service from a list of channel configurations.
     pub fn new(channels: Vec<NotificationChannel>) -> Self {
         Self {
@@ -138,13 +201,20 @@ impl NotificationService {
     }
 }
 
-async fn send_to_channel(http: &Client, channel: &NotificationChannel, msg: &NotificationMessage) -> Result<()> {
+async fn send_to_channel(
+    http: &Client,
+    channel: &NotificationChannel,
+    msg: &NotificationMessage,
+) -> Result<()> {
     match channel {
         NotificationChannel::SlackWebhook { url } => send_slack(http, url, msg).await,
         NotificationChannel::DiscordWebhook { url } => send_discord(http, url, msg).await,
-        NotificationChannel::WhatsApp { account_sid, auth_token, from_phone, to_phone } => {
-            send_whatsapp(http, account_sid, auth_token, from_phone, to_phone, msg).await
-        }
+        NotificationChannel::WhatsApp {
+            account_sid,
+            auth_token,
+            from_phone,
+            to_phone,
+        } => send_whatsapp(http, account_sid, auth_token, from_phone, to_phone, msg).await,
     }
 }
 
@@ -175,7 +245,11 @@ async fn send_slack(http: &Client, url: &str, msg: &NotificationMessage) -> Resu
         ]
     });
 
-    let resp = http.post(url).json(&body).send().await
+    let resp = http
+        .post(url)
+        .json(&body)
+        .send()
+        .await
         .context("Slack webhook POST failed")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -196,14 +270,30 @@ struct EmbedField<'a> {
 /// Send a Discord rich embed to a webhook URL.
 async fn send_discord(http: &Client, url: &str, msg: &NotificationMessage) -> Result<()> {
     let mut fields = vec![
-        EmbedField { name: "Ticket", value: &msg.ticket_id, inline: true },
-        EmbedField { name: "Role", value: &msg.role, inline: true },
+        EmbedField {
+            name: "Ticket",
+            value: &msg.ticket_id,
+            inline: true,
+        },
+        EmbedField {
+            name: "Role",
+            value: &msg.role,
+            inline: true,
+        },
     ];
     if !msg.workspace_link.is_empty() {
-        fields.push(EmbedField { name: "Workspace", value: &msg.workspace_link, inline: false });
+        fields.push(EmbedField {
+            name: "Workspace",
+            value: &msg.workspace_link,
+            inline: false,
+        });
     }
     if !msg.github_link.is_empty() {
-        fields.push(EmbedField { name: "GitHub", value: &msg.github_link, inline: false });
+        fields.push(EmbedField {
+            name: "GitHub",
+            value: &msg.github_link,
+            inline: false,
+        });
     }
 
     let body = serde_json::json!({
@@ -221,7 +311,11 @@ async fn send_discord(http: &Client, url: &str, msg: &NotificationMessage) -> Re
         }]
     });
 
-    let resp = http.post(url).json(&body).send().await
+    let resp = http
+        .post(url)
+        .json(&body)
+        .send()
+        .await
         .context("Discord webhook POST failed")?;
     if !resp.status().is_success() && resp.status().as_u16() != 204 {
         let status = resp.status();
@@ -249,7 +343,9 @@ async fn send_whatsapp(
 
     let mut body_text = format!(
         "OpenFlows Alert: {} (Ticket {})\nReason: {}",
-        msg.role.to_uppercase(), msg.ticket_id, msg.reason
+        msg.role.to_uppercase(),
+        msg.ticket_id,
+        msg.reason
     );
     if !msg.workspace_link.is_empty() {
         body_text.push_str(&format!("\nWorkspace: {}", msg.workspace_link));
@@ -258,13 +354,10 @@ async fn send_whatsapp(
         body_text.push_str(&format!("\nGitHub: {}", msg.github_link));
     }
 
-    let form = [
-        ("From", from_phone),
-        ("To", to_phone),
-        ("Body", &body_text),
-    ];
+    let form = [("From", from_phone), ("To", to_phone), ("Body", &body_text)];
 
-    let resp = http.post(&url)
+    let resp = http
+        .post(&url)
         .basic_auth(account_sid, Some(auth_token))
         .form(&form)
         .send()
