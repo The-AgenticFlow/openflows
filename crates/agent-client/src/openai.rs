@@ -77,7 +77,8 @@ impl OpenAiClient {
     pub fn from_proxy(model_override: &str) -> Result<Self> {
         let proxy_url = std::env::var("PROXY_URL")
             .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
-            .context("PROXY_URL not set — required for OpenAI-compatible proxy routing")?;
+            .or_else(|_| std::env::var("LITELLM_PROXY_URL"))
+            .context("PROXY_URL (or LITELLM_PROXY_URL / ANTHROPIC_BASE_URL) not set — required for OpenAI-compatible proxy routing")?;
         let api_url = format!("{}/chat/completions", proxy_url.trim_end_matches('/'));
         // Priority: PROXY_API_KEY > OPENAI_API_KEY > dummy key for no-auth proxies
         let api_key = std::env::var("PROXY_API_KEY")

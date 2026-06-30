@@ -24,7 +24,9 @@ use crate::types::{LlmClient, LlmResponse, Message, ToolSchema};
 
 /// Check if a proxy is configured.
 fn proxy_is_configured() -> bool {
-    std::env::var("PROXY_URL").is_ok() || std::env::var("ANTHROPIC_BASE_URL").is_ok()
+    std::env::var("PROXY_URL").is_ok()
+        || std::env::var("ANTHROPIC_BASE_URL").is_ok()
+        || std::env::var("LITELLM_PROXY_URL").is_ok()
 }
 
 /// Check if an external connector (gateway) is configured.
@@ -229,24 +231,38 @@ impl FallbackClient {
         let mapped_provider = model_override.and_then(resolve_provider_for_model);
         let external_connector = external_connector_is_configured();
 
+        // Support LITELLM_PROXY_URL as fallback when PROXY_URL is not set
+        let proxy_url = std::env::var("PROXY_URL")
+            .ok()
+            .or_else(|| std::env::var("LITELLM_PROXY_URL").ok());
+
         info!(
             model = model,
             mapped_provider = ?mapped_provider,
             external_connector = external_connector,
+            proxy_url = ?proxy_url,
             "Proxy mode: configuring client{}",
             if external_connector { " (external connector - no direct fallbacks)" } else { " (with direct-key fallbacks)" }
         );
 
         match mapped_provider.as_deref() {
-            Some("openai") => match OpenAiClient::from_proxy(model) {
-                Ok(c) => {
-                    info!(provider = "openai-proxy", model = %c.model(), "Proxy client initialized");
-                    clients.push(Box::new(c));
+            Some("openai") => {
+                if let Some(ref proxy) = proxy_url {
+                    std::env::set_var("PROXY_URL", proxy);
                 }
-                Err(e) => {
-                    warn!(provider = "openai-proxy", error = %e, "Failed to init proxy client")
+                match OpenAiClient::from_proxy(model) {
+                    Ok(c) => {
+                        info!(provider = "openai-proxy", model = %c.model(), "Proxy client initialized");
+                        clients.push(Box::new(c));
+                    }
+                    Err(e) => {
+                        warn!(provider = "openai-proxy", error = %e, "Failed to init proxy client")
+                    }
                 }
-            },
+                if proxy_url.is_some() {
+                    std::env::remove_var("PROXY_URL");
+                }
+            }
             _ => match AnthropicClient::from_env_with_model(model) {
                 Ok(c) => {
                     info!(provider = "anthropic-proxy", model = %c.model(), "Proxy client initialized");

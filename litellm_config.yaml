@@ -1,33 +1,43 @@
-model_list:
-  - model_name: claude-sonnet-4-5
-    litellm_params:
-      model: anthropic/claude-sonnet-4-5
-      api_key: os.environ/ANTHROPIC_API_KEY
-    model_info:
-      id: forge-key
+# LiteLLM proxy configuration
+# Per-role model aliases for fallback routing (Local mode + non-Anthropic providers).
+# When USE_AI_GATEWAY=true (Coder mode), agents route through Coder's AI Gateway
+# instead of LiteLLM. LiteLLM remains available as a fallback.
 
-  - model_name: claude-sonnet-4-5
+model_list:
+  # NEXUS — Orchestrator (Claude Sonnet 4.5)
+  - model_name: openflows-nexus
     litellm_params:
       model: anthropic/claude-sonnet-4-5
       api_key: os.environ/ANTHROPIC_API_KEY
     model_info:
       id: nexus-key
 
-  - model_name: claude-sonnet-4-5
+  # FORGE — Builder/Coder (Claude Sonnet 4.5)
+  - model_name: openflows-forge
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      id: forge-key
+
+  # SENTINEL — Reviewer (Gemini 2.5 Pro)
+  - model_name: openflows-sentinel
     litellm_params:
       model: gemini/gemini-2.5-pro
       api_key: os.environ/GEMINI_API_KEY
     model_info:
       id: sentinel-key
 
-  - model_name: claude-sonnet-4-5
+  # VESSEL — Merge gatekeeper (Llama 3.3 70B via Groq)
+  - model_name: openflows-vessel
     litellm_params:
       model: groq/llama-3.3-70b-versatile
       api_key: os.environ/GROQ_API_KEY
     model_info:
       id: vessel-key
 
-  - model_name: claude-sonnet-4-5
+  # LORE — Documentation (GPT-4o Mini)
+  - model_name: openflows-lore
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
@@ -37,8 +47,9 @@ model_list:
 router_settings:
   routing_strategy: least-busy
   num_retries: 3
+  # Fallback to Claude for the forge role if primary is unavailable
   fallbacks:
-    - model: claude-sonnet-4-5
+    - model: openflows-forge
       fallback: anthropic/claude-sonnet-4-5
 
 litellm_settings:

@@ -121,3 +121,63 @@ pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
 pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
 pub const ACTION_DOCS_PENDING: &str = "docs_pending";
 pub const ACTION_AWAITING_HUMAN: &str = "awaiting_human";
+
+// ── Ticket-scoped SharedStore key prefixes (Phase 5) ────────────────────
+
+/// Build a ticket-scoped key like `ticket:T-42:chat:forge`.
+pub fn ticket_key(ticket_id: &str, subkey: &str) -> String {
+    format!("ticket:{}:{}", ticket_id, subkey)
+}
+
+/// Key suffix for the workspace ID assigned to a ticket + role.
+/// Full key: `ticket:{id}:workspace:{role}`
+pub const KEY_TICKET_WORKSPACE: &str = "workspace";
+
+/// Key suffix for the task dispatch payload from Nexus to Forge.
+/// Full key: `ticket:{id}:dispatch:{role}`
+pub const KEY_TICKET_DISPATCH: &str = "dispatch";
+
+/// Key suffix for the Coder Chat ID bound to a ticket + role.
+/// Full key: `ticket:{id}:chat:{role}`
+pub const KEY_TICKET_CHAT: &str = "chat";
+
+/// Key suffix for Sentinel review results.
+/// Full key: `ticket:{id}:review:{role}`
+pub const KEY_TICKET_REVIEW: &str = "review";
+
+/// Key suffix for vessel deployment status.
+/// Full key: `ticket:{id}:deployment`
+pub const KEY_TICKET_DEPLOYMENT: &str = "deployment";
+
+/// Key suffix for current ticket status.
+/// Full key: `ticket:{id}:status`
+pub const KEY_TICKET_STATUS: &str = "status";
+
+/// Key suffix for the last action Nexus took on a chat (for waiting disambiguation).
+/// Full key: `ticket:{id}:chat_action:{role}`
+pub const KEY_TICKET_CHAT_ACTION: &str = "chat_action";
+
+/// Key suffix for recovery attempt counter.
+/// Full key: `ticket:{id}:recovery_attempts`
+pub const KEY_TICKET_RECOVERY_ATTEMPTS: &str = "recovery_attempts";
+
+/// Key suffix for the diff_status payload from coder chats.
+/// Full key: `ticket:{id}:diff_status:{role}`
+pub const KEY_TICKET_DIFF_STATUS: &str = "diff_status";
+
+/// Heartbeat key pattern: `heartbeat:{role}-T-{ticket_id}`
+pub fn heartbeat_key(role: &str, ticket_id: &str) -> String {
+    format!("heartbeat:{}-T-{}", role, ticket_id)
+}
+
+/// Build a full ticket-scoped shared store key path.
+/// e.g. `ticket:T-42:chat:forge`
+pub fn full_ticket_key(ticket_id: &str, subkey: &str, role: &str) -> String {
+    format!("ticket:{}:{}:{}", ticket_id, subkey, role)
+}
+
+/// Build a full ticket-scoped shared store key path without role suffix.
+/// e.g. `ticket:T-42:status`
+pub fn full_ticket_key_flat(ticket_id: &str, subkey: &str) -> String {
+    format!("ticket:{}:{}", ticket_id, subkey)
+}

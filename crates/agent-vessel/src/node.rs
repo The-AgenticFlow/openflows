@@ -216,6 +216,61 @@ impl VesselNode {
         }
     }
 
+    /// Destroy a Coder workspace and archive all associated chats.
+    /// Called during merge/cleanup to tear down ephemeral workspaces.
+    async fn destroy_coder_workspace(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        workspace_id: &str,
+    ) {
+        if let Some(client) = Self::coder_client_from_store(store).await {
+            // Archive all chats associated with this workspace
+            let chats = client.list_chats().await.unwrap_or_default();
+            let ws_chats: Vec<_> = chats
+                .iter()
+                .filter(|c| c.workspace_id == workspace_id)
+                .collect();
+
+            let mut archived = 0;
+            for chat in &ws_chats {
+                if client.archive_chat(&chat.id).await.is_ok() {
+                    archived += 1;
+                }
+            }
+
+            if !ws_chats.is_empty() {
+                info!(
+                    workspace_id,
+                    archived,
+                    total = ws_chats.len(),
+                    "Archived chats before workspace destruction"
+                );
+            }
+
+            // Delete the workspace
+            if let Err(e) = client.delete_workspace(workspace_id).await {
+                warn!(
+                    worker_id,
+                    workspace_id,
+                    error = %e,
+                    "Failed to delete Coder workspace"
+                );
+            } else {
+                info!(worker_id, workspace_id, "Destroyed Coder workspace");
+            }
+        }
+
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get_mut(worker_id) {
+            if slot.workspace_id.as_deref() == Some(workspace_id) {
+                slot.workspace_id = None;
+                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+            }
+        }
+    }
+
     /// Stop a Coder workspace for the worker associated with a merged PR.
     async fn stop_coder_workspace_for_pr(
         &self,
@@ -239,6 +294,34 @@ impl VesselNode {
         if let Some(slot) = slots.get(worker_id) {
             if let Some(ref ws_id) = slot.workspace_id {
                 self.stop_coder_workspace_for_worker(store, worker_id, ws_id).await;
+            }
+        }
+    }
+
+    /// Destroy a Coder workspace for the worker associated with a merged PR.
+    /// Archives all chats and deletes the workspace.
+    async fn destroy_coder_workspace_for_pr(
+        &self,
+        store: &SharedStore,
+        pending_prs: &[Value],
+        pr_number: u64,
+    ) {
+        let pr_entry = match pending_prs
+            .iter()
+            .find(|p| p["number"].as_u64() == Some(pr_number))
+        {
+            Some(e) => e,
+            None => return,
+        };
+        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
+        if worker_id.is_empty() {
+            return;
+        }
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get(worker_id) {
+            if let Some(ref ws_id) = slot.workspace_id {
+                self.destroy_coder_workspace(store, worker_id, ws_id).await;
             }
         }
     }
@@ -616,8 +699,8 @@ impl Node for VesselNode {
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, ticket_id).await;
 
-                    // Stop Coder workspace if this worker was using one
-                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
+                    // Destroy Coder workspace (archive chats + delete) for this worker
+                    self.destroy_coder_workspace_for_pr(store, &pending_prs, *pr_number).await;
 
                     // Parallelize post-merge operations for reduced latency
                     // Run GitHub issue close concurrently with store updates

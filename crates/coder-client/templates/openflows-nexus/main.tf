@@ -17,18 +17,6 @@ variable "agent_module_version" {
   description = "Version of the agent module"
 }
 
-variable "role" {
-  type        = string
-  default     = "sentinel"
-  description = "Agent role name"
-}
-
-variable "ticket_id" {
-  type        = string
-  default     = ""
-  description = "Ticket identifier"
-}
-
 variable "enable_ai_gateway" {
   type        = bool
   default     = true
@@ -88,7 +76,7 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} HSET "heartbeat:sentinel-T-${var.ticket_id}" \
+      redis-cli -u ${var.redis_url} HSET "heartbeat:nexus" \
         "ts" "$(date +%s)" \
         "ws_id" "${data.coder_workspace.me.id}" \
         "status" "running" 2>/dev/null || true
@@ -98,11 +86,11 @@ resource "coder_agent" "main" {
 }
 
 resource "docker_volume" "workspace" {
-  name = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
 resource "docker_container" "workspace" {
-  name  = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name  = "openflows-nexus-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
   volumes {
@@ -115,8 +103,7 @@ resource "docker_container" "workspace" {
     "REDIS_URL=${var.redis_url}",
     "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
     "USE_AI_GATEWAY=${var.use_ai_gateway}",
-    "ROLE=sentinel",
-    "TICKET_ID=${var.ticket_id}",
+    "ROLE=nexus",
   ]
 
   # Connect to the openflows_default compose network for Redis access.

@@ -14,10 +14,20 @@
 pub mod bootstrap;
 pub mod types;
 
+#[cfg(feature = "chats-api")]
+pub mod chat_stream;
+#[cfg(feature = "chats-api")]
+pub use chat_stream::{ChatEvent, ChatStream};
+
+#[cfg(test)]
+pub mod mock_chat_server;
+
 pub use types::*;
 
 use anyhow::{bail, Context, Result};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// Client for the Coder OSS REST API.
@@ -35,6 +45,10 @@ pub struct CoderClient {
     /// Session token for `coder ssh` via `CODER_SESSION_TOKEN` env.
     /// When set, used instead of the API token for workspace SSH operations.
     session_token: Option<String>,
+    /// Cached model configurations from `list_chat_models()`.
+    /// Lazily populated on first access to reduce API call overhead.
+    #[cfg(feature = "chats-api")]
+    cached_models: Arc<RwLock<Option<Vec<crate::types::ModelInfo>>>>,
 }
 
 impl CoderClient {
@@ -48,6 +62,8 @@ impl CoderClient {
                 .unwrap_or_default(),
             workspace_name: None,
             session_token: None,
+            #[cfg(feature = "chats-api")]
+            cached_models: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -97,6 +113,8 @@ impl CoderClient {
                 .unwrap_or_default(),
             workspace_name: None,
             session_token: None,
+            #[cfg(feature = "chats-api")]
+            cached_models: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -777,7 +795,354 @@ impl CoderClient {
     }
 }
 
-/// Shell-escape a path to prevent command injection.
+// Chats API (Phase 3)
+
+impl CoderClient {
+    /// Get the current user's username (for constructing chat API paths).
+    pub fn current_username(&self) -> String {
+        // Extract from workspace_name if available (format: "owner/workspace")
+        if let Some(ref ws) = self.workspace_name {
+            if let Some((owner, _)) = ws.split_once('/') {
+                return owner.to_string();
+            }
+        }
+        "admin".to_string()
+    }
+
+    /// Create a new Chat session bound to a workspace.
+    /// POST /api/experimental/chats
+    pub async fn create_chat(&self, req: &crate::types::CreateChatRequest) -> Result<crate::types::Chat> {
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/experimental/chats")
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create chat")?;
+
+        if resp.status().is_success() || resp.status().as_u16() == 201 {
+            let chat: crate::types::Chat = resp.json().await?;
+            info!(chat_id = %chat.id, "Created chat");
+            Ok(chat)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create chat ({}): {}", status, body)
+        }
+    }
+
+    /// Get a Chat by ID.
+    /// GET /api/experimental/chats/{chat}
+    pub async fn get_chat(&self, chat_id: &str) -> Result<crate::types::Chat> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, &format!("/api/experimental/chats/{}", chat_id))
+            .send()
+            .await
+            .context("Failed to get chat")?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get chat ({}): {}", status, body)
+        }
+    }
+
+    /// List all Chats for the current user.
+    /// GET /api/experimental/chats
+    pub async fn list_chats(&self) -> Result<Vec<crate::types::Chat>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats")
+            .send()
+            .await
+            .context("Failed to list chats")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let chats = body
+                .get("chats")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(chats)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list chats ({}): {}", status, body)
+        }
+    }
+
+    /// Send a message to an existing Chat.
+    /// POST /api/experimental/chats/{chat_id}/messages
+    pub async fn send_chat_message(
+        &self,
+        chat_id: &str,
+        content: Vec<crate::types::ChatInputPart>,
+    ) -> Result<crate::types::ChatMessage> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/experimental/chats/{}/messages", chat_id),
+            )
+            .json(&serde_json::json!({
+                "content": content,
+            }))
+            .send()
+            .await
+            .context("Failed to send chat message")?;
+
+        if resp.status().is_success() || resp.status().as_u16() == 201 {
+            let msg: crate::types::ChatMessage = resp.json().await?;
+            info!(chat_id, message_id = %msg.id, "Sent chat message");
+            Ok(msg)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to send chat message ({}): {}", status, body)
+        }
+    }
+
+    /// Archive a Chat (soft delete).
+    /// PATCH /api/experimental/chats/{chat_id}
+    pub async fn archive_chat(&self, chat_id: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::PATCH,
+                &format!("/api/experimental/chats/{}", chat_id),
+            )
+            .json(&serde_json::json!({ "archived": true }))
+            .send()
+            .await
+            .context("Failed to archive chat")?;
+
+        if resp.status().is_success() {
+            info!(chat_id, "Archived chat");
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to archive chat ({}): {}", status, body)
+        }
+    }
+
+    /// Interrupt a running Chat.
+    /// POST /api/experimental/chats/{chat_id}/interrupt
+    pub async fn interrupt_chat(&self, chat_id: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/experimental/chats/{}/interrupt", chat_id),
+            )
+            .send()
+            .await
+            .context("Failed to interrupt chat")?;
+
+        if resp.status().is_success() || resp.status().as_u16() == 202 {
+            info!(chat_id, "Interrupted chat");
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to interrupt chat ({}): {}", status, body)
+        }
+    }
+
+    /// List available models for chats.
+    /// GET /api/experimental/chats/models
+    ///
+    /// Uses an internal cache (5-minute TTL) to reduce API calls.
+    /// Call `invalidate_cache()` to force a refresh.
+    #[cfg(feature = "chats-api")]
+    pub async fn list_chat_models(&self) -> Result<Vec<crate::types::ModelInfo>> {
+        // Check cache first
+        {
+            let cached = self.cached_models.read().await;
+            if let Some(ref models) = *cached {
+                debug!(count = models.len(), "Returning cached chat models");
+                return Ok(models.clone());
+            }
+        }
+
+        // Fetch from API
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats/models")
+            .send()
+            .await
+            .context("Failed to list chat models")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+        let models: Vec<crate::types::ModelInfo> = body
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+            
+        // Update cache
+        {
+            let mut cached = self.cached_models.write().await;
+            *cached = Some(models.clone());
+        }
+        
+        Ok(models)
+        } else {
+            bail!("Failed to list chat models: {}", resp.status())
+        }
+    }
+
+    /// List available models for chats without caching.
+    /// GET /api/experimental/chats/models
+    #[cfg(not(feature = "chats-api"))]
+    pub async fn list_chat_models(&self) -> Result<Vec<crate::types::ModelInfo>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats/models")
+            .send()
+            .await
+            .context("Failed to list chat models")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let models = body
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(models)
+        } else {
+            bail!("Failed to list chat models: {}", resp.status())
+        }
+    }
+
+    /// Invalidate the cached model configurations.
+    #[cfg(feature = "chats-api")]
+    pub async fn invalidate_model_cache(&self) {
+        let mut cached = self.cached_models.write().await;
+        *cached = None;
+    }
+
+    // ── Convenience methods (Phase 3, Tasks 3.3 + 3.4) ─────────────────────
+
+    /// Create a workspace and chat in one step, with standard OpenFlows labels.
+    ///
+    /// 1. Creates (or finds existing) Coder workspace: `{role}-T-{ticket_id}`
+    /// 2. Creates a Chat bound to that workspace with labels:
+    ///    `ticket_id`, `role`, `flow=openflows`
+    /// 3. Returns `(workspace_id, chat)` for lifecycle tracking
+    pub async fn create_ticket_chat(
+        &self,
+        ticket_id: &str,
+        role: &str,
+        prompt: &str,
+        model_config_id: &str,
+    ) -> Result<(String, crate::types::Chat)> {
+        use crate::types::build_chat_labels;
+        use crate::types::ChatInputPart;
+        use crate::types::CreateChatRequest;
+        use crate::types::CreateWorkspaceRequest;
+
+        // Build naming convention: {role}-T-{ticket_id}
+        let workspace_name = format!("{}-T-{}", role, ticket_id);
+        let repository: String = std::env::var("OPENFLOWS_REPOSITORY")
+            .or_else(|_| std::env::var("AGENTFLOW_REPOSITORY"))
+            .unwrap_or_else(|_| "openflows/target".to_string());
+        let repo_url = format!("https://github.com/{}.git", repository);
+        let template_name = std::env::var("CODER_FORGE_TEMPLATE")
+            .unwrap_or_else(|_| "openflows-forge".to_string());
+
+        // Create (or find existing) workspace
+        info!(
+            workspace_name,
+            ticket_id, role, "Creating or finding workspace for ticket chat"
+        );
+        let workspace = self
+            .create_workspace(&CreateWorkspaceRequest {
+                template_name,
+                name: workspace_name.clone(),
+                parameters: serde_json::json!({ "repo_url": repo_url }),
+            })
+            .await?;
+
+        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
+            .await?;
+
+        // Create chat with OpenFlows labels
+        let labels = build_chat_labels(ticket_id, role, "openflows");
+        let chat_req = CreateChatRequest {
+            workspace_id: workspace.id.clone(),
+            model_config_id: model_config_id.to_string(),
+            content: vec![ChatInputPart::text(prompt)],
+            labels: Some(labels),
+        };
+
+        info!(
+            workspace_id = %workspace.id,
+            ticket_id,
+            role,
+            "Creating chat for ticket"
+        );
+        let chat = self.create_chat(&chat_req).await?;
+
+        Ok((workspace.id, chat))
+    }
+
+    /// Find all chats labeled with the given `ticket_id` and archive them.
+    ///
+    /// Uses `list_chats()` and filters by the `CHAT_LABEL_TICKET` label,
+    /// then archives each matching chat via `archive_chat()`.
+    pub async fn archive_ticket_chats(&self, ticket_id: &str) -> Result<usize> {
+        use crate::types::CHAT_LABEL_TICKET;
+
+        let all_chats = self.list_chats().await?;
+        let matching: Vec<_> = all_chats
+            .iter()
+            .filter(|c| {
+                c.labels
+                    .get(CHAT_LABEL_TICKET)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == ticket_id)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if matching.is_empty() {
+            info!(ticket_id, "No chats found to archive for ticket");
+            return Ok(0);
+        }
+
+        let mut archived_count = 0;
+        for chat in &matching {
+            match self.archive_chat(&chat.id).await {
+                Ok(()) => {
+                    archived_count += 1;
+                    info!(chat_id = %chat.id, ticket_id, "Archived chat");
+                }
+                Err(e) => {
+                    warn!(
+                        chat_id = %chat.id,
+                        ticket_id,
+                        error = %e,
+                        "Failed to archive chat"
+                    );
+                }
+            }
+        }
+
+        info!(ticket_id, archived = archived_count, total = matching.len(), "Archived ticket chats");
+        Ok(archived_count)
+    }
+}
 /// Wraps the path in single quotes and escapes any embedded single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))

@@ -122,31 +122,22 @@ impl CoderBootstrapper {
         info!("  ✓ API token generated");
 
         // 4. Push workspace templates (bundled in binary)
-        let forge_template = include_bytes!("../templates/openflows-forge.tar.gz");
-        let sentinel_template = include_bytes!("../templates/openflows-sentinel.tar.gz");
-
-        match client
-            .push_template("openflows-forge", forge_template)
-            .await
-        {
-            Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
-            Err(e) => {
-                // Template may already exist, try to update
-                info!("  ⚠ Template push failed (may already exist): {}", e);
-            }
-        }
-
-        match client
-            .push_template("openflows-sentinel", sentinel_template)
-            .await
-        {
-            Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
-            Err(e) => {
-                info!("  ⚠ Template push failed (may already exist): {}", e);
-            }
-        }
+        push_template_silently(&client, "openflows-forge", include_bytes!("../templates/openflows-forge.tar.gz")).await;
+        push_template_silently(&client, "openflows-sentinel", include_bytes!("../templates/openflows-sentinel.tar.gz")).await;
+        push_template_silently(&client, "openflows-nexus", include_bytes!("../templates/openflows-nexus.tar.gz")).await;
+        push_template_silently(&client, "openflows-vessel", include_bytes!("../templates/openflows-vessel.tar.gz")).await;
+        push_template_silently(&client, "openflows-lore", include_bytes!("../templates/openflows-lore.tar.gz")).await;
 
         info!("  ✓ Coder bootstrapped");
         Ok(client)
+    }
+}
+
+async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) {
+    match client.push_template(name, data).await {
+        Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
+        Err(e) => {
+            info!("  ⚠ Template '{}' push failed (may already exist): {}", name, e);
+        }
     }
 }

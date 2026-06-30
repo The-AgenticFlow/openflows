@@ -248,6 +248,12 @@ pub fn get_backend_config(backend: CliBackend, worktree: &Path, shared: &Path) -
             let path = std::env::var("CODEX_PATH").unwrap_or_else(|_| "codex".to_string());
             BackendConfig::codex(&path, worktree, shared)
         }
+        CliBackend::Aider | CliBackend::Goose => {
+            // Aider and Goose follow the same Claude-style config layout
+            let binary = backend.binary_name();
+            let path = std::env::var(backend.path_env_var()).unwrap_or_else(|_| binary.to_string());
+            BackendConfig::claude(&path, worktree, shared)
+        }
     }
 }
 

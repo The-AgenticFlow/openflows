@@ -17,18 +17,6 @@ variable "agent_module_version" {
   description = "Version of the agent module"
 }
 
-variable "role" {
-  type        = string
-  default     = "sentinel"
-  description = "Agent role name"
-}
-
-variable "ticket_id" {
-  type        = string
-  default     = ""
-  description = "Ticket identifier"
-}
-
 variable "enable_ai_gateway" {
   type        = bool
   default     = true
@@ -79,6 +67,20 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
+    # Install documentation tooling
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq pandoc >/dev/null 2>&1 || true
+    
+    # Install mdbook if cargo is available
+    if command -v cargo &>/dev/null; then
+      cargo install mdbook --quiet 2>/dev/null || true
+    fi
+    
+    # Install markdownlint-cli via npm
+    if command -v npm &>/dev/null; then
+      npm install -g markdownlint-cli 2>/dev/null || true
+    fi
+
     # git pull or clone
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull origin main 2>/dev/null || true
@@ -88,7 +90,7 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} HSET "heartbeat:sentinel-T-${var.ticket_id}" \
+      redis-cli -u ${var.redis_url} HSET "heartbeat:lore-T-${var.ticket_id}" \
         "ts" "$(date +%s)" \
         "ws_id" "${data.coder_workspace.me.id}" \
         "status" "running" 2>/dev/null || true
@@ -98,11 +100,11 @@ resource "coder_agent" "main" {
 }
 
 resource "docker_volume" "workspace" {
-  name = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name = "openflows-lore-${data.coder_workspace.me.id}"
 }
 
 resource "docker_container" "workspace" {
-  name  = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name  = "openflows-lore-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
   volumes {
@@ -115,8 +117,7 @@ resource "docker_container" "workspace" {
     "REDIS_URL=${var.redis_url}",
     "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
     "USE_AI_GATEWAY=${var.use_ai_gateway}",
-    "ROLE=sentinel",
-    "TICKET_ID=${var.ticket_id}",
+    "ROLE=lore",
   ]
 
   # Connect to the openflows_default compose network for Redis access.
@@ -131,14 +132,14 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
-# Agent module (configurable CLI backend)
+# Lore agent module (CLI backend installer)
 module "agent" {
   source  = var.agent_module_source
   version = var.agent_module_version
 
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  permission_mode   = "plan"
+  permission_mode   = "acceptEdits"
   enable_ai_gateway = var.enable_ai_gateway
 
   mcp = var.mcp_config != "" ? var.mcp_config : null

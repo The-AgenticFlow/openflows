@@ -499,6 +499,8 @@ fn is_fireworks_chat_model(model_id: &str) -> bool {
 pub fn default_model_for_backend(cli_backend: &str) -> &'static str {
     match cli_backend {
         "codex" => "openai/gpt-4o",
+        "aider" => "anthropic/claude-sonnet-4-5",
+        "goose" => "anthropic/claude-sonnet-4-5",
         _ => "openai/gpt-4o",
     }
 }

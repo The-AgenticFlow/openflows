@@ -14,6 +14,7 @@ members = [
     "binary",
     "crates/anthropic-mock",
     "crates/agentflow-tui",
+    "crates/notifier",
 ]
 
 [workspace.dependencies]
@@ -21,6 +22,7 @@ members = [
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures     = "0.3"
+futures-util = "0.3"
 
 # error handling
 anyhow    = "1"

@@ -9,11 +9,18 @@ description = "Client library for the Coder REST API"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
+futures = { workspace = true }
+futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { version = "0.26", optional = true, features = ["rustls-tls-webpki-roots"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+chats-api = ["tokio-tungstenite"]

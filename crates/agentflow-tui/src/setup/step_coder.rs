@@ -19,6 +19,9 @@ pub struct CoderStep {
     selected: usize,
     coder_url: String,
     admin_password: String,
+    advanced_open: bool,
+    ai_gateway_toggle: bool,
+    slackme_toggle: bool,
 }
 
 impl CoderStep {
@@ -27,6 +30,9 @@ impl CoderStep {
             selected: 0,
             coder_url: "http://localhost:7080".to_string(),
             admin_password: "openflows".to_string(),
+            advanced_open: false,
+            ai_gateway_toggle: true,
+            slackme_toggle: false,
         }
     }
 
@@ -47,41 +53,64 @@ impl CoderStep {
 
                 let mut lines = Vec::new();
                 lines.push(String::new());
-                lines.push("╔══════════════════════════════════════════════════╗".to_string());
+                lines.push("═".repeat(area.width as usize - 2));
                 lines.push("║     Workspace Architecture                       ║".to_string());
-                lines.push("╚══════════════════════════════════════════════════╝".to_string());
+                lines.push("╚".to_string() + &"═".repeat(area.width as usize - 3));
                 lines.push(String::new());
-                lines.push("How should FORGE-SENTINEL pairs run?".to_string());
+                lines.push("How should agent pairs run?".to_string());
                 lines.push(String::new());
-                lines.push("This choice determines whether agent pairs share".to_string());
+                lines.push("This choice determines whether agents share".to_string());
                 lines.push("a local git worktree (simpler) or run in isolated".to_string());
                 lines.push("Coder workspaces (more secure, requires Docker).".to_string());
                 lines.push(String::new());
 
                 for (i, opt) in options.iter().enumerate() {
-                    if i == self.selected {
-                        lines.push(format!("  > {}", opt));
-                    } else {
-                        lines.push(format!("    {}", opt));
+                    match i {
+                        0 if !self.advanced_open && i == self.selected => {
+                            lines.push(format!("  ▶ {}", opt));
+                        }
+                        _ if i == self.selected => {
+                            lines.push(format!("  > {}", opt));
+                        }
+                        _ => {
+                            lines.push(format!("    {}", opt));
+                        }
                     }
                 }
 
                 lines.push(String::new());
+
                 if self.selected == 1 {
                     lines.push("── Coder Settings ──".to_string());
                     lines.push(format!("  URL:     {}", self.coder_url));
-                    lines.push(format!("  Password: {}", "*".repeat(self.admin_password.len())));
+                    lines.push(format!("  Password: {}", "*".repeat(self.admin_password.len() + 1)));
+                    lines.push(String::new());
+                    if self.advanced_open {
+                        lines.push("── Advanced Options ──".to_string());
+                        if self.ai_gateway_toggle {
+                            lines.push("  [x] Enable AI Gateway (Premium)".to_string());
+                        } else {
+                            lines.push("  [ ] Enable AI Gateway (Premium)".to_string());
+                        }
+                        if self.slackme_toggle {
+                            lines.push("  [x] Enable Slack Notifications (requires Coder external auth)".to_string());
+                        } else {
+                            lines.push("  [ ] Enable Slack Notifications (requires Coder external auth)".to_string());
+                        }
+                    } else {
+                        lines.push("  [Tab] Show Advanced Options (AI Gateway, Slack)".to_string());
+                    }
                     lines.push(String::new());
                     lines.push("  Requires: Coder server running + Docker".to_string());
                     lines.push("  Openflows will bootstrap Coder on startup.".to_string());
                 } else {
                     lines.push("── Local Mode ──".to_string());
-                    lines.push("  Pairs run in git worktrees on this machine.".to_string());
+                    lines.push("  Agents run in git worktrees on this machine.".to_string());
                     lines.push("  No Docker or Coder required.".to_string());
                 }
 
                 lines.push(String::new());
-                lines.push("[↑/↓] Select  [Enter] Confirm".to_string());
+                lines.push("[↑/↓] Select  [←/→ or Tab] Toggle  [Enter] Confirm  [q] Quit".to_string());
 
                 let content = lines.join("\n");
                 let paragraph = ratatui::widgets::Paragraph::new(content).style(theme.text_style());
@@ -102,7 +131,28 @@ impl CoderStep {
                             }
                         }
                         crossterm::event::KeyCode::Enter => {
-                            break;
+                            if self.selected == 0 && !self.advanced_open {
+                                // Toggle advanced options
+                                self.advanced_open = true;
+                            } else {
+                                break;
+                            }
+                        }
+                        crossterm::event::KeyCode::Tab => {
+                            if self.selected == 1 {
+                                self.advanced_open = !self.advanced_open;
+                            }
+                        }
+                        crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Right => {
+                            if self.advanced_open {
+                                if self.ai_gateway_toggle {
+                                    self.ai_gateway_toggle = false;
+                                } else if self.slackme_toggle {
+                                    self.slackme_toggle = false;
+                                } else {
+                                    self.ai_gateway_toggle = true;
+                                }
+                            }
                         }
                         crossterm::event::KeyCode::Char('q') => {
                             return Err(anyhow::anyhow!("Setup cancelled"));
@@ -118,11 +168,15 @@ impl CoderStep {
                 config.workspace_provider = WorkspaceProvider::Local;
                 config.coder_url = None;
                 config.coder_admin_password = None;
+                config.enable_ai_gateway = false;
+                config.enable_slackme = false;
             }
             1 => {
                 config.workspace_provider = WorkspaceProvider::Coder;
                 config.coder_url = Some(self.coder_url.clone());
                 config.coder_admin_password = Some(self.admin_password.clone());
+                config.enable_ai_gateway = self.ai_gateway_toggle;
+                config.enable_slackme = self.slackme_toggle;
             }
             _ => {}
         }

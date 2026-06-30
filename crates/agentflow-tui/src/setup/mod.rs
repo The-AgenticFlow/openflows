@@ -13,6 +13,8 @@ pub mod step_env;
 pub mod step_existing;
 pub mod step_github;
 pub mod step_mode;
+pub mod step_module;
+pub mod step_notifications;
 pub mod step_provider;
 pub mod step_proxy;
 pub mod step_repo;
@@ -28,11 +30,19 @@ use step_env::EnvStep;
 use step_existing::{ConfigAction, ExistingConfigStep};
 use step_github::GitHubStep;
 use step_mode::{ModeStep, SetupMode};
+use step_module::ModuleStep;
+use step_notifications::NotificationsStep;
 use step_provider::ProviderStep;
 use step_proxy::ProxyStep;
 use step_repo::RepoStep;
 use step_security::SecurityStep;
 use step_welcome::WelcomeStep;
+
+/// Resolve the Coder Registry module for a given CLI backend and role.
+/// Used by step_module.rs and write_registry_file.
+pub fn resolve_coder_module_for_cli(cli: &str, _role: &str) -> config::registry::CoderModule {
+    config::registry::resolve_coder_module(cli, None)
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -72,6 +82,10 @@ pub struct SetupConfig {
     pub workspace_provider: WorkspaceProvider,
     pub coder_url: Option<String>,
     pub coder_admin_password: Option<String>,
+    pub enable_ai_gateway: bool,
+    pub enable_slackme: bool,
+    pub slack_webhook_url: Option<String>,
+    pub discord_webhook_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +129,10 @@ impl Default for SetupConfig {
             workspace_provider: WorkspaceProvider::Local,
             coder_url: Some("http://localhost:7080".to_string()),
             coder_admin_password: Some("openflows".to_string()),
+            enable_ai_gateway: true,
+            enable_slackme: false,
+            slack_webhook_url: None,
+            discord_webhook_url: None,
         }
     }
 }
@@ -196,6 +214,20 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
     agents_step
         .render(&mut terminal, &theme, &mut config)
         .await?;
+
+    // Step 8b: Agent Module Selection (Coder mode only)
+    if config.workspace_provider == WorkspaceProvider::Coder {
+        let mut module_step = ModuleStep::new();
+        module_step
+            .render(&mut terminal, &theme, &mut config)
+            .await?;
+
+        // Step 8c: Notification Configuration (Coder mode only)
+        let mut notifications_step = NotificationsStep::new();
+        notifications_step
+            .render(&mut terminal, &theme, &mut config)
+            .await?;
+    }
 
     // Step 9: GitHub Authentication (uses agent config to determine token fields)
     let github_step = GitHubStep::new();
@@ -302,10 +334,32 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
             content.push_str("CODER_ADMIN_USERNAME=admin\n");
             content.push_str("CODER_ADMIN_EMAIL=admin@openflows.dev\n");
             content.push_str("CODER_PG_PASSWORD=coder\n");
+            content.push_str(&format!("USE_AI_GATEWAY={}\n", if config.enable_ai_gateway { "true" } else { "false" }));
+            content.push_str(&format!("ENABLE_SLACKME={}\n", if config.enable_slackme { "true" } else { "false" }));
+
+            // Coder external auth for slackme (Slack DM notifications)
+            if config.enable_slackme {
+                content.push_str("CODER_EXTERNAL_AUTH_1_TYPE=slack\n");
+                // Client ID and secret would come from Slack app configuration
+                // These are placeholders — user must fill in their real values
+                content.push_str("# CODER_EXTERNAL_AUTH_1_CLIENT_ID=<your-slack-client-id>\n");
+                content.push_str("# CODER_EXTERNAL_AUTH_1_CLIENT_SECRET=<your-slack-client-secret>\n");
+            }
         }
         WorkspaceProvider::Local => {
             content.push_str("WORKSPACE_PROVIDER=local\n");
         }
+    }
+
+    // LiteLLM fallback proxy (available in both modes)
+    content.push_str("LITELLM_PROXY_URL=http://proxy:4000\n");
+
+    // Notification webhook URLs
+    if let Some(ref url) = config.slack_webhook_url {
+        content.push_str(&format!("SLACK_WEBHOOK_URL={}\n", url));
+    }
+    if let Some(ref url) = config.discord_webhook_url {
+        content.push_str(&format!("DISCORD_WEBHOOK_URL={}\n", url));
     }
 
     // Write domain configuration
@@ -352,6 +406,32 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
             _ => "openai/gpt-4o".to_string(),
         });
 
+    // Resolve coder_module for a given CLI when workspace_provider is Coder
+    let is_coder = config.workspace_provider == WorkspaceProvider::Coder;
+    let resolve_coder_module = |cli: &str, role: &str| -> Option<config::registry::CoderModule> {
+        if !is_coder {
+            return None;
+        }
+        let (source, version) = config::registry::DEFAULT_AGENT_MODULES
+            .iter()
+            .find(|(key, _, _)| *key == cli)
+            .map(|(_, source, version)| (source.to_string(), version.to_string()))
+            .unwrap_or_else(|| (
+                "registry.coder.com/coder/claude-code/coder".to_string(),
+                "5.2.0".to_string(),
+            ));
+        let permission_mode = config::registry::default_permission_mode_for_role(role);
+        let mut params = serde_json::Map::new();
+        params.insert("workdir".to_string(), serde_json::Value::String("/home/coder/workspace".to_string()));
+        params.insert("permission_mode".to_string(), serde_json::Value::String(permission_mode.to_string()));
+        params.insert("enable_ai_gateway".to_string(), serde_json::Value::Bool(config.enable_ai_gateway));
+        Some(config::registry::CoderModule::with_params(
+            source,
+            version,
+            serde_json::Value::Object(params),
+        ))
+    };
+
     let registry = config::Registry {
         default_cli: default_cli.clone(),
         allowed_domains: vec![
@@ -374,6 +454,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
                     workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    coder_module: resolve_coder_module(&default_cli, "nexus"),
                 },
                 config::RegistryEntry {
                     id: "forge".to_string(),
@@ -391,6 +472,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "crates.io".to_string(),
                     ]),
                     workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    coder_module: resolve_coder_module(&default_cli, "forge"),
                 },
                 config::RegistryEntry {
                     id: "sentinel".to_string(),
@@ -405,6 +487,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         "*.github.com".to_string(),
                     ]),
                     workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    coder_module: resolve_coder_module(&default_cli, "sentinel"),
                 },
                 config::RegistryEntry {
                     id: "vessel".to_string(),
@@ -416,6 +499,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
                     workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    coder_module: resolve_coder_module(&default_cli, "vessel"),
                 },
                 config::RegistryEntry {
                     id: "lore".to_string(),
@@ -427,6 +511,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                     github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
                     allowed_domains: None,
                     workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                    coder_module: resolve_coder_module(&default_cli, "lore"),
                 },
             ]
         } else {
@@ -442,10 +527,10 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                             None
                         }
                     });
+                    let cli = if agent.cli.is_empty() { default_cli.clone() } else { agent.cli.clone() };
                     config::RegistryEntry {
                         id: agent.id.clone(),
-                        // Update CLI to match selected provider's CLI backend
-                        cli: default_cli.clone(),
+                        cli: cli.clone(),
                         active: agent.active,
                         instances: agent.instances,
                         model_backend: agent.model_backend.clone(),
@@ -453,6 +538,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
                         github_token_env: token_env,
                         allowed_domains: None,
                         workspace_provider: Some(config::state::WorkspaceProvider::from(config.workspace_provider.clone())),
+                        coder_module: resolve_coder_module(&cli, &agent.id),
                     }
                 })
                 .collect()

@@ -7,19 +7,19 @@ terraform {
 
 variable "agent_module_source" {
   type        = string
-  default     = "registry.coder.com/coder/claude-code/coder"
+  default     = "registry.coder.com/coder-labs/codex/coder"
   description = "Coder Registry module source for agent CLI"
 }
 
 variable "agent_module_version" {
   type        = string
-  default     = "5.2.0"
+  default     = "VERIFY_ON_REGISTRY"
   description = "Version of the agent module"
 }
 
 variable "role" {
   type        = string
-  default     = "sentinel"
+  default     = "vessel"
   description = "Agent role name"
 }
 
@@ -68,6 +68,13 @@ variable "mcp_config" {
   description = "MCP server configuration (JSON string)"
 }
 
+variable "github_token" {
+  type        = string
+  sensitive   = true
+  default     = ""
+  description = "GitHub token for merge operations"
+}
+
 resource "coder_agent" "main" {
   os         = "linux"
   arch       = "amd64"
@@ -88,7 +95,7 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} HSET "heartbeat:sentinel-T-${var.ticket_id}" \
+      redis-cli -u ${var.redis_url} HSET "heartbeat:vessel-T-${var.ticket_id}" \
         "ts" "$(date +%s)" \
         "ws_id" "${data.coder_workspace.me.id}" \
         "status" "running" 2>/dev/null || true
@@ -98,11 +105,11 @@ resource "coder_agent" "main" {
 }
 
 resource "docker_volume" "workspace" {
-  name = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name = "openflows-vessel-${data.coder_workspace.me.id}"
 }
 
 resource "docker_container" "workspace" {
-  name  = "openflows-sentinel-${data.coder_workspace.me.id}"
+  name  = "openflows-vessel-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
   volumes {
@@ -115,7 +122,8 @@ resource "docker_container" "workspace" {
     "REDIS_URL=${var.redis_url}",
     "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
     "USE_AI_GATEWAY=${var.use_ai_gateway}",
-    "ROLE=sentinel",
+    "ROLE=vessel",
+    "GITHUB_TOKEN=${var.github_token}",
     "TICKET_ID=${var.ticket_id}",
   ]
 
@@ -131,15 +139,18 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
-# Agent module (configurable CLI backend)
+# Vessel agent module (CLI backend installer)
 module "agent" {
   source  = var.agent_module_source
   version = var.agent_module_version
 
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
-  permission_mode   = "plan"
+  permission_mode   = "acceptEdits"
   enable_ai_gateway = var.enable_ai_gateway
+
+  # API key may be needed when AI Gateway doesn't proxy this provider
+  # openai_api_key = var.github_token  # only if AI Gateway doesn't support this provider
 
   mcp = var.mcp_config != "" ? var.mcp_config : null
 }

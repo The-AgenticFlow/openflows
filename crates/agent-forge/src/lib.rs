@@ -278,6 +278,20 @@ impl BatchNode for ForgeNode {
                 cli_binary,
                 prompt,
             ),
+            config::CliBackend::Aider => format!(
+                "cd {} && {} --no-auto-edit --no-confirm --message {} <<'OPENFLOWS_PROMPT'\n{}\nOPENFLOWS_PROMPT",
+                shell_quote(&worktree_path),
+                cli_binary,
+                shell_quote_str(&prompt),
+                prompt,
+            ),
+            config::CliBackend::Goose => format!(
+                "cd {} && {} --non-interactive --message '{}' <<'OPENFLOWS_PROMPT'\n{}\nOPENFLOWS_PROMPT",
+                shell_quote(&worktree_path),
+                cli_binary,
+                prompt.replace('\'', "'\\''"),
+                prompt,
+            ),
         };
 
         let timeout_dur = std::time::Duration::from_secs(1800);

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use coder_client::{CoderClient, CreateWorkspaceRequest};
 use config::{
-    state::{KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
+    state::{full_ticket_key, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_WORKSPACE, KEY_TICKETS, KEY_WORKER_SLOTS},
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider,
     ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
@@ -176,15 +176,36 @@ pub struct StaleWorker {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrashedWorkspace {
+    pub workspace_id: String,
+    pub worker_id: String,
+    pub ticket_id: String,
+    pub reason: String,
+    pub recovery_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrashedChat {
+    pub chat_id: String,
+    pub worker_id: String,
+    pub ticket_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FlowRecovery {
     pub unmerged_prs: Vec<UnmergedPr>,
     pub orphaned_tickets: Vec<OrphanedTicket>,
     pub stale_workers: Vec<StaleWorker>,
     pub completed_without_pr: Vec<String>,
+    pub crashed_workspaces: Vec<CrashedWorkspace>,
+    pub crashed_chats: Vec<CrashedChat>,
     pub has_unmerged_prs: bool,
     pub has_orphaned_tickets: bool,
     pub has_stale_workers: bool,
     pub has_completed_without_pr: bool,
+    pub has_crashed_workspaces: bool,
+    pub has_crashed_chats: bool,
     pub needs_recovery: bool,
 }
 
@@ -631,7 +652,7 @@ impl NexusNode {
             .unwrap_or_default();
         let template_name = std::env::var("CODER_FORGE_TEMPLATE")
             .unwrap_or_else(|_| "openflows-forge".to_string());
-        let workspace_name = format!("{}-{}", worker_id, ticket_id);
+        let workspace_name = Self::workspace_name_for_ticket(worker_id, ticket_id);
 
         info!(
             worker_id,
@@ -663,6 +684,182 @@ impl NexusNode {
             "Coder workspace provisioned"
         );
         Ok(Some(workspace.id))
+    }
+
+    /// Destroy a Coder workspace and archive all associated chats.
+    ///
+    /// Used during merge/cleanup to tear down ephemeral workspaces.
+    /// Archives chats via `archive_ticket_chats()` before destroying the workspace.
+    async fn destroy_coder_workspace(&self, store: &SharedStore, workspace_id: &str) -> Result<()> {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(client) => client,
+            None => {
+                warn!(workspace_id, "No Coder client available to destroy workspace");
+                return Ok(());
+            }
+        };
+
+        // Archive all chats associated with this workspace
+        let chats = client.list_chats().await.unwrap_or_default();
+        let ws_chats: Vec<_> = chats
+            .iter()
+            .filter(|c| c.workspace_id == workspace_id)
+            .collect();
+
+        let mut archived = 0;
+        for chat in &ws_chats {
+            if client.archive_chat(&chat.id).await.is_ok() {
+                archived += 1;
+            }
+        }
+
+        if !ws_chats.is_empty() {
+            info!(
+                workspace_id,
+                archived,
+                total = ws_chats.len(),
+                "Archived chats before workspace destruction"
+            );
+        }
+
+        // Delete the workspace
+        client
+            .delete_workspace(workspace_id)
+            .await
+            .context("Failed to delete Coder workspace")?;
+
+        // Clear the workspace_id from the associated slot
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        for slot in slots.values_mut() {
+            if slot.workspace_id.as_deref() == Some(workspace_id) {
+                slot.workspace_id = None;
+            }
+        }
+        store.set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?).await;
+
+        info!(workspace_id, "Destroyed Coder workspace");
+        Ok(())
+    }
+
+    /// Build a workspace name following the `{role}-T-{ticket_id}` convention.
+    fn workspace_name_for_ticket(worker_id: &str, ticket_id: &str) -> String {
+        // Extract role from worker_id (e.g., "forge-1" -> "forge")
+        let role = worker_id
+            .rsplit_once('-')
+            .map(|(base, _)| base)
+            .unwrap_or(worker_id);
+        format!("{}-T-{}", role, ticket_id)
+    }
+
+    /// Create a Coder Chat for a ticket assignment and store the chat ID in SharedStore.
+    ///
+    /// This is called after workspace provisioning to set up the chat-driven workflow.
+    /// The chat ID is stored at `ticket:{ticket_id}:chat:{worker_id}` so Nexus can
+    /// monitor it during reconciliation.
+    async fn create_chat_for_assignment(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        ticket_id: &str,
+    ) {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(c) => c,
+            None => {
+                debug!(worker_id, ticket_id, "No Coder client available, skipping chat creation");
+                return;
+            }
+        };
+
+        let slots: HashMap<String, WorkerSlot> =
+            match store.get_typed(KEY_WORKER_SLOTS).await {
+                Some(s) => s,
+                None => return,
+            };
+
+        let slot = match slots.get(worker_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if slot.workspace_provider != WorkspaceProvider::Coder {
+            return;
+        }
+
+        let workspace_id = match &slot.workspace_id {
+            Some(ws) => ws.clone(),
+            None => {
+                warn!(worker_id, ticket_id, "Workspace not yet provisioned, skipping chat creation");
+                return;
+            }
+        };
+
+        // Extract role from worker_id (e.g., "forge-1" -> "forge")
+        let role = worker_id
+            .rsplit_once('-')
+            .map(|(base, _)| base)
+            .unwrap_or(worker_id);
+
+        // Build the ticket dispatch payload for Forge
+        let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
+        let dispatch_payload = json!({
+            "ticket_id": ticket_id,
+            "worker_id": worker_id,
+            "chat_id": "pending", // Will be updated after chat creation
+            "workspace_id": workspace_id,
+            "role": role,
+        });
+
+        // Create the chat with an initial prompt
+        let prompt = format!("Work on ticket {}: Review the dispatch payload and begin implementation.", ticket_id);
+        
+        // Get model config ID - try cache first, then fetch
+        let model_config_id = "default"; // For now, use default. Can be enhanced later with caching.
+
+        use coder_client::types::{build_chat_labels, ChatInputPart, CreateChatRequest};
+        let labels = build_chat_labels(ticket_id, role, "openflows");
+        let chat_req = CreateChatRequest {
+            workspace_id: workspace_id.clone(),
+            model_config_id: model_config_id.to_string(),
+            content: vec![ChatInputPart::text(&prompt)],
+            labels: Some(labels),
+        };
+
+        match client.create_chat(&chat_req).await {
+            Ok(chat) => {
+                info!(
+                    chat_id = %chat.id,
+                    worker_id,
+                    ticket_id,
+                    "Created Chat for ticket assignment"
+                );
+
+                // Store chat ID in SharedStore
+                let chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
+                store.set(&chat_key, json!(chat.id)).await;
+
+                // Store chat_action as "created" for tracking
+                let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+                store.set(&action_key, json!("created")).await;
+
+                // Update dispatch payload with actual chat ID
+                let mut updated_dispatch = dispatch_payload.clone();
+                updated_dispatch["chat_id"] = json!(chat.id);
+                store.set(&dispatch_key, updated_dispatch).await;
+
+                // Store workspace_id mapping
+                let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
+                store.set(&ws_key, json!(workspace_id)).await;
+            }
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    ticket_id,
+                    error = %e,
+                    "Failed to create Chat for ticket assignment"
+                );
+            }
+        }
     }
 
     async fn check_ci_readiness(
@@ -1425,6 +1622,9 @@ impl Node for NexusNode {
                         );
                         }
                     }
+
+                    // Create a Coder Chat for this assignment and record it in SharedStore
+                    self.create_chat_for_assignment(store, worker_id, ticket_id).await;
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
                     if let Some(issue_url) = &decision.issue_url {

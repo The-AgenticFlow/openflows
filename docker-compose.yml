@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
 
   coder:
-    image: ghcr.io/coder/coder:latest
+    image: ghcr.io/coder/coder:v2.35.0
     user: "0:0"
     profiles:
       - coder
@@ -54,6 +54,9 @@ services:
       CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
+      CODER_EXTERNAL_AUTH_1_TYPE: ${CODER_EXTERNAL_AUTH_1_TYPE:-}
+      CODER_EXTERNAL_AUTH_1_CLIENT_ID: ${CODER_EXTERNAL_AUTH_1_CLIENT_ID:-}
+      CODER_EXTERNAL_AUTH_1_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_1_CLIENT_SECRET:-}
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

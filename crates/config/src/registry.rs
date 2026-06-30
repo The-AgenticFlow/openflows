@@ -16,6 +16,10 @@ pub enum CliBackend {
     Claude,
     /// OpenAI Codex CLI
     Codex,
+    /// Aider AI coding assistant
+    Aider,
+    /// Block Goose AI agent
+    Goose,
 }
 
 impl std::str::FromStr for CliBackend {
@@ -25,6 +29,8 @@ impl std::str::FromStr for CliBackend {
         Ok(match s.to_lowercase().as_str() {
             "codex" => CliBackend::Codex,
             "claude" => CliBackend::Claude,
+            "aider" => CliBackend::Aider,
+            "goose" => CliBackend::Goose,
             _ => CliBackend::Claude, // Default fallback
         })
     }
@@ -41,6 +47,8 @@ impl CliBackend {
         match self {
             CliBackend::Claude => "claude",
             CliBackend::Codex => "codex",
+            CliBackend::Aider => "aider",
+            CliBackend::Goose => "goose",
         }
     }
 
@@ -49,6 +57,8 @@ impl CliBackend {
         match self {
             CliBackend::Claude => "claude",
             CliBackend::Codex => "codex",
+            CliBackend::Aider => "aider",
+            CliBackend::Goose => "goose",
         }
     }
 
@@ -57,7 +67,83 @@ impl CliBackend {
         match self {
             CliBackend::Claude => "CLAUDE_PATH",
             CliBackend::Codex => "CODEX_PATH",
+            CliBackend::Aider => "AIDER_PATH",
+            CliBackend::Goose => "GOOSE_PATH",
         }
+    }
+}
+
+/// Coder Registry module configuration for agent workspace templates.
+
+/// Maps an agent CLI to a Terraform module source with version and parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CoderModule {
+    /// Terraform module source URL, e.g. "registry.coder.com/coder/claude-code/coder"
+    pub source: String,
+    /// Module version, e.g. "5.2.0"
+    pub version: String,
+    /// Module parameters passed to the Terraform module
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl CoderModule {
+    /// Create a new Coder module configuration.
+    pub fn new(source: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            version: version.into(),
+            params: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    /// Create with parameters.
+    pub fn with_params(
+        source: impl Into<String>,
+        version: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            version: version.into(),
+            params,
+        }
+    }
+
+    /// Get the workdir parameter, defaulting to "/home/coder/workspace".
+    pub fn workdir(&self) -> String {
+        self.params
+            .get("workdir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("/home/coder/workspace")
+            .to_string()
+    }
+
+    /// Get the permission_mode parameter, defaulting to "auto".
+    pub fn permission_mode(&self) -> String {
+        self.params
+            .get("permission_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string()
+    }
+
+    /// Check if AI Gateway is enabled for this module.
+    /// Defaults to true for claude-code modules, false otherwise.
+    pub fn ai_gateway_enabled(&self) -> bool {
+        if let Some(v) = self.params.get("enable_ai_gateway") {
+            return v.as_bool().unwrap_or(false);
+        }
+        self.source.contains("claude-code")
+    }
+}
+
+/// Role-specific permission mode defaults for agent modules.
+pub fn default_permission_mode_for_role(role: &str) -> &'static str {
+    match role {
+        "forge" | "vessel" | "lore" => "acceptEdits",
+        "sentinel" | "nexus" => "plan",
+        _ => "auto",
     }
 }
 
@@ -66,15 +152,15 @@ impl CliBackend {
 pub struct RegistryEntry {
     pub id: String,
     #[serde(default)]
-    pub cli: String, // "claude" | "codex" - defaults to registry's default_cli or "claude"
+    pub cli: String, // "claude" | "codex" | "aider" | "goose"
     pub active: bool,
-    pub instances: u32, // registry.json is sole source — .agent.md has no instances field
+    pub instances: u32,
     #[serde(default)]
-    pub model_backend: Option<String>, // e.g. "anthropic/claude-sonnet-4-5", "gemini/gemini-2.5-pro"
+    pub model_backend: Option<String>,
     #[serde(default)]
-    pub routing_key: Option<String>, // LiteLLM proxy routing key, e.g. "forge-key"
+    pub routing_key: Option<String>,
     #[serde(default)]
-    pub github_token_env: Option<String>, // Per-agent GitHub token env var, e.g. "AGENT_NEXUS_GITHUB_TOKEN"
+    pub github_token_env: Option<String>,
     /// Network domains this agent is allowed to access (for sandbox configuration).
     /// Falls back to the registry-level `allowed_domains` if not set per-agent.
     /// Examples: ["api.github.com", "*.github.com", "pypi.org", "crates.io"]
@@ -82,6 +168,9 @@ pub struct RegistryEntry {
     pub allowed_domains: Option<Vec<String>>,
     #[serde(default)]
     pub workspace_provider: Option<crate::state::WorkspaceProvider>,
+    /// Coder Registry module configuration (for WorkspaceProvider::Coder).
+    #[serde(default)]
+    pub coder_module: Option<CoderModule>,
 }
 
 /// The full registry — a thin wrapper around the team list.
@@ -111,6 +200,35 @@ fn default_allowed_domains() -> Vec<String> {
 /// Environment variable name for overriding the default CLI backend.
 pub const DEFAULT_CLI_ENV_VAR: &str = "DEFAULT_CLI";
 
+/// Default agent module mapping: cli -> (source, version).
+/// Used when an agent entry has no explicit `coder_module` field.
+pub const DEFAULT_AGENT_MODULES: &[(&str, &str, &str)] = &[
+    ("claude", "registry.coder.com/coder/claude-code/coder", "5.2.0"),
+    // codex/aider/goose versions must be verified against live registry
+    ("codex", "registry.coder.com/coder-labs/codex/coder", "VERIFY_ON_REGISTRY"),
+    ("aider", "registry.coder.com/coder/aider/coder", "VERIFY_ON_REGISTRY"),
+    ("goose", "registry.coder.com/coder/goose/coder", "VERIFY_ON_REGISTRY"),
+];
+
+/// Resolve the coder module for a given CLI backend name.
+/// Checks the entry's explicit `coder_module` first, then falls back
+/// to the default mapping.
+pub fn resolve_coder_module(cli: &str, entry_module: Option<&CoderModule>) -> CoderModule {
+    if let Some(m) = entry_module {
+        return m.clone();
+    }
+    for &(key, source, version) in DEFAULT_AGENT_MODULES {
+        if key == cli {
+            return CoderModule::new(source, version);
+        }
+    }
+    // Hardcoded fallback for unknown CLI names
+    CoderModule::new(
+        "registry.coder.com/coder/claude-code/coder",
+        "5.2.0",
+    )
+}
+
 impl RegistryEntry {
     /// Get the CLI backend for this agent, respecting priority:
     /// 1. Agent-specific `cli` field (highest priority)
@@ -132,6 +250,12 @@ impl RegistryEntry {
             Some(domains) if !domains.is_empty() => domains.as_slice(),
             _ => registry_defaults,
         }
+    }
+
+    /// Get the resolved coder module for this agent.
+    /// Uses the entry's explicit `coder_module` or falls back to DEFAULT_AGENT_MODULES.
+    pub fn resolve_coder_module(&self) -> CoderModule {
+        resolve_coder_module(&self.cli, self.coder_module.as_ref())
     }
 }
 
