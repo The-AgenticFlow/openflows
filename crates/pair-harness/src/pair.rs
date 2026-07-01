@@ -403,42 +403,57 @@ impl ForgeSentinelPair {
         let project_root = config.project_root.clone();
         let cli_backend = config.cli_backend;
 
+        // Build ProcessManager, propagating Coder config when applicable.
+        // In Coder mode, the CLI binary runs inside the Coder workspace —
+        // local binary validation is skipped and spawn methods will use
+        // the Coder exec API instead of local process spawning.
+        let process = match (&config.redis_url, &config.proxy_url) {
+            (Some(redis_url), Some(proxy_url)) => ProcessManager::with_proxy(
+                &config.github_token,
+                Some(redis_url.clone()),
+                proxy_url,
+                &config.worktree,
+                &config.shared,
+            )
+            .with_default_backend(cli_backend)
+            .with_model_backend(config.model_backend.clone()),
+            (Some(redis_url), None) => ProcessManager::with_redis(
+                &config.github_token,
+                redis_url,
+                &config.worktree,
+                &config.shared,
+            )
+            .with_default_backend(cli_backend)
+            .with_model_backend(config.model_backend.clone()),
+            (None, Some(proxy_url)) => ProcessManager::with_proxy(
+                &config.github_token,
+                None,
+                proxy_url,
+                &config.worktree,
+                &config.shared,
+            )
+            .with_default_backend(cli_backend)
+            .with_model_backend(config.model_backend.clone()),
+            (None, None) => {
+                ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
+                    .with_default_backend(cli_backend)
+                    .with_model_backend(config.model_backend.clone())
+            }
+        };
+        // If Coder workspace is configured, apply Coder-specific settings
+        // so the ProcessManager knows to skip local binary validation and
+        // (eventually) use Coder exec for spawn operations.
+        let process = match (&config.workspace_provider, &config.coder_workspace_id, &config.coder_url, &config.coder_api_token) {
+            (WorkspaceProvider::Coder, Some(ws_id), Some(url), Some(token)) => {
+                process.with_coder_config(url, token, ws_id)
+            }
+            _ => process,
+        };
+
         Self {
             worktree: WorktreeManager::new(&project_root),
             locks: FileLockManager::new(&project_root),
-            process: match (&config.redis_url, &config.proxy_url) {
-                (Some(redis_url), Some(proxy_url)) => ProcessManager::with_proxy(
-                    &config.github_token,
-                    Some(redis_url.clone()),
-                    proxy_url,
-                    &config.worktree,
-                    &config.shared,
-                )
-                .with_default_backend(cli_backend)
-                .with_model_backend(config.model_backend.clone()),
-                (Some(redis_url), None) => ProcessManager::with_redis(
-                    &config.github_token,
-                    redis_url,
-                    &config.worktree,
-                    &config.shared,
-                )
-                .with_default_backend(cli_backend)
-                .with_model_backend(config.model_backend.clone()),
-                (None, Some(proxy_url)) => ProcessManager::with_proxy(
-                    &config.github_token,
-                    None,
-                    proxy_url,
-                    &config.worktree,
-                    &config.shared,
-                )
-                .with_default_backend(cli_backend)
-                .with_model_backend(config.model_backend.clone()),
-                (None, None) => {
-                    ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
-                        .with_default_backend(cli_backend)
-                        .with_model_backend(config.model_backend.clone())
-                }
-            },
+            process,
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
             watchdog: match config.workspace_provider {
                 WorkspaceProvider::Coder => Watchdog::new_coder(config.watchdog_timeout_secs),
@@ -660,6 +675,35 @@ impl ForgeSentinelPair {
         self.write_task_context(ticket).await?;
 
         // 6. Spawn FORGE process
+        // In Coder mode, FORGE and SENTINEL run inside the workspace via
+        // the Coder exec API (not as local processes).  The Coder exec
+        // integration requires a valid workspace ID — if it's missing we
+        // stop gracefully rather than falling back to local execution.
+        if self.config.workspace_provider == WorkspaceProvider::Coder {
+            if self.config.coder_workspace_id.is_none() {
+                return Ok(PairOutcome::Blocked {
+                    reason: "Coder workspace not provisioned (workspace_id missing). \
+                             Cannot spawn FORGE inside the workspace — no local fallback \
+                             when Coder is the chosen provider."
+                        .to_string(),
+                    blockers: vec![],
+                });
+            }
+            // TODO(wire-coder-exec): REMOVE THIS BLOCK — once spawn_forge_coder /
+            // spawn_sentinel_coder from coder_process.rs are wired into this
+            // lifecycle, Coder mode will spawn agents via workspace_exec instead
+            // of falling through to local process spawning.  Delete this entire
+            // `else` branch and the `coder_workspace_id.is_none()` guard above
+            // at that point.
+            return Ok(PairOutcome::Blocked {
+                reason: "Coder workspace exec spawning is not yet wired into the \
+                         pair lifecycle.  The FORGE-SENTINEL pair must run inside \
+                         the workspace via Coder exec, which is not yet implemented \
+                         in pair.rs.  No local fallback when Coder is the chosen provider."
+                    .to_string(),
+                blockers: vec![],
+            });
+        }
         let mut forge = self.spawn_forge().await?;
 
         // 7. Start event watcher (filesystem for local, SharedStore polling for Coder)

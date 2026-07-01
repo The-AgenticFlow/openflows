@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
                         .env("CODER_ADMIN_PASSWORD", &coder_password)
                         .env("CODER_PG_PASSWORD", &pg_password)
                         .env("CODER_HTTP_ADDRESS", format!("0.0.0.0:{}", coder_port))
-                        .env("CODER_ACCESS_URL", format!("http://localhost:{}", coder_port))
+                        .env("CODER_ACCESS_URL", format!("http://172.17.0.1:{}", coder_port))
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .output()

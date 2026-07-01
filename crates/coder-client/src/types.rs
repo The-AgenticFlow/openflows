@@ -31,6 +31,29 @@ pub struct CoderUser {
     pub email: String,
 }
 
+/// A Coder organization.
+///
+/// Returned by `GET /api/v2/organizations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderOrganization {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default, rename = "created_at")]
+    pub created_at_raw: String,
+    #[serde(default, rename = "updated_at")]
+    pub updated_at_raw: String,
+}
+
 /// A Coder template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoderTemplate {
@@ -70,14 +93,52 @@ impl CoderWorkspace {
             || self.status == "running"
     }
 
+    /// Returns the agent lifecycle state if available in the workspace data.
+    ///
+    /// The Coder API embeds agent information inside the resources array of
+    /// the latest build. This method extracts the first agent's lifecycle state.
+    /// Returns `AgentLifecycleState::Unknown("no_agent")` when no agent is found.
+    pub fn agent_lifecycle_state(&self) -> AgentLifecycleState {
+        self.latest_build
+            .as_ref()
+            .and_then(|b| {
+                b.resources
+                    .iter()
+                    .find_map(|r| r.agents.first().map(|a| &a.lifecycle_state))
+            })
+            .cloned()
+            .unwrap_or_else(|| AgentLifecycleState::Unknown("no_agent".to_string()))
+    }
+
+    /// Returns the agent connection status if available in the workspace data.
+    pub fn agent_status(&self) -> AgentStatus {
+        self.latest_build
+            .as_ref()
+            .and_then(|b| {
+                b.resources
+                    .iter()
+                    .find_map(|r| r.agents.first().map(|a| a.status.clone()))
+            })
+            .unwrap_or_else(|| AgentStatus::Unknown("no_agent".to_string()))
+    }
+
+    /// Returns true when the workspace build is "running" **and** the agent
+    /// lifecycle state is "ready". This is more reliable than `is_running()`
+    /// alone because a workspace can report "running" while the agent is still
+    /// initializing (state "created" / "starting").
+    pub fn is_agent_ready(&self) -> bool {
+        self.is_running() && self.agent_lifecycle_state().is_ready()
+    }
+
     pub fn workspace_status(&self) -> WorkspaceStatus {
         WorkspaceStatus::from_status_str(&self.status)
     }
 
-    pub fn agent_status(&self) -> AgentStatus {
+    #[deprecated(note = "Use agent_status() instead, which reads from the embedded agent resource")]
+    pub fn agent_status_legacy(&self) -> AgentStatus {
         match &self.latest_build {
             Some(build) => AgentStatus::from_build_status(&build.status),
-            None => AgentStatus::Unknown,
+            None => AgentStatus::Unknown("no_build".to_string()),
         }
     }
 }
@@ -113,14 +174,76 @@ impl WorkspaceStatus {
     }
 }
 
-/// Status of the agent inside a Coder workspace, derived from the latest build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A workspace build (status info).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceBuild {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub transition: Option<String>,
+    #[serde(default)]
+    pub resources: Vec<WorkspaceResource>,
+}
+
+/// A workspace resource (e.g., docker_container) containing agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceResource {
+    #[serde(default)]
+    pub agents: Vec<WorkspaceAgent>,
+}
+
+/// An agent inside a workspace resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceAgent {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub status: AgentStatus,
+    #[serde(default)]
+    pub lifecycle_state: AgentLifecycleState,
+}
+
+/// Lifecycle state of a Coder workspace agent.
+/// Derived from the agent's `lifecycle_state` field in the workspace API response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLifecycleState {
+    Created,
+    Starting,
+    Ready,
+    ShuttingDown,
+    ShutDown,
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl AgentLifecycleState {
+    /// Returns true when the agent is fully initialized and accepting connections.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, AgentLifecycleState::Ready)
+    }
+}
+
+impl Default for AgentLifecycleState {
+    fn default() -> Self {
+        AgentLifecycleState::Unknown("unset".to_string())
+    }
+}
+
+/// Status of the agent connection inside a Coder workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Connected,
     Disconnected,
     Timeout,
-    Unknown,
+    Unknown(String),
+}
+
+impl Default for AgentStatus {
+    fn default() -> Self {
+        AgentStatus::Unknown("unset".to_string())
+    }
 }
 
 impl AgentStatus {
@@ -129,18 +252,9 @@ impl AgentStatus {
             "running" => AgentStatus::Connected,
             "stopped" | "stopping" => AgentStatus::Disconnected,
             "timeout" => AgentStatus::Timeout,
-            _ => AgentStatus::Unknown,
+            other => AgentStatus::Unknown(other.to_string()),
         }
     }
-}
-
-/// A workspace build (status info).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceBuild {
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub transition: Option<String>,
 }
 
 /// A Coder API key (token).
@@ -215,6 +329,10 @@ impl ChatInputPart {
 /// Request body for creating a new Chat session.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateChatRequest {
+    /// Organization ID that the chat belongs to.
+    /// Required by the Coder experimental chats API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     /// Workspace ID to run the chat in.
     pub workspace_id: String,
     /// The model config ID (from `/api/experimental/chats/models`).

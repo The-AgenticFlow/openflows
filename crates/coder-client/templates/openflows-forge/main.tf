@@ -122,8 +122,9 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  # Keep container alive so Coder agent can manage it
-  entrypoint = ["sleep", "infinity"]
+  # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
+  # Replace localhost/127.0.0.1 with Docker host gateway so the agent can reach the Coder server
+  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
 }
 
 data "coder_workspace" "me" {}

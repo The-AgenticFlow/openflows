@@ -201,6 +201,36 @@ impl BatchNode for ForgeNode {
             && std::env::var("CODER_URL").is_ok()
             && std::env::var("CODER_API_TOKEN").is_ok();
 
+        // When Coder is the configured provider but the workspace was not
+        // provisioned (workspace_id is None), we must NOT silently fall back
+        // to local execution.  Either the workspace self-heals or we stop
+        // gracefully — a local fallback violates the user's expectation that
+        // everything runs inside Coder workspaces.
+        if matches!(slot.workspace_provider, WorkspaceProvider::Coder) && !use_coder_workspace {
+            let reason = if slot.workspace_id.is_none() {
+                format!(
+                    "Coder workspace not provisioned for worker {} (workspace_id missing). \
+                     Cannot proceed without a Coder workspace — no local fallback \
+                     when Coder is the chosen provider.",
+                    worker_id
+                )
+            } else {
+                format!(
+                    "Coder workspace not available for worker {} (missing CODER_URL or \
+                     CODER_API_TOKEN env vars). Cannot proceed — no local fallback \
+                     when Coder is the chosen provider.",
+                    worker_id
+                )
+            };
+            warn!(worker = worker_id, reason = %reason);
+            return Ok(json!({
+                "worker_id": worker_id,
+                "ticket_id": ticket_id,
+                "outcome": "blocked",
+                "reason": reason,
+            }));
+        }
+
         let (worktree_path, transport): (PathBuf, Box<dyn WorkspaceTransport>) =
             if use_coder_workspace {
                 let coder_client = CoderClient::new(
@@ -219,7 +249,9 @@ impl BatchNode for ForgeNode {
                     Box::new(CoderTransport::new(coder_client, &workspace_id)),
                 )
             } else {
-                // Create worktree manager for local mode.
+                // Coder not configured — this branch is only reached when
+                // workspace_provider is Local (the else-case was removed above
+                // since we return Blocked for Coder-without-workspace).
                 let worktree_mgr = WorktreeManager::new(&self.workspace_root);
                 let setup_result = worktree_mgr
                     .create_worktree(&worker_id, &ticket_id, &worker_token)
@@ -1992,6 +2024,36 @@ impl BatchNode for ForgePairNode {
             && slot.workspace_id.is_some()
             && std::env::var("CODER_URL").is_ok()
             && std::env::var("CODER_API_TOKEN").is_ok();
+
+        // When Coder is the configured provider but the workspace was not
+        // provisioned (workspace_id is None), we must NOT silently fall back
+        // to local execution.  Either the workspace self-heals or we stop
+        // gracefully — a local fallback violates the user's expectation that
+        // everything runs inside Coder workspaces.
+        if matches!(slot.workspace_provider, WorkspaceProvider::Coder) && !use_coder_workspace {
+            let reason = if slot.workspace_id.is_none() {
+                format!(
+                    "Coder workspace not provisioned for worker {} (workspace_id missing). \
+                     Cannot proceed without a Coder workspace — no local fallback \
+                     when Coder is the chosen provider.",
+                    worker_id
+                )
+            } else {
+                format!(
+                    "Coder workspace not available for worker {} (missing CODER_URL or \
+                     CODER_API_TOKEN env vars). Cannot proceed — no local fallback \
+                     when Coder is the chosen provider.",
+                    worker_id
+                )
+            };
+            warn!(worker = worker_id, reason = %reason);
+            return Ok(json!({
+                "worker_id": worker_id,
+                "ticket_id": ticket_id,
+                "outcome": "blocked",
+                "reason": reason,
+            }));
+        }
 
         let config = if use_coder_workspace {
             let coder_workspace_id = slot.workspace_id.clone();

@@ -671,8 +671,47 @@ impl NexusNode {
         if workspace_provider != WorkspaceProvider::Coder {
             return Ok(existing_workspace_id);
         }
-        if let Some(existing) = existing_workspace_id {
-            return Ok(Some(existing));
+        if let Some(ref existing) = existing_workspace_id {
+            // Re-verify that the existing workspace is actually ready before
+            // treating it as provisioned.  If readiness was never confirmed
+            // (e.g. the previous attempt timed out and persisted the ID
+            // optimistically), this re-check prevents an unready workspace
+            // from being silently treated as ready.
+            if let Some(client) = Self::coder_client_from_store(store).await {
+                match client
+                    .wait_for_workspace_ready(existing, std::time::Duration::from_secs(180))
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            worker_id,
+                            workspace_id = %existing,
+                            "Existing Coder workspace verified ready"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            worker_id,
+                            workspace_id = %existing,
+                            error = %e,
+                            "Existing Coder workspace not ready — clearing stale workspace_id"
+                        );
+                        // Remove the stale ID so a fresh workspace can be
+                        // created on the next attempt.
+                        if let Some(slot) = slots.get_mut(worker_id) {
+                            slot.workspace_id = None;
+                        }
+                        store
+                            .set(KEY_WORKER_SLOTS, serde_json::to_value(&slots)?)
+                            .await;
+                        return Err(anyhow::anyhow!(
+                            "Coder workspace {} not ready on re-check: {}",
+                            existing, e
+                        ));
+                    }
+                }
+            }
+            return Ok(Some(existing.clone()));
         }
 
         let client = match Self::coder_client_from_store(store).await {
@@ -708,16 +747,94 @@ impl NexusNode {
             })
             .await?;
 
-        client
-            .wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
-            .await?;
-
+        // Persist the workspace ID immediately so that even if readiness
+        // polling times out, retries can reuse the same workspace rather
+        // than creating duplicates.
         if let Some(slot) = slots.get_mut(worker_id) {
             slot.workspace_id = Some(workspace.id.clone());
         }
         store
-            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(&slots)?)
             .await;
+
+        // Retry workspace readiness up to 3 attempts, extending the timeout
+        // each time.  Coder workspaces can take a while to provision
+        // (especially on resource-constrained hosts).
+        let max_ready_attempts: u32 = 3;
+        let base_ready_timeout_secs: u64 = 180;
+        for attempt in 1..=max_ready_attempts {
+            let timeout = std::time::Duration::from_secs(base_ready_timeout_secs);
+            info!(
+                worker_id,
+                workspace_id = %workspace.id,
+                attempt,
+                max_attempts = max_ready_attempts,
+                timeout_secs = timeout.as_secs(),
+                "Waiting for Coder workspace to become ready"
+            );
+            match client.wait_for_workspace_ready(&workspace.id, timeout).await {
+                Ok(()) => {
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        attempt,
+                        max_attempts = max_ready_attempts,
+                        error = %e,
+                        "Workspace not ready within timeout — will retry"
+                    );
+                    if attempt == max_ready_attempts {
+                        // Last attempt failed — return an error so the caller
+                        // can decide how to handle it (e.g. mark ticket as
+                        // blocked rather than silently falling back).
+                        return Err(anyhow::anyhow!(
+                            "Coder workspace {} did not become ready after {} attempts ({}s each): {}",
+                            workspace.id, max_ready_attempts,
+                            base_ready_timeout_secs, e
+                        ));
+                    }
+                    // Brief pause before retry
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+
+        // Wait for SSH to be available before provisioning configuration.
+        // A workspace can report "running" before the agent's SSH daemon is
+        // ready to accept connections, leading to timeouts on `coder ssh`
+        // commands during pair provisioning.
+        // Retry SSH readiness with the same patience.
+        let max_ssh_attempts: u32 = 3;
+        let base_ssh_timeout_secs: u64 = 120;
+        for attempt in 1..=max_ssh_attempts {
+            let timeout = std::time::Duration::from_secs(base_ssh_timeout_secs);
+            match client.wait_for_workspace_ssh(&workspace.id, timeout).await {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        attempt,
+                        max_attempts = max_ssh_attempts,
+                        error = %e,
+                        "Workspace SSH not ready within timeout — will retry"
+                    );
+                    if attempt == max_ssh_attempts {
+                        warn!(
+                            worker_id,
+                            workspace_id = %workspace.id,
+                            "Workspace SSH not ready after {} attempts; continuing anyway — \
+                             exec operations may fail until SSH becomes available",
+                            max_ssh_attempts
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
 
         info!(
             worker_id,
@@ -934,7 +1051,23 @@ impl NexusNode {
 
         use coder_client::types::{build_chat_labels, ChatInputPart, CreateChatRequest};
         let labels = build_chat_labels(ticket_id, role, "openflows");
+
+        // Resolve the default organization ID required by the Coder chats API.
+        let organization_id = match client.get_default_organization_id().await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(
+                    worker_id,
+                    ticket_id,
+                    error = %e,
+                    "Failed to resolve default organization ID; chat creation may fail"
+                );
+                None
+            }
+        };
+
         let chat_req = CreateChatRequest {
+            organization_id,
             workspace_id: workspace_id.clone(),
             model_config_id: None, // Let Coder use its default model
             content: vec![ChatInputPart::text(&prompt)],

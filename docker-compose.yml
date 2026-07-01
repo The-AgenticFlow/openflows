@@ -1,3 +1,5 @@
+name: openflows
+
 services:
   proxy:
     image: ghcr.io/berriai/litellm:main-latest

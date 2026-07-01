@@ -320,6 +320,57 @@ impl CoderClient {
         }
     }
 
+    /// List all organizations visible to the authenticated user.
+    /// GET /api/v2/organizations
+    pub async fn list_organizations(&self) -> Result<Vec<CoderOrganization>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/v2/organizations")
+            .send()
+            .await
+            .context("Failed to list organizations")?;
+
+        if resp.status().is_success() {
+            let orgs: Vec<CoderOrganization> = resp.json().await?;
+            Ok(orgs)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list organizations ({}): {}", status, body)
+        }
+    }
+
+    /// Get the default organization ID.
+    ///
+    /// Queries `GET /api/v2/organizations` and returns the ID of the first
+    /// organization marked `is_default`. If none is explicitly marked as
+    /// default, returns the first organization in the list. Returns an error
+    /// if no organizations are found at all.
+    pub async fn get_default_organization_id(&self) -> Result<String> {
+        let orgs = self.list_organizations().await?;
+        if orgs.is_empty() {
+            bail!("No organizations found in Coder");
+        }
+        // Prefer the one flagged is_default, otherwise fall back to the first.
+        let default_org = match orgs.iter().find(|o| o.is_default) {
+            Some(org) => org,
+            None => {
+                warn!(
+                    total_orgs = orgs.len(),
+                    fallback_org_name = %orgs[0].name,
+                    "No organization marked is_default; falling back to first organization"
+                );
+                &orgs[0]
+            }
+        };
+        info!(
+            org_id = %default_org.id,
+            org_name = %default_org.name,
+            is_default = default_org.is_default,
+            "Resolved default organization"
+        );
+        Ok(default_org.id.clone())
+    }
+
     /// Create an API token for a user. Attempts to reuse an existing token
     /// with the same name first for idempotency.
     pub async fn create_api_token(&self, user_id: &str, name: &str) -> Result<CoderApiKey> {
@@ -711,20 +762,31 @@ impl CoderClient {
         }
     }
 
-    /// Wait until a workspace's agent is ready (accepting connections).
+    /// Wait until a workspace's build status is "running" **and** its agent
+    /// lifecycle state is "ready".
+    ///
+    /// A workspace can report "running" before the in-container agent has
+    /// finished starting up and accepting connections. This method polls
+    /// until both conditions are true, which eliminates the race condition
+    /// that causes `coder ssh` timeouts.
     pub async fn wait_for_workspace_ready(&self, id: &str, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
         info!(workspace_id = id, "Waiting for workspace to be ready");
         while start.elapsed() < timeout {
             match self.get_workspace(id).await {
-                Ok(ws) if ws.is_running() => {
-                    info!(workspace_id = id, "Workspace is ready");
+                Ok(ws) if ws.is_agent_ready() => {
+                    info!(
+                        workspace_id = id,
+                        agent_lifecycle = ?ws.agent_lifecycle_state(),
+                        "Workspace is ready (agent connected)"
+                    );
                     return Ok(());
                 }
                 Ok(ws) => {
                     debug!(
                         workspace_id = id,
-                        status = ?ws.status,
+                        build_status = ?ws.latest_build.as_ref().map(|b| &b.status),
+                        agent_lifecycle = ?ws.agent_lifecycle_state(),
                         "Workspace not yet ready, retrying..."
                     );
                 }
@@ -735,6 +797,50 @@ impl CoderClient {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         bail!("Workspace {} did not become ready within {:?}", id, timeout)
+    }
+
+    /// Wait until a workspace's SSH daemon is reachable via `coder ssh`.
+    ///
+    /// This must be called **after** `wait_for_workspace_ready()` because a
+    /// workspace can report `"running"` before the in-container agent has
+    /// finished initialising its SSH endpoint. The probe runs a lightweight
+    /// `echo ready` command and retries until SSH succeeds or the timeout
+    /// expires.
+    pub async fn wait_for_workspace_ssh(
+        &self,
+        workspace_id: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        info!(workspace_id, "Waiting for workspace SSH to become available");
+        while start.elapsed() < timeout {
+            match self
+                .workspace_exec_with_timeout(workspace_id, "echo ready", 15)
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    info!(workspace_id, "Workspace SSH is available");
+                    return Ok(());
+                }
+                Ok(output) => {
+                    debug!(
+                        workspace_id,
+                        exit_code = output.exit_code,
+                        stderr = %output.stderr,
+                        "SSH probe returned non-zero, retrying..."
+                    );
+                }
+                Err(e) => {
+                    debug!(workspace_id, error = %e, "SSH probe failed, retrying...");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        bail!(
+            "Workspace {} SSH not available within {:?}",
+            workspace_id,
+            timeout
+        )
     }
 
     /// Execute a command in a workspace via `coder ssh`.
@@ -1121,9 +1227,25 @@ impl CoderClient {
         self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
             .await?;
 
+        self.wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(120))
+            .await?;
+
+        // Resolve the default organization ID required by the Coder chats API.
+        let organization_id = match self.get_default_organization_id().await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to resolve default organization ID; chat creation may fail"
+                );
+                None
+            }
+        };
+
         // Create chat with OpenFlows labels
         let labels = build_chat_labels(ticket_id, role, "openflows");
         let chat_req = CreateChatRequest {
+            organization_id,
             workspace_id: workspace.id.clone(),
             model_config_id: None,
             content: vec![ChatInputPart::text(prompt)],

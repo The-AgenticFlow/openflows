@@ -246,6 +246,12 @@ impl CoderBootstrapper {
                     let _ = client
                         .wait_for_workspace_ready(&workspace.id, Duration::from_secs(180))
                         .await;
+                    if let Err(e) = client
+                        .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
+                        .await
+                    {
+                        warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
+                    }
 
                     if let Ok(home) = std::env::var("HOME") {
                         let state_dir = format!("{}/.openflows", home);

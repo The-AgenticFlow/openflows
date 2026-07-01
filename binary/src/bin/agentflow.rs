@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
                         std::env::set_var("CODER_PORT", coder_port.to_string());
                         std::env::set_var(
                             "CODER_ACCESS_URL",
-                            format!("http://localhost:{}", coder_port),
+                            format!("http://172.17.0.1:{}", coder_port),
                         );
                         std::env::set_var("CODER_HTTP_ADDRESS", format!("0.0.0.0:{}", coder_port));
                         eprintln!("  ⚠ Port {} is already in use on {}", old_port, coder_host);
@@ -502,7 +502,7 @@ async fn main() -> Result<()> {
                                 .env("CODER_HTTP_ADDRESS", "0.0.0.0:7080")
                                 .env(
                                     "CODER_ACCESS_URL",
-                                    format!("http://localhost:{}", coder_port),
+                                    format!("http://172.17.0.1:{}", coder_port),
                                 );
                             // Conditionally pass external auth vars — only when non-empty.
                             // Empty values crash Coder: "read external auth providers from

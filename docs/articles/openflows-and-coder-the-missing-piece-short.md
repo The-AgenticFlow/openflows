@@ -1,6 +1,6 @@
-# The Missing Piece: Why Agents Need Both @OpenFlows and @Coder
+# The Missing Piece: Why AI Agents Need @OpenFlows Orchestration + @Coder Infrastructure
 
-> Intelligence without infrastructure is reckless. Infrastructure without intelligence is incomplete. Together, they're transformative.
+> OpenFlows orchestrates agent teams. Coder governs where they run. Together: coordinated, isolated, auditable, enterprise-ready.
 
 ---
 
@@ -12,23 +12,9 @@ It falls apart in production. API keys exposed in env files. Agents with unrestr
 
 The agent works. The system around it doesn't.
 
-@Coder and @OpenFlows have been solving this problem from opposite sides. **Coder governs where agents run. OpenFlows governs how agents coordinate.**
+**OpenFlows** solves the orchestration — how agents coordinate like a real team. Add **Coder** as the deployment target, and those agents run inside governed, isolated environments.
 
-Neither is complete without the other. But together?
-
----
-
-## What Coder Actually Does
-
-Coder is **infrastructure for running agents** — and humans — inside controlled, network-isolated workspaces:
-
-- **Terraform-defined workspaces** — reproducible environments. Zero "works on my machine" drift.
-- **A control plane** — LLM runs centrally. API keys never touch the workspace. Nothing to exfiltrate.
-- **Identity & audit** — every action attributed to the human who started it. No shared bot accounts.
-- **Network isolation** — workspaces reach only what they need. Full egress control.
-- **Model governance** — admins approve providers, manage costs, enforce policies.
-
-Coder solves the **_where_** problem. But its built-in agent is single-agent, single-workspace. It doesn't plan before coding, review its own work, or coordinate parallel workstreams.
+Neither is the full answer alone. But together?
 
 ---
 
@@ -36,51 +22,63 @@ Coder solves the **_where_** problem. But its built-in agent is single-agent, si
 
 OpenFlows is an **orchestration system** — a team of specialized agents that coordinate like a real engineering team:
 
-- **NEXUS** — the orchestrator. Picks up issues, assigns workers, routes failures, keeps the pipeline moving.
-- **FORGE** — the builder. Plans, segments work, writes code, opens PRs.
-- **SENTINEL** — the reviewer. Spawns fresh per evaluation with specific, actionable feedback against contracts.
-- **VESSEL** — the merge gate. Deterministic (no LLM). Checks CI, handles conflicts, cleans up.
-- **LORE** — the documentarian. Records decisions, maintains project history, prevents knowledge loss.
+- **NEXUS** — picks up issues, assigns workers, routes failures, keeps the pipeline moving
+- **FORGE** — plans, segments work, writes code, opens PRs
+- **SENTINEL** — spawns fresh per evaluation with specific, actionable feedback against contracts
+- **VESSEL** — deterministic (no LLM). Checks CI, handles conflicts, merges
+- **LORE** — records decisions, updates changelogs, maintains project history
 
-Agents communicate through a **shared state store**, not chat messages. Event-driven, recoverable, observable.
+Agents communicate through a **shared state store**, not chat messages. Event-driven, recoverable, observable. Works standalone right now — `openflows` on any machine with git.
 
-But OpenFlows doesn't govern where agents run. Doesn't control API key distribution. Doesn't enforce network boundaries. Doesn't provide enterprise audit attribution.
-
-**OpenFlows is the brain. Coder is the building. They need each other.**
+But standalone OpenFlows runs on developer machines. API keys in env files. No network isolation. No enterprise audit attribution. Works great for small teams and OSS. A gap for regulated industries.
 
 ---
 
-## Why They're Indispensable Together
+## What Coder Actually Does
 
-### Without Coder:
-OpenFlows agents run on developer machines. API keys in env files. No network isolation. No central audit. Works for small teams. Breaks in finance, healthcare, government — where **every action needs attribution and every connection needs justification**.
+Coder is **infrastructure for running agents** — and humans — inside controlled, network-isolated workspaces:
 
-### Without OpenFlows:
-Coder's agent handles individual tasks well. But it **can't decompose features into parallel workstreams**. Can't have one agent write while another reviews independently. Can't recover from failures by routing around blocked workers. Lacks the architectural intelligence that makes multi-agent teams effective.
+- **Terraform-defined workspaces** — reproducible environments, zero "works on my machine" drift
+- **A control plane** — LLM runs centrally, API keys never touch the workspace
+- **Identity & audit** — every action attributed to the human who started it
+- **Network isolation** — workspaces reach only what they need, full egress control
+- **Model governance** — admins approve providers, manage costs, enforce policies
 
-### Together:
-An enterprise-grade, AI-native development platform where agents are both **well-governed** and **well-coordinated**.
+Coder solves the **_where_** problem. But its built-in agent is single-agent, single-workspace. No multi-agent planning, no parallel review, no orchestration intelligence.
 
 ---
 
-## Five Integration Layers That Unlock New Capability
+## Why They Need Each Other
+
+**OpenFlows orchestrates agent workflows. Coder governs where those workflows run.**
+
+Without Coder, OpenFlows agents run on developer machines with exposed API keys and no audit trail. Fine for small teams. Not enough for finance, healthcare, or government — where **every action needs attribution and every connection needs justification**.
+
+Without OpenFlows, Coder's agent does individual tasks well but **can't run a multi-agent pipeline**. Can't decompose features into parallel workstreams. Can't have one agent write while another reviews independently. Can't recover from failures by routing around blocked workers.
+
+Together: OpenFlows provides the orchestration brain. Coder provides the governed environment.
+
+---
+
+## Five Integration Layers
 
 **Layer 1: Kernel-Level Isolation**
-Standalone OpenFlows uses git worktrees with sticky-note file locks. With Coder, each agent gets its own isolated workspace. Agent A literally cannot access Agent B's work. Separation goes from convention to enforcement.
+Standalone OpenFlows uses git worktrees with file locks. With Coder, each agent gets its own isolated workspace. Agent A literally cannot access Agent B's work. Separation goes from convention to enforcement.
 
 **Layer 2: Flow Graphs Replace Agent Loops**
-Coder's agent does prompt → think → respond. OpenFlows replaces this with a declared **flow graph** where each node (NEXUS, FORGE-SENTINEL, VESSEL) follows prep-execute-post patterns. One agent can hold one conversation. A flow graph runs a factory.
+Coder's agent does prompt → think → respond. OpenFlows replaces this with a declared **flow graph** where each node (NEXUS, FORGE-SENTINEL, VESSEL) follows prep-execute-post patterns. One agent can hold one conversation. A flow graph runs a pipeline.
 
 **Layer 3: Human Attribution**
-OpenFlows alone uses a shared bot token. Coder attributes every action to the authenticated human who started it. Not negotiable for regulated industries.
+OpenFlows alone uses a shared bot token. Coder attributes every agent action to the authenticated human who started it. Required by regulated industries. Not negotiable.
 
 **Layer 4: Workspaces as Orchestration Objects**
-NEXUS provisions workspaces from templates on ticket assignment. VESSEL stops them on merge. Crashes trigger automatic recreation with shared state resumption. Infrastructure becomes part of the orchestration graph.
+NEXUS provisions workspaces from templates on ticket assignment. VESSEL stops them on merge. Crashes trigger automatic recreation. Infrastructure becomes part of the orchestration graph.
 
 **Layer 5: Gradual Adoption**
-- Standalone OpenFlows — works today with local worktrees
-- Coder + OpenFlows — enterprise deployment with full governance
-- Coder only — workspace governance without multi-agent orchestration yet
+- **Standalone OpenFlows** — works today with local worktrees
+- **Coder + OpenFlows** — enterprise deployment with full governance
+- **Coder only** — workspace governance without multi-agent orchestration
+
 Each mode independently valuable. Each transition incremental.
 
 ---
@@ -112,6 +110,7 @@ The developer describes the work. The system handles the rest — safely.
 ## Where It Stands Right Now
 
 This isn't theoretical. The codebase already implements:
+
 - `CoderClient` speaking the Chats API
 - NEXUS creating Coder workspaces bound to ticket assignments
 - VESSEL destroying workspaces on merge (no dead infrastructure)
@@ -119,21 +118,21 @@ This isn't theoretical. The codebase already implements:
 - Templates installing modules, writing heartbeats, keeping persistent workspaces alive
 - Notifier layer escalating `awaiting_human` to Slack, Discord, or WhatsApp
 
-The incremental roadmap continues: transport abstraction, shared state migration, full lifecycle management, governance integration, and an MCP bridge for the Coder dashboard.
+The incremental roadmap continues: transport abstraction, shared state migration, full lifecycle management, governance integration, and an MCP bridge for the Coder dashboard. Each phase independently deployable.
 
 ---
 
 ## The Deeper Pattern
 
-The history of software engineering is the history of **separation of concerns**. We separated design from implementation. Testing from development. Deployment from building. Each separation created a discipline.
+The history of software engineering is **separation of concerns**. AI agents are going through the same evolution.
 
-AI agents are going through the same evolution. Most tools conflate intelligence and infrastructure governance. OpenFlows answers "how smart can the agents be?" with architectural intelligence — plan before coding, review before merging, recover from failure. Coder answers "how safely can they run?" with infrastructure governance — control where agents run, who authorized them, what they can reach.
+Most tools conflate intelligence and infrastructure governance. You shouldn't have to choose between "smart agents" and "governed agents." OpenFlows answers "how smart can the agents be?" Add Coder and you get "how safely can they run?"
 
-The teams that figure out both questions first will ship **faster** and **safer**. Not one or the other. Both.
+The teams that figure out both first will ship **faster and safer**. Not one or the other. Both.
 
-**Because code is the output. Architecture is the product.**
+**Because code is the output. Orchestration is the brain. Infrastructure is the building.**
 
 ---
 
-*OpenFlows is open-source at [github.com/The-AgenticFlow/openflows](https://github.com/The-AgenticFlow/openflows)*
-*Coder is at [coder.com](https://coder.com)*
+*\@OpenFlows is open-source at [github.com/The-AgenticFlow/openflows](https://github.com/The-AgenticFlow/openflows)*
+*\@Coder is at [coder.com](https://coder.com)*

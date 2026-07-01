@@ -49,8 +49,7 @@ router_settings:
   num_retries: 3
   # Fallback to Claude for the forge role if primary is unavailable
   fallbacks:
-    - model: openflows-forge
-      fallback: anthropic/claude-sonnet-4-5
+    - openflows-forge: ["anthropic/claude-sonnet-4-5"]
 
 litellm_settings:
   request_timeout: 600

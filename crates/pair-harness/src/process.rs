@@ -797,9 +797,16 @@ impl ProcessManager {
             ),
         );
 
-        // Validate all registered backends
+        // Validate all registered backends (logs warnings; spawn-time
+        // validation will fail hard in Local mode if binary is missing).
+        // At construction time the provider is always Local; when
+        // with_coder_config() is called later the provider changes to
+        // Coder and the binaries are no longer needed on the host.
+        let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+                warn!("{}", e);
+            }
         }
 
         Self {
@@ -846,8 +853,11 @@ impl ProcessManager {
             ),
         );
 
+        let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+                warn!("{}", e);
+            }
         }
 
         Self {
@@ -894,8 +904,11 @@ impl ProcessManager {
             ),
         );
 
+        let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+                warn!("{}", e);
+            }
         }
 
         Self {
@@ -1051,7 +1064,9 @@ impl ProcessManager {
 
     /// Register a custom backend config (for testing or third-party backends).
     pub fn register_backend(&mut self, backend: CliBackend, config: BackendConfig) {
-        Self::validate_cli_binary(&config.binary_path, backend.binary_name());
+        if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &self.workspace_provider) {
+            warn!("{}", e);
+        }
         self.backends.insert(backend, config);
     }
 
@@ -1064,15 +1079,40 @@ impl ProcessManager {
     }
 
     /// Validate a CLI binary exists and is executable.
-    fn validate_cli_binary(path: &Path, name: &str) {
+    ///
+    /// In Coder mode (workspace_provider == Coder), the CLI runs inside the
+    /// workspace provided by the Coder module — it is NOT required on the
+    /// host.  Validation is skipped entirely in that case to avoid false
+    /// failures (e.g., `claude` not installed locally).
+    ///
+    /// In Local mode, validation is strict: a missing binary returns `Err`
+    /// so the caller can fail fast instead of waiting until spawn time to
+    /// discover the problem.
+    fn validate_cli_binary(
+        path: &Path,
+        name: &str,
+        workspace_provider: &crate::types::WorkspaceProvider,
+    ) -> Result<(), String> {
+        // Skip validation when execution happens inside a Coder workspace.
+        if matches!(workspace_provider, crate::types::WorkspaceProvider::Coder) {
+            info!(
+                binary = %path.display(),
+                name,
+                "Skipping local CLI binary validation — execution targets a Coder workspace"
+            );
+            return Ok(());
+        }
+
         let env_var = format!("{}_PATH", name.to_uppercase());
         if path.is_absolute() {
             if !path.exists() {
-                error!(
-                    path = %path.display(),
-                    "{} binary not found. Install {} CLI or set {} in .env",
-                    env_var, name, env_var
-                );
+                return Err(format!(
+                    "{} binary not found at {}. Install {} CLI or set {} in .env",
+                    env_var,
+                    path.display(),
+                    name,
+                    env_var
+                ));
             } else {
                 #[cfg(unix)]
                 {
@@ -1080,11 +1120,12 @@ impl ProcessManager {
                     if let Ok(metadata) = path.metadata() {
                         let perms = metadata.permissions();
                         if perms.mode() & 0o111 == 0 {
-                            error!(
-                                path = %path.display(),
-                                "{} binary exists but is not executable. Run: chmod +x {}",
-                                env_var, path.display()
-                            );
+                            return Err(format!(
+                                "{} binary exists at {} but is not executable. Run: chmod +x {}",
+                                env_var,
+                                path.display(),
+                                path.display()
+                            ));
                         }
                     }
                 }
@@ -1100,14 +1141,14 @@ impl ProcessManager {
                         "codex" => "https://github.com/openai/codex",
                         _ => "the vendor's website",
                     };
-                    error!(
-                        binary = %path.display(),
+                    return Err(format!(
                         "{} CLI binary not found on PATH. Install it from {} or set {}_PATH in .env to an absolute path",
                         name, install_url, name.to_uppercase()
-                    );
+                    ));
                 }
             }
         }
+        Ok(())
     }
 
     /// Ensure the backend-specific home directory exists and write a minimal
@@ -1642,6 +1683,15 @@ trust_level = "trusted"
             backend = ?backend,
             "Spawning FORGE process"
         );
+
+        // In Local mode, the CLI binary must exist on the host. Fail fast
+        // with a clear error instead of waiting for OS error 2 at spawn time.
+        // In Coder mode the binary runs inside the workspace — skip validation.
+        if matches!(self.workspace_provider, crate::types::WorkspaceProvider::Local) {
+            let config = self.get_backend(backend);
+            Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &self.workspace_provider)
+                .map_err(|e| anyhow!("{}", e))?;
+        }
 
         // Build the initial prompt for FORGE
         let initial_prompt = self.build_forge_prompt(shared);

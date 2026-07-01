@@ -5,7 +5,7 @@
 //! local filesystem, enabling both local git worktree workflows and remote
 //! Coder workspace workflows through the same interface.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::path::Path;
 use std::path::PathBuf;
@@ -126,11 +126,18 @@ impl WorkspaceTransport for LocalTransport {
 
     async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()> {
         let full_target = self.resolve_path(target);
-        if source.is_dir() {
-            std::os::unix::fs::symlink(source, &full_target)?;
-        } else {
-            std::os::unix::fs::symlink(source, &full_target)?;
+        // Remove existing target (symlink, file, or dir) so re-provisioning succeeds
+        if full_target.exists() || full_target.symlink_metadata().is_ok() {
+            if full_target.is_dir() && !full_target.is_symlink() {
+                std::fs::remove_dir_all(&full_target)
+                    .with_context(|| format!("Failed to remove existing dir at {}", full_target.display()))?;
+            } else {
+                std::fs::remove_file(&full_target)
+                    .with_context(|| format!("Failed to remove existing target at {}", full_target.display()))?;
+            }
         }
+        std::os::unix::fs::symlink(source, &full_target)
+            .with_context(|| format!("Failed to symlink {} -> {}", source.display(), full_target.display()))?;
         Ok(())
     }
 
