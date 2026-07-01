@@ -122,6 +122,7 @@ resource "docker_container" "workspace" {
     "CODER_API_TOKEN=${var.coder_api_token}",
     "OPENFLOWS_REGISTRY_JSON=${var.registry_json}",
     "ROLE=nexus",
+    "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]
 
   # Connect to the openflows_default compose network for Redis access.
@@ -129,8 +130,8 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c"]
-  command    = [coder_agent.main.startup_script]
+  # Keep container alive so Coder agent can manage it
+  entrypoint = ["sleep", "infinity"]
 }
 
 data "coder_workspace" "me" {}

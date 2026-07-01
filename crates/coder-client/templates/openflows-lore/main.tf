@@ -128,8 +128,8 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c"]
-  command    = [coder_agent.main.startup_script]
+  # Keep container alive so Coder agent can manage it
+  entrypoint = ["sleep", "infinity"]
 }
 
 data "coder_workspace" "me" {}

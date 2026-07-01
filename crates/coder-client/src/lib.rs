@@ -1090,15 +1090,14 @@ impl CoderClient {
         ticket_id: &str,
         role: &str,
         prompt: &str,
-        model_config_id: &str,
     ) -> Result<(String, crate::types::Chat)> {
         use crate::types::build_chat_labels;
         use crate::types::ChatInputPart;
         use crate::types::CreateChatRequest;
         use crate::types::CreateWorkspaceRequest;
 
-        // Build naming convention: {role}-T-{ticket_id}
-        let workspace_name = format!("{}-T-{}", role, ticket_id);
+        // Build naming convention: {role}-{ticket_id} — ticket_id already includes "T-" prefix
+        let workspace_name = format!("{}-{}", role, ticket_id);
         let repository: String = std::env::var("OPENFLOWS_REPOSITORY")
             .or_else(|_| std::env::var("AGENTFLOW_REPOSITORY"))
             .unwrap_or_else(|_| "openflows/target".to_string());
@@ -1126,7 +1125,7 @@ impl CoderClient {
         let labels = build_chat_labels(ticket_id, role, "openflows");
         let chat_req = CreateChatRequest {
             workspace_id: workspace.id.clone(),
-            model_config_id: model_config_id.to_string(),
+            model_config_id: None,
             content: vec![ChatInputPart::text(prompt)],
             labels: Some(labels),
         };

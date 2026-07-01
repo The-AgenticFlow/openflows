@@ -788,10 +788,11 @@ impl NexusNode {
         Ok(())
     }
 
-    /// Build a workspace name following the `{role}-T-{ticket_id}` convention.
+    /// Build a workspace name following the `{role}-{ticket_id}` convention.
+    /// ticket_id already includes the "T-" prefix (e.g., "T-041"), so we don't add another one.
     fn workspace_name_for_ticket(worker_id: &str, ticket_id: &str) -> String {
         let role = Self::worker_role(worker_id);
-        format!("{}-T-{}", role, ticket_id)
+        format!("{}-{}", role, ticket_id)
     }
 
     /// Resolve the template name for a worker role.
@@ -931,14 +932,11 @@ impl NexusNode {
             ticket_id
         );
 
-        // Get model config ID - try cache first, then fetch
-        let model_config_id = "default"; // For now, use default. Can be enhanced later with caching.
-
         use coder_client::types::{build_chat_labels, ChatInputPart, CreateChatRequest};
         let labels = build_chat_labels(ticket_id, role, "openflows");
         let chat_req = CreateChatRequest {
             workspace_id: workspace_id.clone(),
-            model_config_id: model_config_id.to_string(),
+            model_config_id: None, // Let Coder use its default model
             content: vec![ChatInputPart::text(&prompt)],
             labels: Some(labels),
         };

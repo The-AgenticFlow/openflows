@@ -86,7 +86,7 @@ resource "coder_agent" "main" {
 
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} SET "heartbeat:forge-T-${var.ticket_id}" \
+      redis-cli -u ${var.redis_url} SET "heartbeat:forge-${var.ticket_id}" \
         "{\"ts\":$(date +%s),\"ws_id\":\"${data.coder_workspace.me.id}\",\"status\":\"running\"}" \
         2>/dev/null || true
       sleep 30
@@ -114,6 +114,7 @@ resource "docker_container" "workspace" {
     "USE_AI_GATEWAY=${var.use_ai_gateway}",
     "ROLE=forge",
     "TICKET_ID=${var.ticket_id}",
+    "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]
 
   # Connect to the openflows_default compose network for Redis access.
@@ -121,8 +122,8 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c"]
-  command    = [coder_agent.main.startup_script]
+  # Keep container alive so Coder agent can manage it
+  entrypoint = ["sleep", "infinity"]
 }
 
 data "coder_workspace" "me" {}

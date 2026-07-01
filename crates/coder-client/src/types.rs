@@ -218,7 +218,9 @@ pub struct CreateChatRequest {
     /// Workspace ID to run the chat in.
     pub workspace_id: String,
     /// The model config ID (from `/api/experimental/chats/models`).
-    pub model_config_id: String,
+    /// If None, Coder will use the workspace's default model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_config_id: Option<String>,
     /// The initial prompt / message content.
     pub content: Vec<ChatInputPart>,
     /// Key-value labels for filtering and querying chats.
@@ -236,8 +238,8 @@ pub struct Chat {
     pub owner_id: String,
     #[serde(default)]
     pub workspace_id: String,
-    #[serde(default)]
-    pub model_config_id: String,
+    #[serde(default, rename = "model_config_id")]
+    pub model_config_id: Option<String>,
     #[serde(default, rename = "status")]
     pub status_raw: String,
     #[serde(default)]
