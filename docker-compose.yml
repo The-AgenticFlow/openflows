@@ -50,7 +50,7 @@ services:
       - "${CODER_PORT:-7080}:${CODER_INTERNAL_PORT:-7080}"
     environment:
       CODER_PG_CONNECTION_URL: postgres://coder:${CODER_PG_PASSWORD:-coder}@coder-db:5432/coder?sslmode=disable
-      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://localhost:${CODER_PORT:-7080}}
+      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://172.17.0.1:${CODER_PORT:-7080}}
       CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
