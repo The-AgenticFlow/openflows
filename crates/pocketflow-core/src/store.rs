@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, trace};
 
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
@@ -124,7 +124,11 @@ impl SharedStore {
 
     pub async fn get(&self, key: &str) -> Option<Value> {
         let v = self.backend.get(key).await;
-        debug!(key, found = v.is_some(), "store.get");
+        // Per-key gets fire at very high cadence (polling watchers hit
+        // every artifact every ~200ms per pair).  Demote successful-and-miss
+        // probe logs to trace so they stop burying diagnostic output.  Adding
+        // keys via `set` / `del` are infrequent and stay at debug.
+        trace!(key, found = v.is_some(), "store.get");
         v
     }
 

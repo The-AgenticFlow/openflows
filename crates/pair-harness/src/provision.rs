@@ -1371,7 +1371,12 @@ developer_instructions = """
                 continue;
             }
 
-            let rel_path = format!("hooks/{}/{}.sh", role, hook_name);
+            // Claude Code resolves hook command paths relative to the
+            // project cwd, NOT relative to the settings.json file.  The
+            // hooks are installed to <target>/.claude/hooks/<role>/ (see
+            // install_claude_hook_scripts), so the command must include
+            // the ".claude/" prefix to resolve correctly from the cwd.
+            let rel_path = format!(".claude/hooks/{}/{}.sh", role, hook_name);
 
             let hook_entry = json!({
                 "matcher": match *event {

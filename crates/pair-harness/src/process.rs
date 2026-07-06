@@ -19,6 +19,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::types::CliBackend;
 
+#[cfg(feature = "coder")]
+use crate::pair::tail_truncate;
+
 use serde::Deserialize;
 
 /// Cross-provider process handle for local child processes and Coder exec tasks.
@@ -1982,8 +1985,8 @@ trust_level = "trusted"
             error!(
                 pair = pair_id,
                 pid,
-                log = %if log_content.len() > 1000 { &log_content[..1000] } else { &log_content },
-                "FORGE process died immediately after spawn — see log above"
+                log = %tail_truncate(&log_content, 1200),
+                "FORGE process died immediately after spawn — see log above (tail of log shown; the actual error normally follows the SessionStart hook banner)"
             );
         }
 

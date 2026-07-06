@@ -286,6 +286,26 @@ fn truncate_message(message: &str, max_len: usize) -> String {
     }
 }
 
+/// Take the **tail** of a log string, so the error at the end survives
+/// truncation instead of the (often long, informational) hook output at the
+/// beginning.  Used for FORGE startup-error logs where the actual cause
+/// (auth failure, API error, missing binary) always appears after the
+/// SessionStart hook banner.
+pub(crate) fn tail_truncate(log: &str, max_len: usize) -> &str {
+    if log.len() <= max_len {
+        log
+    } else {
+        let start = log.len() - max_len;
+        // Advance to the next char boundary in case we landed mid-byte.
+        let start = log[start..]
+            .char_indices()
+            .next()
+            .map(|(i, _)| start + i)
+            .unwrap_or(start);
+        &log[start..]
+    }
+}
+
 fn compute_effective_timeout(base_secs: u64, complexity: &Complexity) -> u64 {
     let overhead =
         ENV_OVERHEAD_NETWORK_SECS + ENV_OVERHEAD_STREAMING_SECS + ENV_OVERHEAD_BUFFER_SECS;
@@ -1108,17 +1128,16 @@ impl ForgeSentinelPair {
                             error!(
                                 consecutive_exits = self.rapid_exit_count,
                                 startup_error = ?startup_error.as_deref().map(|s| {
-                                    // Truncate to first 500 chars for log readability
-                                    if s.len() > 500 { &s[..500] } else { s }
+                                    tail_truncate(s, 500)
                                 }),
                                 "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
                             );
                             let reason = match startup_error {
                                 Some(log) if !log.trim().is_empty() => {
-                                    let truncated = if log.len() > 2000 { &log[..2000] } else { &log[..] };
+                                    let truncated = tail_truncate(&log, 2000);
                                     format!(
                                         "FORGE exited {} times within 30 seconds — startup error. \
-                                         FORGE log:\n{}",
+                                         FORGE log (tail):\n{}",
                                         self.rapid_exit_count, truncated
                                     )
                                 }
@@ -1138,6 +1157,19 @@ impl ForgeSentinelPair {
                             consecutive = self.rapid_exit_count,
                             "FORGE exited quickly with stale progress files — likely startup error, not segment completion"
                         );
+                        // Surface the actual startup error on the *first* rapid
+                        // exit instead of waiting for MAX_RAPID_EXITS so the
+                        // cause (e.g. auth/403) is visible immediately.
+                        if self.rapid_exit_count == 1 {
+                            if let Some(log) = self.read_forge_startup_error().await {
+                                let truncated = tail_truncate(&log, 1200);
+                                warn!(
+                                    startup_error = %truncated,
+                                    "FORGE startup error captured on first rapid exit (pair will retry up to {} times)",
+                                    MAX_RAPID_EXITS,
+                                );
+                            }
+                        }
                         // Treat the same as "no progress" quick exit: retry with backoff
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
@@ -1210,16 +1242,16 @@ impl ForgeSentinelPair {
                             error!(
                                 consecutive_exits = self.rapid_exit_count,
                                 startup_error = ?startup_error.as_deref().map(|s| {
-                                    if s.len() > 500 { &s[..500] } else { s }
+                                    tail_truncate(s, 500)
                                 }),
                                 "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
                             );
                             let reason = match startup_error {
                                 Some(log) if !log.trim().is_empty() => {
-                                    let truncated = if log.len() > 2000 { &log[..2000] } else { &log[..] };
+                                    let truncated = tail_truncate(&log, 2000);
                                     format!(
                                         "FORGE exited {} times within 30 seconds — startup error. \
-                                         FORGE log:\n{}",
+                                         FORGE log (tail):\n{}",
                                         self.rapid_exit_count, truncated
                                     )
                                 }
@@ -1240,6 +1272,19 @@ impl ForgeSentinelPair {
                             consecutive = self.rapid_exit_count,
                             "FORGE exited quickly without progress - retrying spawn"
                         );
+                        // Surface the actual startup error on the *first* rapid
+                        // exit instead of waiting for MAX_RAPID_EXITS so the
+                        // cause (e.g. auth/403) is visible immediately.
+                        if self.rapid_exit_count == 1 {
+                            if let Some(log) = self.read_forge_startup_error().await {
+                                let truncated = tail_truncate(&log, 1200);
+                                warn!(
+                                    startup_error = %truncated,
+                                    "FORGE startup error captured on first rapid exit (pair will retry up to {} times)",
+                                    MAX_RAPID_EXITS,
+                                );
+                            }
+                        }
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
                     } else {

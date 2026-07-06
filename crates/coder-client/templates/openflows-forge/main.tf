@@ -29,18 +29,6 @@ variable "ticket_id" {
   description = "Ticket identifier"
 }
 
-variable "prevent_destroy" {
-  type        = bool
-  default     = false
-  description = <<EOT
-When true, Terraform refuses to destroy the workspace container — protecting
-in-flight agent work during template rollouts.  Coder workspace stop/delete
-runs `terraform destroy`, so leave this false for normal ephemeral lifecycle;
-set it true only when pushing a template update that would force-recreate
-running workspaces, then lower it again once in-flight tickets complete.
-EOT
-}
-
 variable "enable_ai_gateway" {
   type        = bool
   default     = true
@@ -153,10 +141,6 @@ resource "docker_container" "workspace" {
   # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
   # Replace localhost/127.0.0.1 with Docker host gateway so the agent can reach the Coder server
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
-
-  lifecycle {
-    prevent_destroy = var.prevent_destroy
-  }
 }
 
 data "coder_workspace" "me" {}
