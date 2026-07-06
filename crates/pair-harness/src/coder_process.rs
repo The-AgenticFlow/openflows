@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "coder")]
 use crate::process::BackendConfig;
@@ -33,31 +33,77 @@ pub struct CoderTaskHandle {
 impl CoderTaskHandle {
     /// Check if the task is still running by examining the process list.
     pub async fn is_running(&self) -> bool {
-        let check_cmd = format!("ps aux | grep -v grep | grep {}", self.task_id);
+        let Some(pid) = self.validated_pid() else {
+            return false;
+        };
+        let check_cmd = format!("kill -0 {}", pid);
         match self
             .client
             .workspace_exec_with_timeout(&self.workspace_id, &check_cmd, 10)
             .await
         {
-            Ok(output) => output.exit_code == 0 && !output.stdout.trim().is_empty(),
-            Err(_) => false,
+            Ok(output) => {
+                if output.exit_code != 0 {
+                    debug!(
+                        task_id = %self.task_id,
+                        pid,
+                        exit_code = output.exit_code,
+                        stderr = %output.stderr.trim(),
+                        "FORGE liveness probe: process not running"
+                    );
+                }
+                output.exit_code == 0
+            }
+            Err(e) => {
+                debug!(
+                    task_id = %self.task_id,
+                    pid,
+                    error = %e,
+                    "FORGE liveness probe: coder ssh command failed — treating as not running"
+                );
+                false
+            }
         }
     }
 
     /// Kill the task by its PID (embedded in task_id).
     pub async fn kill(&self) -> Result<()> {
-        let parts: Vec<&str> = self.task_id.rsplitn(2, '-').collect();
-        if parts.len() < 2 {
-            error!(task_id = %self.task_id, "Cannot parse PID from task ID");
+        let Some(pid) = self.validated_pid() else {
+            error!(task_id = %self.task_id, "Cannot parse a valid numeric PID from task ID");
             return Ok(());
-        }
-        let pid = parts[0];
+        };
         let _ = self
             .client
             .workspace_exec_with_timeout(&self.workspace_id, &format!("kill -9 {}", pid), 10)
             .await;
         info!(task_id = %self.task_id, pid, "Killed Coder workspace task");
         Ok(())
+    }
+
+    /// Raw PID suffix extracted from `task_id` (after the last `-`).
+    ///
+    /// This is **not** validated — callers that interpolate the PID into a
+    /// remote shell command must use [`validated_pid`] instead to guard
+    /// against command injection via a malformed remote-produced value.
+    fn pid(&self) -> Option<&str> {
+        self.task_id.rsplit_once('-').map(|(_, pid)| pid)
+    }
+
+    /// Return the PID suffix only if it is a non-empty ASCII-integer.
+    ///
+    /// The PID originates from remote exec stdout (`output.stdout.trim()`),
+    /// which is untrusted output.  Interpolating a non-numeric value into
+    /// `kill -0 <pid>` / `kill -9 <pid>` would let a crafted remote response
+    /// inject shell metacharacters.  This guard rejects anything that is not
+    /// a clean integer.
+    fn validated_pid(&self) -> Option<&str> {
+        let pid = self.pid()?;
+        if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) {
+            Some(pid)
+        } else {
+            warn!(task_id = %self.task_id, raw_pid = pid, "PID is not a valid integer — refusing to interpolate");
+            None
+        }
     }
 }
 

@@ -29,6 +29,18 @@ variable "ticket_id" {
   description = "Ticket identifier"
 }
 
+variable "prevent_destroy" {
+  type        = bool
+  default     = false
+  description = <<EOT
+When true, Terraform refuses to destroy the workspace container — protecting
+in-flight agent work during template rollouts.  Coder workspace stop/delete
+runs `terraform destroy`, so leave this false for normal ephemeral lifecycle;
+set it true only when pushing a template update that would force-recreate
+running workspaces, then lower it again once in-flight tickets complete.
+EOT
+}
+
 variable "enable_ai_gateway" {
   type        = bool
   default     = true
@@ -84,6 +96,22 @@ resource "coder_agent" "main" {
       git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
     fi
 
+    # Install Claude Code hooks from orchestration/plugin/hooks/forge/
+    HOOKS_SRC="/home/coder/workspace/orchestration/plugin/hooks/forge"
+    HOOKS_DST="/home/coder/workspace/.claude/hooks/forge"
+    if [ -d "$HOOKS_SRC" ]; then
+      mkdir -p "$HOOKS_DST"
+      for hook in "$HOOKS_SRC"/*.sh; do
+        if [ -f "$hook" ]; then
+          cp "$hook" "$HOOKS_DST/"
+          chmod +x "$HOOKS_DST/$(basename "$hook")"
+        fi
+      done
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Forge hooks installed from $HOOKS_SRC" >&2
+    else
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Forge hooks source not found at $HOOKS_SRC - hooks will be provisioned separately" >&2
+    fi
+
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
       redis-cli -u ${var.redis_url} SET "heartbeat:forge-${var.ticket_id}" \
@@ -94,18 +122,18 @@ resource "coder_agent" "main" {
   EOT
 }
 
-resource "docker_volume" "workspace" {
-  name = "openflows-forge-${data.coder_workspace.me.id}"
-}
-
 resource "docker_container" "workspace" {
   name  = "openflows-forge-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
-  volumes {
-    container_path = "/home/coder/workspace"
-    volume_name    = docker_volume.workspace.name
-  }
+  # NOTE: /home/coder/workspace is intentionally NOT backed by a named Docker
+  # volume.  A `docker_volume` is created root-owned, but the agent runs as the
+  # `coder` user, which then cannot write to it — breaking both the startup
+  # `git clone` and the provisioner's `mkdir`/settings writes.  Using the
+  # container's writable layer keeps the workspace dir coder-owned (it lives
+  # under /home/coder in the image).  Forge workspaces are per-ticket and
+  # ephemeral; the repo is re-cloned on each start via the startup_script, so
+  # cross-restart persistence of the clone is not required.
 
   env = [
     "REPO_URL=${var.repo_url}",
@@ -125,6 +153,10 @@ resource "docker_container" "workspace" {
   # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
   # Replace localhost/127.0.0.1 with Docker host gateway so the agent can reach the Coder server
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
+
+  lifecycle {
+    prevent_destroy = var.prevent_destroy
+  }
 }
 
 data "coder_workspace" "me" {}

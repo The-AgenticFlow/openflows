@@ -706,7 +706,8 @@ impl NexusNode {
                             .await;
                         return Err(anyhow::anyhow!(
                             "Coder workspace {} not ready on re-check: {}",
-                            existing, e
+                            existing,
+                            e
                         ));
                     }
                 }
@@ -772,7 +773,10 @@ impl NexusNode {
                 timeout_secs = timeout.as_secs(),
                 "Waiting for Coder workspace to become ready"
             );
-            match client.wait_for_workspace_ready(&workspace.id, timeout).await {
+            match client
+                .wait_for_workspace_ready(&workspace.id, timeout)
+                .await
+            {
                 Ok(()) => {
                     break;
                 }
@@ -848,6 +852,7 @@ impl NexusNode {
     ///
     /// Used during merge/cleanup to tear down ephemeral workspaces.
     /// Archives chats via `archive_ticket_chats()` before destroying the workspace.
+    #[allow(dead_code)]
     async fn destroy_coder_workspace(&self, store: &SharedStore, workspace_id: &str) -> Result<()> {
         let client = match Self::coder_client_from_store(store).await {
             Some(client) => client,

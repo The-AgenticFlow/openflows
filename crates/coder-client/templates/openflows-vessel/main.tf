@@ -91,6 +91,22 @@ resource "coder_agent" "main" {
       git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
     fi
 
+    # Install Claude Code hooks from orchestration/plugin/hooks/vessel/
+    HOOKS_SRC="/home/coder/workspace/orchestration/plugin/hooks/vessel"
+    HOOKS_DST="/home/coder/workspace/.claude/hooks/vessel"
+    if [ -d "$HOOKS_SRC" ]; then
+      mkdir -p "$HOOKS_DST"
+      for hook in "$HOOKS_SRC"/*.sh; do
+        if [ -f "$hook" ]; then
+          cp "$hook" "$HOOKS_DST/"
+          chmod +x "$HOOKS_DST/$(basename "$hook")"
+        fi
+      done
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Vessel hooks installed from $HOOKS_SRC" >&2
+    else
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Vessel hooks source not found at $HOOKS_SRC - hooks will be provisioned separately" >&2
+    fi
+
     # SharedStore heartbeat writer
     nohup bash -c 'while true; do
       redis-cli -u ${var.redis_url} SET "heartbeat:vessel-T-${var.ticket_id}" \
@@ -101,18 +117,13 @@ resource "coder_agent" "main" {
   EOT
 }
 
-resource "docker_volume" "workspace" {
-  name = "openflows-vessel-${data.coder_workspace.me.id}"
-}
-
 resource "docker_container" "workspace" {
   name  = "openflows-vessel-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
-  volumes {
-    container_path = "/home/coder/workspace"
-    volume_name    = docker_volume.workspace.name
-  }
+  # /home/coder/workspace uses the container layer (not a root-owned named
+  # volume) so the `coder` agent user can write to it. See forge template for
+  # the full rationale.
 
   env = [
     "REPO_URL=${var.repo_url}",

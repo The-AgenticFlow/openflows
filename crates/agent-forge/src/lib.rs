@@ -2056,21 +2056,34 @@ impl BatchNode for ForgePairNode {
         }
 
         let config = if use_coder_workspace {
-            let coder_workspace_id = slot.workspace_id.clone();
+            let coder_workspace_id = slot.workspace_id.clone().unwrap();
+            let coder_url = std::env::var("CODER_URL").unwrap_or_default();
+            let coder_api_token = std::env::var("CODER_API_TOKEN").unwrap_or_default();
+            let redis_url = std::env::var("REDIS_URL")
+                .or_else(|_| std::env::var("SPRINTLESS_REDIS_URL"))
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
             info!(
                 worker = worker_id,
                 ticket = ticket_id,
-                coder_workspace_id = %coder_workspace_id.as_ref().unwrap(),
+                coder_workspace_id = %coder_workspace_id,
                 "Using Coder workspace — skipping local worktree provisioning"
             );
-            PairConfig::with_provider(
+            PairConfig::with_coder(
                 &worker_id,
                 &ticket_id,
                 &self.workspace_root,
                 &worker_token,
-                config::state::WorkspaceProvider::Coder,
+                coder_url,
+                coder_api_token,
                 coder_workspace_id,
+                redis_url,
             )
+            // In Coder mode every filesystem op is dispatched to the remote
+            // workspace via the CoderTransport, so the worktree/shared paths
+            // must point at the remote workspace root (where the template's
+            // startup script clones the repo), not the local project_root
+            // derived paths that with_provider defaults to.
+            .with_coder_remote_paths("/home/coder/workspace")
             .with_cli_backend(cli_backend)
             .with_model_backend(model_backend)
         } else {

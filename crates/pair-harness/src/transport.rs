@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Output from a command executed in a workspace.
 #[derive(Debug, Clone)]
@@ -176,6 +176,7 @@ impl WorkspaceTransport for LocalTransport {
 pub struct CoderTransport {
     client: coder_client::CoderClient,
     workspace_id: String,
+    verbose: bool,
 }
 
 #[cfg(feature = "coder")]
@@ -184,6 +185,21 @@ impl CoderTransport {
         Self {
             client,
             workspace_id: workspace_id.to_string(),
+            verbose: std::env::var("CODER_TRANSPORT_VERBOSE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+        }
+    }
+
+    /// Enable verbose logging for this transport.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    fn verbose_log(&self, msg: &str) {
+        if self.verbose {
+            info!(workspace_id = %self.workspace_id, "{}", msg);
         }
     }
 
@@ -192,7 +208,11 @@ impl CoderTransport {
         source_dir: &'a Path,
         target_dir: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        let verbose = self.verbose;
         Box::pin(async move {
+            if verbose {
+                info!(source = %source_dir.display(), target = %target_dir, "	copy_dir_recursive");
+            }
             self.create_dir_all(target_dir).await?;
             for entry in std::fs::read_dir(source_dir)? {
                 let entry = entry?;
@@ -223,10 +243,18 @@ impl WorkspaceTransport for CoderTransport {
     }
 
     async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        self.client
-            .workspace_write_file(&self.workspace_id, path, content)
-            .await
-            .map_err(|e| anyhow::anyhow!("CoderTransport write_file failed: {}", e))
+        let content_len = content.len();
+        self.verbose_log(&format!("CoderTransport write_file: {} ({} bytes)", path, content_len));
+        match self.client.workspace_write_file(&self.workspace_id, path, content).await {
+            Ok(_) => {
+                self.verbose_log(&format!("CoderTransport write_file success: {}", path));
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(path = %path, error = %e, "CoderTransport write_file failed");
+                Err(anyhow::anyhow!("CoderTransport write_file failed: {}", e))
+            }
+        }
     }
 
     async fn execute(&self, command: &str) -> Result<CommandOutput> {
@@ -268,16 +296,19 @@ impl WorkspaceTransport for CoderTransport {
         }
     }
 
-    async fn create_dir_all(&self, path: &str) -> Result<()> {
+async fn create_dir_all(&self, path: &str) -> Result<()> {
+        self.verbose_log(&format!("CoderTransport create_dir_all: {}", path));
         let escaped_path = shell_escape(path);
         let output = self
             .client
             .workspace_exec(&self.workspace_id, &format!("mkdir -p {}", escaped_path))
             .await
-            .map_err(|e| anyhow::anyhow!("CoderTransport create_dir_all failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("create_dir_all failed: {}", e))?;
         if output.exit_code != 0 {
+            tracing::error!(path = %path, stderr = %output.stderr, "CoderTransport create_dir_all failed");
             anyhow::bail!("create_dir_all failed: {}", output.stderr);
         }
+        self.verbose_log(&format!("CoderTransport create_dir_all success: {}", path));
         Ok(())
     }
 
@@ -306,10 +337,23 @@ impl WorkspaceTransport for CoderTransport {
     async fn copy_file(&self, source_local: &Path, target: &str) -> Result<()> {
         let content = std::fs::read_to_string(source_local)
             .map_err(|e| anyhow::anyhow!("copy_file: failed to read local file: {}", e))?;
-        self.client
-            .workspace_write_file(&self.workspace_id, target, &content)
-            .await
-            .map_err(|e| anyhow::anyhow!("copy_file: workspace_write_file failed: {}", e))
+        let content_len = content.len();
+        self.verbose_log(&format!(
+            "CoderTransport copy_file: {} -> {} ({} bytes)",
+            source_local.display(),
+            target,
+            content_len
+        ));
+        match self.client.workspace_write_file(&self.workspace_id, target, &content).await {
+            Ok(_) => {
+                self.verbose_log(&format!("CoderTransport copy_file success: {} -> {}", source_local.display(), target));
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(source = %source_local.display(), target = %target, error = %e, "CoderTransport copy_file failed");
+                Err(anyhow::anyhow!("copy_file: workspace_write_file failed: {}", e))
+            }
+        }
     }
 }
 

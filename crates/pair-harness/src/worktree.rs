@@ -509,12 +509,27 @@ impl WorktreeManager {
         }
     }
 
-    /// Ensure `worktrees/` is listed in `.gitignore` so that worktree
-    /// directories created inside the repo aren't tracked by git.
+    /// Ensure `worktrees/` (and `orchestration/`) are listed so that the
+    /// runtime directories created inside the repo aren't tracked by git.
+    ///
+    /// We deliberately write to the repo-local, **untracked** exclude file
+    /// (`.git/info/exclude`) rather than the tracked `.gitignore`. Writing to
+    /// `.gitignore` dirties the working tree, which then breaks
+    /// `git pull --rebase` on every subsequent startup ("cannot pull with
+    /// rebase: You have unstaged changes"). The exclude file achieves the same
+    /// git-ignore behavior without touching any tracked file.
     fn ensure_worktrees_gitignored(&self) {
-        let gitignore_path = self.project_root.join(".gitignore");
+        let git_dir = self.project_root.join(".git");
+        let exclude_path = git_dir.join("info").join("exclude");
 
-        let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        // The exclude file lives inside .git/info, which always exists in a
+        // valid repo, but create it defensively in case of an unusual setup.
+        if let Err(e) = std::fs::create_dir_all(git_dir.join("info")) {
+            warn!(error = %e, "Failed to create .git/info directory for exclude file");
+            return;
+        }
+
+        let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
 
         let entries = ["worktrees/", "orchestration/"];
         let mut updated = existing.clone();
@@ -533,10 +548,10 @@ impl WorktreeManager {
         }
 
         if updated != existing {
-            if let Err(e) = std::fs::write(&gitignore_path, &updated) {
-                warn!(error = %e, "Failed to update .gitignore");
+            if let Err(e) = std::fs::write(&exclude_path, &updated) {
+                warn!(error = %e, "Failed to update .git/info/exclude");
             } else {
-                info!(path = %gitignore_path.display(), "Updated .gitignore with runtime directories");
+                info!(path = %exclude_path.display(), "Updated .git/info/exclude with runtime directories");
             }
         }
     }

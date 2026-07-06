@@ -10,16 +10,16 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Child;
 use tracing::{debug, error, info, warn};
 
 use crate::isolation::FileLockManager;
 #[cfg(feature = "coder")]
 use crate::pair_state::CoderWatcherAdapter;
 use crate::pair_state::{
-    FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, WatcherAdapter,
+    FilesystemPairState, PairArtifact, PairStateStore, PairWatcher, SharedStorePairState,
+    WatcherAdapter,
 };
-use crate::process::{ProcessManager, SentinelMode};
+use crate::process::{ManagedProcess, ProcessManager, SentinelMode};
 use crate::provision::Provisioner;
 use crate::reset::ResetManager;
 #[cfg(feature = "coder")]
@@ -300,7 +300,7 @@ fn compute_effective_timeout(base_secs: u64, complexity: &Complexity) -> u64 {
 struct SentinelTracker {
     mode: SentinelMode,
     spawn_time: Instant,
-    child: Child,
+    child: ManagedProcess,
     timeout_secs: u64,
 }
 
@@ -383,6 +383,11 @@ pub struct ForgeSentinelPair {
     sentinel_retries: SentinelRetryState,
     last_sentinel_spawn_time: Option<Instant>,
     last_sentinel_failure: Option<SentinelFailureInfo>,
+    /// Cached result + timestamp of the last FORGE liveness probe.  In Coder
+    /// mode `is_running` is a remote `coder ssh … kill -0` round-trip, so we
+    /// throttle it to avoid a busy loop of remote API calls every event-loop
+    /// tick (~10/s).
+    forge_liveness: Option<(Instant, bool)>,
     ticket_id: String,
     plan_approved: bool,
     final_approved: bool,
@@ -391,10 +396,23 @@ pub struct ForgeSentinelPair {
     verification_state: VerificationState,
     rapid_exit_count: u32,
     pair_state: Option<Arc<dyn PairStateStore>>,
+    /// Workspace transport for artifact I/O.  In Coder mode this dispatches
+    /// reads/writes/existence checks to the remote workspace via `coder ssh`;
+    /// in local mode it wraps `tokio::fs`.  Initialized once at the start of
+    /// `run()` so artifact-reading methods can use [`shared_exists`] /
+    /// [`read_shared`] / [`write_shared`] instead of raw `tokio::fs` on
+    /// `self.config.shared` (which in Coder mode points at a remote path).
+    transport: Option<Box<dyn WorkspaceTransport>>,
 }
 
 /// Maximum consecutive rapid FORGE exits before giving up.
 const MAX_RAPID_EXITS: u32 = 5;
+
+/// Minimum interval between FORGE liveness probes.  In Coder mode each probe
+/// is a remote `coder ssh … kill -0` round-trip; probing every event-loop
+/// tick (~100 ms) would hammer the Coder API.  In local mode the probe is a
+/// cheap `try_wait`, so this throttle is harmless there too.
+const FORGE_LIVENESS_PROBE_INTERVAL_SECS: u64 = 5;
 
 impl ForgeSentinelPair {
     /// Create a new ForgeSentinelPair.
@@ -443,7 +461,12 @@ impl ForgeSentinelPair {
         // If Coder workspace is configured, apply Coder-specific settings
         // so the ProcessManager knows to skip local binary validation and
         // (eventually) use Coder exec for spawn operations.
-        let process = match (&config.workspace_provider, &config.coder_workspace_id, &config.coder_url, &config.coder_api_token) {
+        let process = match (
+            &config.workspace_provider,
+            &config.coder_workspace_id,
+            &config.coder_url,
+            &config.coder_api_token,
+        ) {
             (WorkspaceProvider::Coder, Some(ws_id), Some(url), Some(token)) => {
                 process.with_coder_config(url, token, ws_id)
             }
@@ -469,6 +492,7 @@ impl ForgeSentinelPair {
             sentinel_retries: SentinelRetryState::new(),
             last_sentinel_spawn_time: None,
             last_sentinel_failure: None,
+            forge_liveness: None,
             ticket_id: String::new(),
             plan_approved: false,
             final_approved: false,
@@ -476,6 +500,7 @@ impl ForgeSentinelPair {
             error_feedback_attempts: 0,
             rapid_exit_count: 0,
             pair_state: None,
+            transport: None,
         }
     }
 
@@ -504,10 +529,30 @@ impl ForgeSentinelPair {
         self.start_time = Instant::now();
         self.ticket_id = ticket.id.clone();
 
+        if self.config.workspace_provider == WorkspaceProvider::Coder && self.pair_state.is_none() {
+            let redis_url =
+                self.config.redis_url.as_ref().context(
+                    "redis_url required for Coder mode (SharedStore-backed pair artifacts)",
+                )?;
+            let store = pocketflow_core::SharedStore::new_redis(redis_url)
+                .await
+                .context("Failed to create Redis SharedStore for Coder pair artifacts")?;
+            self.pair_state = Some(Arc::new(SharedStorePairState::new(store)));
+        }
+
+        // Initialize the workspace transport once so artifact-reading methods
+        // can dispatch to the remote workspace (Coder) or local fs (Local)
+        // uniformly.  In Coder mode `self.config.shared` points at a remote
+        // path, so raw `tokio::fs` calls on it would silently miss — the
+        // transport-backed helpers (`shared_exists` / `read_shared` /
+        // `write_shared`) are the correct entry points.
+        if self.transport.is_none() {
+            self.transport = Some(self.create_transport().await);
+        }
+
         // Check if this is a resume with existing approved plan
-        let contract_path = self.config.shared.join("CONTRACT.md");
-        if contract_path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&contract_path).await {
+        if self.shared_exists("CONTRACT.md").await {
+            if let Ok(content) = self.read_shared("CONTRACT.md").await {
                 if content.contains("status: AGREED") || content.contains("status: \"AGREED\"") {
                     self.plan_approved = true;
                     self.contract_timeout = Self::parse_timeout_profile(&content);
@@ -517,8 +562,7 @@ impl ForgeSentinelPair {
         }
 
         // Check if this is a conflict rework — skip plan review, go straight to implementation
-        let conflict_resolution_path = self.config.shared.join("CONFLICT_RESOLUTION.md");
-        if conflict_resolution_path.exists() {
+        if self.shared_exists("CONFLICT_RESOLUTION.md").await {
             self.plan_approved = true;
             self.final_approved = true;
             info!(
@@ -528,8 +572,7 @@ impl ForgeSentinelPair {
         }
 
         // Check if this is a CI fix rework — skip plan review, go straight to implementation
-        let ci_fix_path = self.config.shared.join("CI_FIX.md");
-        if ci_fix_path.exists() {
+        if self.shared_exists("CI_FIX.md").await {
             self.plan_approved = true;
             self.final_approved = true;
             info!(
@@ -539,8 +582,7 @@ impl ForgeSentinelPair {
         }
 
         // Check if ERROR_FEEDBACK.md exists — skip plan/final review, forge will attempt self-repair
-        let error_feedback_path = self.config.shared.join("ERROR_FEEDBACK.md");
-        if error_feedback_path.exists() {
+        if self.shared_exists("ERROR_FEEDBACK.md").await {
             self.plan_approved = true;
             self.final_approved = true;
             info!(
@@ -550,9 +592,8 @@ impl ForgeSentinelPair {
         }
 
         // Check if this is a resume with existing final approval
-        let final_review_path = self.config.shared.join("final-review.md");
-        if final_review_path.exists() {
-            if let Ok(content) = tokio::fs::read_to_string(&final_review_path).await {
+        if self.shared_exists("final-review.md").await {
+            if let Ok(content) = self.read_shared("final-review.md").await {
                 if content.contains("APPROVED") {
                     self.final_approved = true;
                     info!("Resuming with final approval - FORGE should create PR");
@@ -562,7 +603,7 @@ impl ForgeSentinelPair {
 
         // Check if all segments are already approved on resume
         if self.plan_approved && self.all_segments_approved().await? {
-            if final_review_path.exists() {
+            if self.shared_exists("final-review.md").await {
                 self.final_approved = true;
                 info!("All segments approved and final review exists on resume");
             } else {
@@ -583,7 +624,7 @@ impl ForgeSentinelPair {
         }
 
         // 1b. If conflict rework: merge origin/main into worktree so conflicts are visible to FORGE
-        if conflict_resolution_path.exists() {
+        if self.shared_exists("CONFLICT_RESOLUTION.md").await {
             match self.worktree.merge_origin_main(&self.config.worktree) {
                 Ok(MergeMainResult::Clean) => {
                     info!(
@@ -621,7 +662,7 @@ impl ForgeSentinelPair {
         }
 
         // 1c. If CI fix rework: merge origin/main so FORGE has latest workflow files + detects conflicts
-        if ci_fix_path.exists() {
+        if self.shared_exists("CI_FIX.md").await {
             match self.worktree.merge_origin_main(&self.config.worktree) {
                 Ok(MergeMainResult::Clean) => {
                     info!(
@@ -689,20 +730,11 @@ impl ForgeSentinelPair {
                     blockers: vec![],
                 });
             }
-            // TODO(wire-coder-exec): REMOVE THIS BLOCK — once spawn_forge_coder /
-            // spawn_sentinel_coder from coder_process.rs are wired into this
-            // lifecycle, Coder mode will spawn agents via workspace_exec instead
-            // of falling through to local process spawning.  Delete this entire
-            // `else` branch and the `coder_workspace_id.is_none()` guard above
-            // at that point.
-            return Ok(PairOutcome::Blocked {
-                reason: "Coder workspace exec spawning is not yet wired into the \
-                         pair lifecycle.  The FORGE-SENTINEL pair must run inside \
-                         the workspace via Coder exec, which is not yet implemented \
-                         in pair.rs.  No local fallback when Coder is the chosen provider."
-                    .to_string(),
-                blockers: vec![],
-            });
+            // Coder exec spawning is wired in: spawn_forge() dispatches to
+            // spawn_coder_forge() via ProcessManager when workspace_provider
+            // is Coder, and spawn_sentinel_for_* dispatches to
+            // spawn_coder_sentinel().  Artifact I/O is routed through the
+            // WorkspaceTransport (see shared_exists/read_shared/write_shared).
         }
         let mut forge = self.spawn_forge().await?;
 
@@ -747,7 +779,7 @@ impl ForgeSentinelPair {
     /// The main event loop.
     async fn event_loop(
         &mut self,
-        forge: &mut Child,
+        forge: &mut ManagedProcess,
         watcher: &mut PairWatcher,
     ) -> Result<PairOutcome> {
         loop {
@@ -761,7 +793,7 @@ impl ForgeSentinelPair {
 
             // Check if SENTINEL has already exited.
             if let Some(SentinelState::Active(tracker)) = &mut self.sentinel_tracker {
-                match tracker.child.try_wait() {
+                match tracker.child.try_poll_exit() {
                     Ok(Some(status)) => {
                         let mode = tracker.mode.clone();
                         if status.success() {
@@ -823,8 +855,7 @@ impl ForgeSentinelPair {
 
             // Check for FORGE startup timeout (no PLAN.md written)
             let forge_startup_timeout = get_forge_startup_timeout_secs();
-            let plan_path = self.config.shared.join("PLAN.md");
-            if !plan_path.exists()
+            if !self.shared_exists("PLAN.md").await
                 && self.forge_spawn_time.elapsed().as_secs() > forge_startup_timeout
             {
                 error!(
@@ -833,7 +864,7 @@ impl ForgeSentinelPair {
                 );
 
                 // Check if FORGE is still running
-                if self.process.is_running(forge).await {
+                if self.forge_is_running(forge).await {
                     warn!("Killing stuck FORGE process and respawning");
                     self.process.kill(forge).await?;
                     self.sentinel_retries.reset_all();
@@ -975,7 +1006,7 @@ impl ForgeSentinelPair {
             }
 
             // Check if FORGE has exited
-            if !self.process.is_running(forge).await {
+            if !self.forge_is_running(forge).await {
                 // Drain any pending watcher events first - FORGE may have written
                 // files just before exiting and the events may not have been
                 // processed yet in the event-handling section above.
@@ -1057,7 +1088,7 @@ impl ForgeSentinelPair {
                     self.sentinel_retries.reset_all();
                     *forge = self.spawn_forge_resume().await?;
                     self.reset.increment_reset();
-                } else if self.config.shared.join("STATUS.json").exists() {
+                } else if self.shared_exists("STATUS.json").await {
                     if let Some(status) = self.read_status().await? {
                         return Ok(status);
                     }
@@ -1073,16 +1104,32 @@ impl ForgeSentinelPair {
                     if forge_uptime < 30 && !self.reset.has_handoff() {
                         self.rapid_exit_count += 1;
                         if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            let startup_error = self.read_forge_startup_error().await;
                             error!(
                                 consecutive_exits = self.rapid_exit_count,
+                                startup_error = ?startup_error.as_deref().map(|s| {
+                                    // Truncate to first 500 chars for log readability
+                                    if s.len() > 500 { &s[..500] } else { s }
+                                }),
                                 "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
                             );
-                            return Ok(PairOutcome::Blocked {
-                                reason: format!(
+                            let reason = match startup_error {
+                                Some(log) if !log.trim().is_empty() => {
+                                    let truncated = if log.len() > 2000 { &log[..2000] } else { &log[..] };
+                                    format!(
+                                        "FORGE exited {} times within 30 seconds — startup error. \
+                                         FORGE log:\n{}",
+                                        self.rapid_exit_count, truncated
+                                    )
+                                }
+                                _ => format!(
                                     "FORGE exited {} times within 30 seconds — likely a startup error. \
                                      Check forge-stderr.log in the shared directory.",
                                     self.rapid_exit_count
                                 ),
+                            };
+                            return Ok(PairOutcome::Blocked {
+                                reason,
                                 blockers: vec![],
                             });
                         }
@@ -1102,11 +1149,10 @@ impl ForgeSentinelPair {
                         self.rapid_exit_count = 0;
 
                         // Check the lifecycle phase and spawn SENTINEL if needed
-                        let plan_exists = self.config.shared.join("PLAN.md").exists();
-                        let contract_exists = self.config.shared.join("CONTRACT.md").exists();
-                        let worklog_exists = self.config.shared.join("WORKLOG.md").exists();
-                        let final_review_exists =
-                            self.config.shared.join("final-review.md").exists();
+                        let plan_exists = self.shared_exists("PLAN.md").await;
+                        let contract_exists = self.shared_exists("CONTRACT.md").await;
+                        let worklog_exists = self.shared_exists("WORKLOG.md").await;
+                        let final_review_exists = self.shared_exists("final-review.md").await;
 
                         if plan_exists && !contract_exists && !self.plan_approved {
                             // Plan written but not reviewed - spawn SENTINEL
@@ -1160,16 +1206,31 @@ impl ForgeSentinelPair {
                     if forge_uptime < 30 {
                         self.rapid_exit_count += 1;
                         if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            let startup_error = self.read_forge_startup_error().await;
                             error!(
                                 consecutive_exits = self.rapid_exit_count,
+                                startup_error = ?startup_error.as_deref().map(|s| {
+                                    if s.len() > 500 { &s[..500] } else { s }
+                                }),
                                 "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
                             );
-                            return Ok(PairOutcome::Blocked {
-                                reason: format!(
+                            let reason = match startup_error {
+                                Some(log) if !log.trim().is_empty() => {
+                                    let truncated = if log.len() > 2000 { &log[..2000] } else { &log[..] };
+                                    format!(
+                                        "FORGE exited {} times within 30 seconds — startup error. \
+                                         FORGE log:\n{}",
+                                        self.rapid_exit_count, truncated
+                                    )
+                                }
+                                _ => format!(
                                     "FORGE exited {} times within 30 seconds — likely a startup error. \
                                      Check forge-stderr.log in the shared directory.",
                                     self.rapid_exit_count
                                 ),
+                            };
+                            return Ok(PairOutcome::Blocked {
+                                reason,
                                 blockers: vec![],
                             });
                         }
@@ -1258,7 +1319,11 @@ impl ForgeSentinelPair {
                 }
                 // Try to resolve owner/workspace_name for unambiguous coder ssh targeting.
                 let _ = client.set_workspace_name_from_id(workspace_id).await;
-                Box::new(CoderTransport::new(client, workspace_id))
+                // Enable verbose transport logging when debugging
+                let verbose = std::env::var("OPENFLOWS_DEBUG")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false);
+                Box::new(CoderTransport::new(client, workspace_id).with_verbose(verbose))
             }
             #[cfg(not(feature = "coder"))]
             WorkspaceProvider::Coder => {
@@ -1272,6 +1337,44 @@ impl ForgeSentinelPair {
     #[cfg(feature = "coder")]
     fn resolve_session_token() -> Option<String> {
         std::env::var("CODER_SESSION_TOKEN").ok()
+    }
+
+    /// Transport-backed "does `<shared>/<name>` exist?" check.
+    ///
+    /// Use this instead of `self.config.shared.join(name).exists()` so that
+    /// Coder mode probes the remote workspace rather than the (non-existent)
+    /// local path.  Falls back to a raw `Path::exists` if the transport was
+    /// not initialized (e.g. in unit tests that don't call `run()`).
+    async fn shared_exists(&self, name: &str) -> bool {
+        let path = self.config.shared.join(name);
+        match self.transport.as_ref() {
+            Some(t) => t.path_exists(&path.to_string_lossy()).await,
+            None => path.exists(),
+        }
+    }
+
+    /// Transport-backed read of `<shared>/<name>`.
+    ///
+    /// Use this instead of `tokio::fs::read_to_string(&self.config.shared.join(name))`
+    /// so Coder mode reads from the remote workspace.
+    async fn read_shared(&self, name: &str) -> Result<String> {
+        let path = self.config.shared.join(name);
+        match self.transport.as_ref() {
+            Some(t) => t.read_file(&path.to_string_lossy()).await,
+            None => tokio::fs::read_to_string(&path).await.map_err(Into::into),
+        }
+    }
+
+    /// Transport-backed write of `content` to `<shared>/<name>`.
+    ///
+    /// Use this instead of `tokio::fs::write(&self.config.shared.join(name), …)`
+    /// so Coder mode writes to the remote workspace.
+    async fn write_shared(&self, name: &str, content: &str) -> Result<()> {
+        let path = self.config.shared.join(name);
+        match self.transport.as_ref() {
+            Some(t) => t.write_file(&path.to_string_lossy(), content).await,
+            None => tokio::fs::write(&path, content).await.map_err(Into::into),
+        }
     }
 
     /// Provision configuration files.
@@ -1347,12 +1450,16 @@ impl ForgeSentinelPair {
         let path = self.config.shared.join("ERROR_FEEDBACK.md");
         // Ensure the shared directory exists — write_error_feedback can be called
         // early (e.g. from provision_worktree) before create_shared_structure runs.
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("Failed to create shared directory for ERROR_FEEDBACK.md")?;
+        // In Coder mode the transport handles remote dir creation; in local mode
+        // we still need to mkdir on the host.
+        if self.transport.is_none() {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("Failed to create shared directory for ERROR_FEEDBACK.md")?;
+            }
         }
-        tokio::fs::write(&path, &content)
+        self.write_shared("ERROR_FEEDBACK.md", &content)
             .await
             .context("Failed to write ERROR_FEEDBACK.md")?;
 
@@ -1695,9 +1802,67 @@ If a PR already exists for this branch, do NOT create a new one — just push an
         tokio::fs::read_to_string(path).await.unwrap_or_default()
     }
 
+    /// Read the FORGE startup log from the workspace to diagnose why FORGE
+    /// died immediately.  In Coder mode the log is at
+    /// `/tmp/agentflow-<pair_id>-forge.log` inside the workspace; in local
+    /// mode it's streamed to `<shared>/logs/forge-stdout.log`.
+    async fn read_forge_startup_error(&self) -> Option<String> {
+        match self.config.workspace_provider {
+            WorkspaceProvider::Local => {
+                let log_path = self.config.shared.join("logs").join("forge-stderr.log");
+                let content = tokio::fs::read_to_string(&log_path).await.ok()?;
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            #[cfg(feature = "coder")]
+            WorkspaceProvider::Coder => {
+                let log_name = format!("logs/forge-stderr.log");
+                match self.read_shared(&log_name).await {
+                    Ok(content) if !content.trim().is_empty() => Some(content),
+                    _ => {
+                        // Fall back to the /tmp log file written by nohup
+                        let tmp_log = format!("/tmp/agentflow-{}-forge.log", self.config.pair_id);
+                        match self.transport.as_ref() {
+                            Some(t) => t.read_file(&tmp_log).await.ok(),
+                            None => None,
+                        }
+                        .filter(|c| !c.trim().is_empty())
+                    }
+                }
+            }
+            #[cfg(not(feature = "coder"))]
+            _ => None,
+        }
+    }
+
+    /// Throttled FORGE liveness probe.
+    ///
+    /// In Coder mode `ProcessManager::is_running` issues a remote exec per
+    /// call; calling it every event-loop tick (~100 ms) would generate a busy
+    /// loop of remote API calls for the entire pair lifetime.  This caches the
+    /// result for [`FORGE_LIVENESS_PROBE_INTERVAL_SECS`] and re-probes only
+    /// when the cache expires.  The cache must be invalidated (set to `None`)
+    /// whenever FORGE is respawned so a stale "alive" isn't carried over.
+    async fn forge_is_running(&mut self, forge: &mut ManagedProcess) -> bool {
+        if let Some((checked_at, alive)) = self.forge_liveness {
+            if checked_at.elapsed().as_secs() < FORGE_LIVENESS_PROBE_INTERVAL_SECS {
+                return alive;
+            }
+        }
+        let alive = self.process.is_running(forge).await;
+        self.forge_liveness = Some((Instant::now(), alive));
+        alive
+    }
+
     /// Spawn FORGE process.
-    async fn spawn_forge(&mut self) -> Result<Child> {
+    async fn spawn_forge(&mut self) -> Result<ManagedProcess> {
         self.forge_spawn_time = Instant::now();
+        // Invalidate the throttled liveness cache so a stale "alive" result
+        // from the previous FORGE instance isn't carried over.
+        self.forge_liveness = None;
         self.process
             .spawn_forge(
                 &self.config.pair_id,
@@ -1709,9 +1874,12 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     /// Spawn FORGE process in resume mode.
-    async fn spawn_forge_resume(&mut self) -> Result<Child> {
+    async fn spawn_forge_resume(&mut self) -> Result<ManagedProcess> {
         self.append_sentinel_failure_to_handoff().await?;
         self.forge_spawn_time = Instant::now();
+        // Invalidate the throttled liveness cache so a stale "alive" result
+        // from the previous FORGE instance isn't carried over.
+        self.forge_liveness = None;
         self.sentinel_retries.reset_all();
         self.process
             .spawn_forge_resume(
@@ -1724,8 +1892,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     /// Spawn FORGE process for PR creation after final approval.
-    async fn spawn_forge_for_pr(&mut self) -> Result<Child> {
+    async fn spawn_forge_for_pr(&mut self) -> Result<ManagedProcess> {
         self.forge_spawn_time = Instant::now();
+        // Invalidate the throttled liveness cache so a stale "alive" result
+        // from the previous FORGE instance isn't carried over.
+        self.forge_liveness = None;
         self.process
             .spawn_forge_for_pr(
                 &self.config.pair_id,
@@ -1868,7 +2039,7 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     /// Spawn SENTINEL for final review.
     async fn spawn_sentinel_for_final(&mut self) -> Result<()> {
         // Don't spawn if final review already done
-        if self.config.shared.join("final-review.md").exists() {
+        if self.shared_exists("final-review.md").await {
             debug!("Final review already exists - skipping spawn");
             return Ok(());
         }
@@ -1921,26 +2092,25 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Check if all segments from PLAN.md are approved.
     async fn all_segments_approved(&self) -> Result<bool> {
-        let plan_path = self.config.shared.join("PLAN.md");
-        if !plan_path.exists() {
+        if !self.shared_exists("PLAN.md").await {
             return Ok(false);
         }
 
-        let content = tokio::fs::read_to_string(&plan_path).await?;
+        let content = self.read_shared("PLAN.md").await?;
         let implementation_segments = Self::implementation_segments_from_plan(&content);
         let total_segments = implementation_segments.len();
 
         if total_segments == 0 {
             // If no segments defined, check if WORKLOG.md exists (implementation done)
-            return Ok(self.config.shared.join("WORKLOG.md").exists());
+            return Ok(self.shared_exists("WORKLOG.md").await);
         }
 
         // Count approved segment evaluations
         let mut approved_count = 0;
         for n in implementation_segments {
-            let eval_path = self.config.shared.join(format!("segment-{}-eval.md", n));
-            if eval_path.exists() {
-                let eval_content = tokio::fs::read_to_string(&eval_path).await?;
+            let eval_name = format!("segment-{}-eval.md", n);
+            if self.shared_exists(&eval_name).await {
+                let eval_content = self.read_shared(&eval_name).await?;
                 if eval_content.contains("APPROVED") {
                     approved_count += 1;
                 }
@@ -1952,12 +2122,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Read CONTRACT.md status.
     async fn read_contract_status(&self) -> Result<String> {
-        let path = self.config.shared.join("CONTRACT.md");
-        if !path.exists() {
+        if !self.shared_exists("CONTRACT.md").await {
             return Ok("UNKNOWN".to_string());
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = self.read_shared("CONTRACT.md").await?;
         if content.contains("status: AGREED") || content.contains("status: \"AGREED\"") {
             Ok("AGREED".to_string())
         } else if content.contains("status: ISSUES") || content.contains("status: \"ISSUES\"") {
@@ -1969,12 +2138,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Parse the timeout_profile section from CONTRACT.md and store it.
     async fn read_contract_timeout_profile(&mut self) -> Result<()> {
-        let path = self.config.shared.join("CONTRACT.md");
-        if !path.exists() {
+        if !self.shared_exists("CONTRACT.md").await {
             return Ok(());
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = self.read_shared("CONTRACT.md").await?;
         self.contract_timeout = Self::parse_timeout_profile(&content);
         Ok(())
     }
@@ -2049,12 +2217,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Extract the latest segment number from WORKLOG.md.
     async fn extract_latest_segment(&self) -> Result<u32> {
-        let path = self.config.shared.join("WORKLOG.md");
-        if !path.exists() {
+        if !self.shared_exists("WORKLOG.md").await {
             return Ok(0);
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = self.read_shared("WORKLOG.md").await?;
 
         let mut latest = 0;
         for line in content.lines() {
@@ -2075,12 +2242,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     /// Find the next segment number that needs SENTINEL evaluation.
     /// Returns None if no segments need evaluation or if WORKLOG.md doesn't exist.
     async fn next_segment_to_eval(&self) -> Result<Option<u32>> {
-        let worklog_path = self.config.shared.join("WORKLOG.md");
-        if !worklog_path.exists() {
+        if !self.shared_exists("WORKLOG.md").await {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(&worklog_path).await?;
+        let content = self.read_shared("WORKLOG.md").await?;
 
         let mut segments_in_worklog: Vec<u32> = Vec::new();
         for line in content.lines() {
@@ -2096,8 +2262,8 @@ If a PR already exists for this branch, do NOT create a new one — just push an
         }
 
         for n in &segments_in_worklog {
-            let eval_path = self.config.shared.join(format!("segment-{}-eval.md", n));
-            if !eval_path.exists() {
+            let eval_name = format!("segment-{}-eval.md", n);
+            if !self.shared_exists(&eval_name).await {
                 return Ok(Some(*n));
             }
         }
@@ -2114,24 +2280,22 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     ///   where more segments remain to be implemented
     /// - FORGE exited with a genuinely incomplete/partial worklog
     async fn segments_remaining_in_plan(&self) -> Result<Option<u32>> {
-        let plan_path = self.config.shared.join("PLAN.md");
-        if !plan_path.exists() {
+        if !self.shared_exists("PLAN.md").await {
             return Ok(None);
         }
 
-        let plan_content = tokio::fs::read_to_string(&plan_path).await?;
+        let plan_content = self.read_shared("PLAN.md").await?;
         let total_in_plan = Self::implementation_segments_from_plan(&plan_content);
 
         if total_in_plan.is_empty() {
             return Ok(None);
         }
 
-        let worklog_path = self.config.shared.join("WORKLOG.md");
-        if !worklog_path.exists() {
+        if !self.shared_exists("WORKLOG.md").await {
             return Ok(Some(total_in_plan.len() as u32));
         }
 
-        let worklog_content = tokio::fs::read_to_string(&worklog_path).await?;
+        let worklog_content = self.read_shared("WORKLOG.md").await?;
         let written_segments: std::collections::HashSet<u32> = worklog_content
             .lines()
             .filter(|line| line.starts_with("## Segment") || line.starts_with("### Segment"))
@@ -2156,12 +2320,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Read final-review.md verdict.
     async fn read_final_review_verdict(&self) -> Result<String> {
-        let path = self.config.shared.join("final-review.md");
-        if !path.exists() {
+        if !self.shared_exists("final-review.md").await {
             return Ok("UNKNOWN".to_string());
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = self.read_shared("final-review.md").await?;
         if content.contains("APPROVED") {
             Ok("APPROVED".to_string())
         } else if content.contains("REJECTED") {
@@ -2172,11 +2335,10 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     async fn check_status_awaiting_sentinel_review(&self) -> bool {
-        let path = self.config.shared.join("STATUS.json");
-        if !path.exists() {
+        if !self.shared_exists("STATUS.json").await {
             return false;
         }
-        tokio::fs::read_to_string(&path)
+        self.read_shared("STATUS.json")
             .await
             .is_ok_and(|c| c.contains("AWAITING_SENTINEL_REVIEW"))
     }
@@ -2187,11 +2349,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     /// rather than crashing the entire pair lifecycle.
     async fn read_status(&mut self) -> Result<Option<PairOutcome>> {
         let path = self.config.shared.join("STATUS.json");
-        if !path.exists() {
+        if !self.shared_exists("STATUS.json").await {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = self.read_shared("STATUS.json").await?;
 
         if content.trim().is_empty() {
             return Ok(None);
@@ -2203,10 +2365,15 @@ If a PR already exists for this branch, do NOT create a new one — just push an
                 warn!(
                     error = %e,
                     path = %path.display(),
-                    "Failed to parse STATUS.json — renaming to .broken to break respawn loop"
+                    "Failed to parse STATUS.json — saving .broken copy and clearing original to break respawn loop"
                 );
-                let broken_path = self.config.shared.join("STATUS.json.broken");
-                let _ = tokio::fs::rename(&path, &broken_path).await;
+                // Preserve the unparseable content for debugging, then clear
+                // the original so the respawn loop doesn't re-read the same
+                // broken payload.  In local mode this is an atomic rename; in
+                // Coder mode the transport lacks rename so we write the copy
+                // and blank the original.
+                let _ = self.write_shared("STATUS.json.broken", &content).await;
+                let _ = self.write_shared("STATUS.json", "").await;
                 return Ok(None);
             }
         };
@@ -2405,33 +2572,25 @@ If a PR already exists for this branch, do NOT create a new one — just push an
 
     /// Check if FORGE has made progress (PLAN.md or WORKLOG.md exists).
     async fn has_progress_files(&self) -> bool {
-        let plan_path = self.config.shared.join("PLAN.md");
-        let worklog_path = self.config.shared.join("WORKLOG.md");
-
-        plan_path.exists() || worklog_path.exists()
+        self.shared_exists("PLAN.md").await || self.shared_exists("WORKLOG.md").await
     }
 
     /// Check if we're waiting for SENTINEL output (plan reviewed but no contract).
     #[allow(dead_code)]
     async fn waiting_for_sentinel_output(&self) -> bool {
-        let plan_path = self.config.shared.join("PLAN.md");
-        let contract_path = self.config.shared.join("CONTRACT.md");
-        let worklog_path = self.config.shared.join("WORKLOG.md");
-
         // Waiting for plan review
-        if plan_path.exists() && !contract_path.exists() {
+        let plan_exists = self.shared_exists("PLAN.md").await;
+        let contract_exists = self.shared_exists("CONTRACT.md").await;
+        if plan_exists && !contract_exists {
             return true;
         }
 
         // Waiting for segment eval (WORKLOG exists but no corresponding eval)
-        if worklog_path.exists() {
+        if self.shared_exists("WORKLOG.md").await {
             if let Ok(segment) = self.extract_latest_segment().await {
                 if segment > 0 {
-                    let eval_path = self
-                        .config
-                        .shared
-                        .join(format!("segment-{}-eval.md", segment));
-                    if !eval_path.exists() {
+                    let eval_name = format!("segment-{}-eval.md", segment);
+                    if !self.shared_exists(&eval_name).await {
                         return true;
                     }
                 }
@@ -2442,8 +2601,7 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     async fn write_synthetic_plan_rejection(&self) -> Result<()> {
-        let path = self.config.shared.join("CONTRACT.md");
-        if path.exists() {
+        if self.shared_exists("CONTRACT.md").await {
             return Ok(());
         }
         let content = format!(
@@ -2455,19 +2613,16 @@ If a PR already exists for this branch, do NOT create a new one — just push an
              Review PLAN.md for completeness and update it before continuing.\n",
             MAX_SENTINEL_RETRIES
         );
-        tokio::fs::write(&path, &content)
+        self.write_shared("CONTRACT.md", &content)
             .await
             .context("Failed to write synthetic CONTRACT.md")?;
-        info!(path = %path.display(), "Wrote synthetic CONTRACT.md with ISSUES verdict");
+        info!("Wrote synthetic CONTRACT.md with ISSUES verdict");
         Ok(())
     }
 
     async fn write_synthetic_segment_rejection(&self, segment: u32) -> Result<()> {
-        let path = self
-            .config
-            .shared
-            .join(format!("segment-{}-eval.md", segment));
-        if path.exists() {
+        let eval_name = format!("segment-{}-eval.md", segment);
+        if self.shared_exists(&eval_name).await {
             return Ok(());
         }
         let content = format!(
@@ -2480,16 +2635,15 @@ If a PR already exists for this branch, do NOT create a new one — just push an
              Check .github/workflows/ for CI commands and run them locally to confirm everything passes.\n",
             segment, MAX_SENTINEL_RETRIES
         );
-        tokio::fs::write(&path, &content)
+        self.write_shared(&eval_name, &content)
             .await
             .context("Failed to write synthetic segment eval")?;
-        info!(path = %path.display(), "Wrote synthetic segment-{}-eval.md with CHANGES_REQUESTED", segment);
+        info!("Wrote synthetic segment-{}-eval.md with CHANGES_REQUESTED", segment);
         Ok(())
     }
 
     async fn write_synthetic_final_rejection(&self) -> Result<()> {
-        let path = self.config.shared.join("final-review.md");
-        if path.exists() {
+        if self.shared_exists("final-review.md").await {
             return Ok(());
         }
         let content = format!(
@@ -2501,16 +2655,15 @@ If a PR already exists for this branch, do NOT create a new one — just push an
              Run the full test suite and all CI checks locally (see .github/workflows/) before proceeding.\n",
             MAX_SENTINEL_RETRIES
         );
-        tokio::fs::write(&path, &content)
+        self.write_shared("final-review.md", &content)
             .await
             .context("Failed to write synthetic final-review.md")?;
-        info!(path = %path.display(), "Wrote synthetic final-review.md with REJECTED verdict");
+        info!("Wrote synthetic final-review.md with REJECTED verdict");
         Ok(())
     }
 
     async fn append_sentinel_failure_to_handoff(&mut self) -> Result<()> {
-        let handoff_path = self.config.shared.join("HANDOFF.md");
-        if !handoff_path.exists() {
+        if !self.shared_exists("HANDOFF.md").await {
             return Ok(());
         }
         let Some(ref failure) = self.last_sentinel_failure else {
@@ -2527,13 +2680,11 @@ If a PR already exists for this branch, do NOT create a new one — just push an
              Reason: {}\n",
             mode_str, failure.reason,
         );
-        let existing = tokio::fs::read_to_string(&handoff_path)
-            .await
-            .unwrap_or_default();
+        let existing = self.read_shared("HANDOFF.md").await.unwrap_or_default();
         if existing.contains("## Last Sentinel Failure") {
             return Ok(());
         }
-        tokio::fs::write(&handoff_path, format!("{}{}", existing, section))
+        self.write_shared("HANDOFF.md", &format!("{}{}", existing, section))
             .await
             .context("Failed to append sentinel failure to HANDOFF.md")?;
         info!("Appended sentinel failure diagnostics to HANDOFF.md");
@@ -2542,51 +2693,42 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     async fn materialize_sentinel_artifact(&self, mode: &SentinelMode) -> Result<()> {
-        match mode {
-            SentinelMode::PlanReview => {
-                let output_path = self.config.shared.join("CONTRACT.md");
-                if output_path.exists() {
-                    return Ok(());
-                }
-
-                if let Some(content) = self.read_sentinel_result_payload(mode).await? {
-                    tokio::fs::write(&output_path, content)
-                        .await
-                        .context("Failed to write CONTRACT.md from SENTINEL stdout")?;
-                    info!(path = %output_path.display(), "Materialized CONTRACT.md from SENTINEL stdout");
-                }
-            }
+        let artifact_name = match mode {
+            SentinelMode::PlanReview => "CONTRACT.md",
             SentinelMode::SegmentEval(segment) => {
-                let output_path = self
-                    .config
-                    .shared
-                    .join(format!("segment-{}-eval.md", segment));
-                if output_path.exists() {
-                    return Ok(());
-                }
-
-                if let Some(content) = self.read_sentinel_result_payload(mode).await? {
-                    tokio::fs::write(&output_path, content)
-                        .await
-                        .context("Failed to write segment eval from SENTINEL stdout")?;
-                    info!(path = %output_path.display(), "Materialized segment eval from SENTINEL stdout");
-                }
+                // Use a stack-allocated name via the shared helper.
+                return self.materialize_named_artifact(
+                    &format!("segment-{}-eval.md", segment),
+                    mode,
+                    "segment eval",
+                )
+                .await;
             }
-            SentinelMode::FinalReview => {
-                let output_path = self.config.shared.join("final-review.md");
-                if output_path.exists() {
-                    return Ok(());
-                }
+            SentinelMode::FinalReview => "final-review.md",
+        };
+        self.materialize_named_artifact(artifact_name, mode, artifact_name)
+            .await
+    }
 
-                if let Some(content) = self.read_sentinel_result_payload(mode).await? {
-                    tokio::fs::write(&output_path, content)
-                        .await
-                        .context("Failed to write final-review.md from SENTINEL stdout")?;
-                    info!(path = %output_path.display(), "Materialized final-review.md from SENTINEL stdout");
-                }
-            }
+    /// Shared body of [`materialize_sentinel_artifact`]: skip if the artifact
+    /// already exists, otherwise write the SENTINEL stdout payload to
+    /// `<shared>/<name>` via the transport (so Coder mode writes to the
+    /// remote workspace, not a non-existent local path).
+    async fn materialize_named_artifact(
+        &self,
+        name: &str,
+        mode: &SentinelMode,
+        label: &str,
+    ) -> Result<()> {
+        if self.shared_exists(name).await {
+            return Ok(());
         }
-
+        if let Some(content) = self.read_sentinel_result_payload(mode).await? {
+            self.write_shared(name, &content)
+                .await
+                .with_context(|| format!("Failed to write {} from SENTINEL stdout", label))?;
+            info!(artifact = name, "Materialized {} from SENTINEL stdout", label);
+        }
         Ok(())
     }
 
@@ -2596,17 +2738,13 @@ If a PR already exists for this branch, do NOT create a new one — just push an
             SentinelMode::SegmentEval(n) => format!("SegmentEval({})", n),
             SentinelMode::FinalReview => "FinalReview".to_string(),
         };
-        let log_path = self
-            .config
-            .shared
-            .join("logs")
-            .join(format!("sentinel-{}-stderr.log", mode_str));
+        let log_name = format!("logs/sentinel-{}-stderr.log", mode_str);
 
-        if !log_path.exists() {
+        if !self.shared_exists(&log_name).await {
             return None;
         }
 
-        let content = match tokio::fs::read_to_string(&log_path).await {
+        let content = match self.read_shared(&log_name).await {
             Ok(c) => c,
             Err(_) => return None,
         };
@@ -2627,17 +2765,14 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     async fn read_sentinel_result_payload(&self, mode: &SentinelMode) -> Result<Option<String>> {
-        let log_path = self
-            .config
-            .shared
-            .join("logs")
-            .join(format!("sentinel-{:?}-stdout.log", mode));
+        let log_name = format!("logs/sentinel-{:?}-stdout.log", mode);
 
-        if !log_path.exists() {
+        if !self.shared_exists(&log_name).await {
             return Ok(None);
         }
 
-        let content = tokio::fs::read_to_string(&log_path)
+        let content = self
+            .read_shared(&log_name)
             .await
             .context("Failed to read SENTINEL stdout log")?;
 
@@ -2772,7 +2907,7 @@ If a PR already exists for this branch, do NOT create a new one — just push an
     }
 
     /// Cleanup after pair completion.
-    async fn cleanup(&self, _forge: &Child) -> Result<()> {
+    async fn cleanup(&self, _forge: &ManagedProcess) -> Result<()> {
         self.locks.release_all_for_pair(&self.config.pair_id)?;
 
         let conflict_path = self.config.shared.join("CONFLICT_RESOLUTION.md");

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 const DEBOUNCE_MS: u64 = 500;
-const POLL_INTERVAL_MS: u64 = 1000; // 1s for fallback polling
+const POLL_INTERVAL_MS: u64 = 100; // low-latency fallback polling
 
 struct EventDebouncer {
     last_seen: HashMap<String, Instant>,
@@ -84,7 +84,9 @@ impl SharedDirWatcher {
 
         // Configure for low latency
         watcher
-            .configure(Config::default().with_poll_interval(Duration::from_millis(100)))
+            .configure(
+                Config::default().with_poll_interval(Duration::from_millis(POLL_INTERVAL_MS)),
+            )
             .context("Failed to configure watcher")?;
 
         // Watch the shared directory (non-recursive since we only care about top-level files)

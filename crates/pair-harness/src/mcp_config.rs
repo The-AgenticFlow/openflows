@@ -10,6 +10,8 @@ use std::fs;
 use std::path::Path;
 use tracing::{debug, info};
 
+use crate::transport::WorkspaceTransport;
+
 /// Generates MCP configuration files for pairs.
 pub struct McpConfigGenerator {
     /// GitHub token for MCP tools
@@ -27,16 +29,9 @@ impl McpConfigGenerator {
         }
     }
 
-    /// Generate FORGE's mcp.json.
-    pub fn generate_forge_config(
-        &self,
-        worktree: &Path,
-        shared: &Path,
-        output_path: &Path,
-    ) -> Result<()> {
-        info!(path = %output_path.display(), "Generating FORGE mcp.json");
-
-        let config = json!({
+    /// Build the FORGE mcp.json configuration value.
+    fn build_forge_config(&self, worktree: &Path, shared: &Path) -> Value {
+        json!({
             "mcpServers": {
                 "github": {
                     "command": "npx",
@@ -62,21 +57,12 @@ impl McpConfigGenerator {
                     ]
                 }
             }
-        });
-
-        self.write_config(output_path, &config)
+        })
     }
 
-    /// Generate SENTINEL's mcp.json (read-only access).
-    pub fn generate_sentinel_config(
-        &self,
-        worktree: &Path,
-        shared: &Path,
-        output_path: &Path,
-    ) -> Result<()> {
-        info!(path = %output_path.display(), "Generating SENTINEL mcp.json");
-
-        let config = json!({
+    /// Build the SENTINEL mcp.json configuration value (read-only access).
+    fn build_sentinel_config(&self, worktree: &Path, shared: &Path) -> Value {
+        json!({
             "mcpServers": {
                 "github": {
                     "command": "npx",
@@ -102,9 +88,74 @@ impl McpConfigGenerator {
                     ]
                 }
             }
-        });
+        })
+    }
 
+    /// Generate FORGE's mcp.json (local filesystem write).
+    ///
+    /// Kept for local-mode convenience and unit tests. Production code in
+    /// Coder mode must use [`Self::generate_forge_config_via_transport`],
+    /// because the `output_path` is a path inside the remote Coder workspace
+    /// and cannot be written to via the local `std::fs`.
+    pub fn generate_forge_config(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        output_path: &Path,
+    ) -> Result<()> {
+        info!(path = %output_path.display(), "Generating FORGE mcp.json");
+        let config = self.build_forge_config(worktree, shared);
         self.write_config(output_path, &config)
+    }
+
+    /// Generate SENTINEL's mcp.json (local filesystem write; read-only access).
+    ///
+    /// See [`Self::generate_forge_config`] for why the transport variant
+    /// should be used in Coder mode.
+    pub fn generate_sentinel_config(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        output_path: &Path,
+    ) -> Result<()> {
+        info!(path = %output_path.display(), "Generating SENTINEL mcp.json");
+        let config = self.build_sentinel_config(worktree, shared);
+        self.write_config(output_path, &config)
+    }
+
+    /// Generate FORGE's mcp.json, writing through a [`WorkspaceTransport`].
+    ///
+    /// Use this in Coder mode (and it is equally valid in local mode via
+    /// `LocalTransport`): the `output_path` resolves to a path inside the
+    /// workspace (e.g. `/home/coder/workspace/.claude/mcp.json`), which only
+    /// exists remotely. The transport takes care of creating parent
+    /// directories and writing the file in the correct location.
+    pub async fn generate_forge_config_via_transport(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        output_path: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
+        info!(path = %output_path.display(), "Generating FORGE mcp.json");
+        let config = self.build_forge_config(worktree, shared);
+        self.write_config_via_transport(output_path, &config, transport)
+            .await
+    }
+
+    /// Generate SENTINEL's mcp.json (read-only access), writing through a
+    /// [`WorkspaceTransport`]. See [`Self::generate_forge_config_via_transport`].
+    pub async fn generate_sentinel_config_via_transport(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        output_path: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
+        info!(path = %output_path.display(), "Generating SENTINEL mcp.json");
+        let config = self.build_sentinel_config(worktree, shared);
+        self.write_config_via_transport(output_path, &config, transport)
+            .await
     }
 
     /// Write config to file atomically.
@@ -125,6 +176,33 @@ impl McpConfigGenerator {
         fs::rename(&temp_path, path).context("Failed to rename mcp.json")?;
 
         debug!(path = %path.display(), "MCP config written");
+        Ok(())
+    }
+
+    /// Write config to a workspace through a [`WorkspaceTransport`].
+    ///
+    /// The transport is responsible for creating parent directories (both
+    /// `LocalTransport` and `CoderTransport` do so internally), so this does
+    /// not need a separate `create_dir_all` call. Using the transport keeps
+    /// the write inside the correct workspace when running in Coder mode,
+    /// where `path` resolves to a remote location (e.g.
+    /// `/home/coder/workspace/.claude/mcp.json`) that does not exist on the
+    /// local host.
+    async fn write_config_via_transport(
+        &self,
+        path: &Path,
+        config: &Value,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
+        let content =
+            serde_json::to_string_pretty(config).context("Failed to serialize mcp.json")?;
+
+        transport
+            .write_file(&path.to_string_lossy(), &content)
+            .await
+            .context("Failed to write mcp.json via transport")?;
+
+        debug!(path = %path.display(), "MCP config written via transport");
         Ok(())
     }
 

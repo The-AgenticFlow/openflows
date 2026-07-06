@@ -248,6 +248,36 @@ impl PairConfig {
         }
     }
 
+    /// Remap the pair's `worktree` and `shared` paths to the **remote** Coder
+    /// workspace root.
+    ///
+    /// In Coder mode, every filesystem operation in `provision_pair` (and the
+    /// downstream pair lifecycle) is dispatched to the remote workspace via the
+    /// `CoderTransport`.  The default `with_provider` constructor leaves
+    /// `worktree`/`shared` pointing at *local* paths derived from
+    /// `project_root` (e.g. `/home/…/workspaces/<repo>/worktrees/forge-1`).
+    /// Sending those local paths over the remote transport makes `mkdir` /
+    /// file writes target a tree the `coder` user cannot create (and which has
+    /// nothing to do with the cloned repo), so provisioning silently misfires.
+    ///
+    /// This remaps both to live inside the remote workspace root — the
+    /// directory the template's startup script clones the repo into — so the
+    /// FORGE worktree and the `.pair-shared` coordination directory land in
+    /// the right place.  `shared` is derived as `<remote_worktree>/.pair-shared`,
+    /// mirroring the local-mode layout (`shared = worktree/.pair-shared`) and
+    /// staying inside the repo tree so the existing `.pair-shared/` gitignore
+    /// entry keeps coordination files out of commits.
+    ///
+    /// Note: callers should only apply this when `workspace_provider` is
+    /// `Coder`.  Local git operations that run on the *host* (e.g. conflict /
+    /// CI-fix rework helpers) already no-op in Coder mode and are unaffected.
+    pub fn with_coder_remote_paths(mut self, remote_worktree: impl Into<PathBuf>) -> Self {
+        let worktree = PathBuf::from(remote_worktree.into());
+        self.shared = worktree.join(Self::SHARED_DIR_NAME);
+        self.worktree = worktree;
+        self
+    }
+
     /// Set the workspace provider (Coder or Local) and optional Coder workspace ID.
     pub fn with_workspace_provider(
         mut self,

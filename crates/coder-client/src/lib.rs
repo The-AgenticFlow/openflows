@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 /// since Coder v2 has no `/api/v2/workspaces/{id}/exec` route). The client
 /// stores both the workspace ID and workspace name so that REST and SSH
 /// operations can use the appropriate identifier.
+#[derive(Clone)]
 pub struct CoderClient {
     base_url: String,
     token: String,
@@ -224,9 +225,15 @@ impl CoderClient {
             .context("Failed to send create_first_user request")?;
 
         if resp.status().is_success() {
-            let body = resp.text().await.context("Failed to read create_first_user response body")?;
+            let body = resp
+                .text()
+                .await
+                .context("Failed to read create_first_user response body")?;
             let user: CoderUser = serde_json::from_str(&body).with_context(|| {
-                format!("Failed to deserialize create_first_user response as CoderUser: {}", body)
+                format!(
+                    "Failed to deserialize create_first_user response as CoderUser: {}",
+                    body
+                )
             })?;
             info!(user_id = %user.id, username = %user.username, "Created first user");
             Ok(user)
@@ -812,7 +819,10 @@ impl CoderClient {
         timeout: Duration,
     ) -> Result<()> {
         let start = std::time::Instant::now();
-        info!(workspace_id, "Waiting for workspace SSH to become available");
+        info!(
+            workspace_id,
+            "Waiting for workspace SSH to become available"
+        );
         while start.elapsed() < timeout {
             match self
                 .workspace_exec_with_timeout(workspace_id, "echo ready", 15)
@@ -846,6 +856,28 @@ impl CoderClient {
     /// Execute a command in a workspace via `coder ssh`.
     /// Coder v2 has no REST exec endpoint; commands are run through the
     /// coder CLI which uses SSH to reach the workspace agent.
+    ///
+    /// # How the command reaches the remote shell
+    ///
+    /// `coder ssh <ws> -- <args...>` **joins** all args after `--` with spaces
+    /// and runs the resulting string through the *remote* login shell. It does
+    /// **not** preserve argv boundaries.  Consequently the naïve form
+    /// `-- bash -lc "<cmd>"` is silently broken: the remote shell re-splits
+    /// `bash -lc <cmd>` so bash's `-c` grabs only the *first word* of `<cmd>`
+    /// as its script — the remaining words become `$0`, `$1`, … and are never
+    /// executed.  Symptom: `mkdir -p .claude` arrived as `bash -lc mkdir -p
+    /// .claude` → bash ran bare `mkdir` → `mkdir: missing operand`.  The
+    /// `echo ready` liveness probe likewise ran bare `echo` (rc 0, empty
+    /// stdout) — a false-positive "SSH is available".
+    ///
+    /// To survive the join+resplit, the entire payload is base64-encoded (no
+    /// spaces, no shell metacharacters) and decoded on the remote inside a
+    /// single shell token, then executed by a login bash so `$PATH` and
+    /// profile tools (`git`, `claude`, …) are available:
+    ///
+    /// ```text
+    /// coder ssh <ws> -- 'echo <B64> | base64 -d | bash -l'
+    /// ```
     pub async fn workspace_exec_with_timeout(
         &self,
         _workspace_id: &str,
@@ -860,13 +892,25 @@ impl CoderClient {
             "Executing command via coder ssh"
         );
 
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(command.as_bytes());
+        // One single shell token — spaces/pipes are parsed by the REMOTE shell
+        // after coder ssh joins this sole post-`--` arg. base64 guarantees no
+        // quoting/escaping issues regardless of the command's contents.
+        let wrapped = format!("echo '{}' | base64 -d | bash -l", b64);
+
         let ssh_token = self.session_token();
         let output = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             tokio::process::Command::new("coder")
-                .args(["ssh", ws_target, "--", "bash", "-lc", command])
+                .args(["ssh", ws_target, "--", &wrapped])
                 .env("CODER_URL", &self.base_url)
                 .env("CODER_SESSION_TOKEN", ssh_token)
+                // Ensure the local `coder` process is killed when the future
+                // is dropped (timeout or JoinHandle abort).  Killing the ssh
+                // session closes the remote shell (SIGHUP), terminating the
+                // remote SENTINEL instead of orphaning it.
+                .kill_on_drop(true)
                 .output(),
         )
         .await

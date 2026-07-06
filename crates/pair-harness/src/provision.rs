@@ -9,10 +9,10 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::pair_state::{PairArtifact, PairStateStore};
-use crate::process::{get_backend_config, BackendConfig};
+use crate::process::{get_backend_config, shell_quote, BackendConfig};
 use crate::transport::WorkspaceTransport;
 use crate::types::{CliBackend, WorkspaceProvider};
 
@@ -154,6 +154,7 @@ impl Provisioner {
         model_backend: Option<&str>,
     ) -> Result<()> {
         info!(pair = pair_id, backend = ?cli_backend, "Provisioning pair configuration");
+        info!(orchestrator_dir = %self.orchestrator_dir().display(), worktree = %worktree.display(), shared = %shared.display(), "Using orchestrator directory for hooks source");
 
         let backend_config = get_backend_config(cli_backend, worktree, shared);
 
@@ -180,21 +181,30 @@ impl Provisioner {
         if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(worktree);
-            mcp_gen.generate_forge_config(worktree, shared, &mcp_path)?;
+            // Write through the transport so the file lands inside the
+            // workspace (remote Coder path or local worktree), not on the
+            // local host's filesystem. See McpConfigGenerator docs.
+            mcp_gen
+                .generate_forge_config_via_transport(worktree, shared, &mcp_path, transport)
+                .await?;
         }
 
         // 5. Create SENTINEL mcp.json
         if !backend_config.mcp_config_rel.as_os_str().is_empty() && !is_codex_non_responses {
             let mcp_gen = crate::mcp_config::McpConfigGenerator::new(github_token, redis_url);
             let mcp_path = backend_config.mcp_config_path(shared);
-            mcp_gen.generate_sentinel_config(worktree, shared, &mcp_path)?;
+            mcp_gen
+                .generate_sentinel_config_via_transport(worktree, shared, &mcp_path, transport)
+                .await?;
         }
 
         // 6. Symlink/copy plugin to FORGE
+        info!("Symlinking plugin to FORGE worktree");
         self.symlink_plugin(worktree, "forge", &backend_config, transport)
             .await?;
 
         // 7. Symlink/copy plugin to SENTINEL
+        info!("Symlinking plugin to SENTINEL shared");
         self.symlink_plugin(shared, "sentinel", &backend_config, transport)
             .await?;
 
@@ -202,6 +212,7 @@ impl Provisioner {
         self.create_shared_structure(shared, transport).await?;
 
         // 9. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
+        info!(needs_extras = backend_config.needs_extras_provisioning, "Checking if backend needs extras provisioning");
         if backend_config.needs_extras_provisioning {
             self.provision_backend_extras(
                 pair_id,
@@ -359,11 +370,13 @@ coder_ai_gateway      = {}
             self.symlink_skills_to_claude(worktree, transport).await?;
             self.symlink_skills_to_claude_for_role(shared, "sentinel", transport)
                 .await?;
-            let _ = self.enhance_claude_permissions(worktree, shared);
+            let _ = self
+                .enhance_claude_permissions(worktree, shared, transport)
+                .await;
         }
 
-        self.write_agents_md(worktree, "forge")?;
-        self.write_agents_md(shared, "sentinel")?;
+        self.write_agents_md(worktree, "forge", transport).await?;
+        self.write_agents_md(shared, "sentinel", transport).await?;
 
         Ok(())
     }
@@ -622,18 +635,6 @@ coder_ai_gateway      = {}
         }
 
         debug!(path = %shared.display(), "Shared directory structure created");
-        Ok(())
-    }
-
-    /// Write JSON to file atomically.
-    fn write_json(&self, path: &Path, value: &Value) -> Result<()> {
-        let temp_path = path.with_extension("json.tmp");
-        let content = serde_json::to_string_pretty(value).context("Failed to serialize JSON")?;
-
-        fs::write(&temp_path, content).context("Failed to write JSON")?;
-
-        fs::rename(&temp_path, path).context("Failed to rename JSON file")?;
-
         Ok(())
     }
 
@@ -1153,7 +1154,7 @@ developer_instructions = """
         &self,
         worktree: &Path,
         shared: &Path,
-        _transport: &dyn WorkspaceTransport,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let hooks_source = self
             .orchestrator_dir()
@@ -1162,28 +1163,45 @@ developer_instructions = """
             .join("hooks");
 
         if !hooks_source.exists() {
-            debug!("Hooks source directory not found, skipping Claude hooks generation");
+            warn!(
+                hooks_dir = %hooks_source.display(),
+                "Hooks source directory not found - Claude hooks will not be installed"
+            );
             return Ok(());
         }
 
+        info!(
+            hooks_dir = %hooks_source.display(),
+            worktree = %worktree.display(),
+            shared = %shared.display(),
+            "Starting Claude hooks installation"
+        );
+
         // Install hook scripts for FORGE and update settings
-        self.install_claude_hook_scripts(worktree, "forge", &hooks_source)?;
-        self.add_hooks_to_claude_settings(worktree, "forge", &hooks_source)?;
+        info!("Installing FORGE hook scripts");
+        self.install_claude_hook_scripts(worktree, "forge", &hooks_source, transport)
+            .await?;
+        self.add_hooks_to_claude_settings(worktree, "forge", &hooks_source, transport)
+            .await?;
 
         // Install hook scripts for SENTINEL and update settings
-        self.install_claude_hook_scripts(shared, "sentinel", &hooks_source)?;
-        self.add_hooks_to_claude_settings(shared, "sentinel", &hooks_source)?;
+        info!("Installing SENTINEL hook scripts");
+        self.install_claude_hook_scripts(shared, "sentinel", &hooks_source, transport)
+            .await?;
+        self.add_hooks_to_claude_settings(shared, "sentinel", &hooks_source, transport)
+            .await?;
 
-        info!("Claude hooks configuration generated for FORGE and SENTINEL");
+        info!("Claude hooks configuration complete for FORGE and SENTINEL");
         Ok(())
     }
 
     /// Copy hook scripts from source repo into .claude/hooks/{role}/ in the target directory.
-    fn install_claude_hook_scripts(
+    async fn install_claude_hook_scripts(
         &self,
         target: &Path,
         role: &str,
         hooks_source: &Path,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let hook_names: Vec<&str> = match role {
             "forge" => vec![
@@ -1208,33 +1226,47 @@ developer_instructions = """
         };
 
         let hooks_dest = target.join(".claude").join("hooks").join(role);
-        fs::create_dir_all(&hooks_dest).context("Failed to create Claude hooks directory")?;
+        transport
+            .create_dir_all(&hooks_dest.to_string_lossy())
+            .await
+            .context("Failed to create Claude hooks directory")?;
 
         for hook_name in &hook_names {
             let src = hooks_source.join(role).join(format!("{}.sh", hook_name));
             if !src.exists() {
-                debug!(
+                info!(
                     path = %src.display(),
+                    role = %role,
                     "Hook script not found in source, skipping copy"
                 );
                 continue;
             }
-            let dst = hooks_dest.join(format!("{}.sh", hook_name));
-            fs::copy(&src, &dst).context(format!("Failed to copy hook script {}", hook_name))?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = fs::metadata(&dst)?.permissions().mode();
-                if mode & 0o111 == 0 {
-                    fs::set_permissions(&dst, fs::Permissions::from_mode(mode | 0o755))?;
-                }
-            }
-
-            debug!(
+            let dst_path = hooks_dest.join(format!("{}.sh", hook_name));
+            let content = fs::read_to_string(&src).context(format!(
+                "Failed to read Claude hook source {}",
+                src.display()
+            ))?;
+            info!(
                 src = %src.display(),
-                dst = %dst.display(),
-                "Claude hook script copied"
+                dst = %dst_path.display(),
+                role = %role,
+                "Installing Claude hook script via transport"
+            );
+            transport
+                .write_file(&dst_path.to_string_lossy(), &content)
+                .await
+                .context(format!("Failed to write Claude hook script {}", hook_name))?;
+
+            info!(dst = %dst_path.display(), "Setting executable permissions on hook");
+            let _ = transport
+                .execute(&format!("chmod +x {}", shell_quote(&dst_path)))
+                .await;
+
+            info!(
+                src = %src.display(),
+                dst = %dst_path.display(),
+                role = %role,
+                "Claude hook script installed successfully"
             );
         }
 
@@ -1247,17 +1279,22 @@ developer_instructions = """
     }
 
     /// Add hooks configuration to existing .claude/settings.json.
-    fn add_hooks_to_claude_settings(
+    async fn add_hooks_to_claude_settings(
         &self,
         target: &Path,
         role: &str,
         hooks_source: &Path,
+        transport: &dyn WorkspaceTransport,
     ) -> Result<()> {
         let settings_path = target.join(".claude").join("settings.json");
 
-        // Read existing settings
-        let mut settings: Value = if settings_path.exists() {
-            let content = fs::read_to_string(&settings_path)
+        let mut settings: Value = if transport
+            .path_exists(&settings_path.to_string_lossy())
+            .await
+        {
+            let content = transport
+                .read_file(&settings_path.to_string_lossy())
+                .await
                 .context("Failed to read Claude settings.json")?;
             serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
         } else {
@@ -1369,12 +1406,17 @@ developer_instructions = """
                 .push(hook_entry);
         }
 
-        if !hooks_map.is_empty() {
+        let hook_count = hooks_map.len();
+        if hook_count > 0 {
             settings["hooks"] = Value::Object(hooks_map);
+            info!(role = %role, hook_count = hook_count, "Registering hooks in settings.json");
+        } else {
+            info!(role = %role, "No hooks to register in settings.json (all hook scripts missing from source)");
         }
 
-        self.write_json(&settings_path, &settings)?;
-        info!(path = %settings_path.display(), role = role, "Claude hooks added to settings.json");
+        self.write_json_via_transport(settings_path.clone(), &settings, transport)
+            .await?;
+        info!(path = %settings_path.display(), role = role, hook_count = hook_count, "Claude hooks configuration complete");
         Ok(())
     }
 
@@ -1485,11 +1527,21 @@ developer_instructions = """
     }
 
     /// Enhance Claude settings.json with permission rules.
-    fn enhance_claude_permissions(&self, worktree: &Path, shared: &Path) -> Result<()> {
+    async fn enhance_claude_permissions(
+        &self,
+        worktree: &Path,
+        shared: &Path,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         // FORGE permissions
         let forge_settings = worktree.join(".claude").join("settings.json");
-        if forge_settings.exists() {
-            let content = fs::read_to_string(&forge_settings)
+        if transport
+            .path_exists(&forge_settings.to_string_lossy())
+            .await
+        {
+            let content = transport
+                .read_file(&forge_settings.to_string_lossy())
+                .await
                 .context("Failed to read FORGE settings.json")?;
             let mut settings: Value = serde_json::from_str(&content)
                 .unwrap_or_else(|_| json!({ "permissions": { "defaultMode": "auto" } }));
@@ -1513,14 +1565,20 @@ developer_instructions = """
                 { "tool": "Bash", "command": "cargo install *" }
             ]);
 
-            self.write_json(&forge_settings, &settings)?;
+            self.write_json_via_transport(forge_settings.clone(), &settings, transport)
+                .await?;
             info!(path = %forge_settings.display(), "Claude FORGE permissions enhanced");
         }
 
         // SENTINEL permissions (read-only)
         let sentinel_settings = shared.join(".claude").join("settings.json");
-        if sentinel_settings.exists() {
-            let content = fs::read_to_string(&sentinel_settings)
+        if transport
+            .path_exists(&sentinel_settings.to_string_lossy())
+            .await
+        {
+            let content = transport
+                .read_file(&sentinel_settings.to_string_lossy())
+                .await
                 .context("Failed to read SENTINEL settings.json")?;
             let mut settings: Value = serde_json::from_str(&content)
                 .unwrap_or_else(|_| json!({ "permissions": { "defaultMode": "auto" } }));
@@ -1536,7 +1594,8 @@ developer_instructions = """
                 { "tool": "Bash", "command": "pip install *" }
             ]);
 
-            self.write_json(&sentinel_settings, &settings)?;
+            self.write_json_via_transport(sentinel_settings.clone(), &settings, transport)
+                .await?;
             info!(path = %sentinel_settings.display(), "Claude SENTINEL permissions enhanced");
         }
 
@@ -1704,7 +1763,12 @@ developer_instructions = """
     }
 
     /// Write AGENTS.md at worktree root from existing agent.md persona file.
-    fn write_agents_md(&self, target: &Path, agent_id: &str) -> Result<()> {
+    async fn write_agents_md(
+        &self,
+        target: &Path,
+        agent_id: &str,
+        transport: &dyn WorkspaceTransport,
+    ) -> Result<()> {
         let agent_md_path = self
             .orchestrator_dir()
             .join("orchestration")
@@ -1755,7 +1819,9 @@ developer_instructions = """
             body = body,
         );
 
-        fs::write(&agents_md_path, content)
+        transport
+            .write_file(&agents_md_path.to_string_lossy(), &content)
+            .await
             .context(format!("Failed to write {}", agents_md_path.display()))?;
         info!(path = %agents_md_path.display(), "AGENTS.md generated");
         Ok(())
@@ -1982,16 +2048,80 @@ enabled = true
     }
 }
 
-fn shell_quote(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::LocalTransport;
+    use crate::transport::{CommandOutput, DirEntry, WorkspaceTransport};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        dirs: Mutex<Vec<String>>,
+        files: Mutex<HashMap<String, String>>,
+        commands: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl WorkspaceTransport for RecordingTransport {
+        async fn read_file(&self, path: &str) -> Result<String> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .with_context(|| format!("missing file: {path}"))
+        }
+
+        async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), content.to_string());
+            Ok(())
+        }
+
+        async fn execute(&self, command: &str) -> Result<CommandOutput> {
+            self.commands.lock().unwrap().push(command.to_string());
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn list_directory(&self, _path: &str) -> Result<Vec<DirEntry>> {
+            Ok(vec![])
+        }
+
+        async fn symlink_or_copy(&self, _source: &Path, _target: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn create_dir_all(&self, path: &str) -> Result<()> {
+            self.dirs.lock().unwrap().push(path.to_string());
+            Ok(())
+        }
+
+        async fn path_exists(&self, path: &str) -> bool {
+            self.files.lock().unwrap().contains_key(path)
+        }
+
+        async fn remove_dir_all(&self, path: &str) -> Result<()> {
+            self.dirs.lock().unwrap().retain(|dir| dir != path);
+            self.files.lock().unwrap().retain(|file, _| file != path);
+            Ok(())
+        }
+
+        async fn copy_file(&self, source_local: &Path, target: &str) -> Result<()> {
+            let content = fs::read_to_string(source_local)?;
+            self.write_file(target, &content).await
+        }
+    }
 
     #[tokio::test]
     async fn test_create_forge_settings() {
@@ -2093,5 +2223,46 @@ mod tests {
 
         let content = fs::read_to_string(&copied).unwrap();
         assert_eq!(content, "#!/bin/bash\necho sentinel-start");
+    }
+
+    #[tokio::test]
+    async fn test_install_claude_hook_scripts_uses_transport_for_remote_paths() {
+        let dir = tempdir().unwrap();
+        let hooks_source = dir.path().join("hooks");
+        let forge_src = hooks_source.join("forge");
+        fs::create_dir_all(&forge_src).unwrap();
+        fs::write(
+            forge_src.join("session_start.sh"),
+            "#!/bin/bash\necho forge-start",
+        )
+        .unwrap();
+
+        let provisioner = Provisioner::new(dir.path());
+        let transport = RecordingTransport::default();
+        let remote_target = Path::new("/home/coder/workspace");
+
+        provisioner
+            .install_claude_hook_scripts(remote_target, "forge", &hooks_source, &transport)
+            .await
+            .unwrap();
+
+        let hooks_dir = "/home/coder/workspace/.claude/hooks/forge";
+        assert!(transport
+            .dirs
+            .lock()
+            .unwrap()
+            .contains(&hooks_dir.to_string()));
+
+        let hook_path = format!("{hooks_dir}/session_start.sh");
+        assert_eq!(
+            transport.files.lock().unwrap().get(&hook_path),
+            Some(&"#!/bin/bash\necho forge-start".to_string())
+        );
+        assert!(transport
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command.contains("chmod +x")));
     }
 }

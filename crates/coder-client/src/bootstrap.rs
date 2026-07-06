@@ -53,8 +53,8 @@ impl CoderBootstrapper {
         let url = std::env::var("CODER_URL").context("CODER_URL not set")?;
         let email = std::env::var("CODER_ADMIN_EMAIL")
             .unwrap_or_else(|_| "admin@openflows.dev".to_string());
-        let raw_password =
-            std::env::var("CODER_ADMIN_PASSWORD").unwrap_or_else(|_| SECURE_DEFAULT_PASSWORD.to_string());
+        let raw_password = std::env::var("CODER_ADMIN_PASSWORD")
+            .unwrap_or_else(|_| SECURE_DEFAULT_PASSWORD.to_string());
         let username =
             std::env::var("CODER_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
 

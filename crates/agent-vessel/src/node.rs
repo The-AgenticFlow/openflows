@@ -158,6 +158,7 @@ impl VesselNode {
         }
     }
 
+    #[allow(dead_code)]
     async fn worker_slot_for_pr(
         &self,
         store: &SharedStore,
@@ -181,6 +182,7 @@ impl VesselNode {
         slots.get(&worker_id).cloned().map(|slot| (worker_id, slot))
     }
 
+    #[allow(dead_code)]
     async fn coder_transport_for_pr(
         &self,
         store: &SharedStore,
@@ -333,6 +335,7 @@ impl VesselNode {
         }
     }
 
+    #[allow(dead_code)]
     fn build_conflict_resolution_content(
         pr_info: &PrInfo,
         conflicted_files: &[String],
@@ -379,6 +382,7 @@ impl VesselNode {
         )
     }
 
+    #[allow(dead_code)]
     async fn write_conflict_resolution_md_to_transport<T: WorkspaceTransport + ?Sized>(
         &self,
         transport: &T,
@@ -410,6 +414,7 @@ impl VesselNode {
         }
     }
 
+    #[allow(dead_code)]
     async fn detect_default_branch_via_transport<T: WorkspaceTransport + ?Sized>(
         transport: &T,
     ) -> String {
@@ -442,6 +447,7 @@ impl VesselNode {
         "main".to_string()
     }
 
+    #[allow(dead_code)]
     async fn list_conflicted_files_via_transport<T: WorkspaceTransport + ?Sized>(
         transport: &T,
     ) -> Vec<String> {
@@ -459,6 +465,7 @@ impl VesselNode {
         }
     }
 
+    #[allow(dead_code)]
     async fn merge_origin_main_via_transport<T: WorkspaceTransport + ?Sized>(
         &self,
         transport: &T,

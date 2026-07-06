@@ -42,6 +42,7 @@ const DEFAULT_CODER_PORT: u16 = 7080;
 const CODER_PORT_SCAN_LIMIT: u16 = 12;
 const DEFAULT_CODER_IMAGE_TAG: &str = "latest";
 const CODER_IMAGE_TAG_FALLBACKS: &[&str] = &["preview"];
+const DEFAULT_PAIR_REDIS_URL: &str = "redis://127.0.0.1:6379";
 
 fn parse_coder_url(coder_url: &str) -> (String, u16) {
     let parsed = reqwest::Url::parse(coder_url).ok();
@@ -94,6 +95,124 @@ fn coder_image_tag_candidates_from_env(coder_image_tag: Option<&str>) -> Vec<Str
 
 fn coder_image_tag_candidates() -> Vec<String> {
     coder_image_tag_candidates_from_env(std::env::var("CODER_IMAGE_TAG").ok().as_deref())
+}
+
+fn redis_url_is_host_reachable(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    !matches!(parsed.host_str(), Some("redis") | None)
+}
+
+fn pair_redis_url_from_env(sprintless_redis_url: Option<&str>, redis_url: Option<&str>) -> String {
+    if let Some(url) = sprintless_redis_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return url.to_string();
+    }
+
+    if let Some(url) = redis_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty() && redis_url_is_host_reachable(url))
+    {
+        return url.to_string();
+    }
+
+    DEFAULT_PAIR_REDIS_URL.to_string()
+}
+
+fn pair_redis_url() -> String {
+    pair_redis_url_from_env(
+        std::env::var("SPRINTLESS_REDIS_URL").ok().as_deref(),
+        std::env::var("REDIS_URL").ok().as_deref(),
+    )
+}
+
+fn redis_socket_addr(redis_url: &str) -> (String, u16) {
+    let parsed = reqwest::Url::parse(redis_url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(|url| url.host_str())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let port = parsed.as_ref().and_then(|url| url.port()).unwrap_or(6379);
+    (host, port)
+}
+
+async fn redis_is_reachable(redis_url: &str) -> bool {
+    let (host, port) = redis_socket_addr(redis_url);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_redis(redis_url: &str, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if redis_is_reachable(redis_url).await {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+async fn ensure_pair_redis(
+    redis_url: &str,
+    compose_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if redis_is_reachable(redis_url).await {
+        eprintln!("  ✓ Redis is available at {}", redis_url);
+        return Ok(());
+    }
+
+    let Some(compose_path) = compose_path else {
+        anyhow::bail!(
+            "Redis is not reachable at {} and no docker-compose.yml was found",
+            redis_url
+        );
+    };
+
+    eprintln!("  • Redis is not reachable at {}", redis_url);
+    eprintln!("    Starting Redis service from {}", compose_path.display());
+
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            compose_path.to_str().unwrap_or("docker-compose.yml"),
+            "--env-file",
+            "/dev/null",
+            "up",
+            "-d",
+            "redis",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first_line = stderr.lines().next().unwrap_or("docker compose failed");
+        anyhow::bail!("failed to start Redis service: {}", first_line);
+    }
+
+    if wait_for_redis(redis_url, std::time::Duration::from_secs(15)).await {
+        eprintln!("  ✓ Redis service is ready at {}", redis_url);
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Redis service started but did not accept connections at {}",
+            redis_url
+        )
+    }
 }
 
 async fn coder_port_is_free(port: u16) -> bool {
@@ -703,6 +822,27 @@ async fn main() -> Result<()> {
             }
         }
 
+        if !skip_coder {
+            let redis_url = pair_redis_url();
+            std::env::set_var("SPRINTLESS_REDIS_URL", &redis_url);
+            if let Err(e) = ensure_pair_redis(&redis_url, compose_path.as_deref()).await {
+                eprintln!();
+                eprintln!("  ✗ Redis setup failed:");
+                eprintln!("    {}", e);
+                eprintln!();
+                eprintln!("  Falling back to local mode (git worktrees).");
+                eprintln!();
+                warn!(
+                    error = %e,
+                    redis_url = %redis_url,
+                    "Redis setup failed for Coder pair artifacts; falling back to local mode"
+                );
+                std::env::set_var("WORKSPACE_PROVIDER", "local");
+                std::env::remove_var("CODER_URL");
+                skip_coder = true;
+            }
+        }
+
         // Step 3: Bootstrap Coder (create admin user, push templates)
         //         Instead of calling bootstrapper.bootstrap() which silently waits up to 120s,
         //         we do our own health-wait loop with progress output, then call bootstrap for
@@ -1124,7 +1264,9 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::coder_image_tag_candidates_from_env;
+    use super::{
+        coder_image_tag_candidates_from_env, pair_redis_url_from_env, DEFAULT_PAIR_REDIS_URL,
+    };
 
     #[test]
     fn defaults_to_latest_then_preview() {
@@ -1151,6 +1293,30 @@ mod tests {
         assert_eq!(
             coder_image_tag_candidates_from_env(Some("latest")),
             vec!["latest".to_string(), "preview".to_string()]
+        );
+    }
+
+    #[test]
+    fn pair_redis_prefers_sprintless_url() {
+        assert_eq!(
+            pair_redis_url_from_env(Some("redis://127.0.0.1:6380"), Some("redis://redis:6379")),
+            "redis://127.0.0.1:6380"
+        );
+    }
+
+    #[test]
+    fn pair_redis_ignores_compose_alias_for_host_process() {
+        assert_eq!(
+            pair_redis_url_from_env(None, Some("redis://redis:6379")),
+            DEFAULT_PAIR_REDIS_URL
+        );
+    }
+
+    #[test]
+    fn pair_redis_uses_host_reachable_redis_url() {
+        assert_eq!(
+            pair_redis_url_from_env(None, Some("redis://localhost:6379")),
+            "redis://localhost:6379"
         );
     }
 }

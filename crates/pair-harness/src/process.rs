@@ -9,6 +9,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,6 +20,186 @@ use tracing::{debug, error, info, warn};
 use crate::types::CliBackend;
 
 use serde::Deserialize;
+
+/// Cross-provider process handle for local child processes and Coder exec tasks.
+pub enum ManagedProcess {
+    Local(Child),
+    #[cfg(feature = "coder")]
+    Coder(crate::coder_process::CoderTaskHandle),
+    #[cfg(feature = "coder")]
+    CoderJoin(Option<tokio::task::JoinHandle<Result<i32>>>),
+}
+
+/// Minimal exit status used by the pair lifecycle without tying it to
+/// std::process::ExitStatus.
+pub struct ManagedExitStatus {
+    code: Option<i32>,
+}
+
+impl ManagedExitStatus {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+}
+
+impl From<std::process::ExitStatus> for ManagedExitStatus {
+    fn from(status: std::process::ExitStatus) -> Self {
+        ManagedExitStatus { code: status.code() }
+    }
+}
+
+impl ManagedProcess {
+    /// Poll whether the process has exited without blocking.
+    ///
+    /// Returns `Ok(None)` while still running. Remote Coder PID tasks have no
+    /// synchronous poll available, so they report as still running here;
+    /// completion is detected via the file-watching event loop instead.
+    pub fn try_poll_exit(&mut self) -> std::io::Result<Option<ManagedExitStatus>> {
+        match self {
+            ManagedProcess::Local(child) => {
+                child.try_wait().map(|opt| opt.map(ManagedExitStatus::from))
+            }
+            #[cfg(feature = "coder")]
+            ManagedProcess::CoderJoin(opt) => {
+                use futures::FutureExt;
+                let Some(handle) = opt.as_mut() else {
+                    return Ok(Some(ManagedExitStatus { code: None }));
+                };
+                match handle.now_or_never() {
+                    None => Ok(None),
+                    Some(res) => {
+                        // The JoinHandle has resolved; drop the stored handle.
+                        *opt = None;
+                        match res {
+                            Ok(Ok(code)) => Ok(Some(ManagedExitStatus { code: Some(code) })),
+                            _ => Ok(Some(ManagedExitStatus { code: None })),
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "coder")]
+            ManagedProcess::Coder(_) => Ok(None),
+        }
+    }
+}
+
+/// Shell-quote a single token for safe interpolation into a `sh -c` command.
+///
+/// Tokens consisting solely of "safe" characters (alphanumeric plus
+/// `_-./:=`) are passed through unquoted; everything else is wrapped in
+/// single quotes with embedded single quotes escaped.  This is the single
+/// escaping primitive used by both the Coder remote-spawn path and the
+/// provisioner's transport commands, so a correctness fix here propagates
+/// everywhere.
+pub(crate) fn shell_quote(value: impl AsRef<OsStr>) -> String {
+    let s = value.as_ref().to_string_lossy();
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='))
+    {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Derive the Redis URL that a process running *inside* a Coder workspace
+/// container should use to reach the same Redis instance the host
+/// orchestrator connects to.
+///
+/// The host resolves a host-reachable URL (e.g. `redis://127.0.0.1:6379`)
+/// because it probes TCP from the host and deliberately rejects the
+/// `redis://redis:6379` compose-network alias (the host can't resolve it).
+/// That same loopback URL is unreachable from inside the workspace
+/// container, where `127.0.0.1` is the container's own loopback.  The
+/// container is attached to the compose network, so the compose service
+/// alias `redis` is the correct target.
+///
+/// An explicit override can be supplied via the `CODER_REDIS_URL` env var;
+/// otherwise loopback hosts in the host URL are rewritten to `redis`.
+#[cfg(feature = "coder")]
+fn container_reachable_redis_url(host_redis_url: &str) -> String {
+    if let Ok(override_url) = std::env::var("CODER_REDIS_URL") {
+        let trimmed = override_url.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(parsed) = reqwest::Url::parse(host_redis_url) {
+        let host = parsed.host_str().unwrap_or("redis");
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0");
+        if is_loopback {
+            let port = parsed.port().unwrap_or(6379);
+            return format!("redis://redis:{}", port);
+        }
+    }
+    host_redis_url.to_string()
+}
+
+/// Build the content of a remote env-file from a `Command`'s environment.
+///
+/// Each entry is emitted as `export KEY='value'` so the file can be sourced
+/// with `. <file>`.  The content is written to the workspace via
+/// `workspace_write_file`, which base64-encodes it on the wire — so secret
+/// values never appear in a shell command string or in the tracing log.
+#[cfg(feature = "coder")]
+fn build_env_file_content(cmd: &Command) -> String {
+    let cmd = cmd.as_std();
+    let mut lines = String::new();
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            // The key is an env-var name (always safe chars); only the value
+            // needs quoting.
+            lines.push_str(&format!(
+                "export {}={}\n",
+                key.to_string_lossy(),
+                shell_quote(value)
+            ));
+        }
+    }
+    lines
+}
+
+/// Render the program + args of a `Command` as a shell command string,
+/// **without** any `env KEY=VALUE …` prefix.  Environment is delivered via a
+/// sourced env-file (see [`build_env_file_content`]) so that secrets are not
+/// inlined into the command string.
+#[cfg(feature = "coder")]
+fn command_args_to_shell(cmd: &Command) -> String {
+    let cmd = cmd.as_std();
+    let mut parts = vec![shell_quote(cmd.get_program())];
+    parts.extend(cmd.get_args().map(shell_quote));
+    parts.join(" ")
+}
+
+/// Write the command's environment to a remote env-file and return
+/// `(env_file_path, shell_cmd_without_envs)`.
+///
+/// This is the shared half of every Coder spawn: it guarantees that secrets
+/// live only in the env-file (transmitted via base64, never logged) and that
+/// the returned `shell_cmd` contains only the program and its arguments.
+#[cfg(feature = "coder")]
+async fn prepare_coder_remote_command(
+    client: &coder_client::CoderClient,
+    workspace_id: &str,
+    pair_id: &str,
+    cmd: &Command,
+) -> Result<(String, String)> {
+    let env_file = format!("/tmp/agentflow-{}-env", pair_id);
+    let env_content = build_env_file_content(cmd);
+    client
+        .workspace_write_file(workspace_id, &env_file, &env_content)
+        .await
+        .context("Failed to write env file into Coder workspace")?;
+    let shell_cmd = command_args_to_shell(cmd);
+    Ok((env_file, shell_cmd))
+}
 
 /// Configuration for a specific CLI backend (Claude, Codex, etc.).
 /// Encapsulates all backend-specific behavior: binary path, spawn flags,
@@ -804,7 +985,11 @@ impl ProcessManager {
         // Coder and the binaries are no longer needed on the host.
         let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+            if let Err(e) = Self::validate_cli_binary(
+                &config.binary_path,
+                backend.binary_name(),
+                &initial_provider,
+            ) {
                 warn!("{}", e);
             }
         }
@@ -855,7 +1040,11 @@ impl ProcessManager {
 
         let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+            if let Err(e) = Self::validate_cli_binary(
+                &config.binary_path,
+                backend.binary_name(),
+                &initial_provider,
+            ) {
                 warn!("{}", e);
             }
         }
@@ -906,7 +1095,11 @@ impl ProcessManager {
 
         let initial_provider = crate::types::WorkspaceProvider::Local;
         for (backend, config) in &backends {
-            if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &initial_provider) {
+            if let Err(e) = Self::validate_cli_binary(
+                &config.binary_path,
+                backend.binary_name(),
+                &initial_provider,
+            ) {
                 warn!("{}", e);
             }
         }
@@ -952,6 +1145,8 @@ impl ProcessManager {
     ) -> Self {
         self.workspace_provider = crate::types::WorkspaceProvider::Coder;
         self.coder_workspace_id = Some(coder_workspace_id.to_string());
+        #[cfg(not(feature = "coder"))]
+        let _ = (coder_url, coder_api_token);
         #[cfg(feature = "coder")]
         {
             let session_token = std::env::var("CODER_SESSION_TOKEN")
@@ -1064,7 +1259,11 @@ impl ProcessManager {
 
     /// Register a custom backend config (for testing or third-party backends).
     pub fn register_backend(&mut self, backend: CliBackend, config: BackendConfig) {
-        if let Err(e) = Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &self.workspace_provider) {
+        if let Err(e) = Self::validate_cli_binary(
+            &config.binary_path,
+            backend.binary_name(),
+            &self.workspace_provider,
+        ) {
             warn!("{}", e);
         }
         self.backends.insert(backend, config);
@@ -1602,6 +1801,270 @@ trust_level = "trusted"
         Self::inject_llm_env(cmd);
     }
 
+    #[cfg(feature = "coder")]
+    fn coder_context(&self) -> Result<(coder_client::CoderClient, String)> {
+        let client = self
+            .coder_client
+            .clone()
+            .context("Coder workspace execution requested but Coder client is not configured")?;
+        let workspace_id = self
+            .coder_workspace_id
+            .clone()
+            .context("Coder workspace execution requested but workspace_id is missing")?;
+        Ok((client, workspace_id))
+    }
+
+    /// Shared env-building for Coder spawns.  Sets the common `SPRINTLESS_*`
+    /// variables, injects backend LLM env, ensures a HOME dir, and configures
+    /// either Redis (using a *container-reachable* URL, not the host-loopback
+    /// one) or a state-file fallback.
+    ///
+    /// This exists once so FORGE and SENTINEL spawns share an identical env
+    /// contract — adding a new variable here reaches both.
+    #[cfg(feature = "coder")]
+    fn configure_coder_command(
+        &self,
+        cmd: &mut Command,
+        pair_id: &str,
+        ticket_id: &str,
+        segment: &str,
+        worktree: &Path,
+        shared: &Path,
+        backend: CliBackend,
+        extra_envs: &[(&str, &str)],
+    ) {
+        let config = self.get_backend(backend);
+        if config.needs_extras_provisioning {
+            let _ = self.apply_codex_extras();
+        }
+
+        cmd.env("SPRINTLESS_PAIR_ID", pair_id)
+            .env("SPRINTLESS_TICKET_ID", ticket_id)
+            .env("SPRINTLESS_SEGMENT", segment)
+            .env("SPRINTLESS_WORKTREE", worktree.to_string_lossy().to_string())
+            .env("SPRINTLESS_SHARED", shared.to_string_lossy().to_string())
+            .env("SPRINTLESS_GITHUB_TOKEN", &self.github_token);
+        for (k, v) in extra_envs {
+            cmd.env(k, v);
+        }
+        self.inject_cli_env(cmd, backend);
+        Self::ensure_home_dir(cmd, config, worktree);
+
+        if let Some(host_redis_url) = &self.redis_url {
+            // The remote process runs inside the Coder container on the
+            // compose network; the host's loopback Redis URL is unreachable
+            // there, so rewrite it to the container-reachable form.
+            cmd.env(
+                "SPRINTLESS_REDIS_URL",
+                container_reachable_redis_url(host_redis_url),
+            );
+        } else {
+            cmd.env(
+                "SPRINTLESS_STATE_FILE",
+                shared.join("state.json").to_string_lossy().to_string(),
+            );
+        }
+    }
+
+    #[cfg(feature = "coder")]
+    async fn spawn_coder_forge(
+        &self,
+        pair_id: &str,
+        ticket_id: &str,
+        worktree: &Path,
+        shared: &Path,
+        backend: CliBackend,
+        pr_mode: bool,
+    ) -> Result<ManagedProcess> {
+        use std::sync::Arc;
+
+        let (client, workspace_id) = self.coder_context()?;
+        let prompt = if pr_mode {
+            self.build_forge_pr_prompt(shared)
+        } else {
+            self.build_forge_prompt(shared)
+        };
+        let prompt_file = format!("/tmp/agentflow-{}-forge.prompt", pair_id);
+        client
+            .workspace_write_file(&workspace_id, &prompt_file, &prompt)
+            .await
+            .context("Failed to write FORGE prompt into Coder workspace")?;
+
+        let mut cmd = self.build_cli_command(backend, worktree, shared);
+        self.configure_coder_command(
+            &mut cmd,
+            pair_id,
+            ticket_id,
+            "",
+            worktree,
+            shared,
+            backend,
+            &[],
+        );
+
+        let (env_file, shell_cmd) =
+            prepare_coder_remote_command(&client, &workspace_id, pair_id, &cmd).await?;
+        let log_path = format!("/tmp/agentflow-{}-forge.log", pair_id);
+        // Source the env file (which contains secrets) before running, so
+        // secrets never appear in the command string that is logged or in the
+        // remote process argv.
+        let remote_cmd = format!(
+            "cd {} && . {} && nohup sh -c {} < {} > {} 2>&1 & echo $!",
+            shell_quote(worktree),
+            shell_quote(&env_file),
+            shell_quote(&shell_cmd),
+            shell_quote(&prompt_file),
+            shell_quote(&log_path),
+        );
+        // Log the command being sent (shell_cmd contains only program+args,
+        // no secrets — those are in the env file which is never logged).
+        info!(
+            pair = pair_id,
+            ticket = ticket_id,
+            shell_cmd = %shell_cmd,
+            env_file = %env_file,
+            prompt_file = %prompt_file,
+            log_path = %log_path,
+            "FORGE remote command constructed"
+        );
+        let output = client
+            .workspace_exec_with_timeout(&workspace_id, &remote_cmd, 120)
+            .await
+            .context("Failed to spawn FORGE in Coder workspace")?;
+
+        if output.exit_code != 0 {
+            anyhow::bail!(
+                "FORGE spawn command failed in Coder workspace (exit {}): {}",
+                output.exit_code,
+                output.stderr
+            );
+        }
+
+        let pid = output.stdout.trim();
+        if pid.is_empty() {
+            anyhow::bail!("FORGE spawn command did not return a PID");
+        }
+        // The PID comes from untrusted remote stdout — reject anything that is
+        // not a clean integer before embedding it in `coder-pid-<pid>` (which
+        // is later interpolated into remote `kill` commands).
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!(
+                "FORGE spawn command returned a non-numeric PID (got {:?}) — refusing to use it",
+                pid
+            );
+        }
+
+        info!(
+            pair = pair_id,
+            ticket = ticket_id,
+            workspace_id = %workspace_id,
+            pid,
+            "FORGE spawned in Coder workspace"
+        );
+
+        // Brief delay then check if the process survived startup.  If it died
+        // immediately, read the log file so the error is visible in the
+        // blocked reason instead of a generic "exited N times" message.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let alive = {
+            let check = format!("kill -0 {}", pid);
+            client
+                .workspace_exec_with_timeout(&workspace_id, &check, 10)
+                .await
+                .map(|o| o.exit_code == 0)
+                .unwrap_or(false)
+        };
+        if !alive {
+            let log_content = client
+                .workspace_read_file(&workspace_id, &log_path)
+                .await
+                .unwrap_or_default();
+            error!(
+                pair = pair_id,
+                pid,
+                log = %if log_content.len() > 1000 { &log_content[..1000] } else { &log_content },
+                "FORGE process died immediately after spawn — see log above"
+            );
+        }
+
+        Ok(ManagedProcess::Coder(crate::coder_process::CoderTaskHandle {
+            task_id: format!("coder-pid-{}", pid),
+            workspace_id,
+            client: Arc::new(client),
+            spawn_time: std::time::Instant::now(),
+        }))
+    }
+
+    #[cfg(feature = "coder")]
+    async fn spawn_coder_sentinel(
+        &self,
+        pair_id: &str,
+        ticket_id: &str,
+        mode: SentinelMode,
+        worktree: &Path,
+        shared: &Path,
+        timeout_secs: u64,
+        backend: CliBackend,
+    ) -> Result<ManagedProcess> {
+        let (client, workspace_id) = self.coder_context()?;
+        let prompt = self.build_sentinel_prompt(shared, &mode);
+        let prompt_file = format!("/tmp/agentflow-{}-sentinel.prompt", pair_id);
+        client
+            .workspace_write_file(&workspace_id, &prompt_file, &prompt)
+            .await
+            .context("Failed to write SENTINEL prompt into Coder workspace")?;
+
+        let segment = mode.segment_value();
+        let mut cmd = self.build_sentinel_command(backend, worktree, shared);
+        self.configure_coder_command(
+            &mut cmd,
+            pair_id,
+            ticket_id,
+            &segment,
+            worktree,
+            shared,
+            backend,
+            &[("SPRINTLESS_SENTINEL_TIMEOUT_SECS", &timeout_secs.to_string())],
+        );
+
+        let (env_file, shell_cmd) =
+            prepare_coder_remote_command(&client, &workspace_id, pair_id, &cmd).await?;
+        let log_path = format!("/tmp/agentflow-{}-sentinel-{}.log", pair_id, segment);
+        let remote_cmd = format!(
+            "cd {} && . {} && sh -c {} < {} > {} 2>&1",
+            shell_quote(shared),
+            shell_quote(&env_file),
+            shell_quote(&shell_cmd),
+            shell_quote(&prompt_file),
+            shell_quote(&log_path),
+        );
+        let task_client = client.clone();
+        let task_workspace_id = workspace_id.clone();
+        // Use a grace ceiling beyond the event-loop timeout so that the
+        // event-loop timeout (which records the failure as a *timeout* via
+        // `append_sentinel_failure`) always fires first and owns termination.
+        // If the exec ever hits this ceiling it means the event loop itself
+        // stalled; `kill_on_drop` on the `coder` process ensures the remote
+        // shell is terminated when the handle is aborted.
+        let exec_ceiling = timeout_secs.saturating_add(120);
+        let handle = tokio::spawn(async move {
+            let output = task_client
+                .workspace_exec_with_timeout(&task_workspace_id, &remote_cmd, exec_ceiling)
+                .await?;
+            Ok(output.exit_code)
+        });
+
+        info!(
+            pair = pair_id,
+            ticket = ticket_id,
+            mode = ?mode,
+            workspace_id = %workspace_id,
+            "SENTINEL spawned in Coder workspace"
+        );
+
+        Ok(ManagedProcess::CoderJoin(Some(handle)))
+    }
+
     /// Apply Codex-specific settings (marketplace.json).
     fn apply_codex_extras(&self) -> Result<()> {
         let home = std::env::var("HOME")
@@ -1675,7 +2138,7 @@ trust_level = "trusted"
         worktree: &Path,
         shared: &Path,
         backend: CliBackend,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         info!(
             pair = pair_id,
             ticket = ticket_id,
@@ -1684,13 +2147,30 @@ trust_level = "trusted"
             "Spawning FORGE process"
         );
 
+        #[cfg(feature = "coder")]
+        if matches!(
+            self.workspace_provider,
+            crate::types::WorkspaceProvider::Coder
+        ) {
+            return self
+                .spawn_coder_forge(pair_id, ticket_id, worktree, shared, backend, false)
+                .await;
+        }
+
         // In Local mode, the CLI binary must exist on the host. Fail fast
         // with a clear error instead of waiting for OS error 2 at spawn time.
         // In Coder mode the binary runs inside the workspace — skip validation.
-        if matches!(self.workspace_provider, crate::types::WorkspaceProvider::Local) {
+        if matches!(
+            self.workspace_provider,
+            crate::types::WorkspaceProvider::Local
+        ) {
             let config = self.get_backend(backend);
-            Self::validate_cli_binary(&config.binary_path, backend.binary_name(), &self.workspace_provider)
-                .map_err(|e| anyhow!("{}", e))?;
+            Self::validate_cli_binary(
+                &config.binary_path,
+                backend.binary_name(),
+                &self.workspace_provider,
+            )
+            .map_err(|e| anyhow!("{}", e))?;
         }
 
         // Build the initial prompt for FORGE
@@ -1768,7 +2248,7 @@ trust_level = "trusted"
         }
 
         info!(pair = pair_id, pid = ?child.id(), "FORGE process spawned");
-        Ok(child)
+        Ok(ManagedProcess::Local(child))
     }
 
     /// Spawn a FORGE process (long-running) using default backend.
@@ -1778,7 +2258,7 @@ trust_level = "trusted"
         ticket_id: &str,
         worktree: &Path,
         shared: &Path,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         self.spawn_forge_with_backend(pair_id, ticket_id, worktree, shared, self.default_backend)
             .await
     }
@@ -1789,7 +2269,7 @@ trust_level = "trusted"
         ticket_id: &str,
         worktree: &Path,
         shared: &Path,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         info!(
             pair = pair_id,
             ticket = ticket_id,
@@ -1805,7 +2285,7 @@ trust_level = "trusted"
         ticket_id: &str,
         worktree: &Path,
         shared: &Path,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         info!(
             pair = pair_id,
             ticket = ticket_id,
@@ -1813,6 +2293,17 @@ trust_level = "trusted"
         );
 
         let backend = self.default_backend;
+
+        #[cfg(feature = "coder")]
+        if matches!(
+            self.workspace_provider,
+            crate::types::WorkspaceProvider::Coder
+        ) {
+            return self
+                .spawn_coder_forge(pair_id, ticket_id, worktree, shared, backend, true)
+                .await;
+        }
+
         let initial_prompt = self.build_forge_pr_prompt(shared);
 
         let mut cmd = self.build_cli_command(backend, worktree, shared);
@@ -1887,7 +2378,7 @@ trust_level = "trusted"
         }
 
         info!(pair = pair_id, pid = ?child.id(), "FORGE process (PR mode) spawned");
-        Ok(child)
+        Ok(ManagedProcess::Local(child))
     }
 
     /// Spawn a SENTINEL process (ephemeral, for single evaluation).
@@ -1899,7 +2390,7 @@ trust_level = "trusted"
         mode: SentinelMode,
         worktree: &Path,
         shared: &Path,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         self.spawn_sentinel_with_timeout(pair_id, ticket_id, mode, worktree, shared, 300)
             .await
     }
@@ -1913,7 +2404,7 @@ trust_level = "trusted"
         worktree: &Path,
         shared: &Path,
         timeout_secs: u64,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         self.spawn_sentinel_with_backend(
             pair_id,
             ticket_id,
@@ -1937,7 +2428,7 @@ trust_level = "trusted"
         shared: &Path,
         timeout_secs: u64,
         backend: CliBackend,
-    ) -> Result<Child> {
+    ) -> Result<ManagedProcess> {
         let segment = mode.segment_value();
 
         info!(
@@ -1948,6 +2439,16 @@ trust_level = "trusted"
             backend = ?backend,
             "Spawning SENTINEL process (ephemeral)"
         );
+
+        #[cfg(feature = "coder")]
+        if matches!(
+            self.workspace_provider,
+            crate::types::WorkspaceProvider::Coder
+        ) {
+            return self
+                .spawn_coder_sentinel(pair_id, ticket_id, mode, worktree, shared, timeout_secs, backend)
+                .await;
+        }
 
         // Build the initial prompt for SENTINEL based on mode
         let initial_prompt = self.build_sentinel_prompt(shared, &mode);
@@ -2026,52 +2527,110 @@ trust_level = "trusted"
         }
 
         info!(pair = pair_id, pid = ?child.id(), mode = ?mode, "SENTINEL process spawned");
-        Ok(child)
+        Ok(ManagedProcess::Local(child))
     }
 
     /// Wait for a process to complete with timeout.
     pub async fn wait_with_timeout(
         &self,
-        child: &mut Child,
+        child: &mut ManagedProcess,
         timeout: Duration,
     ) -> Result<ProcessOutcome> {
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                if status.success() {
-                    Ok(ProcessOutcome::Success)
-                } else {
-                    warn!(exit_code = ?status.code(), "Process exited with error");
-                    Ok(ProcessOutcome::Failed {
-                        exit_code: status.code(),
-                    })
+        match child {
+            ManagedProcess::Local(c) => {
+                match tokio::time::timeout(timeout, c.wait()).await {
+                    Ok(Ok(status)) => {
+                        if status.success() {
+                            Ok(ProcessOutcome::Success)
+                        } else {
+                            warn!(exit_code = ?status.code(), "Process exited with error");
+                            Ok(ProcessOutcome::Failed {
+                                exit_code: status.code(),
+                            })
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        error!(error = %e, "Failed to wait for process");
+                        Err(anyhow!("Failed to wait for process: {}", e))
+                    }
+                    Err(_) => {
+                        warn!("Process timed out, killing");
+                        c.kill().await.context("Failed to kill timed-out process")?;
+                        Ok(ProcessOutcome::Timeout)
+                    }
                 }
             }
-            Ok(Err(e)) => {
-                error!(error = %e, "Failed to wait for process");
-                Err(anyhow!("Failed to wait for process: {}", e))
+            #[cfg(feature = "coder")]
+            ManagedProcess::CoderJoin(opt) => {
+                let Some(handle) = opt.as_mut() else {
+                    return Ok(ProcessOutcome::Failed { exit_code: None });
+                };
+                match tokio::time::timeout(timeout, handle).await {
+                    Ok(Ok(Ok(code))) => {
+                        if code == 0 {
+                            Ok(ProcessOutcome::Success)
+                        } else {
+                            warn!(exit_code = code, "Coder task exited with error");
+                            Ok(ProcessOutcome::Failed { exit_code: Some(code) })
+                        }
+                    }
+                    Ok(Ok(Err(e))) => {
+                        error!(error = %e, "Coder task returned an error");
+                        Ok(ProcessOutcome::Failed { exit_code: None })
+                    }
+                    Ok(Err(e)) => {
+                        error!(error = %e, "Coder task join failed");
+                        Ok(ProcessOutcome::Failed { exit_code: None })
+                    }
+                    Err(_) => {
+                        warn!("Coder task timed out, aborting");
+                        if let Some(h) = opt.take() {
+                            h.abort();
+                        }
+                        Ok(ProcessOutcome::Timeout)
+                    }
+                }
             }
-            Err(_) => {
-                warn!("Process timed out, killing");
-                child
-                    .kill()
-                    .await
-                    .context("Failed to kill timed-out process")?;
-                Ok(ProcessOutcome::Timeout)
+            #[cfg(feature = "coder")]
+            ManagedProcess::Coder(_) => {
+                // Long-running remote FORGE PID; not meant to be awaited here.
+                Ok(ProcessOutcome::Failed { exit_code: None })
             }
         }
     }
 
     /// Kill a process.
-    pub async fn kill(&self, child: &mut Child) -> Result<()> {
-        info!(pid = ?child.id(), "Killing process");
-        child.kill().await.context("Failed to kill process")?;
+    pub async fn kill(&self, child: &mut ManagedProcess) -> Result<()> {
+        match child {
+            ManagedProcess::Local(c) => {
+                info!(pid = ?c.id(), "Killing process");
+                c.kill().await.context("Failed to kill process")?;
+            }
+            #[cfg(feature = "coder")]
+            ManagedProcess::Coder(handle) => {
+                handle.kill().await?;
+            }
+            #[cfg(feature = "coder")]
+            ManagedProcess::CoderJoin(opt) => {
+                if let Some(handle) = opt.take() {
+                    handle.abort();
+                }
+            }
+        }
         Ok(())
     }
 
     /// Check if a process is still running.
-    pub async fn is_running(&self, child: &mut Child) -> bool {
-        // Try to get exit status without blocking
-        matches!(child.try_wait(), Ok(None))
+    pub async fn is_running(&self, child: &mut ManagedProcess) -> bool {
+        match child {
+            ManagedProcess::Local(c) => matches!(c.try_wait(), Ok(None)),
+            #[cfg(feature = "coder")]
+            ManagedProcess::Coder(handle) => handle.is_running().await,
+            #[cfg(feature = "coder")]
+            ManagedProcess::CoderJoin(opt) => {
+                opt.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+            }
+        }
     }
 
     /// Build the initial prompt for FORGE based on current state.
@@ -2603,7 +3162,7 @@ impl ForgeProcessBuilder {
     }
 
     /// Build and spawn the FORGE process.
-    pub async fn spawn(self) -> Result<Child> {
+    pub async fn spawn(self) -> Result<ManagedProcess> {
         let manager = match (&self.redis_url, &self.proxy_url) {
             (Some(redis_url), Some(proxy_url)) => ProcessManager::with_proxy(
                 self.github_token,
