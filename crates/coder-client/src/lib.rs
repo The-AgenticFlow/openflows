@@ -1254,6 +1254,8 @@ impl CoderClient {
         let repo_url = format!("https://github.com/{}.git", repository);
         let template_name =
             std::env::var("CODER_FORGE_TEMPLATE").unwrap_or_else(|_| "openflows-forge".to_string());
+        let cli_name = std::env::var("OPENFLOWS_FORGE_CLI").unwrap_or_else(|_| "claude".into());
+        let host_cli_binary = crate::resolve_host_cli_binary(&cli_name);
 
         // Create (or find existing) workspace
         info!(
@@ -1264,7 +1266,11 @@ impl CoderClient {
             .create_workspace(&CreateWorkspaceRequest {
                 template_name,
                 name: workspace_name.clone(),
-                parameters: serde_json::json!({ "repo_url": repo_url }),
+                parameters: serde_json::json!({
+                    "repo_url": repo_url,
+                    "host_cli_binary": host_cli_binary,
+                    "cli_binary_name": cli_name,
+                }),
             })
             .await?;
 
@@ -1361,4 +1367,66 @@ impl CoderClient {
 /// Wraps the path in single quotes and escapes any embedded single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Resolve the host-side CLI binary path for a given agent CLI name, to expose
+/// it to Coder workspace templates via the `host_cli_binary` parameter.
+///
+/// Coder agent modules (e.g. `claude-code`, `codex`) install the CLI by
+/// downloading it at workspace startup. When the download endpoint is slow or
+/// unreachable (common behind corporate egress), workspaces boot without the
+/// CLI on PATH and every agent spawn dies with `sh: <cli>: not found`.
+///
+/// This helper lets operators reuse an already-installed host binary by
+/// bind-mounting it read-only into the workspace (see the `host_cli_binary`
+/// variable in the `openflows-*` templates). The binary is typically a
+/// self-contained ELF with only glibc deps, so it runs unchanged inside the
+/// Ubuntu-based workspace container.
+///
+/// Resolution order:
+/// 1. `HOST_<CLI>_BINARY` env var (e.g. `HOST_CLAUDE_BINARY`,
+///    `HOST_CODEX_BINARY`) — an absolute path on the host; symlinks are
+///    resolved so the bind mount targets the real ELF, not a broken link.
+/// 2. Auto-detect: run `command -v <cli_name>` on the host and canonicalize.
+/// 3. Empty string if neither yields a path (the module's installer is used
+///    instead, preserving the original behavior).
+pub fn resolve_host_cli_binary(cli_name: &str) -> String {
+    let env_key = format!(
+        "HOST_{}_BINARY",
+        cli_name.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Ok(p) = std::env::var(&env_key) {
+        let trimmed = p.trim().to_string();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        return canonicalize_host_path(&trimmed);
+    }
+    // Auto-detect via `command -v <cli_name>` on the host. This runs on the
+    // orchestrator host (where openflows runs), which is the same Docker host
+    // that provisions workspaces, so the resolved path is valid for a bind mount.
+    if let Ok(out) = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", shell_escape(cli_name)))
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return canonicalize_host_path(&s);
+            }
+        }
+    }
+    String::new()
+}
+
+fn canonicalize_host_path(p: &str) -> String {
+    // Resolve symlinks so the bind mount targets the real ELF (e.g. /usr/bin/claude
+    // -> /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe). Fall back
+    // to the raw path if canonicalization fails (std::fs::canonicalize errors on
+    // non-existent paths).
+    match std::fs::canonicalize(p) {
+        Ok(resolved) => resolved.to_string_lossy().into_owned(),
+        Err(_) => p.to_string(),
+    }
 }

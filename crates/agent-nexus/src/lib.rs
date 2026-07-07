@@ -734,17 +734,31 @@ impl NexusNode {
             .unwrap_or_default();
         let template_name = Self::template_name_for_worker(worker_id);
         let workspace_name = Self::workspace_name_for_ticket(worker_id, ticket_id);
+        // Resolve the CLI backend for this worker's role from the registry,
+        // then resolve a matching host binary to bind-mount into the workspace.
+        // This works for any CLI (claude, codex, aider, goose, ...) — the binary
+        // is bind-mounted read-only and symlinked onto PATH so the agent spawn
+        // (sh -c <cli> ...) finds it without waiting for the module's installer.
+        let cli_name = self
+            .load_registry()
+            .ok()
+            .and_then(|reg| {
+                let base_id = reg.normalize_agent_id(worker_id);
+                reg.get(base_id).map(|e| e.cli.clone())
+            })
+            .unwrap_or_else(|| "claude".to_string());
+        let host_cli_binary = coder_client::resolve_host_cli_binary(&cli_name);
 
         info!(
             worker_id,
-            ticket_id, template_name, "Provisioning Coder workspace for worker"
+            ticket_id, template_name, cli = %cli_name, "Provisioning Coder workspace for worker"
         );
 
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
                 template_name,
                 name: workspace_name,
-                parameters: json!({ "repo_url": repo_url }),
+                parameters: json!({ "repo_url": repo_url, "host_cli_binary": host_cli_binary, "cli_binary_name": cli_name }),
             })
             .await?;
 

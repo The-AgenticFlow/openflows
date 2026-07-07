@@ -217,6 +217,7 @@ impl CoderBootstrapper {
             let litellm_proxy_url = std::env::var("LITELLM_PROXY_URL")
                 .unwrap_or_else(|_| "http://proxy:4000".to_string());
             let use_ai_gateway = std::env::var("USE_AI_GATEWAY").unwrap_or_else(|_| "true".into());
+            let host_cli_binary = crate::resolve_host_cli_binary("claude");
             let registry_json = match std::env::var("OPENFLOWS_REGISTRY_JSON") {
                 Ok(json) => json,
                 Err(_) => {
@@ -235,6 +236,8 @@ impl CoderBootstrapper {
                         "redis_url": redis_url,
                         "litellm_proxy_url": litellm_proxy_url,
                         "use_ai_gateway": use_ai_gateway,
+                        "host_cli_binary": host_cli_binary,
+                        "cli_binary_name": "claude",
                         "coder_url": client.base_url(),
                         "coder_api_token": nexus_api_token,
                         "registry_json": registry_json,

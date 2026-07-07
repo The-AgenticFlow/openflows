@@ -40,6 +40,18 @@ variable "use_ai_gateway" {
   default = "true"
 }
 
+variable "host_cli_binary" {
+  type        = string
+  default     = ""
+  description = "Host path to a pre-built CLI ELF binary (bind-mounted to skip startup download)"
+}
+
+variable "cli_binary_name" {
+  type        = string
+  default     = "claude"
+  description = "Name of the CLI binary to expose on PATH inside the workspace"
+}
+
 variable "litellm_proxy_url" {
   type    = string
   default = "http://proxy:4000"
@@ -91,6 +103,15 @@ resource "coder_agent" "main" {
       git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
     fi
 
+    # If a host-provided CLI binary is bind-mounted, install it onto PATH
+    # before any hooks/agent work so the VESSEL spawn (sh -c <cli> ...) finds it.
+    if [ -x /opt/host-cli/${var.cli_binary_name} ]; then
+      mkdir -p /home/coder/.local/bin /tmp/coder-script-data/bin
+      ln -sf /opt/host-cli/${var.cli_binary_name} /home/coder/.local/bin/${var.cli_binary_name}
+      ln -sf /opt/host-cli/${var.cli_binary_name} /tmp/coder-script-data/bin/${var.cli_binary_name}
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${var.cli_binary_name} installed from host bind-mount" >&2
+    fi
+
     # Install Claude Code hooks from orchestration/plugin/hooks/vessel/
     HOOKS_SRC="/home/coder/workspace/orchestration/plugin/hooks/vessel"
     HOOKS_DST="/home/coder/workspace/.claude/hooks/vessel"
@@ -139,6 +160,15 @@ resource "docker_container" "workspace" {
   # Connect to the openflows_default compose network for Redis access.
   networks_advanced {
     name = "openflows_default"
+  }
+
+  dynamic "volumes" {
+    for_each = var.host_cli_binary != "" ? [var.host_cli_binary] : []
+    content {
+      host_path      = volumes.value
+      container_path = "/opt/host-cli/${var.cli_binary_name}"
+      read_only      = true
+    }
   }
 
   # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
