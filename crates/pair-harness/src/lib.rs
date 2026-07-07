@@ -31,7 +31,7 @@ pub use pair_state::{
     CoderWatcherAdapter, FilesystemPairState, FilesystemWatcher, PairArtifact, PairStateStore,
     PairStateWatcher, PairWatcher, SharedStorePairState, SharedStoreWatcher, WatcherAdapter,
 };
-pub use process::{ProcessManager, SentinelMode};
+pub use process::{GatewayConfigError, ProcessManager, SentinelMode};
 pub use provision::Provisioner;
 pub use reset::ResetManager;
 pub use responses_proxy::start_responses_proxy;

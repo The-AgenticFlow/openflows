@@ -1994,19 +1994,34 @@ impl BatchNode for ForgePairNode {
             backend
         };
 
-        // Resolve model_backend from registry for this worker.
-        // This overrides the OPENAI_MODEL / ANTHROPIC_MODEL env vars
-        // passed to the spawned CLI process, ensuring each agent uses
-        // the model specified in registry.json's model_backend field.
-        let model_backend = if let Some(registry_path) = &self.registry_path {
+        // Resolve model_backend and ai_gateway_enabled for this worker.
+        //
+        // `model_backend` overrides the OPENAI_MODEL / ANTHROPIC_MODEL env
+        // vars passed to the spawned CLI, ensuring each agent uses the model
+        // from registry.json's `model_backend` field.
+        //
+        // `ai_gateway_enabled` controls whether the Coder AI Gateway (premium
+        // feature) manages model selection. The `USE_AI_GATEWAY` env var is
+        // the authority; when unset, fall back to the per-agent
+        // `coder_module.params.enable_ai_gateway` in registry.json. When
+        // enabled and running in a Coder workspace, the harness omits
+        // `--model` so the gateway picks the model. This resolution is
+        // shared with the Coder tfvars provisioner via
+        // `config::registry::resolve_ai_gateway_enabled` so the deployed
+        // workspace's `coder_ai_gateway` tfvar and the runtime flag agree.
+        let (model_backend, ai_gateway_enabled) = if let Some(registry_path) = &self.registry_path {
             let registry = config::Registry::load(registry_path)?;
             let base_id = worker_id
                 .rfind('-')
                 .map(|i| &worker_id[..i])
                 .unwrap_or(&worker_id);
-            let model = registry
-                .get(base_id)
-                .and_then(|entry| entry.model_backend.clone());
+            let entry = registry.get(base_id);
+            let model = entry.and_then(|e| e.model_backend.clone());
+            let module_default = entry
+                .and_then(|e| e.coder_module.as_ref())
+                .map(|m| m.ai_gateway_enabled())
+                .unwrap_or(false);
+            let gw = config::registry::resolve_ai_gateway_enabled(module_default);
             if let Some(ref m) = model {
                 info!(worker_id, base_id, model = %m, "Model backend resolved from registry");
             } else {
@@ -2015,9 +2030,12 @@ impl BatchNode for ForgePairNode {
                     base_id, "No model_backend in registry, using env var default"
                 );
             }
-            model
+            info!(worker_id, base_id, ai_gateway_enabled = gw, "AI Gateway flag resolved");
+            (model, gw)
         } else {
-            None
+            // No registry: resolve gateway from env var, default false.
+            let gw = config::registry::resolve_ai_gateway_enabled(false);
+            (None, gw)
         };
 
         let use_coder_workspace = matches!(slot.workspace_provider, WorkspaceProvider::Coder)
@@ -2086,17 +2104,44 @@ impl BatchNode for ForgePairNode {
             .with_coder_remote_paths("/home/coder/workspace")
             .with_cli_backend(cli_backend)
             .with_model_backend(model_backend)
+            .with_ai_gateway_enabled(ai_gateway_enabled)
         } else {
             PairConfig::new(&worker_id, &ticket_id, &self.workspace_root, &worker_token)
                 .with_cli_backend(cli_backend)
                 .with_model_backend(model_backend)
+                .with_ai_gateway_enabled(ai_gateway_enabled)
         };
 
         let mut pair = ForgeSentinelPair::new(config);
-        let outcome = pair
-            .run(&ticket)
-            .await
-            .map_err(|e| anyhow!("Pair lifecycle failed: {:#}", e))?;
+        let outcome = pair.run(&ticket).await;
+
+        // Spawn-time gateway misconfiguration (typed `GatewayConfigError`)
+        // is converted to a `blocked` outcome with audit/blocker handling,
+        // matching the `PairOutcome::Blocked` arm below — instead of a hard
+        // lifecycle `Err` that bypasses blocker recording.
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                if e.downcast_ref::<pair_harness::GatewayConfigError>().is_some() {
+                    let reason = format!("{:#}", e);
+                    warn!(
+                        worker = worker_id,
+                        ticket = ticket_id,
+                        reason = %reason,
+                        "Pair blocked at spawn — Coder AI Gateway misconfigured"
+                    );
+                    return Ok(json!({
+                        "worker_id": worker_id,
+                        "ticket_id": ticket_id,
+                        "outcome": "blocked",
+                        "reason": reason,
+                        "blockers": [],
+                    }));
+                }
+                // Non-gateway spawn failure — propagate as a hard lifecycle Err.
+                return Err(anyhow!("Pair lifecycle failed: {:#}", e));
+            }
+        };
 
         match outcome {
             PairOutcome::PrOpened {

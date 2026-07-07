@@ -81,6 +81,12 @@ pub struct PairConfig {
     /// Coder API token for authentication.
     /// Only used when workspace_provider is Coder.
     pub coder_api_token: Option<String>,
+    /// Whether the Coder AI Gateway (premium feature) manages model selection.
+    /// When `true` and `workspace_provider` is `Coder`, the harness omits
+    /// `--model` from the spawned CLI so the gateway picks the model.
+    /// Driven by the `USE_AI_GATEWAY` env var (authority), falling back to
+    /// the registry's per-agent `coder_module.params.enable_ai_gateway`.
+    pub ai_gateway_enabled: bool,
 }
 
 impl PairConfig {
@@ -174,6 +180,7 @@ impl PairConfig {
             coder_workspace_id,
             coder_url: None,
             coder_api_token: None,
+            ai_gateway_enabled: false,
         }
     }
 
@@ -213,6 +220,7 @@ impl PairConfig {
             coder_workspace_id: Some(coder_workspace_id),
             coder_url: Some(coder_url.into()),
             coder_api_token: Some(coder_api_token.into()),
+            ai_gateway_enabled: false,
         }
     }
 
@@ -245,6 +253,7 @@ impl PairConfig {
             coder_workspace_id: None,
             coder_url: None,
             coder_api_token: None,
+            ai_gateway_enabled: false,
         }
     }
 
@@ -312,6 +321,14 @@ impl PairConfig {
     /// Set the model backend override.
     pub fn with_model_backend(mut self, model: Option<String>) -> Self {
         self.model_backend = model.filter(|m| !m.is_empty());
+        self
+    }
+
+    /// Set whether the Coder AI Gateway manages model selection.
+    /// When `true` and `workspace_provider` is `Coder`, the harness omits
+    /// `--model` from the spawned CLI so the gateway picks the model.
+    pub fn with_ai_gateway_enabled(mut self, enabled: bool) -> Self {
+        self.ai_gateway_enabled = enabled;
         self
     }
 }

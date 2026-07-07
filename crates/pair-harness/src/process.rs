@@ -955,7 +955,62 @@ pub struct ProcessManager {
     /// Coder client for workspace execution.
     #[cfg(feature = "coder")]
     coder_client: Option<coder_client::CoderClient>,
+    /// Whether the Coder AI Gateway (premium feature) manages model selection.
+    /// When `true` and `workspace_provider` is `Coder`, the harness omits
+    /// `--model` from the spawned CLI so the gateway picks the model.
+    /// Driven by the `USE_AI_GATEWAY` env var (authority), falling back to
+    /// the registry's per-agent `coder_module.params.enable_ai_gateway`.
+    ai_gateway_enabled: bool,
+    /// Model discovered from the Coder AI Gateway via `list_chat_models()`,
+    /// populated lazily by `discover_gateway_model()` in the async spawn
+    /// path. When set, the harness injects this clean, verified model as
+    /// `--model` instead of delegating to the gateway's (potentially broken)
+    /// auto-default. Mutex because the discovery runs in async context but
+    /// `resolve_cli_model()` is sync.
+    discovered_gateway_model: std::sync::Mutex<Option<String>>,
 }
+
+/// Resolved model-selection decision for a spawned CLI.
+///
+/// `GatewayDelegated` means the harness omits `--model` so the Coder AI
+/// Gateway (premium feature) picks the model from its configured list.
+/// `Inject(clean)` means the harness passes `--model <clean>` to the CLI.
+/// `None` means no model pinning (the CLI uses its own default / env var).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliModelResolution {
+    GatewayDelegated,
+    Inject(String),
+    None,
+}
+
+/// Typed error raised by `discover_gateway_model` when the Coder AI Gateway
+/// is enabled but cannot serve a usable model (empty list or unreachable).
+///
+/// Carrying this as a typed marker (rather than a bare `anyhow` string) lets
+/// the caller distinguish a *gateway misconfiguration* — which should surface
+/// as a `PairOutcome::Blocked` so it gets audit/blocker handling — from a
+/// transient or unrelated spawn failure that should propagate as a hard
+/// lifecycle `Err`. See `agent_forge::ForgePairNode` for the downcast.
+#[derive(Debug)]
+pub struct GatewayConfigError {
+    pub reason: String,
+}
+
+impl GatewayConfigError {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for GatewayConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for GatewayConfigError {}
 
 impl ProcessManager {
     /// Create a new ProcessManager with default CLI backend (Claude).
@@ -1010,6 +1065,8 @@ impl ProcessManager {
             coder_workspace_id: None,
             #[cfg(feature = "coder")]
             coder_client: None,
+            ai_gateway_enabled: false,
+            discovered_gateway_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -1065,6 +1122,8 @@ impl ProcessManager {
             coder_workspace_id: None,
             #[cfg(feature = "coder")]
             coder_client: None,
+            ai_gateway_enabled: false,
+            discovered_gateway_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -1120,6 +1179,8 @@ impl ProcessManager {
             coder_workspace_id: None,
             #[cfg(feature = "coder")]
             coder_client: None,
+            ai_gateway_enabled: false,
+            discovered_gateway_model: std::sync::Mutex::new(None),
         }
     }
 
@@ -1135,6 +1196,204 @@ impl ProcessManager {
     pub fn with_model_backend(mut self, model: Option<String>) -> Self {
         self.model_backend = model.filter(|m| !m.is_empty());
         self
+    }
+
+    /// Set whether the Coder AI Gateway manages model selection.
+    /// When `true` and `workspace_provider` is `Coder`, the harness omits
+    /// `--model` from the spawned CLI so the gateway picks the model.
+    pub fn with_ai_gateway_enabled(mut self, enabled: bool) -> Self {
+        self.ai_gateway_enabled = enabled;
+        self
+    }
+
+    /// Strip ANSI/terminal escape sequences from a string. Some upstream
+    /// sources (CLI `models` output, gateway endpoints that colorize) embed
+    /// SGR codes (e.g. `ESC[1m`) in model names, which then 404 at the API.
+    /// This sanitises them defensively.
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // Skip CSI sequence: ESC '[' ... terminal letter
+                i += 2;
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume the final letter
+                }
+                continue;
+            }
+            // Also strip bare CSI without leading ESC (e.g. "[1m" leaked)
+            if bytes[i] == b'[' {
+                let mut j = i + 1;
+                let mut saw_param = false;
+                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b'm') {
+                    if bytes[j] == b'm' {
+                        // Looks like a leaked SGR "[Nm" — skip it
+                        i = j + 1;
+                        saw_param = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if saw_param {
+                    continue;
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    /// Pick a preferred model from the gateway's available list.
+    /// Prefers capable Claude models in a sensible order, then any claude-*
+    /// model, then the first available. Returns `None` if the list is empty.
+    /// Strips ANSI codes and provider prefixes from the chosen model id.
+    #[cfg(feature = "coder")]
+    fn pick_gateway_model(models: &[coder_client::ModelInfo]) -> Option<String> {
+        const PREFERRED: &[&str] = &[
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-1",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+        ];
+        let ids: Vec<String> = models
+            .iter()
+            .map(|m| Self::strip_ansi(&m.id).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for pref in PREFERRED {
+            if let Some(id) = ids.iter().find(|id| {
+                let bare = strip_provider_prefix(id);
+                bare == *pref || id.as_str() == *pref
+            }) {
+                return Some(strip_provider_prefix(id).to_string());
+            }
+        }
+        // Any claude-* model
+        if let Some(id) = ids.iter().find(|id| {
+            let bare = strip_provider_prefix(id);
+            bare.starts_with("claude-")
+        }) {
+            return Some(strip_provider_prefix(id).to_string());
+        }
+        // First available, prefix-stripped
+        ids.first().map(|id| strip_provider_prefix(id).to_string())
+    }
+
+    /// Discover available models from the Coder AI Gateway and cache a clean,
+    /// preferred model in `discovered_gateway_model`. Called from the async
+    /// Coder spawn path before `build_*_command`.
+    ///
+    /// Returns `Err(GatewayConfigError)` when the gateway is enabled but
+    /// either the `list_chat_models()` call fails (gateway unreachable) or
+    /// the gateway returns zero models (no default chat model config). The
+    /// caller (`agent_forge::ForgePairNode`) downcasts this typed error and
+    /// surfaces it as a `PairOutcome::Blocked` so it gets audit/blocker
+    /// handling — instead of the 5× rapid-exit death-loop that would
+    /// otherwise occur on the CLI's `model_not_found` 404. Non-gateway spawn
+    /// failures propagate as a hard lifecycle `Err` unchanged.
+    #[cfg(feature = "coder")]
+    pub async fn discover_gateway_model(&self) -> Result<()> {
+        if !self.ai_gateway_enabled
+            || !matches!(
+                self.workspace_provider,
+                crate::types::WorkspaceProvider::Coder
+            )
+        {
+            return Ok(());
+        }
+        // Fast-path: a model was already discovered for this process lifetime
+        // (the same ProcessManager is reused across the FORGE then SENTINEL
+        // spawns of a pair). Counting on the client's 5-min HTTP cache alone
+        // still re-runs pick+lock churn on every spawn; skip it entirely once
+        // resolved. This also limits a gateway blip to a single discovery per
+        // pair rather than every spawn in the pair lifecycle.
+        if let Ok(guard) = self.discovered_gateway_model.lock() {
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let Some(client) = &self.coder_client else {
+            return Err(GatewayConfigError::new(
+                "AI Gateway is enabled (USE_AI_GATEWAY=true) but the Coder \
+                 client is not configured — cannot discover models. \
+                 Fix: ensure CODER_URL / CODER_API_TOKEN are set, or disable \
+                 the gateway with USE_AI_GATEWAY=false and provide a direct \
+                 API key + valid model_backend in registry.json."
+            )
+            .into());
+        };
+        // Listing failure (network / timeout / 5xx) is treated as a
+        // *transient* gateway availability issue and retried with a short
+        // backoff before escalating — distinct from the permanent
+        // misconfiguration of an empty-but-200 model list. Persistently
+        // unreachable gateways still surface as a typed GatewayConfigError so
+        // agent_forge routes them to a `blocked` outcome instead of a rapid
+        // CLI 404 death-loop.
+        const MAX_ATTEMPTS: usize = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        let mut last_err: Option<String> = None;
+        let mut models: Option<Vec<_>> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            match client.list_chat_models().await {
+                Ok(m) => {
+                    models = Some(m);
+                    break;
+                }
+                Err(e) => last_err = Some(format!("{e}")),
+            }
+        }
+        let models = match models {
+            Some(m) => m,
+            None => {
+                return Err(GatewayConfigError::new(format!(
+                    "AI Gateway is enabled (USE_AI_GATEWAY=true) but listing \
+                     models failed after {MAX_ATTEMPTS} attempts: {}. The \
+                     gateway is unreachable or misconfigured. Fix: verify the \
+                     Coder deployment and AI Gateway, or set \
+                     USE_AI_GATEWAY=false and provide a direct API key + valid \
+                     model_backend in registry.json.",
+                    last_err.unwrap_or_else(|| "unknown error".into())
+                ))
+                .into());
+            }
+        };
+        info!(count = models.len(), "Discovered models from Coder AI Gateway");
+        for m in &models {
+            let clean = Self::strip_ansi(&m.id).trim().to_string();
+            let suffix = if clean != m.id { format!(" (raw: {:?})", m.id) } else { String::new() };
+            debug!(id = %clean, name = %m.name, provider = %m.provider, "gateway model{}", suffix);
+        }
+        match Self::pick_gateway_model(&models) {
+            Some(m) => {
+                info!(model = %m, "Selected model from Coder AI Gateway list — will inject as --model to override gateway default");
+                if let Ok(mut guard) = self.discovered_gateway_model.lock() {
+                    *guard = Some(m);
+                }
+                Ok(())
+            }
+            None => Err(GatewayConfigError::new(
+                "AI Gateway is enabled (USE_AI_GATEWAY=true) but \
+                 returned ZERO models from its chat-models endpoint — \
+                 the gateway has no usable model to serve. Spawning \
+                 the CLI would 404 with model_not_found on its \
+                 (corrupted) auto-default. Fix: configure a default \
+                 chat model in Coder (Admin → Models), or set \
+                 USE_AI_GATEWAY=false and provide a direct API key \
+                 + valid model_backend in registry.json."
+            )
+            .into()),
+        }
     }
 
     /// Configure Coder workspace execution.
@@ -1447,6 +1706,54 @@ trust_level = "trusted"
         self.proxy_api_key.as_deref()
     }
 
+    /// Resolve the `--model` decision for a CLI backend.
+    ///
+    /// When the `USE_AI_GATEWAY`-driven `ai_gateway_enabled` flag is set and
+    /// we're running in a Coder workspace, model selection is delegated to the
+    /// gateway. Otherwise, `model_backend` (from registry.json) takes
+    /// precedence, with a fallback to the backend-specific env var
+    /// (`OPENAI_MODEL`, `ANTHROPIC_MODEL`, …). Provider prefixes
+    /// (e.g. `anthropic/`) are stripped because CLI backends expect bare
+    /// model names.
+    ///
+    /// `model_env_value` is the resolved value of the backend's model env var
+    /// (None when unset/empty) — passed as a parameter so the decision is pure
+    /// and unit-testable without touching the global process environment.
+    pub(crate) fn resolve_cli_model(
+        &self,
+        backend: CliBackend,
+        model_env_value: Option<&str>,
+    ) -> CliModelResolution {
+        let config = self.get_backend(backend);
+        if self.ai_gateway_enabled
+            && matches!(self.workspace_provider, crate::types::WorkspaceProvider::Coder)
+        {
+            // Gateway manages auth/routing. If we discovered a clean, valid
+            // model from the gateway's own list, inject it explicitly to
+            // override the gateway's (sometimes broken) auto-default. Only
+            // delegate selection when discovery failed.
+            if let Ok(guard) = self.discovered_gateway_model.lock() {
+                if let Some(m) = &*guard {
+                    return CliModelResolution::Inject(m.clone());
+                }
+            }
+            return CliModelResolution::GatewayDelegated;
+        }
+        if let Some(model) = &self.model_backend {
+            if !model.is_empty() {
+                return CliModelResolution::Inject(strip_provider_prefix(model).to_string());
+            }
+        }
+        if config.model_env.is_some() {
+            if let Some(model) = model_env_value {
+                if !model.is_empty() {
+                    return CliModelResolution::Inject(strip_provider_prefix(model).to_string());
+                }
+            }
+        }
+        CliModelResolution::None
+    }
+
     /// Build a command for the given CLI backend.
     fn build_cli_command(&self, backend: CliBackend, _worktree: &Path, _shared: &Path) -> Command {
         let config = self.get_backend(backend);
@@ -1456,24 +1763,25 @@ trust_level = "trusted"
             cmd.arg(arg);
         }
 
-        // Pass model from ProcessManager's model_backend override (from registry.json)
-        // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
-        // Provider prefixes (e.g. "anthropic/") are stripped because CLI backends
-        // expect bare model names.
-        if let Some(model) = &self.model_backend {
-            if !model.is_empty() {
-                let clean = strip_provider_prefix(model);
-                cmd.arg("--model").arg(clean);
-                info!(model = %model, clean_model = %clean, "{}: using model from registry model_backend", backend.as_str());
+        // Resolve model: when the Coder AI Gateway (premium feature) is
+        // enabled and we're running in a Coder workspace, model selection is
+        // delegated to the gateway — omit `--model` so it picks from its
+        // list. Otherwise inject `--model <clean>` from registry's
+        // model_backend or the backend-specific env var.
+        let model_env_value = config
+            .model_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok());
+        match self.resolve_cli_model(backend, model_env_value.as_deref()) {
+            CliModelResolution::GatewayDelegated => info!(
+                "{}: AI Gateway enabled — delegating model selection to Coder AI Gateway, skipping --model",
+                backend.as_str()
+            ),
+            CliModelResolution::Inject(clean) => {
+                cmd.arg("--model").arg(&clean);
+                info!(clean_model = %clean, "{}: using model from registry model_backend", backend.as_str());
             }
-        } else if let Some(model_env) = &config.model_env {
-            if let Ok(model) = std::env::var(model_env) {
-                if !model.is_empty() {
-                    let clean = strip_provider_prefix(&model);
-                    cmd.arg("--model").arg(clean);
-                    info!(model = %model, clean_model = %clean, "{}: using model from {}", backend.as_str(), model_env);
-                }
-            }
+            CliModelResolution::None => {}
         }
 
         // Codex CLI provider configuration — determined at startup based on
@@ -1620,24 +1928,23 @@ trust_level = "trusted"
         cmd.arg("--sandbox");
         cmd.arg("workspace-write");
 
-        // Pass model from ProcessManager's model_backend override (from registry.json)
-        // or fall back to the backend-specific env var (OPENAI_MODEL, ANTHROPIC_MODEL, etc.)
-        // Provider prefixes (e.g. "anthropic/") are stripped because CLI backends
-        // expect bare model names.
-        if let Some(model) = &self.model_backend {
-            if !model.is_empty() {
-                let clean = strip_provider_prefix(model);
-                cmd.arg("--model").arg(clean);
-                info!(model = %model, clean_model = %clean, "{}: using model from registry model_backend (sentinel)", backend.as_str());
+        // Model selection: delegate to resolve_cli_model() so the gating
+        // logic (AI Gateway delegation vs --model injection) is shared with
+        // build_cli_command and unit-tested in one place.
+        let model_env_value = config
+            .model_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok());
+        match self.resolve_cli_model(backend, model_env_value.as_deref()) {
+            CliModelResolution::GatewayDelegated => info!(
+                "{}: AI Gateway enabled — delegating model selection to Coder AI Gateway, skipping --model (sentinel)",
+                backend.as_str()
+            ),
+            CliModelResolution::Inject(clean) => {
+                cmd.arg("--model").arg(&clean);
+                info!(clean_model = %clean, "{}: using model from registry model_backend (sentinel)", backend.as_str());
             }
-        } else if let Some(model_env) = &config.model_env {
-            if let Ok(model) = std::env::var(model_env) {
-                if !model.is_empty() {
-                    let clean = strip_provider_prefix(&model);
-                    cmd.arg("--model").arg(clean);
-                    info!(model = %model, clean_model = %clean, "{}: using model from {} (sentinel)", backend.as_str(), model_env);
-                }
-            }
+            CliModelResolution::None => {}
         }
 
         // Codex CLI provider configuration (same probe-based logic as FORGE)
@@ -1893,6 +2200,14 @@ trust_level = "trusted"
             .await
             .context("Failed to write FORGE prompt into Coder workspace")?;
 
+        // Discover a clean, valid model from the Coder AI Gateway before
+        // building the command, so we can override a broken gateway default.
+        // Aborts the spawn with a typed `GatewayConfigError` if the gateway is
+        // empty or unreachable — `agent_forge::ForgePairNode` converts that
+        // into a `PairOutcome::Blocked` (audit + blocker recording) rather
+        // than the 5× rapid-exit death-loop.
+        self.discover_gateway_model().await?;
+
         let mut cmd = self.build_cli_command(backend, worktree, shared);
         self.configure_coder_command(
             &mut cmd,
@@ -2016,6 +2331,14 @@ trust_level = "trusted"
             .workspace_write_file(&workspace_id, &prompt_file, &prompt)
             .await
             .context("Failed to write SENTINEL prompt into Coder workspace")?;
+
+        // Discover a clean, valid model from the Coder AI Gateway before
+        // building the command, so we can override a broken gateway default.
+        // Aborts the spawn with a typed `GatewayConfigError` if the gateway is
+        // empty or unreachable — `agent_forge::ForgePairNode` converts that
+        // into a `PairOutcome::Blocked` (audit + blocker recording) rather
+        // than the 5× rapid-exit death-loop.
+        self.discover_gateway_model().await?;
 
         let segment = mode.segment_value();
         let mut cmd = self.build_sentinel_command(backend, worktree, shared);
@@ -3400,5 +3723,173 @@ mod tests {
         let config = manager.get_backend(CliBackend::Codex);
         let expected_codex_home = worktree.join(".codex-home");
         assert_eq!(config.home_dir(&worktree), expected_codex_home);
+    }
+
+    /// Hermetic model-resolution tests. These assert the AI-Gateway gating
+    /// without spawning any CLI: `resolve_cli_model` is a pure decision the
+    /// command builders consult, so we test it directly.
+    fn make_manager(worktree: &Path, shared: &Path) -> ProcessManager {
+        std::fs::create_dir_all(worktree).unwrap();
+        std::fs::create_dir_all(shared).unwrap();
+        ProcessManager::new("ghp_test", worktree, shared)
+    }
+
+    #[test]
+    fn test_model_resolution_gateway_enabled_skips_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(Some("anthropic/claude-haiku-4-5-20251001".to_string()))
+            .with_ai_gateway_enabled(true)
+            .with_coder_config("https://coder.example.com", "tok", "ws-id");
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        assert_eq!(decision, CliModelResolution::GatewayDelegated);
+    }
+
+    #[test]
+    fn test_model_resolution_gateway_disabled_injects_model_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(Some("anthropic/claude-haiku-4-5-20251001".to_string()))
+            .with_ai_gateway_enabled(false)
+            .with_coder_config("https://coder.example.com", "tok", "ws-id");
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        assert_eq!(
+            decision,
+            CliModelResolution::Inject("claude-haiku-4-5-20251001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_resolution_gateway_enabled_local_mode_still_injects() {
+        // In Local mode the gateway is irrelevant — model_backend must still
+        // be injected so direct-API / LiteLLM-proxy routing keeps working.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(Some("anthropic/claude-haiku-4-5-20251001".to_string()))
+            .with_ai_gateway_enabled(true); // gateway flag set but provider is Local
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        assert_eq!(
+            decision,
+            CliModelResolution::Inject("claude-haiku-4-5-20251001".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_resolution_no_model_falls_back_to_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(None)
+            .with_ai_gateway_enabled(false)
+            .with_coder_config("https://coder.example.com", "tok", "ws-id");
+        let decision =
+            manager.resolve_cli_model(CliBackend::Claude, Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(
+            decision,
+            CliModelResolution::Inject("claude-sonnet-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_resolution_no_model_no_env_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(None)
+            .with_ai_gateway_enabled(false);
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        assert_eq!(decision, CliModelResolution::None);
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_sgr_codes() {
+        use super::ProcessManager;
+        // Full CSI sequence with leading ESC
+        assert_eq!(ProcessManager::strip_ansi("claude-opus-4-8\u{1b}[1m"), "claude-opus-4-8");
+        // Leaked CSI without leading ESC (the corruption seen in production logs)
+        assert_eq!(ProcessManager::strip_ansi("claude-opus-4-8[1m"), "claude-opus-4-8");
+        // Multiple codes
+        assert_eq!(
+            ProcessManager::strip_ansi("\u{1b}[1mclaude\u{1b}[0m-sonnet"),
+            "claude-sonnet"
+        );
+        // No codes — unchanged
+        assert_eq!(ProcessManager::strip_ansi("claude-sonnet-4-5"), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    #[cfg(feature = "coder")]
+    fn test_pick_gateway_model_prefers_sonnet() {
+        let models = vec![
+            coder_client::ModelInfo {
+                id: "claude-opus-4-8[1m".to_string(),
+                name: "Opus".to_string(),
+                display_name: "Opus".to_string(),
+                provider: "anthropic".to_string(),
+            },
+            coder_client::ModelInfo {
+                id: "anthropic/claude-sonnet-4-5".to_string(),
+                name: "Sonnet".to_string(),
+                display_name: "Sonnet".to_string(),
+                provider: "anthropic".to_string(),
+            },
+        ];
+        // Should prefer the listed Sonnet AND strip ANSI/prefix from it.
+        assert_eq!(
+            ProcessManager::pick_gateway_model(&models),
+            Some("claude-sonnet-4-5".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "coder")]
+    fn test_pick_gateway_model_strips_ansi_from_corrupted_default() {
+        // The broken production default, here as the only available model.
+        let models = vec![coder_client::ModelInfo {
+            id: "claude-opus-4-8[1m".to_string(),
+            name: "Opus".to_string(),
+            display_name: "Opus".to_string(),
+            provider: "anthropic".to_string(),
+        }];
+        assert_eq!(
+            ProcessManager::pick_gateway_model(&models),
+            Some("claude-opus-4-8".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "coder")]
+    fn test_pick_gateway_model_empty_returns_none() {
+        assert_eq!(ProcessManager::pick_gateway_model(&[]), None);
+    }
+
+    #[test]
+    fn test_resolve_cli_model_uses_discovered_gateway_model_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_model_backend(Some("anthropic/claude-haiku-4-5-20251001".to_string()))
+            .with_ai_gateway_enabled(true)
+            .with_coder_config("https://coder.example.com", "tok", "ws-id");
+        // Simulate a successful discovery caching a clean model.
+        *manager.discovered_gateway_model.lock().unwrap() =
+            Some("claude-sonnet-4-5".to_string());
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        // Discovered model wins over both model_backend and GatewayDelegated.
+        assert_eq!(
+            decision,
+            CliModelResolution::Inject("claude-sonnet-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gateway_config_error_is_typed_and_displayable() {
+        // The error must implement std::error::Error so agent_forge can
+        // downcast an anyhow::Error to it and route gateway misconfig to a
+        // PairOutcome::Blocked (audit + blockers) instead of a hard Err.
+        let err = GatewayConfigError::new("gateway returned zero models");
+        let any: anyhow::Error = err.into();
+        assert!(any.downcast_ref::<GatewayConfigError>().is_some());
+        assert_eq!(format!("{}", any), "gateway returned zero models");
+        // Confirm it satisfies the std::error::Error trait via the source.
+        let typed = any.downcast_ref::<GatewayConfigError>().unwrap();
+        assert!(std::error::Error::source(typed).is_none());
     }
 }

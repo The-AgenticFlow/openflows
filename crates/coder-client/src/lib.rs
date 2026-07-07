@@ -54,6 +54,79 @@ pub struct CoderClient {
     cached_models: Arc<RwLock<Option<Vec<crate::types::ModelInfo>>>>,
 }
 
+/// Parse the JSON body returned by `GET /api/experimental/chats/models`.
+///
+/// Coder nests models under a top-level `providers` array:
+/// `{"providers":[{"provider":"openai-compat","models":[
+///     {"id":"openai-compat:adorsys-reviewer-pro","model":"adorsys-reviewer-pro",...}]}]}`.
+/// Some older/alternate shapes expose a top-level `models` array. Both are
+/// supported here (entry is keyed by `id`, de-duplicated). Each model's `id` is
+/// normalized to the bare model name the gateway routes on — preferring the
+/// `model` field, and otherwise stripping a `provider:` colon prefix from
+/// `id` (e.g. `openai-compat:adorsys-reviewer-pro` -> `adorsys-reviewer-pro`)
+/// — so downstream CLI `--model` injection never leaks a prefixed id that the
+/// gateway rejects with model_not_found.
+fn parse_chat_models_body(body: &serde_json::Value) -> Vec<crate::types::ModelInfo> {
+    use serde_json::Value;
+
+    fn normalize_id(m: &mut crate::types::ModelInfo, v: &Value) {
+        if let Some(bare) = v.get("model").and_then(Value::as_str) {
+            let bare = bare.trim();
+            if !bare.is_empty() {
+                m.id = bare.to_string();
+                return;
+            }
+        }
+        if let Some((_, rhs)) = m.id.rsplit_once(':') {
+            let rhs = rhs.trim();
+            if !rhs.is_empty() {
+                m.id = rhs.to_string();
+            }
+        }
+    }
+
+    fn from_value(v: &Value) -> Option<crate::types::ModelInfo> {
+        let mut m: crate::types::ModelInfo = serde_json::from_value(v.clone()).ok()?;
+        normalize_id(&mut m, v);
+        Some(m)
+    }
+
+    fn add(
+        m: crate::types::ModelInfo,
+        models: &mut Vec<crate::types::ModelInfo>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if seen.insert(m.id.clone()) {
+            models.push(m);
+        }
+    }
+
+    let mut models: Vec<crate::types::ModelInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Canonical current Coder shape: `providers[].models`.
+    if let Some(providers) = body.get("providers").and_then(Value::as_array) {
+        for provider in providers {
+            if let Some(arr) = provider.get("models").and_then(Value::as_array) {
+                for v in arr {
+                    if let Some(m) = from_value(v) {
+                        add(m, &mut models, &mut seen);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback/legacy shape: top-level `models` array.
+    if let Some(arr) = body.get("models").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(m) = from_value(v) {
+                add(m, &mut models, &mut seen);
+            }
+        }
+    }
+    models
+}
+
 impl CoderClient {
     pub fn new(base_url: &str, token: &str) -> Self {
         Self {
@@ -1171,15 +1244,7 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await?;
-            let models: Vec<crate::types::ModelInfo> = body
-                .get("models")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let models = parse_chat_models_body(&body);
 
             // Update cache
             {
@@ -1205,15 +1270,7 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let body: serde_json::Value = resp.json().await?;
-            let models = body
-                .get("models")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let models = parse_chat_models_body(&body);
             Ok(models)
         } else {
             bail!("Failed to list chat models: {}", resp.status())
@@ -1428,5 +1485,88 @@ fn canonicalize_host_path(p: &str) -> String {
     match std::fs::canonicalize(p) {
         Ok(resolved) => resolved.to_string_lossy().into_owned(),
         Err(_) => p.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_chat_models_body;
+
+    #[test]
+    fn flattens_provider_nested_models_and_normalizes_id() {
+        let body = serde_json::json!({
+            "providers": [{
+                "provider": "openai-compat",
+                "available": true,
+                "models": [
+                    {"id":"openai-compat:adorsys-reviewer-pro","provider":"openai-compat","model":"adorsys-reviewer-pro","display_name":"adorsys-reviewer-pro"}
+                ]
+            }]
+        });
+        let models = parse_chat_models_body(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "adorsys-reviewer-pro");
+        assert_eq!(models[0].provider, "openai-compat");
+        assert_eq!(models[0].display_name, "adorsys-reviewer-pro");
+    }
+
+    #[test]
+    fn keeps_top_level_models_shape() {
+        let body = serde_json::json!({
+            "models": [
+                {"id":"anthropic/claude-sonnet-4-5","provider":"anthropic","model":"claude-sonnet-4-5-20250929","display_name":"Sonnet"}
+            ]
+        });
+        let models = parse_chat_models_body(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn empty_when_no_models_anywhere() {
+        let body = serde_json::json!({"providers": []});
+        assert!(parse_chat_models_body(&body).is_empty());
+        assert!(parse_chat_models_body(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_id_when_model_field_missing() {
+        let body = serde_json::json!({
+            "providers": [{
+                "models": [
+                    {"id":"some-model","provider":"p"}
+                ]
+            }]
+        });
+        let models = parse_chat_models_body(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "some-model");
+    }
+
+    #[test]
+    fn strips_colon_provider_prefix_when_model_field_missing() {
+        let body = serde_json::json!({
+            "providers": [{
+                "models": [
+                    {"id":"openai-compat:adorsys-reviewer-pro","provider":"openai-compat"}
+                ]
+            }]
+        });
+        let models = parse_chat_models_body(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "adorsys-reviewer-pro");
+    }
+
+    #[test]
+    fn dedupes_across_canonical_and_legacy_shapes() {
+        let body = serde_json::json!({
+            "providers": [{
+                "models": [{"id":"openai-compat:x","model":"x","provider":"openai-compat"}]
+            }],
+            "models": [{"id":"openai-compat:x","model":"x","provider":"openai-compat"}]
+        });
+        let models = parse_chat_models_body(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "x");
     }
 }

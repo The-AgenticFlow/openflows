@@ -1,18 +1,20 @@
 # OpenFlows Demo Guide
 
-This guide walks you through running a complete autonomous development cycle, from zero to a working application.
+This guide walks you through running a complete autonomous development cycle, from zero to a working application. OpenFlows runs in two modes — **Coder mode** (ephemeral governed workspaces, recommended) and **Local mode** (local git worktrees). Both paths are covered.
 
 ## Prerequisites
 
-1. **API Keys Required**:
-   - `ANTHROPIC_API_KEY` - For Claude Code (forge worker)
-   - `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `ANTHROPIC_API_KEY` - For Nexus orchestrator (LLM provider)
-   - `GITHUB_PERSONAL_ACCESS_TOKEN` - For GitHub MCP operations (create PRs, push code)
+1. **API Keys Required:**
+   - `GITHUB_PERSONAL_ACCESS_TOKEN` — For GitHub MCP operations (create PRs, push code)
+   - A provider key — in Coder mode with AI Gateway, this lives in the Coder control plane (or `litellm_config.yaml` as fallback); in Local mode it goes in `.env`:
+     - `ANTHROPIC_API_KEY` — Claude Code (forge worker)
+     - `OPENAI_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` — for AUX per-role routing in LiteLLM config
 
-2. **Tools Required**:
-   - Rust 1.70+ (`rustc --version`)
-   - Node.js 18+ (`node --version`) - For GitHub MCP server
-   - Claude Code CLI (`claude --version`) - Install from [Anthropic](https://www.anthropic.com/claude-code)
+2. **Tools Required:**
+   - Docker 24+ — only for Coder mode (`docker compose --profile coder up`)
+   - Rust 1.70+ (`rustc --version`) — only for building from source / Local mode
+   - Node.js 18+ (`node --version`) — for the GitHub MCP server
+   - Claude Code CLI (`claude --version`) — only required on the host for Local mode; in Coder mode it installs inside the workspace via the [Coder Registry module](https://registry.coder.com)
 
 ## Setup
 
@@ -94,7 +96,17 @@ gh issue create --title "Add UI styling" --body "Style the calculator with a mod
 
 ### Start the Orchestration
 
-**If you have direct Anthropic API access** (or a LiteLLM proxy that supports Anthropic format):
+**Coder mode (recommended) — full ephemeral workspace stack:**
+
+```bash
+docker compose --profile coder up
+```
+
+The `CoderBootstrapper` provisions the Coder admin user and pushes the role workspace templates on startup. NEXUS then creates an ephemeral Coder workspace per agent per ticket, with the [Claude Code Coder Registry module](https://registry.coder.com/coder/claude-code/coder) and AI Gateway enabled (LLM keys stay in the control plane).
+
+**Local mode — agents in local git worktrees:**
+
+If you have direct Anthropic API access (or a LiteLLM proxy that supports Anthropic format):
 
 ```bash
 # From OpenFlows directory
@@ -116,28 +128,37 @@ cargo run --bin openflows
 ```
 [Step 0] NEXUS Node
     |
-    |-- 1. Syncs worker slots from registry.json
+    |-- 1. Syncs worker slots from registry.json (reads workspace_provider per agent)
     |-- 2. Calls list_issues via GitHub MCP to discover open issues
     |-- 3. Matches issues to available workers
     |-- 4. Outputs decision: {"action": "work_assigned", "assign_to": "forge-1", ...}
+    |-- 5. (Coder mode) Provisions an ephemeral Coder workspace from the
+    |       openflows-forge template; the claude-code module installs the CLI
+    |       and wires up AI Gateway routing + managed_settings permissions
     |
     v
 [Step 1] FORGE Node (for each assigned worker)
     |
-    |-- 1. Creates git worktree in workspaces/<repo>/worktrees/forge-1/
-    |-- 2. Spawns Claude Code with forge.agent.md persona
+    |-- 1. (Local) creates git worktree in workspaces/<repo>/worktrees/forge-1/
+    |   (Coder) boots inside the ephemeral Coder workspace — harness binary
+    |       + agent CLI run inside, git pull on the persistent volume
+    |-- 2. Spawns Claude Code with forge.agent.md persona (acceptEdits)
     |-- 3. Claude Code:
     |       |-- Reads the GitHub issue
-    |       |-- Implements the solution
+    |       |-- Writes PLAN.md → CONTRACT.md (the FORGE-SENTINEL planning cycle)
+    |       |-- Implements the solution against the contract
     |       |-- Writes tests
     |       |-- Creates STATUS.json
-    |       |-- (Optional) Opens a PR
-    |-- 4. Parses STATUS.json and updates worker status
+    |       |-- Opens a PR
+    |-- 4. Parses STATUS.json and updates worker status in SharedStore
     |
     v
 [Step 2] NEXUS Node (loop)
     |
+    |-- Dispatches the PR to SENTINEL for adversarial review
     |-- Checks for completed work, open PRs, or blocked workers
+    |-- NEXUS::reconcile() runs — detects orphans, stale workers,
+    |   unmerged PRs, and crashed workspaces (Coder mode), recovering
     |-- Assigns more work if available
     |-- Or returns "no_work" if nothing to do
 ```
@@ -190,21 +211,30 @@ Example STATUS.json:
 OpenFlows/
 |-- orchestration/agent/
 |   |-- agents/
-|   |   |-- nexus.agent.md    # Orchestrator persona
-|   |   |-- forge.agent.md    # Builder persona
-|   |-- registry.json         # Worker slot definitions
+|   |   |-- nexus.agent.md    # Orchestrator persona (plan)
+|   |   |-- forge.agent.md    # Builder persona (acceptEdits)
+|   |   |-- sentinel.agent.md # Reviewer persona (plan)
+|   |   |-- vessel.agent.md   # DevOps persona (acceptEdits)
+|   |   `-- lore.agent.md     # Writer persona (acceptEdits, disabled by default)
+|   |-- registry.json         # team + Coder modules + workspace_provider config
 |
 |-- crates/
-|   |-- agent-nexus/          # Nexus node implementation
-|   |-- agent-forge/          # Forge node implementation
+|   |-- pocketflow-core/      # Flow engine, SharedStore, routing (Node trait)
+|   |-- agent-nexus/          # Nexus node — reconcile() failure recovery
+|   |-- agent-forge/          # Forge node — CONTRACT.md → implementation
+|   |-- agent-sentinel/       # Sentinel node — adversarial review
+|   |-- agent-vessel/         # Vessel node — CI merge + workspace teardown
+|   |-- agent-lore/           # Lore node — documentation
 |   |-- agent-client/         # LLM client + MCP integration
-|   |-- pair-harness/         # Worktree management, process spawning
-|   |-- pocketflow-core/      # Flow engine, shared store, routing
+|   |-- pair-harness/         # Worktree/workspace management, transport, provisioner
+|   |-- coder-client/         # Coder REST/SSH client + CoderBootstrapper (feature-gated)
+|   `-- notifier/             # awaiting_human escalation (Slack/Discord)
 |
 |-- binary/src/bin/
-|   |-- openflows.rs          # Live orchestration entry point
+|   |-- agentflow.rs          # Live orchestration entry point (openflows)
 |   |-- demo.rs               # Mocked demo
 |
+|-- docker-compose.yml        # Coder + Postgres + LiteLLM + Redis + OpenFlows
 |-- .env                      # Your API keys (not in git)
 ```
 

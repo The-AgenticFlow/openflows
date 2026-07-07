@@ -454,7 +454,8 @@ impl ForgeSentinelPair {
                 &config.shared,
             )
             .with_default_backend(cli_backend)
-            .with_model_backend(config.model_backend.clone()),
+            .with_model_backend(config.model_backend.clone())
+            .with_ai_gateway_enabled(config.ai_gateway_enabled),
             (Some(redis_url), None) => ProcessManager::with_redis(
                 &config.github_token,
                 redis_url,
@@ -462,7 +463,8 @@ impl ForgeSentinelPair {
                 &config.shared,
             )
             .with_default_backend(cli_backend)
-            .with_model_backend(config.model_backend.clone()),
+            .with_model_backend(config.model_backend.clone())
+            .with_ai_gateway_enabled(config.ai_gateway_enabled),
             (None, Some(proxy_url)) => ProcessManager::with_proxy(
                 &config.github_token,
                 None,
@@ -471,11 +473,13 @@ impl ForgeSentinelPair {
                 &config.shared,
             )
             .with_default_backend(cli_backend)
-            .with_model_backend(config.model_backend.clone()),
+            .with_model_backend(config.model_backend.clone())
+            .with_ai_gateway_enabled(config.ai_gateway_enabled),
             (None, None) => {
                 ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
                     .with_default_backend(cli_backend)
                     .with_model_backend(config.model_backend.clone())
+                    .with_ai_gateway_enabled(config.ai_gateway_enabled)
             }
         };
         // If Coder workspace is configured, apply Coder-specific settings

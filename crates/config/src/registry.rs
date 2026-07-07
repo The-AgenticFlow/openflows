@@ -138,6 +138,23 @@ impl CoderModule {
     }
 }
 
+/// Resolve the effective AI-Gateway-enabled flag from a single source of
+/// truth: the `USE_AI_GATEWAY` environment variable (authority, accepts
+/// `"true"`/`"1"`), with a fallback to a per-module default.
+///
+/// Both the runtime harness (`agent_forge`) and the Coder tfvars provisioner
+/// (`pair_harness::provision`) call this so the deployed workspace's
+/// `coder_ai_gateway` tfvar and the harness's runtime `ai_gateway_enabled`
+/// flag always agree — preventing split-authority bugs where `USE_AI_GATEWAY=false`
+/// disables harness delegation while an already-provisioned workspace keeps
+/// the gateway wired in.
+pub fn resolve_ai_gateway_enabled(module_default: bool) -> bool {
+    match std::env::var("USE_AI_GATEWAY") {
+        Ok(v) => v == "true" || v == "1",
+        Err(_) => module_default,
+    }
+}
+
 /// Role-specific permission mode defaults for agent modules.
 pub fn default_permission_mode_for_role(role: &str) -> &'static str {
     match role {

@@ -281,7 +281,7 @@ coder_ai_gateway      = {}
                 module.version,
                 module.workdir(),
                 module.permission_mode(),
-                module.ai_gateway_enabled(),
+                config::registry::resolve_ai_gateway_enabled(module.ai_gateway_enabled()),
                 if let Some(m) = model_backend {
                     format!("model_backend         = \"{}\"", m)
                 } else {
