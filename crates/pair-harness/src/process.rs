@@ -1249,41 +1249,24 @@ impl ProcessManager {
         out
     }
 
-    /// Pick a preferred model from the gateway's available list.
-    /// Prefers capable Claude models in a sensible order, then any claude-*
-    /// model, then the first available. Returns `None` if the list is empty.
-    /// Strips ANSI codes and provider prefixes from the chosen model id.
+    /// Pick a model from the gateway's available list.
+    /// Returns the first available model after stripping ANSI codes and
+    /// provider prefixes. No hardcoded preferences — the gateway provides
+    /// the models; the system uses them. Custom/internal model IDs
+    /// (e.g. `adorsys-coder`) are valid because the CLI sends them to the
+    /// Coder bridge (`ANTHROPIC_BASE_URL`) which handles routing to the
+    /// actual backend.
+    /// Returns `None` if the list is empty.
     #[cfg(feature = "coder")]
     fn pick_gateway_model(models: &[coder_client::ModelInfo]) -> Option<String> {
-        const PREFERRED: &[&str] = &[
-            "claude-sonnet-4-5",
-            "claude-sonnet-4-5-20250929",
-            "claude-opus-4-1",
-            "claude-opus-4-5",
-            "claude-haiku-4-5",
-            "claude-3-5-sonnet-20241022",
-        ];
         let ids: Vec<String> = models
             .iter()
             .map(|m| Self::strip_ansi(&m.id).trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        for pref in PREFERRED {
-            if let Some(id) = ids.iter().find(|id| {
-                let bare = strip_provider_prefix(id);
-                bare == *pref || id.as_str() == *pref
-            }) {
-                return Some(strip_provider_prefix(id).to_string());
-            }
-        }
-        // Any claude-* model
-        if let Some(id) = ids.iter().find(|id| {
-            let bare = strip_provider_prefix(id);
-            bare.starts_with("claude-")
-        }) {
-            return Some(strip_provider_prefix(id).to_string());
-        }
-        // First available, prefix-stripped
+        // Use whatever model the gateway provides — no opinion on which
+        // model is "better". The gateway admin configures the available
+        // models; we just use them.
         ids.first().map(|id| strip_provider_prefix(id).to_string())
     }
 
@@ -1299,6 +1282,11 @@ impl ProcessManager {
     /// handling — instead of the 5× rapid-exit death-loop that would
     /// otherwise occur on the CLI's `model_not_found` 404. Non-gateway spawn
     /// failures propagate as a hard lifecycle `Err` unchanged.
+    #[cfg(feature = "coder")]
+    pub fn discovered_gateway_model(&self) -> Option<String> {
+        self.discovered_gateway_model.lock().ok().and_then(|g| g.clone())
+    }
+
     #[cfg(feature = "coder")]
     pub async fn discover_gateway_model(&self) -> Result<()> {
         if !self.ai_gateway_enabled
@@ -1376,7 +1364,7 @@ impl ProcessManager {
         }
         match Self::pick_gateway_model(&models) {
             Some(m) => {
-                info!(model = %m, "Selected model from Coder AI Gateway list — will inject as --model to override gateway default");
+                info!(model = %m, "Selected model from Coder AI Gateway list — will use as Terraform anthropic_model");
                 if let Ok(mut guard) = self.discovered_gateway_model.lock() {
                     *guard = Some(m);
                 }
@@ -1663,7 +1651,7 @@ trust_level = "trusted"
         cmd.env(&backend.api_key_env, proxy_api_key.unwrap_or(""));
     }
 
-    fn inject_llm_env(cmd: &mut Command) {
+    fn inject_llm_env(cmd: &mut Command, ai_gateway_coder: bool) {
         cmd.env(
             "LLM_PROVIDER",
             std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "fallback".to_string()),
@@ -1676,18 +1664,33 @@ trust_level = "trusted"
             "MODEL_PROVIDER_MAP",
             std::env::var("MODEL_PROVIDER_MAP").unwrap_or_default(),
         );
-        cmd.env(
-            "ANTHROPIC_MODEL",
-            std::env::var("ANTHROPIC_MODEL").unwrap_or_default(),
-        );
+        // When the Coder AI Gateway manages model routing, do NOT forward
+        // ANTHROPIC_MODEL / OPENAI_MODEL from the host.  The Coder Terraform
+        // module sets these inside the container to values the bridge
+        // recognises.  Forwarding a host-side value (which may be empty,
+        // stale, or ANSI-corrupted) overrides the Terraform value and causes
+        // model_not_found 404s.  Omitting the env override lets the
+        // container-internal value take effect.
+        if !ai_gateway_coder {
+            // Only forward ANTHROPIC_MODEL from the host if it is set.  When
+            // the host has no such var, omitting the env override lets
+            // Terraform's container env take effect.
+            if std::env::var("ANTHROPIC_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                // Strip ANSI escape codes — some sources embed SGR codes in
+                // model names, which then 404 at the API.
+                cmd.env("ANTHROPIC_MODEL", Self::strip_ansi(&std::env::var("ANTHROPIC_MODEL").unwrap()));
+            }
+        }
         cmd.env(
             "OPENAI_API_KEY",
             std::env::var("OPENAI_API_KEY").unwrap_or_default(),
         );
-        cmd.env(
-            "OPENAI_MODEL",
-            std::env::var("OPENAI_MODEL").unwrap_or_default(),
-        );
+        if !ai_gateway_coder {
+            // Same rationale as ANTHROPIC_MODEL.
+            if std::env::var("OPENAI_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                cmd.env("OPENAI_MODEL", Self::strip_ansi(&std::env::var("OPENAI_MODEL").unwrap()));
+            }
+        }
         cmd.env(
             "GEMINI_API_KEY",
             std::env::var("GEMINI_API_KEY").unwrap_or_default(),
@@ -1728,13 +1731,20 @@ trust_level = "trusted"
         if self.ai_gateway_enabled
             && matches!(self.workspace_provider, crate::types::WorkspaceProvider::Coder)
         {
-            // Gateway manages auth/routing. If we discovered a clean, valid
-            // model from the gateway's own list, inject it explicitly to
-            // override the gateway's (sometimes broken) auto-default. Only
-            // delegate selection when discovery failed.
+            // Gateway manages auth/routing and model selection.  The Coder
+            // Terraform module configures ANTHROPIC_MODEL and
+            // ANTHROPIC_BASE_URL inside the container to values the bridge
+            // recognises.  Omit --model so the CLI reads the container env.
+            //
+            // The gateway's `list_chat_models()` IDs (e.g. "adorsys-coder")
+            // are internal catalog names that the bridge does NOT accept as
+            // model names in API requests — injecting them via --model causes
+            // model_not_found 404s.  `inject_llm_env` also skips forwarding
+            // the host's ANTHROPIC_MODEL to avoid overriding the Terraform
+            // value with stale/corrupted host-side data.
             if let Ok(guard) = self.discovered_gateway_model.lock() {
                 if let Some(m) = &*guard {
-                    return CliModelResolution::Inject(m.clone());
+                    debug!(model = %m, "Coder AI Gateway model available (catalog ID, not injected)");
                 }
             }
             return CliModelResolution::GatewayDelegated;
@@ -1773,10 +1783,15 @@ trust_level = "trusted"
             .as_ref()
             .and_then(|name| std::env::var(name).ok());
         match self.resolve_cli_model(backend, model_env_value.as_deref()) {
-            CliModelResolution::GatewayDelegated => info!(
-                "{}: AI Gateway enabled — delegating model selection to Coder AI Gateway, skipping --model",
-                backend.as_str()
-            ),
+            CliModelResolution::GatewayDelegated => {
+                // AI Gateway manages model routing — omit --model so the CLI
+                // reads the container's Terraform-configured ANTHROPIC_MODEL.
+                // Host model env vars are NOT forwarded (see inject_llm_env).
+                info!(
+                    "{}: AI Gateway enabled — using container's Terraform-configured model env var",
+                    backend.as_str()
+                );
+            }
             CliModelResolution::Inject(clean) => {
                 cmd.arg("--model").arg(&clean);
                 info!(clean_model = %clean, "{}: using model from registry model_backend", backend.as_str());
@@ -1937,7 +1952,7 @@ trust_level = "trusted"
             .and_then(|name| std::env::var(name).ok());
         match self.resolve_cli_model(backend, model_env_value.as_deref()) {
             CliModelResolution::GatewayDelegated => info!(
-                "{}: AI Gateway enabled — delegating model selection to Coder AI Gateway, skipping --model (sentinel)",
+                "{}: AI Gateway enabled — using container's Terraform-configured model env var (sentinel)",
                 backend.as_str()
             ),
             CliModelResolution::Inject(clean) => {
@@ -2107,8 +2122,13 @@ trust_level = "trusted"
             }
         }
 
-        // Common LLM environment variables
-        Self::inject_llm_env(cmd);
+        // Common LLM environment variables.  When the AI Gateway is active on
+        // a Coder workspace, model env vars (ANTHROPIC_MODEL, OPENAI_MODEL)
+        // are NOT forwarded from the host — the container's Terraform-
+        // configured values are used instead.
+        let ai_gateway_coder = self.ai_gateway_enabled
+            && matches!(self.workspace_provider, crate::types::WorkspaceProvider::Coder);
+        Self::inject_llm_env(cmd, ai_gateway_coder);
     }
 
     #[cfg(feature = "coder")]
@@ -3817,7 +3837,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "coder")]
-    fn test_pick_gateway_model_prefers_sonnet() {
+    fn test_pick_gateway_model_uses_first_available() {
+        // No preference logic — picks the first model after ANSI/prefix cleanup.
         let models = vec![
             coder_client::ModelInfo {
                 id: "claude-opus-4-8[1m".to_string(),
@@ -3832,10 +3853,10 @@ mod tests {
                 provider: "anthropic".to_string(),
             },
         ];
-        // Should prefer the listed Sonnet AND strip ANSI/prefix from it.
+        // Should pick the first model (Opus, ANSI-stripped) — not prefer Sonnet.
         assert_eq!(
             ProcessManager::pick_gateway_model(&models),
-            Some("claude-sonnet-4-5".to_string())
+            Some("claude-opus-4-8".to_string())
         );
     }
 
@@ -3857,26 +3878,55 @@ mod tests {
 
     #[test]
     #[cfg(feature = "coder")]
+    fn test_pick_gateway_model_custom_internal_id() {
+        // Custom/internal model IDs (e.g. from Coder gateway) are returned as-is.
+        let models = vec![coder_client::ModelInfo {
+            id: "adorsys-coder".to_string(),
+            name: "Custom Model".to_string(),
+            display_name: "Custom Model".to_string(),
+            provider: "anthropic".to_string(),
+        }];
+        assert_eq!(
+            ProcessManager::pick_gateway_model(&models),
+            Some("adorsys-coder".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "coder")]
     fn test_pick_gateway_model_empty_returns_none() {
         assert_eq!(ProcessManager::pick_gateway_model(&[]), None);
     }
 
     #[test]
-    fn test_resolve_cli_model_uses_discovered_gateway_model_when_present() {
+    fn test_resolve_cli_model_delegates_to_gateway_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
             .with_model_backend(Some("anthropic/claude-haiku-4-5-20251001".to_string()))
             .with_ai_gateway_enabled(true)
             .with_coder_config("https://coder.example.com", "tok", "ws-id");
-        // Simulate a successful discovery caching a clean model.
+        // Simulate a successful discovery caching a model.
         *manager.discovered_gateway_model.lock().unwrap() =
-            Some("claude-sonnet-4-5".to_string());
+            Some("adorsys-coder".to_string());
         let decision = manager.resolve_cli_model(CliBackend::Claude, None);
-        // Discovered model wins over both model_backend and GatewayDelegated.
-        assert_eq!(
-            decision,
-            CliModelResolution::Inject("claude-sonnet-4-5".to_string())
-        );
+        // AI Gateway always delegates — the container's Terraform-configured
+        // ANTHROPIC_MODEL env var handles model routing.  Gateway catalog IDs
+        // (e.g. "adorsys-coder") are internal names that the bridge does NOT
+        // accept in API request bodies, so they must NOT be injected via
+        // --model.  model_backend is also ignored when gateway is active.
+        assert_eq!(decision, CliModelResolution::GatewayDelegated);
+    }
+
+    #[test]
+    fn test_resolve_cli_model_delegates_when_no_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_manager(&dir.path().join("wt"), &dir.path().join("sh"))
+            .with_ai_gateway_enabled(true)
+            .with_coder_config("https://coder.example.com", "tok", "ws-id");
+        // No discovery was performed — discovered_gateway_model is None.
+        let decision = manager.resolve_cli_model(CliBackend::Claude, None);
+        // Should still delegate to the container env var.
+        assert_eq!(decision, CliModelResolution::GatewayDelegated);
     }
 
     #[test]

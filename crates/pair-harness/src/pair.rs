@@ -1430,6 +1430,16 @@ impl ForgeSentinelPair {
     async fn provision_config(&self, _ticket: &Ticket) -> Result<()> {
         let transport = self.create_transport().await;
 
+        let mut gateway_model = None;
+        #[cfg(feature = "coder")]
+        if self.config.ai_gateway_enabled {
+            // Trigger discovery now so the provisioner can use the result for tfvars
+            if let Err(e) = self.process.discover_gateway_model().await {
+                warn!("Failed to discover gateway model during provision: {e}");
+            }
+            gateway_model = self.process.discovered_gateway_model();
+        }
+
         let provisioner = match self.config.workspace_provider {
             WorkspaceProvider::Local => Provisioner::new(&self.config.project_root),
             WorkspaceProvider::Coder => {
@@ -1447,6 +1457,7 @@ impl ForgeSentinelPair {
                 self.config.redis_url.as_deref(),
                 self.config.cli_backend,
                 self.config.model_backend.as_deref(),
+                gateway_model.as_deref(),
             )
             .await
     }

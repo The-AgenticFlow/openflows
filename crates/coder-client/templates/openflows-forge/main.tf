@@ -60,6 +60,24 @@ variable "cli_binary_name" {
   description = "Name of the CLI binary to expose on PATH inside the workspace"
 }
 
+variable "anthropic_model" {
+  type        = string
+  default     = "claude-haiku-4-5-20251001"
+  description = "Model for Claude CLI (ANTHROPIC_MODEL env var)"
+}
+
+variable "openai_model" {
+  type        = string
+  default     = "gpt-4o"
+  description = "Model for Codex CLI (OPENAI_MODEL env var)"
+}
+
+variable "coder_access_url" {
+  type        = string
+  default     = ""
+  description = "Coder access URL for AI Gateway routing (auto-detected)"
+}
+
 variable "litellm_proxy_url" {
   type    = string
   default = "http://proxy:4000"
@@ -161,6 +179,12 @@ resource "docker_container" "workspace" {
     "ROLE=forge",
     "TICKET_ID=${var.ticket_id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Model env vars for different CLI backends
+    "ANTHROPIC_MODEL=${var.anthropic_model}",
+    "OPENAI_MODEL=${var.openai_model}",
+    # When using Coder AI Gateway, route all LLM traffic through Coder's bridge
+    "ANTHROPIC_BASE_URL=${data.coder_workspace.me.access_url}/api/v2/aibridge/anthropic",
+    "OPENAI_BASE_URL=${data.coder_workspace.me.access_url}/api/v2/aibridge/openai",
   ]
 
   # Connect to the openflows_default compose network for Redis access.
@@ -194,7 +218,6 @@ module "agent" {
   agent_id          = coder_agent.main.id
   workdir           = "/home/coder/workspace"
   enable_ai_gateway = var.enable_ai_gateway
-
 }
 
 
