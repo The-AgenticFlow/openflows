@@ -1651,7 +1651,7 @@ trust_level = "trusted"
         cmd.env(&backend.api_key_env, proxy_api_key.unwrap_or(""));
     }
 
-    fn inject_llm_env(cmd: &mut Command, ai_gateway_coder: bool) {
+    fn inject_llm_env(cmd: &mut Command) {
         cmd.env(
             "LLM_PROVIDER",
             std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "fallback".to_string()),
@@ -1664,32 +1664,19 @@ trust_level = "trusted"
             "MODEL_PROVIDER_MAP",
             std::env::var("MODEL_PROVIDER_MAP").unwrap_or_default(),
         );
-        // When the Coder AI Gateway manages model routing, do NOT forward
-        // ANTHROPIC_MODEL / OPENAI_MODEL from the host.  The Coder Terraform
-        // module sets these inside the container to values the bridge
-        // recognises.  Forwarding a host-side value (which may be empty,
-        // stale, or ANSI-corrupted) overrides the Terraform value and causes
-        // model_not_found 404s.  Omitting the env override lets the
-        // container-internal value take effect.
-        if !ai_gateway_coder {
-            // Only forward ANTHROPIC_MODEL from the host if it is set.  When
-            // the host has no such var, omitting the env override lets
-            // Terraform's container env take effect.
-            if std::env::var("ANTHROPIC_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
-                // Strip ANSI escape codes — some sources embed SGR codes in
-                // model names, which then 404 at the API.
-                cmd.env("ANTHROPIC_MODEL", Self::strip_ansi(&std::env::var("ANTHROPIC_MODEL").unwrap()));
-            }
+        // Only forward ANTHROPIC_MODEL from the host if it is set.
+        if std::env::var("ANTHROPIC_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            // Strip ANSI escape codes — some sources embed SGR codes in
+            // model names, which then 404 at the API.
+            cmd.env("ANTHROPIC_MODEL", Self::strip_ansi(&std::env::var("ANTHROPIC_MODEL").unwrap()));
         }
         cmd.env(
             "OPENAI_API_KEY",
             std::env::var("OPENAI_API_KEY").unwrap_or_default(),
         );
-        if !ai_gateway_coder {
-            // Same rationale as ANTHROPIC_MODEL.
-            if std::env::var("OPENAI_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
-                cmd.env("OPENAI_MODEL", Self::strip_ansi(&std::env::var("OPENAI_MODEL").unwrap()));
-            }
+        // Same rationale as ANTHROPIC_MODEL.
+        if std::env::var("OPENAI_MODEL").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            cmd.env("OPENAI_MODEL", Self::strip_ansi(&std::env::var("OPENAI_MODEL").unwrap()));
         }
         cmd.env(
             "GEMINI_API_KEY",
@@ -1731,20 +1718,13 @@ trust_level = "trusted"
         if self.ai_gateway_enabled
             && matches!(self.workspace_provider, crate::types::WorkspaceProvider::Coder)
         {
-            // Gateway manages auth/routing and model selection.  The Coder
-            // Terraform module configures ANTHROPIC_MODEL and
-            // ANTHROPIC_BASE_URL inside the container to values the bridge
-            // recognises.  Omit --model so the CLI reads the container env.
-            //
-            // The gateway's `list_chat_models()` IDs (e.g. "adorsys-coder")
-            // are internal catalog names that the bridge does NOT accept as
-            // model names in API requests — injecting them via --model causes
-            // model_not_found 404s.  `inject_llm_env` also skips forwarding
-            // the host's ANTHROPIC_MODEL to avoid overriding the Terraform
-            // value with stale/corrupted host-side data.
+            // Inject the discovered gateway model (e.g. "adorsys-coder") directly
+            // so the CLI uses it immediately, rather than waiting for Terraform
+            // to update the container's environment on the next provision cycle.
             if let Ok(guard) = self.discovered_gateway_model.lock() {
                 if let Some(m) = &*guard {
-                    debug!(model = %m, "Coder AI Gateway model available (catalog ID, not injected)");
+                    debug!(model = %m, "Coder AI Gateway model available, injecting directly");
+                    return CliModelResolution::Inject(m.clone());
                 }
             }
             return CliModelResolution::GatewayDelegated;
@@ -2128,7 +2108,7 @@ trust_level = "trusted"
         // configured values are used instead.
         let ai_gateway_coder = self.ai_gateway_enabled
             && matches!(self.workspace_provider, crate::types::WorkspaceProvider::Coder);
-        Self::inject_llm_env(cmd, ai_gateway_coder);
+        Self::inject_llm_env(cmd);
     }
 
     #[cfg(feature = "coder")]

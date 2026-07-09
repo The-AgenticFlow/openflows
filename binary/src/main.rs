@@ -1,6 +1,7 @@
 // binary/src/main.rs
 mod nodes;
 mod state;
+mod debug;
 
 use anyhow::Result;
 use config::WorkspaceProvider;
@@ -51,6 +52,10 @@ async fn main() -> Result<()> {
             }
             "--help" | "-h" => {
                 print_usage_and_exit();
+            }
+            "debug" => {
+                crate::debug::debug_system().await?;
+                return Ok(());
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
@@ -109,7 +114,8 @@ async fn main() -> Result<()> {
     let github_repo = std::env::var("GITHUB_REPOSITORY");
 
     // Determine workspace directory
-    let workspace_dir = if let (Ok(token), Ok(repo)) = (&github_token, &github_repo) {
+    let workspace_dir = if let Ok(repo) = &github_repo {
+        let token = github_token.as_deref().unwrap_or_default();
         // Production mode: clone/update target repository
         info!(repo = %repo, "Target repository configured, setting up workspace...");
 
@@ -429,6 +435,27 @@ async fn main() -> Result<()> {
                             store.set("coder_url", serde_json::json!(coder_url_str)).await;
                             std::env::set_var("CODER_API_TOKEN", client.token());
                             std::env::set_var("CODER_URL", client.base_url());
+                            
+                            // Auto-inject Coder AI Gateway configuration to bypass local LLM key requirements
+                            if std::env::var("ANTHROPIC_API_KEY").map_or(true, |v| v.is_empty()) {
+                                std::env::set_var("ANTHROPIC_API_KEY", client.token());
+                            }
+                            if std::env::var("OPENAI_API_KEY").map_or(true, |v| v.is_empty()) {
+                                std::env::set_var("OPENAI_API_KEY", client.token());
+                            }
+                            if std::env::var("GATEWAY_API_KEY").map_or(true, |v| v.is_empty()) {
+                                std::env::set_var("GATEWAY_API_KEY", client.token());
+                            }
+                            if std::env::var("ANTHROPIC_BASE_URL").map_or(true, |v| v.is_empty()) {
+                                std::env::set_var("ANTHROPIC_BASE_URL", format!("{}/api/v2/chat/anthropic", client.base_url().trim_end_matches('/')));
+                            }
+                            if std::env::var("OPENAI_BASE_URL").map_or(true, |v| v.is_empty()) {
+                                std::env::set_var("OPENAI_BASE_URL", format!("{}/api/v2/chat/openai", client.base_url().trim_end_matches('/')));
+                            }
+                            
+                            info!("DEBUG ENV VARS: ANTHROPIC_API_KEY={:?}", std::env::var("ANTHROPIC_API_KEY"));
+                            info!("DEBUG ENV VARS: ANTHROPIC_BASE_URL={:?}", std::env::var("ANTHROPIC_BASE_URL"));
+                            
                             WorkspaceProvider::Coder
                         }
                         Err(e) => {

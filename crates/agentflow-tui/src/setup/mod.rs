@@ -200,20 +200,29 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
     env_step.render(&mut terminal, &theme)?;
 
     // Step 6: Provider selection (must come before agent config)
-    let mut provider_step = ProviderStep::new();
-    provider_step
-        .render(&mut terminal, &theme, &mut config)
-        .await?;
+    if config.workspace_provider != WorkspaceProvider::Coder {
+        let mut provider_step = ProviderStep::new();
+        provider_step
+            .render(&mut terminal, &theme, &mut config)
+            .await?;
+    } else {
+        // For Coder mode, automatically set provider to none (which defaults to Codex)
+        config.selected_provider = None;
+    }
 
     // Step 7: LLM API Key Input (based on selected provider)
-    let api_step = ApiStep::new();
-    api_step.render(&mut terminal, &theme, &mut config).await?;
+    if config.workspace_provider != WorkspaceProvider::Coder {
+        let api_step = ApiStep::new();
+        api_step.render(&mut terminal, &theme, &mut config).await?;
+    }
 
     // Step 8: Agent Configuration (instances, model backend filtered by provider)
-    let agents_step = AgentsStep::new();
-    agents_step
-        .render(&mut terminal, &theme, &mut config)
-        .await?;
+    if config.workspace_provider != WorkspaceProvider::Coder {
+        let agents_step = AgentsStep::new();
+        agents_step
+            .render(&mut terminal, &theme, &mut config)
+            .await?;
+    }
 
     // Step 8b: Agent Module Selection (Coder mode only)
     if config.workspace_provider == WorkspaceProvider::Coder {
@@ -230,10 +239,12 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
     }
 
     // Step 9: GitHub Authentication (uses agent config to determine token fields)
-    let github_step = GitHubStep::new();
-    github_step
-        .render(&mut terminal, &theme, &mut config)
-        .await?;
+    if config.workspace_provider != WorkspaceProvider::Coder {
+        let github_step = GitHubStep::new();
+        github_step
+            .render(&mut terminal, &theme, &mut config)
+            .await?;
+    }
 
     // Step 10: Repository Config
     let repo_step = RepoStep::new();

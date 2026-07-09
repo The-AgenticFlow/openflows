@@ -1,5 +1,5 @@
 {
-  "default_cli": "claude",
+  "default_cli": "codex",
   "allowed_domains": [
     "api.github.com",
     "*.github.com",
@@ -10,17 +10,17 @@
   "team": [
     {
       "id": "nexus",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "openai/gpt-5.5",
       "routing_key": "nexus-key",
       "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
       "allowed_domains": null,
       "workspace_provider": "coder",
       "coder_module": {
-        "source": "registry.coder.com/coder/claude-code/coder",
-        "version": "5.2.0",
+        "source": "registry.coder.com/coder-labs/codex/coder",
+        "version": "VERIFY_ON_REGISTRY",
         "params": {
           "enable_ai_gateway": true,
           "permission_mode": "plan",
@@ -30,17 +30,17 @@
     },
     {
       "id": "forge",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 2,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "openai/gpt-5.5",
       "routing_key": "forge-key",
       "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
       "allowed_domains": null,
       "workspace_provider": "coder",
       "coder_module": {
-        "source": "registry.coder.com/coder/claude-code/coder",
-        "version": "5.2.0",
+        "source": "registry.coder.com/coder-labs/codex/coder",
+        "version": "VERIFY_ON_REGISTRY",
         "params": {
           "enable_ai_gateway": true,
           "permission_mode": "acceptEdits",
@@ -50,17 +50,17 @@
     },
     {
       "id": "sentinel",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "openai/gpt-5.5",
       "routing_key": "sentinel-key",
       "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
       "allowed_domains": null,
       "workspace_provider": "coder",
       "coder_module": {
-        "source": "registry.coder.com/coder/claude-code/coder",
-        "version": "5.2.0",
+        "source": "registry.coder.com/coder-labs/codex/coder",
+        "version": "VERIFY_ON_REGISTRY",
         "params": {
           "enable_ai_gateway": true,
           "permission_mode": "plan",
@@ -70,17 +70,17 @@
     },
     {
       "id": "vessel",
-      "cli": "claude",
+      "cli": "codex",
       "active": true,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "openai/gpt-5.5",
       "routing_key": "vessel-key",
       "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
       "allowed_domains": null,
       "workspace_provider": "coder",
       "coder_module": {
-        "source": "registry.coder.com/coder/claude-code/coder",
-        "version": "5.2.0",
+        "source": "registry.coder.com/coder-labs/codex/coder",
+        "version": "VERIFY_ON_REGISTRY",
         "params": {
           "enable_ai_gateway": true,
           "permission_mode": "acceptEdits",
@@ -90,17 +90,17 @@
     },
     {
       "id": "lore",
-      "cli": "claude",
+      "cli": "codex",
       "active": false,
       "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
+      "model_backend": "openai/gpt-5.5",
       "routing_key": "lore-key",
       "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
       "allowed_domains": null,
       "workspace_provider": "coder",
       "coder_module": {
-        "source": "registry.coder.com/coder/claude-code/coder",
-        "version": "5.2.0",
+        "source": "registry.coder.com/coder-labs/codex/coder",
+        "version": "VERIFY_ON_REGISTRY",
         "params": {
           "enable_ai_gateway": true,
           "permission_mode": "acceptEdits",

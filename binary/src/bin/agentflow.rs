@@ -912,9 +912,28 @@ async fn main() -> Result<()> {
                         Ok(bootstrapper) => match bootstrapper.bootstrap().await {
                             Ok(client) => {
                                 std::env::set_var("CODER_API_TOKEN", client.token());
+                                std::env::set_var("CODER_URL", client.base_url());
                                 eprintln!("  ✓ Coder bootstrapped successfully");
                                 eprintln!("    Admin user created, API token obtained, workspace templates pushed");
                                 info!("Coder: bootstrapped — using Coder workspaces");
+
+                                // Auto-inject Coder AI Gateway configuration to bypass local LLM key requirements
+                                if std::env::var("ANTHROPIC_API_KEY").map_or(true, |v| v.is_empty()) {
+                                    std::env::set_var("ANTHROPIC_API_KEY", client.token());
+                                }
+                                if std::env::var("OPENAI_API_KEY").map_or(true, |v| v.is_empty()) {
+                                    std::env::set_var("OPENAI_API_KEY", client.token());
+                                }
+                                if std::env::var("GATEWAY_API_KEY").map_or(true, |v| v.is_empty()) {
+                                    std::env::set_var("GATEWAY_API_KEY", client.token());
+                                }
+                                if std::env::var("ANTHROPIC_BASE_URL").map_or(true, |v| v.is_empty()) {
+                                    std::env::set_var("ANTHROPIC_BASE_URL", format!("{}/api/v2/chat/anthropic", client.base_url().trim_end_matches('/')));
+                                }
+                                if std::env::var("OPENAI_BASE_URL").map_or(true, |v| v.is_empty()) {
+                                    std::env::set_var("OPENAI_BASE_URL", format!("{}/api/v2/chat/openai", client.base_url().trim_end_matches('/')));
+                                }
+
                                 WorkspaceProvider::Coder
                             }
                             Err(e) => {
