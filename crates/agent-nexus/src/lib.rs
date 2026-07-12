@@ -12,7 +12,7 @@ use config::{
         KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
-    ACTION_NO_WORK,
+    ACTION_NO_WORK, ACTION_EMPTY,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
 use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
@@ -2355,19 +2355,55 @@ impl Node for NexusNode {
             }));
         }
 
-        // Do not dispatch new work when no forge worker is idle. Previously exec
-        // hard-coded "forge-1" and dispatched even while forge-1 was busy, so each
-        // forge_pair "empty" bounce returned to a nexus that re-assigned the same
-        // ticket — exhausting max_steps in the nexus <-> forge_pair ping-pong.
-        if tickets.is_empty() || idle_forge_workers.is_empty() {
+        // Busy forge workers (Assigned/Working) — work is already in progress.
+        // We need this to decide whether to cycle (monitor) vs. stop (no work).
+        let busy_forge_workers: Vec<String> = context
+            .get("worker_slots")
+            .and_then(|v| v.as_object())
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter_map(|v| serde_json::from_value::<WorkerSlot>(v.clone()).ok())
+                    .filter(|slot| {
+                        matches!(
+                            slot.status,
+                            WorkerStatus::Assigned { .. } | WorkerStatus::Working { .. }
+                        ) && Self::worker_role(&slot.id) == "forge"
+                    })
+                    .map(|slot| slot.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tickets.is_empty() && idle_forge_workers.is_empty() && busy_forge_workers.is_empty() {
+            // No tickets, no idle workers, no busy workers — truly nothing to do.
             info!(
                 assignable_tickets = tickets.len(),
                 idle_forge_workers = idle_forge_workers.len(),
-                "Nexus: no dispatch possible this pass (no idle forge worker or no assignable ticket)"
+                busy_forge_workers = busy_forge_workers.len(),
+                "Nexus: no work at all — returning no_work"
             );
             return Ok(json!(AgentDecision {
                 action: ACTION_NO_WORK.to_string(),
-                notes: "No idle forge worker available or no assignable tickets".to_string(),
+                notes: "No assignable tickets, no idle or busy forge workers".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
+        }
+
+        if idle_forge_workers.is_empty() {
+            // No idle workers, but forge workers are busy or tickets are pending.
+            // Cycle to forge_pair to monitor in-progress work instead of stopping.
+            info!(
+                assignable_tickets = tickets.len(),
+                idle_forge_workers = idle_forge_workers.len(),
+                busy_forge_workers = busy_forge_workers.len(),
+                "Nexus: no idle forge worker — cycling to forge_pair to monitor busy workers"
+            );
+            return Ok(json!(AgentDecision {
+                action: ACTION_EMPTY.to_string(),
+                notes: "No idle forge worker; busy workers monitored via forge_pair".to_string(),
                 assign_to: None,
                 ticket_id: None,
                 issue_url: None,

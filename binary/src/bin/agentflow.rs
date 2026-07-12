@@ -180,6 +180,7 @@ async fn run_controller() -> Result<()> {
                 (ACTION_WORK_ASSIGNED, "forge_pair"),
                 (ACTION_MERGE_PRS, "vessel"),
                 (ACTION_NO_WORK, "nexus"),
+                (ACTION_EMPTY, "forge_pair"),
                 ("approve_command", "forge_pair"),
                 ("reject_command", "nexus"),
             ],

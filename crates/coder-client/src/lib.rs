@@ -892,7 +892,7 @@ impl CoderClient {
             })
             .await?;
 
-        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
+        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(300))
             .await?;
 
         Ok(workspace)
@@ -1381,7 +1381,7 @@ impl CoderClient {
             })
             .await?;
 
-        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
+        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(300))
             .await?;
 
         self.wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(120))

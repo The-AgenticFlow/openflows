@@ -241,7 +241,7 @@ impl CoderBootstrapper {
             {
                 Ok(workspace) => {
                     let _ = client
-                        .wait_for_workspace_ready(&workspace.id, Duration::from_secs(180))
+                        .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
                         .await;
                     if let Err(e) = client
                         .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
@@ -481,7 +481,7 @@ impl CoderBootstrapper {
             .await?;
 
         client
-            .wait_for_workspace_ready(&workspace.id, Duration::from_secs(180))
+            .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
             .await?;
 
         info!(
