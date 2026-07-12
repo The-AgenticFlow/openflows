@@ -143,7 +143,7 @@ impl CoderModule {
 /// `"true"`/`"1"`), with a fallback to a per-module default.
 ///
 /// Both the runtime harness (`agent_forge`) and the Coder tfvars provisioner
-/// (`pair_harness::provision`) call this so the deployed workspace's
+/// (`provisioner::provision`) call this so the deployed workspace's
 /// `coder_ai_gateway` tfvar and the harness's runtime `ai_gateway_enabled`
 /// flag always agree — preventing split-authority bugs where `USE_AI_GATEWAY=false`
 /// disables harness delegation while an already-provisioned workspace keeps
@@ -164,13 +164,39 @@ pub fn default_permission_mode_for_role(role: &str) -> &'static str {
     }
 }
 
-/// A single agent entry from registry.json.
+/// A single agent entry from registry.json (schema v2 — Coder-only).
+///
+/// v1 fields (cli, instances, model_backend, routing_key, github_token_env,
+/// allowed_domains, coder_module) are kept as serde-optional for backward
+/// compatibility with existing nexus code. Phase 5 will remove their usage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegistryEntry {
     pub id: String,
+    /// v2: Whether this role is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// v2: Coder model hint (matched against GET /api/experimental/chats/models).
     #[serde(default)]
-    pub cli: String, // "claude" | "codex" | "aider" | "goose"
+    pub model: Option<String>,
+    /// v2: Create the chat in plan mode (review-only roles).
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// v2: Maximum parallel worker instances for this role.
+    #[serde(default = "default_one_instance")]
+    pub max_instances: u32,
+    /// v2: Skill names to provision into the workspace's .agents/skills/.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// v2: MCP server config to provision as .mcp.json.
+    #[serde(default)]
+    pub mcp: serde_json::Value,
+
+    // ── v1 fields (deprecated — Phase 5 removes usage) ──────────────────
+    #[serde(default)]
+    pub cli: String,
+    #[serde(default)]
     pub active: bool,
+    #[serde(default)]
     pub instances: u32,
     #[serde(default)]
     pub model_backend: Option<String>,
@@ -178,16 +204,18 @@ pub struct RegistryEntry {
     pub routing_key: Option<String>,
     #[serde(default)]
     pub github_token_env: Option<String>,
-    /// Network domains this agent is allowed to access (for sandbox configuration).
-    /// Falls back to the registry-level `allowed_domains` if not set per-agent.
-    /// Examples: ["api.github.com", "*.github.com", "pypi.org", "crates.io"]
     #[serde(default)]
     pub allowed_domains: Option<Vec<String>>,
     #[serde(default)]
-    pub workspace_provider: Option<crate::state::WorkspaceProvider>,
-    /// Coder Registry module configuration (for WorkspaceProvider::Coder).
-    #[serde(default)]
     pub coder_module: Option<CoderModule>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one_instance() -> u32 {
+    1
 }
 
 /// The full registry — a thin wrapper around the team list.
@@ -282,10 +310,23 @@ impl RegistryEntry {
         }
     }
 
-    /// Get the resolved coder module for this agent.
-    /// Uses the entry's explicit `coder_module` or falls back to DEFAULT_AGENT_MODULES.
-    pub fn resolve_coder_module(&self) -> CoderModule {
-        resolve_coder_module(&self.cli, self.coder_module.as_ref())
+    /// Effective parallel instance count for this agent.
+    ///
+    /// v2 registries declare `max_instances`; v1 registries declared
+    /// `instances`. The live `orchestration/agent/registry.json` is v2 and
+    /// omits `instances` (which deserializes to `0`), so deriving slot/identity
+    /// counts from `instances` alone silently provisioned **zero** forge
+    /// workers — and the old hard-coded `"forge-1"` assignment operated on a
+    /// phantom worker with no `WorkerSlot`, no workspace, and no chat. Falling
+    /// back to `max_instances` when `instances` is unset restores the intended
+    /// fan-out while staying backward-compatible with v1 entries that set
+    /// `instances` (which remain authoritative when non-zero).
+    pub fn effective_instances(&self) -> u32 {
+        if self.instances > 0 {
+            self.instances
+        } else {
+            self.max_instances
+        }
     }
 }
 
@@ -367,14 +408,14 @@ impl Registry {
 
     /// Total active instance count across all agents.
     pub fn total_instances(&self) -> u32 {
-        self.active_agents().map(|e| e.instances).sum()
+        self.active_agents().map(|e| e.effective_instances()).sum()
     }
 
     /// FORGE worker slot names: ["forge-1", "forge-2", ...]
     pub fn forge_slots(&self) -> Vec<String> {
         match self.get("forge") {
             None => vec![],
-            Some(entry) => (1..=entry.instances)
+            Some(entry) => (1..=entry.effective_instances())
                 .map(|i| format!("forge-{}", i))
                 .collect(),
         }
@@ -385,15 +426,18 @@ impl Registry {
     pub fn all_worker_slots(&self) -> Vec<String> {
         let mut slots = Vec::new();
         for entry in self.active_agents() {
-            if entry.instances > 0 {
+            // Use effective_instances() so v2 registries that declare only
+            // max_instances still produce slots (instances is 0 when absent).
+            let count = entry.effective_instances();
+            if count > 0 {
                 if entry.id == "forge" {
-                    for i in 1..=entry.instances {
+                    for i in 1..=count {
                         slots.push(format!("forge-{}", i));
                     }
-                } else if entry.instances == 1 {
+                } else if count == 1 {
                     slots.push(entry.id.clone());
                 } else {
-                    for i in 1..=entry.instances {
+                    for i in 1..=count {
                         slots.push(format!("{}-{}", entry.id, i));
                     }
                 }
@@ -404,19 +448,6 @@ impl Registry {
 
     /// Resolve the workspace provider for a given slot ID.
     ///
-    /// Strips the instance suffix (e.g., "forge-3" -> "forge") to find the
-    /// base agent entry and returns the configured workspace provider.
-    pub fn resolve_workspace_provider(
-        &self,
-        slot_id: &str,
-    ) -> Option<crate::state::WorkspaceProvider> {
-        let base_id = self.normalize_agent_id(slot_id);
-        self.team
-            .iter()
-            .find(|e| e.id == base_id)
-            .and_then(|e| e.workspace_provider.clone())
-    }
-
     /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
     /// Falls back to `GITHUB_PERSONAL_ACCESS_TOKEN` for backward compatibility.
     /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.

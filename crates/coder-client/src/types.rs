@@ -434,11 +434,15 @@ pub const CHAT_LABEL_ROLE: &str = "role";
 /// Label key for the orchestrator flow associated with a chat.
 pub const CHAT_LABEL_FLOW: &str = "flow";
 
+/// Label key for the tenant associated with a chat.
+pub const CHAT_LABEL_TENANT: &str = "tenant";
+
 /// Build a labels map for a ticket-scoped chat.
 pub fn build_chat_labels(
     ticket_id: &str,
     role: &str,
     flow: &str,
+    tenant: &str,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -452,6 +456,10 @@ pub fn build_chat_labels(
     map.insert(
         CHAT_LABEL_FLOW.to_string(),
         serde_json::Value::String(flow.to_string()),
+    );
+    map.insert(
+        CHAT_LABEL_TENANT.to_string(),
+        serde_json::Value::String(tenant.to_string()),
     );
     map
 }

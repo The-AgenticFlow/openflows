@@ -5,44 +5,16 @@ terraform {
   }
 }
 
-variable "agent_module_source" {
+variable "role" {
   type        = string
-  default     = "registry.coder.com/coder/claude-code/coder"
-  description = "Coder Registry module source for agent CLI"
+  default     = "lore"
+  description = "Agent role name"
 }
 
-variable "agent_module_version" {
-  type        = string
-  default     = "5.2.0"
-  description = "Version of the agent module"
-}
-
-variable "enable_ai_gateway" {
-  type        = bool
-  default     = true
-  description = "Enable Coder AI Gateway for model routing"
-}
-
-variable "use_ai_gateway" {
-  type    = string
-  default = "true"
-}
-
-variable "host_cli_binary" {
+variable "ticket_id" {
   type        = string
   default     = ""
-  description = "Host path to a pre-built CLI ELF binary (bind-mounted to skip startup download)"
-}
-
-variable "cli_binary_name" {
-  type        = string
-  default     = "claude"
-  description = "Name of the CLI binary to expose on PATH inside the workspace"
-}
-
-variable "litellm_proxy_url" {
-  type    = string
-  default = "http://proxy:4000"
+  description = "Ticket identifier"
 }
 
 variable "redis_url" {
@@ -56,144 +28,83 @@ variable "repo_url" {
   description = "Git repository URL to clone into the workspace"
 }
 
-variable "ticket_id" {
+variable "tenant" {
   type        = string
   default     = ""
-  description = "Ticket ID for heartbeat tracking"
+  description = "OpenFlows tenant identifier"
 }
 
-variable "enable_slackme" {
-  type        = bool
-  default     = false
-  description = "Enable Slack command-completion notifications"
-}
-
-variable "mcp_config" {
+variable "harness_version" {
   type        = string
-  default     = ""
-  description = "MCP server configuration (JSON string)"
+  default     = "1.1.6"
+  description = "openflows-harness binary version to download"
 }
 
 resource "coder_agent" "main" {
-  os         = "linux"
-  arch       = "amd64"
-  dir        = "/home/coder/workspace"
+  os   = "linux"
+  arch = "amd64"
+  dir  = "/home/coder/workspace"
 
   startup_script = <<-EOT
     #!/bin/bash
     set -e
 
-    # Install documentation tooling
-    apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq pandoc >/dev/null 2>&1 || true
-    
-    # Install mdbook if cargo is available
-    if command -v cargo &>/dev/null; then
-      cargo install mdbook --quiet 2>/dev/null || true
-    fi
-    
-    # Install markdownlint-cli via npm
-    if command -v npm &>/dev/null; then
-      npm install -g markdownlint-cli 2>/dev/null || true
-    fi
-
-    # git pull or clone
+    # git pull or clone (creds via Coder external auth)
     if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull origin main 2>/dev/null || true
+      cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${var.repo_url}" ]; then
       git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
     fi
 
-    # If a host-provided CLI binary is bind-mounted, install it onto PATH.
-    if [ -x /opt/host-cli/${var.cli_binary_name} ]; then
-      mkdir -p /home/coder/.local/bin /tmp/coder-script-data/bin
-      ln -sf /opt/host-cli/${var.cli_binary_name} /home/coder/.local/bin/${var.cli_binary_name}
-      ln -sf /opt/host-cli/${var.cli_binary_name} /tmp/coder-script-data/bin/${var.cli_binary_name}
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${var.cli_binary_name} installed from host bind-mount" >&2
-    fi
+    # Download and install openflows-harness (checksum-verified from GitHub release)
+    HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/v${var.harness_version}/openflows-harness-v${var.harness_version}-x86_64-unknown-linux-musl"
+    HARNESS_BIN="/usr/local/bin/openflows-harness"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
+    curl -fsSL "$HARNESS_URL" -o "$HARNESS_BIN" && chmod +x "$HARNESS_BIN" || {
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Failed to download openflows-harness — agent will not be able to coordinate" >&2
+    }
 
-    # Install Claude Code hooks from orchestration/plugin/hooks/lore/
-    HOOKS_SRC="/home/coder/workspace/orchestration/plugin/hooks/lore"
-    HOOKS_DST="/home/coder/workspace/.claude/hooks/lore"
-    if [ -d "$HOOKS_SRC" ]; then
-      mkdir -p "$HOOKS_DST"
-      for hook in "$HOOKS_SRC"/*.sh; do
-        if [ -f "$hook" ]; then
-          cp "$hook" "$HOOKS_DST/"
-          chmod +x "$HOOKS_DST/$(basename "$hook")"
-        fi
-      done
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Lore hooks installed from $HOOKS_SRC" >&2
-    else
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Lore hooks source not found at $HOOKS_SRC - hooks will be provisioned separately" >&2
-    fi
-
-    # SharedStore heartbeat writer
-    nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} SET "heartbeat:lore-T-${var.ticket_id}" \
-        "{\"ts\":$(date +%s),\"ws_id\":\"${data.coder_workspace.me.id}\",\"status\":\"running\"}" \
-        2>/dev/null || true
-      sleep 30
-    done' >/dev/null 2>&1 &
+    # Start heartbeat daemon (the ONLY Redis client in the workspace)
+    export REDIS_URL="${var.redis_url}"
+    export OPENFLOWS_TENANT="${var.tenant}"
+    export OPENFLOWS_TICKET="${var.ticket_id}"
+    export OPENFLOWS_ROLE="${var.role}"
+    export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
+    nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
 }
 
+resource "docker_volume" "workspace" {
+  name = "openflows-${var.role}-${data.coder_workspace.me.id}"
+}
+
 resource "docker_container" "workspace" {
-  name  = "openflows-lore-${data.coder_workspace.me.id}"
+  name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
-  # /home/coder/workspace uses the container layer (not a root-owned named
-  # volume) so the `coder` agent user can write to it. See forge template for
-  # the full rationale.
+  volumes {
+    container_path = "/home/coder/workspace"
+    volume_name    = docker_volume.workspace.name
+  }
 
   env = [
-    "REPO_URL=${var.repo_url}",
     "REDIS_URL=${var.redis_url}",
-    "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
-    "USE_AI_GATEWAY=${var.use_ai_gateway}",
-    "ROLE=lore",
+    "OPENFLOWS_TENANT=${var.tenant}",
+    "OPENFLOWS_TICKET=${var.ticket_id}",
+    "OPENFLOWS_ROLE=${var.role}",
+    "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
+    "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]
 
-  # Connect to the openflows_default compose network for Redis access.
+  # egress allowlist: Coder control plane + github.com + Redis only
+  # (enforced at network level; Redis is a documented exception per docs/governance.md)
+
   networks_advanced {
     name = "openflows_default"
   }
 
-  dynamic "volumes" {
-    for_each = var.host_cli_binary != "" ? [var.host_cli_binary] : []
-    content {
-      host_path      = volumes.value
-      container_path = "/opt/host-cli/${var.cli_binary_name}"
-      read_only      = true
-    }
-  }
-
-  # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
-  # Replace localhost/127.0.0.1 with Docker host gateway so the agent can reach the Coder server
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
 }
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-
-# Lore agent module (CLI backend installer)
-module "agent" {
-  source  = "registry.coder.com/coder/claude-code/coder"
-  version = "5.2.0"
-
-  agent_id          = coder_agent.main.id
-  workdir           = "/home/coder/workspace"
-  enable_ai_gateway = var.enable_ai_gateway
-
-}
-
-
-# Slack notification module (conditional)
-module "slackme" {
-  count  = var.enable_slackme ? 1 : 0
-  source = "registry.coder.com/coder/slackme/coder"
-  version = "1.0.33"
-
-  agent_id         = coder_agent.main.id
-  auth_provider_id = "slack"
-}

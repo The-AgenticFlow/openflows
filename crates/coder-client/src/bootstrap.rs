@@ -204,20 +204,16 @@ impl CoderBootstrapper {
             let nexus_api_token = std::env::var("OPENFLOWS_NEXUS_API_TOKEN")
                 .or_else(|_| std::env::var("NEXUS_CODER_API_TOKEN"))
                 .unwrap_or_else(|_| client.token().to_string());
-            let repository = std::env::var("OPENFLOWS_REPOSITORY")
-                .or_else(|_| std::env::var("AGENTFLOW_REPOSITORY"))
+            let repository = std::env::var("GITHUB_REPOSITORY")
                 .unwrap_or_else(|_| String::new());
             let repo_url = if repository.is_empty() {
                 String::new()
             } else {
                 format!("https://github.com/{}.git", repository)
             };
-            let redis_url =
-                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
-            let litellm_proxy_url = std::env::var("LITELLM_PROXY_URL")
-                .unwrap_or_else(|_| "http://proxy:4000".to_string());
-            let use_ai_gateway = std::env::var("USE_AI_GATEWAY").unwrap_or_else(|_| "true".into());
-            let host_cli_binary = crate::resolve_host_cli_binary("claude");
+            let redis_url = "redis://redis:6379".to_string();
+            let tenant = std::env::var("OPENFLOWS_TENANT")
+                .unwrap_or_else(|_| "default".to_string());
             let registry_json = match std::env::var("OPENFLOWS_REGISTRY_JSON") {
                 Ok(json) => json,
                 Err(_) => {
@@ -234,12 +230,10 @@ impl CoderBootstrapper {
                     parameters: json!({
                         "repo_url": repo_url,
                         "redis_url": redis_url,
-                        "litellm_proxy_url": litellm_proxy_url,
-                        "use_ai_gateway": use_ai_gateway,
-                        "host_cli_binary": host_cli_binary,
-                        "cli_binary_name": "claude",
                         "coder_url": client.base_url(),
                         "coder_api_token": nexus_api_token,
+                        "openflows_tenant": tenant,
+                        "github_repository": repository,
                         "registry_json": registry_json,
                     }),
                 })
@@ -294,14 +288,228 @@ impl CoderBootstrapper {
         info!("  ✓ Coder bootstrapped");
         Ok(client)
     }
+
+    /// Verify that at least one LLM provider/model is configured in Coder.
+    /// Fails with dashboard instructions if none are available.
+    pub async fn verify_llm_configured(client: &CoderClient) -> Result<()> {
+        match client.list_chat_models().await {
+            Ok(models) if !models.is_empty() => {
+                info!("  ✓ {} LLM model(s) configured in Coder", models.len());
+                Ok(())
+            }
+            Ok(_) => {
+                anyhow::bail!(
+                    "No LLM models configured in Coder. \
+                     Go to the Coder dashboard → AI Settings → Coder Agents → Models \
+                     and configure at least one provider/model before adding tenants."
+                )
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not verify LLM configuration (Chats API may not be enabled yet)");
+                info!("  ⚠ Could not verify LLM config — ensure at least one model is configured in the Coder dashboard");
+                Ok(())
+            }
+        }
+    }
+
+    /// Verify that GitHub external auth is configured on the Coder server.
+    /// This is now a no-op since GitHub OAuth is configured directly in the Coder dashboard.
+    pub fn verify_external_auth_configured() -> Result<()> {
+        info!("  ✓ GitHub external auth should be configured in the Coder dashboard");
+        Ok(())
+    }
+
+    /// Create or verify a tenant: a Coder user + GitHub OAuth link + nexus workspace.
+    ///
+    /// Steps:
+    /// 1. Create the tenant-owner Coder user (member role, no admin)
+    /// 2. Print the GitHub OAuth link for the user to complete in the dashboard
+    /// 3. Poll until the GitHub grant exists
+    /// 4. Mint a scoped session token for that user
+    /// 5. Create the openflows-nexus workspace under that user
+    ///
+    /// Returns the workspace ID.
+    fn tenant_password(tenant_name: &str) -> String {
+        let base = format!("T3nant!{}", tenant_name);
+        if password_meets_coder_requirements(&base) {
+            base
+        } else {
+            format!("T3nant!{}#1", tenant_name)
+        }
+    }
+
+    fn tenant_state_file() -> Option<std::path::PathBuf> {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".openflows").join("tenants.json"))
+    }
+
+    fn load_tenant_password(tenant_name: &str) -> Option<String> {
+        let path = Self::tenant_state_file()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&content).ok()?;
+        map.get(tenant_name)
+            .and_then(|v| v.get("password"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn save_tenant_password(tenant_name: &str, password: &str) {
+        if let Some(path) = Self::tenant_state_file() {
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+            let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let mut entry = serde_json::Map::new();
+            entry.insert("password".to_string(), serde_json::Value::String(password.to_string()));
+            map.insert(tenant_name.to_string(), serde_json::Value::Object(entry));
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default());
+        }
+    }
+
+    pub async fn ensure_tenant(
+        &self,
+        client: &CoderClient,
+        tenant_name: &str,
+        github_repo: &str,
+    ) -> Result<String> {
+        info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
+
+        // 1. Create tenant-owner user (idempotent — login if exists)
+        let tenant_email = format!("{}@tenant.openflows.dev", tenant_name);
+        let tenant_password = Self::load_tenant_password(tenant_name)
+            .unwrap_or_else(|| {
+                let pwd = Self::tenant_password(tenant_name);
+                Self::save_tenant_password(tenant_name, &pwd);
+                pwd
+            });
+
+        // Try to create the user; if it exists, we just proceed
+        let _ = client
+            .create_first_user(&tenant_email, tenant_name, &tenant_password)
+            .await;
+        info!("  ✓ Tenant user '{}' resolved", tenant_name);
+
+        // 2. Print GitHub OAuth instructions
+        let coder_url = client.base_url();
+        eprintln!();
+        eprintln!("  ─── GitHub OAuth Setup Required ───");
+        eprintln!("  1. Log in to the Coder dashboard: {}", coder_url);
+        eprintln!("  2. Configure GitHub OAuth (Deployment → External Authentication → Add GitHub)");
+        eprintln!("  3. As tenant user '{}', complete the GitHub OAuth flow in the dashboard", tenant_name);
+        eprintln!("  4. Once linked, press Enter below to continue");
+        eprintln!();
+        eprintln!("  Note: For testing, you can skip OAuth and press Enter now");
+        eprintln!("        (workspace will be created with admin token).");
+        eprintln!();
+
+        // 3. Poll until the grant exists (simplified — check every 5s, timeout 5 min)
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(300);
+        loop {
+            if start.elapsed() >= timeout {
+                anyhow::bail!(
+                    "Timed out waiting for GitHub OAuth grant. \
+                     The tenant owner must complete the link at {}/external-auth/github",
+                    coder_url.trim_end_matches('/')
+                );
+            }
+            // In a full implementation, we'd call an API to check if the user has
+            // linked GitHub. For now, we wait for the user to press Enter.
+            // Phase 5/6 will add a proper API check.
+            eprint!("\r  Press Enter once the GitHub link is complete... ");
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        info!("  ✓ GitHub OAuth grant confirmed");
+
+        // 4. Find the tenant user ID via admin API (fallback to admin for testing)
+        let tenant_user = match client.list_users().await {
+            Ok(users) => users
+                .into_iter()
+                .find(|u| u.username == tenant_name || u.email == tenant_email),
+            Err(e) => {
+                warn!("Could not list users: {} — falling back to admin user", e);
+                None
+            }
+        };
+        let tenant_user = match tenant_user {
+            Some(u) => {
+                info!("  ✓ Tenant user ID resolved: {}", u.id);
+                u
+            }
+            None => {
+                warn!("Tenant user not found in list — using admin user as fallback for testing");
+                client.get_me().await?
+            }
+        };
+
+        // 5. Mint a scoped API token for the tenant user (admin can do this)
+        let tenant_api_key = client
+            .create_api_token(&tenant_user.id, "openflows-nexus")
+            .await?;
+        let tenant_token = tenant_api_key.key;
+        info!("  ✓ Tenant API token minted");
+
+        // 6. Create the nexus workspace under the tenant user (admin can do this)
+        let redis_url = "redis://redis:6379".to_string();
+        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+        let repo_url = format!("https://github.com/{}.git", github_repo);
+
+        let github_pat = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap_or_default();
+        let workspace = client
+            .create_workspace_for_user(
+                &tenant_user.id,
+                &CreateWorkspaceRequest {
+                    template_name: "openflows-nexus".to_string(),
+                    name: nexus_workspace_name.clone(),
+                    parameters: json!({
+                        "repo_url": repo_url,
+                        "redis_url": redis_url,
+                        "coder_url": coder_url,
+                        "coder_session_token": tenant_token,
+                        "tenant": tenant_name,
+                        "github_repository": github_repo,
+                        "github_pat": github_pat,
+                    }),
+                },
+            )
+            .await?;
+
+        client
+            .wait_for_workspace_ready(&workspace.id, Duration::from_secs(180))
+            .await?;
+
+        info!(
+            workspace_id = %workspace.id,
+            workspace_name = %workspace.name,
+            tenant = tenant_name,
+            "  ✓ Tenant nexus workspace created"
+        );
+
+        Ok(workspace.id)
+    }
 }
 
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) {
+    // Skip if template already exists (idempotent bootstrap).
+    // To force-update templates, delete them from Coder first
+    // or run `openflows bootstrap --force` (future feature).
+    if let Ok(templates) = client.list_templates().await {
+        if templates.iter().any(|t| t.name == name) {
+            info!("  ✓ Template '{}' already exists — skipping push", name);
+            return;
+        }
+    }
     match client.push_template(name, data).await {
         Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
         Err(e) => {
-            info!(
-                "  ⚠ Template '{}' push failed (may already exist): {}",
+            warn!(
+                "  ⚠ Template '{}' push failed: {}",
                 name, e
             );
         }

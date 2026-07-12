@@ -1,14 +1,9 @@
-// crates/agent-vessel/src/types.rs
-//
-// VESSEL-specific types and configuration.
-
 use anyhow::Result;
 use config::Registry;
 use pocketflow_core::{CiPollConfig, MergeMethod};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// CI readiness state — mirrors the nexus CiReadiness for store deserialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiReadiness {
@@ -17,7 +12,6 @@ pub enum CiReadiness {
     SetupInProgress,
 }
 
-/// Configuration for the VESSEL agent.
 #[derive(Debug, Clone, Default)]
 pub struct VesselConfig {
     pub ci_poll: CiPollConfig,
@@ -26,8 +20,6 @@ pub struct VesselConfig {
 }
 
 impl VesselConfig {
-    /// Create config using per-agent token from registry (if configured).
-    /// Falls back to GITHUB_PERSONAL_ACCESS_TOKEN for backward compatibility.
     pub fn from_registry(registry_path: impl AsRef<Path>) -> Result<Self> {
         let registry = Registry::load(registry_path)?;
         let github_token = registry.resolve_github_token("vessel")?;
@@ -39,11 +31,10 @@ impl VesselConfig {
         })
     }
 
-    /// Create config using GITHUB_PERSONAL_ACCESS_TOKEN (fallback).
     pub fn from_env() -> Self {
-        let github_token = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").expect(
-            "GITHUB_PERSONAL_ACCESS_TOKEN (or AGENT_VESSEL_GITHUB_TOKEN via registry) must be set",
-        );
+        let github_token = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN")
+            .or_else(|_| std::env::var("CODER_GITHUB_TOKEN"))
+            .unwrap_or_default();
 
         Self {
             ci_poll: CiPollConfig::default(),
@@ -53,11 +44,9 @@ impl VesselConfig {
     }
 }
 
-/// Result of the VESSEL workflow for a single PR.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VesselOutcome {
-    /// Successfully merged and optionally deployed
     Merged {
         ticket_id: String,
         pr_number: u64,
@@ -65,37 +54,34 @@ pub enum VesselOutcome {
         pr_title: String,
         pr_body: Option<String>,
     },
-    /// CI failed, did not merge
     CiFailed {
         ticket_id: Option<String>,
         pr_number: u64,
         reason: String,
         failure_detail: Option<github::CiFailureDetail>,
     },
-    /// CI passed but merge failed (conflict, etc.)
     MergeBlocked {
         ticket_id: Option<String>,
         pr_number: u64,
         reason: String,
     },
-    /// CI polling timed out
     CiTimeout {
         ticket_id: Option<String>,
         pr_number: u64,
     },
-    /// No CI workflows configured — merged without CI validation
     CiMissing {
         ticket_id: Option<String>,
         pr_number: u64,
     },
-    /// Merge conflicts detected — could not be auto-resolved
     Conflicts {
         ticket_id: Option<String>,
         pr_number: u64,
         conflicted_files: Vec<String>,
     },
-    /// Docs PR with conflicts — closed to allow lore to regenerate
-    DocsPrClosed { pr_number: u64, reason: String },
+    DocsPrClosed {
+        pr_number: u64,
+        reason: String,
+    },
 }
 
 impl VesselOutcome {

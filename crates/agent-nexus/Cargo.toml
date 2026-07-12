@@ -6,7 +6,6 @@ license = "MIT"
 
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }
-agent-client = { path = "../agent-client" }
 config = { path = "../config" }
 github = { path = "../github" }
 coder-client = { path = "../coder-client" }

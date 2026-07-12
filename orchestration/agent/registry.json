@@ -1,112 +1,40 @@
 {
-  "default_cli": "codex",
-  "allowed_domains": [
-    "api.github.com",
-    "*.github.com",
-    "pypi.org",
-    "registry.npmjs.org",
-    "crates.io"
-  ],
   "team": [
     {
-      "id": "nexus",
-      "cli": "codex",
-      "active": true,
-      "instances": 1,
-      "model_backend": "openai/gpt-5.5",
-      "routing_key": "nexus-key",
-      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN",
-      "allowed_domains": null,
-      "workspace_provider": "coder",
-      "coder_module": {
-        "source": "registry.coder.com/coder-labs/codex/coder",
-        "version": "VERIFY_ON_REGISTRY",
-        "params": {
-          "enable_ai_gateway": true,
-          "permission_mode": "plan",
-          "workdir": "/home/coder/workspace"
-        }
-      }
-    },
-    {
       "id": "forge",
-      "cli": "codex",
       "active": true,
-      "instances": 2,
-      "model_backend": "openai/gpt-5.5",
-      "routing_key": "forge-key",
-      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN",
-      "allowed_domains": null,
-      "workspace_provider": "coder",
-      "coder_module": {
-        "source": "registry.coder.com/coder-labs/codex/coder",
-        "version": "VERIFY_ON_REGISTRY",
-        "params": {
-          "enable_ai_gateway": true,
-          "permission_mode": "acceptEdits",
-          "workdir": "/home/coder/workspace"
-        }
-      }
+      "model": "claude-sonnet-4-5",
+      "plan_mode": false,
+      "max_instances": 2,
+      "skills": ["forge-coding", "forge-planning", "shared-harness-protocol"],
+      "mcp": {}
     },
     {
       "id": "sentinel",
-      "cli": "codex",
       "active": true,
-      "instances": 1,
-      "model_backend": "openai/gpt-5.5",
-      "routing_key": "sentinel-key",
-      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN",
-      "allowed_domains": null,
-      "workspace_provider": "coder",
-      "coder_module": {
-        "source": "registry.coder.com/coder-labs/codex/coder",
-        "version": "VERIFY_ON_REGISTRY",
-        "params": {
-          "enable_ai_gateway": true,
-          "permission_mode": "plan",
-          "workdir": "/home/coder/workspace"
-        }
-      }
+      "model": "claude-sonnet-4-5",
+      "plan_mode": true,
+      "max_instances": 1,
+      "skills": ["sentinel-review", "sentinel-criteria", "shared-harness-protocol"],
+      "mcp": {}
     },
     {
       "id": "vessel",
-      "cli": "codex",
       "active": true,
-      "instances": 1,
-      "model_backend": "openai/gpt-5.5",
-      "routing_key": "vessel-key",
-      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN",
-      "allowed_domains": null,
-      "workspace_provider": "coder",
-      "coder_module": {
-        "source": "registry.coder.com/coder-labs/codex/coder",
-        "version": "VERIFY_ON_REGISTRY",
-        "params": {
-          "enable_ai_gateway": true,
-          "permission_mode": "acceptEdits",
-          "workdir": "/home/coder/workspace"
-        }
-      }
+      "model": "claude-haiku-4-5",
+      "plan_mode": false,
+      "max_instances": 1,
+      "skills": ["vessel-merge-protocol", "vessel-ci-gate", "shared-harness-protocol"],
+      "mcp": {}
     },
     {
       "id": "lore",
-      "cli": "codex",
-      "active": false,
-      "instances": 1,
-      "model_backend": "openai/gpt-5.5",
-      "routing_key": "lore-key",
-      "github_token_env": "AGENT_LORE_GITHUB_TOKEN",
-      "allowed_domains": null,
-      "workspace_provider": "coder",
-      "coder_module": {
-        "source": "registry.coder.com/coder-labs/codex/coder",
-        "version": "VERIFY_ON_REGISTRY",
-        "params": {
-          "enable_ai_gateway": true,
-          "permission_mode": "acceptEdits",
-          "workdir": "/home/coder/workspace"
-        }
-      }
+      "active": true,
+      "model": "claude-haiku-4-5",
+      "plan_mode": false,
+      "max_instances": 1,
+      "skills": ["lore-documentation", "lore-changelog", "shared-harness-protocol"],
+      "mcp": {}
     }
   ]
 }

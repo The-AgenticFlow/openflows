@@ -5,134 +5,109 @@ terraform {
   }
 }
 
-variable "agent_module_source" {
-  type        = string
-  default     = "registry.coder.com/coder/claude-code/coder"
-  description = "Coder Registry module source for agent CLI"
-}
-
-variable "agent_module_version" {
-  type        = string
-  default     = "5.2.0"
-  description = "Version of the agent module"
-}
-
-variable "enable_ai_gateway" {
-  type        = bool
-  default     = true
-  description = "Enable Coder AI Gateway for model routing"
-}
-
-variable "coder_url" {
-  type        = string
+# Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
+data "coder_parameter" "coder_url" {
+  name        = "coder_url"
+  description  = "Coder server URL exposed to the Nexus workspace"
   default     = ""
-  description = "Coder server URL exposed to the Nexus workspace"
+  type        = "string"
 }
 
-variable "coder_api_token" {
-  type        = string
+data "coder_parameter" "coder_session_token" {
+  name        = "coder_session_token"
+  description  = "Scoped Coder session token for the Controller"
   default     = ""
-  description = "Coder API token exposed to the Nexus workspace"
+  type        = "string"
 }
 
-variable "registry_json" {
-  type        = string
+data "coder_parameter" "redis_url" {
+  name        = "redis_url"
+  description  = "Redis SharedStore URL"
+  default     = "redis://redis:6379"
+  type        = "string"
+}
+
+data "coder_parameter" "repo_url" {
+  name        = "repo_url"
+  description  = "Git repository URL to clone into the workspace"
   default     = ""
-  description = "Registry JSON injected into the Nexus workspace"
+  type        = "string"
 }
 
-variable "use_ai_gateway" {
-  type    = string
-  default = "true"
-}
-
-variable "host_cli_binary" {
-  type        = string
+data "coder_parameter" "tenant" {
+  name        = "tenant"
+  description  = "OpenFlows tenant identifier"
   default     = ""
-  description = "Host path to a pre-built CLI ELF binary (bind-mounted to skip startup download)"
+  type        = "string"
 }
 
-variable "cli_binary_name" {
-  type        = string
-  default     = "claude"
-  description = "Name of the CLI binary to expose on PATH inside the workspace"
-}
-
-variable "litellm_proxy_url" {
-  type    = string
-  default = "http://proxy:4000"
-}
-
-variable "redis_url" {
-  type    = string
-  default = "redis://redis:6379"
-}
-
-variable "repo_url" {
-  type        = string
+data "coder_parameter" "registry_json" {
+  name        = "registry_json"
+  description  = "Registry JSON injected into the Nexus workspace"
   default     = ""
-  description = "Git repository URL to clone into the workspace"
+  type        = "string"
 }
 
-variable "enable_slackme" {
-  type        = bool
-  default     = false
-  description = "Enable Slack command-completion notifications"
-}
-
-variable "mcp_config" {
-  type        = string
+data "coder_parameter" "github_repository" {
+  name        = "github_repository"
+  description  = "GitHub repository (owner/repo) for the Controller to monitor"
   default     = ""
-  description = "MCP server configuration (JSON string)"
+  type        = "string"
+}
+
+data "coder_parameter" "github_pat" {
+  name        = "github_pat"
+  description  = "GitHub Personal Access Token for issue/PR sync"
+  default     = ""
+  type        = "string"
 }
 
 resource "coder_agent" "main" {
-  os         = "linux"
-  arch       = "amd64"
-  dir        = "/home/coder/workspace"
+  os   = "linux"
+  arch = "amd64"
+  dir  = "/home/coder/workspace"
 
   startup_script = <<-EOT
     #!/bin/bash
     set -e
 
-    # git pull or clone
-    if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull origin main 2>/dev/null || true
-    elif [ -n "${var.repo_url}" ]; then
-      git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
-    fi
-
-    # If a host-provided CLI binary is bind-mounted, install it onto PATH.
-    if [ -x /opt/host-cli/${var.cli_binary_name} ]; then
-      mkdir -p /home/coder/.local/bin /tmp/coder-script-data/bin
-      ln -sf /opt/host-cli/${var.cli_binary_name} /home/coder/.local/bin/${var.cli_binary_name}
-      ln -sf /opt/host-cli/${var.cli_binary_name} /tmp/coder-script-data/bin/${var.cli_binary_name}
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${var.cli_binary_name} installed from host bind-mount" >&2
-    fi
-
-    # Install Claude Code hooks from orchestration/plugin/hooks/nexus/
-    HOOKS_SRC="/home/coder/workspace/orchestration/plugin/hooks/nexus"
-    HOOKS_DST="/home/coder/workspace/.claude/hooks/nexus"
-    if [ -d "$HOOKS_SRC" ]; then
-      mkdir -p "$HOOKS_DST"
-      for hook in "$HOOKS_SRC"/*.sh; do
-        if [ -f "$hook" ]; then
-          cp "$hook" "$HOOKS_DST/"
-          chmod +x "$HOOKS_DST/$(basename "$hook")"
-        fi
-      done
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Nexus hooks installed from $HOOKS_SRC" >&2
+    # TEMPORARY: Use mounted dev binary for local testing
+    # (In production, download from GitHub releases instead)
+    if [ -f /opt/openflows-dev/openflows ]; then
+      echo "Using mounted dev binary..."
+      sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
+      sudo chmod +x /usr/local/bin/openflows
     else
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Nexus hooks source not found at $HOOKS_SRC - hooks will be provisioned separately" >&2
+      echo "WARNING: Dev binary not found at /opt/openflows-dev/openflows"
+      echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # SharedStore heartbeat writer
-    nohup bash -c 'while true; do
-      redis-cli -u ${var.redis_url} SET "heartbeat:nexus" \
-        "{\"ts\":$(date +%s),\"ws_id\":\"${data.coder_workspace.me.id}\",\"status\":\"running\"}" \
-        2>/dev/null || true
-      sleep 30
-    done' >/dev/null 2>&1 &
+    # git pull or clone (creds via Coder external auth)
+    if [ -d /home/coder/workspace/.git ]; then
+      cd /home/coder/workspace && git pull 2>/dev/null || true
+    elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
+      git clone ${data.coder_parameter.repo_url.value} /home/coder/workspace 2>/dev/null || true
+    fi
+
+    # Start the OpenFlows Controller
+    export CODER_URL="${data.coder_parameter.coder_url.value}"
+    export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
+    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
+    export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
+    export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
+    # GitHub PAT for issue sync (in production, use Coder external auth instead)
+    echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
+
+    cd /home/coder/workspace
+    
+    if command -v openflows >/dev/null 2>&1; then
+      echo "Starting OpenFlows Controller..."
+      nohup openflows run >/tmp/openflows-controller.log 2>&1 &
+      echo "Controller started. Check logs: tail -f /tmp/openflows-controller.log"
+    else
+      echo "ERROR: openflows binary not found. Controller not started."
+    fi
   EOT
 }
 
@@ -149,58 +124,31 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
+  # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
+  volumes {
+    container_path = "/opt/openflows-dev"
+    host_path      = "/home/christian/sandbox/openflows/.dev-binaries"
+    read_only      = true
+  }
+
   env = [
-    "REPO_URL=${var.repo_url}",
-    "REDIS_URL=${var.redis_url}",
-    "LITELLM_PROXY_URL=${var.litellm_proxy_url}",
-    "USE_AI_GATEWAY=${var.use_ai_gateway}",
-    "CODER_URL=${var.coder_url}",
-    "CODER_API_TOKEN=${var.coder_api_token}",
-    "OPENFLOWS_REGISTRY_JSON=${var.registry_json}",
+    "CODER_URL=${data.coder_parameter.coder_url.value}",
+    "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
+    "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
+    "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
+    "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]
 
-  # Connect to the openflows_default compose network for Redis access.
   networks_advanced {
     name = "openflows_default"
   }
 
-  dynamic "volumes" {
-    for_each = var.host_cli_binary != "" ? [var.host_cli_binary] : []
-    content {
-      host_path      = volumes.value
-      container_path = "/opt/host-cli/${var.cli_binary_name}"
-      read_only      = true
-    }
-  }
-
-  # Run Coder agent init script as entrypoint (downloads + starts agent, runs startup_script, keeps container alive)
-  # Replace localhost/127.0.0.1 with Docker host gateway so the agent can reach the Coder server
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
 }
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-
-# Agent module (configurable CLI backend)
-module "agent" {
-  source  = "registry.coder.com/coder/claude-code/coder"
-  version = "5.2.0"
-
-  agent_id          = coder_agent.main.id
-  workdir           = "/home/coder/workspace"
-  enable_ai_gateway = var.enable_ai_gateway
-
-}
-
-
-# Slack notification module (conditional)
-module "slackme" {
-  count  = var.enable_slackme ? 1 : 0
-  source = "registry.coder.com/coder/slackme/coder"
-  version = "1.0.33"
-
-  agent_id         = coder_agent.main.id
-  auth_provider_id = "slack"
-}

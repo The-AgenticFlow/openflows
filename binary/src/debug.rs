@@ -24,7 +24,6 @@ pub async fn debug_system() -> Result<()> {
             println!("Worker ID: {}", id);
             println!("  Status: {:?}", slot.status);
             println!("  Workspace ID: {:?}", slot.workspace_id);
-            println!("  Assigned Ticket: {:?}", slot.assigned_ticket);
         }
     }
 

@@ -22,15 +22,6 @@ pub struct StoreEvent {
     pub ts: u64, // unix millis
 }
 
-// ── Backend trait (sealed inside this module) ─────────────────────────────
-
-#[async_trait::async_trait]
-trait StoreBackend: Send + Sync {
-    async fn get(&self, key: &str) -> Option<Value>;
-    async fn set(&self, key: &str, value: Value);
-    async fn del(&self, key: &str);
-}
-
 // ── In-memory backend ─────────────────────────────────────────────────────
 
 struct InMemoryBackend {
@@ -43,24 +34,24 @@ impl InMemoryBackend {
             map: RwLock::new(HashMap::new()),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl StoreBackend for InMemoryBackend {
-    async fn get(&self, key: &str) -> Option<Value> {
-        self.map.read().await.get(key).cloned()
-    }
-    async fn set(&self, key: &str, value: Value) {
-        self.map.write().await.insert(key.to_string(), value);
-    }
-    async fn del(&self, key: &str) {
-        self.map.write().await.remove(key);
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        let map = self.map.read().await;
+        map.keys()
+            .filter(|k| {
+                if pattern == "*" || pattern.ends_with('*') {
+                    let prefix = pattern.trim_end_matches('*');
+                    k.starts_with(prefix)
+                } else {
+                    k == &pattern
+                }
+            })
+            .cloned()
+            .collect()
     }
 }
 
 // ── Redis backend ─────────────────────────────────────────────────────────
-// Allow redis as stub for now
-// Allow redis as stub for now
 struct RedisBackend {
     client: fred::clients::Client,
 }
@@ -73,25 +64,82 @@ impl RedisBackend {
         client.init().await?;
         Ok(Self { client })
     }
+
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        use fred::types::scan::Scanner;
+        use futures::StreamExt;
+        let mut keys = Vec::new();
+        let mut stream = self.client.scan(pattern, None, None);
+        while let Some(result) = stream.next().await {
+            if let Ok(mut scan_result) = result {
+                if let Some(page) = scan_result.take_results() {
+                    for key in page {
+                        if let Some(s) = key.into_string() {
+                            keys.push(s);
+                        }
+                    }
+                }
+                if scan_result.has_more() {
+                    scan_result.next();
+                }
+            }
+        }
+        keys
+    }
 }
 
-#[async_trait::async_trait]
-impl StoreBackend for RedisBackend {
+// ── Backend enum ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum Backend {
+    InMemory(Arc<InMemoryBackend>),
+    Redis(Arc<RedisBackend>),
+}
+
+impl Backend {
     async fn get(&self, key: &str) -> Option<Value> {
-        use fred::prelude::*;
-        let raw: Option<String> = self.client.get(key).await.ok()?;
-        raw.and_then(|s| serde_json::from_str(&s).ok())
-    }
-    async fn set(&self, key: &str, value: Value) {
-        use fred::prelude::*;
-        if let Ok(s) = serde_json::to_string(&value) {
-            let _: core::result::Result<(), _> =
-                self.client.set::<(), _, _>(key, s, None, None, false).await;
+        match self {
+            Backend::InMemory(b) => b.map.read().await.get(key).cloned(),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = b.client.get(key).await.ok()?;
+                raw.and_then(|s| serde_json::from_str(&s).ok())
+            }
         }
     }
+
+    async fn set(&self, key: &str, value: Value) {
+        match self {
+            Backend::InMemory(b) => {
+                b.map.write().await.insert(key.to_string(), value);
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                if let Ok(s) = serde_json::to_string(&value) {
+                    let _: core::result::Result<(), _> =
+                        b.client.set::<(), _, _>(key, s, None, None, false).await;
+                }
+            }
+        }
+    }
+
     async fn del(&self, key: &str) {
-        use fred::prelude::*;
-        let _: core::result::Result<i64, _> = self.client.del(key).await;
+        match self {
+            Backend::InMemory(b) => {
+                b.map.write().await.remove(key);
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let _: core::result::Result<i64, _> = b.client.del(key).await;
+            }
+        }
+    }
+
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        match self {
+            Backend::InMemory(b) => b.keys(pattern).await,
+            Backend::Redis(b) => b.keys(pattern).await,
+        }
     }
 }
 
@@ -99,7 +147,7 @@ impl StoreBackend for RedisBackend {
 
 #[derive(Clone)]
 pub struct SharedStore {
-    backend: Arc<dyn StoreBackend>,
+    backend: Backend,
     ring_buffer: Arc<RwLock<Vec<StoreEvent>>>,
 }
 
@@ -107,7 +155,7 @@ impl SharedStore {
     /// In-memory backend — use for dev and tests.
     pub fn new_in_memory() -> Self {
         Self {
-            backend: Arc::new(InMemoryBackend::new()),
+            backend: Backend::InMemory(Arc::new(InMemoryBackend::new())),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
         }
     }
@@ -115,7 +163,7 @@ impl SharedStore {
     /// Redis backend — use for Docker Compose and production.
     pub async fn new_redis(url: &str) -> Result<Self> {
         Ok(Self {
-            backend: Arc::new(RedisBackend::new(url).await?),
+            backend: Backend::Redis(Arc::new(RedisBackend::new(url).await?)),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
         })
     }
@@ -140,6 +188,10 @@ impl SharedStore {
     pub async fn del(&self, key: &str) {
         debug!(key, "store.del");
         self.backend.del(key).await;
+    }
+
+    pub async fn keys(&self, pattern: &str) -> Vec<String> {
+        self.backend.keys(pattern).await
     }
 
     /// Typed get — deserialises JSON into T. Returns None on missing key or type mismatch.

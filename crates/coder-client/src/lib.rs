@@ -382,6 +382,25 @@ impl CoderClient {
         }
     }
 
+    /// List all users visible to the authenticated user.
+    /// GET /api/v2/users
+    pub async fn list_users(&self) -> Result<Vec<CoderUser>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/v2/users")
+            .send()
+            .await
+            .context("Failed to list users")?;
+
+        if resp.status().is_success() {
+            let users: UsersResponse = resp.json().await?;
+            Ok(users.users)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list users ({}): {}", status, body)
+        }
+    }
+
     /// Get the current authenticated user (/api/v2/users/me).
     pub async fn get_me(&self) -> Result<CoderUser> {
         let resp = self
@@ -648,23 +667,26 @@ impl CoderClient {
         }
     }
 
-    /// Create a workspace from a template.
-    ///
-    /// Resolves the authenticated user's ID via `/users/me`, looks up the template
-    /// ID by name, then creates the workspace at `/api/v2/users/{user_id}/workspaces`.
+    /// Create a workspace from a template for the current authenticated user.
     pub async fn create_workspace(&self, req: &CreateWorkspaceRequest) -> Result<CoderWorkspace> {
-        // Resolve the current user ID
         let user_id = self
             .get_me()
             .await
             .map(|u| u.id)
             .context("Failed to resolve current user ID for workspace creation")?;
-        info!(%user_id, "Resolved user ID for workspace creation");
+        self.create_workspace_for_user(&user_id, req).await
+    }
 
-        // Look up the template by name to get its ID
+    /// Create a workspace for a specific user (admin can create for other users).
+    pub async fn create_workspace_for_user(
+        &self,
+        user_id: &str,
+        req: &CreateWorkspaceRequest,
+    ) -> Result<CoderWorkspace> {
+        info!(%user_id, "Creating workspace for user");
+
         let template_id = self.find_template_id_by_name(&req.template_name).await?;
 
-        // Convert parameters from {"key":"value"} to [{"name":"key","value":"value"}]
         let rich_parameter_values = if req.parameters.is_object() {
             let obj = req.parameters.as_object().unwrap();
             serde_json::Value::Array(
@@ -695,9 +717,8 @@ impl CoderClient {
             info!(workspace_id = %workspace.id, workspace_name = %workspace.name, "Created workspace");
             Ok(workspace)
         } else if resp.status().as_u16() == 409 {
-            // Workspace already exists — find it by name and return it
             info!(workspace_name = %req.name, "Workspace already exists, looking it up");
-            let workspaces = self.list_workspaces(&user_id).await?;
+            let workspaces = self.list_workspaces(user_id).await?;
             workspaces
                 .into_iter()
                 .find(|w| w.name == req.name)
@@ -840,6 +861,41 @@ impl CoderClient {
         } else {
             bail!("Failed to delete workspace: {}", resp.status())
         }
+    }
+
+    /// Create a role-specific worker workspace for a ticket.
+    ///
+    /// Workspace naming convention: `{role}-t-{ticket}` (lowercase, Coder name rules).
+    /// Uses the `openflows-{role}` template. Waits for the workspace to become ready.
+    pub async fn create_role_workspace(
+        &self,
+        role: &str,
+        ticket_id: &str,
+        parameters: serde_json::Value,
+    ) -> Result<CoderWorkspace> {
+        let workspace_name = format!("{}-t-{}", role, ticket_id.to_lowercase());
+        let template_name = format!("openflows-{}", role);
+
+        info!(
+            workspace_name = %workspace_name,
+            template = %template_name,
+            role,
+            ticket_id,
+            "Creating role workspace"
+        );
+
+        let workspace = self
+            .create_workspace(&CreateWorkspaceRequest {
+                template_name,
+                name: workspace_name,
+                parameters,
+            })
+            .await?;
+
+        self.wait_for_workspace_ready(&workspace.id, std::time::Duration::from_secs(180))
+            .await?;
+
+        Ok(workspace)
     }
 
     /// Wait until a workspace's build status is "running" **and** its agent
@@ -1305,14 +1361,10 @@ impl CoderClient {
 
         // Build naming convention: {role}-{ticket_id} — ticket_id already includes "T-" prefix
         let workspace_name = format!("{}-{}", role, ticket_id);
-        let repository: String = std::env::var("OPENFLOWS_REPOSITORY")
-            .or_else(|_| std::env::var("AGENTFLOW_REPOSITORY"))
+        let repository: String = std::env::var("GITHUB_REPOSITORY")
             .unwrap_or_else(|_| "openflows/target".to_string());
         let repo_url = format!("https://github.com/{}.git", repository);
-        let template_name =
-            std::env::var("CODER_FORGE_TEMPLATE").unwrap_or_else(|_| "openflows-forge".to_string());
-        let cli_name = std::env::var("OPENFLOWS_FORGE_CLI").unwrap_or_else(|_| "claude".into());
-        let host_cli_binary = crate::resolve_host_cli_binary(&cli_name);
+        let template_name = format!("openflows-{}", role);
 
         // Create (or find existing) workspace
         info!(
@@ -1325,8 +1377,6 @@ impl CoderClient {
                 name: workspace_name.clone(),
                 parameters: serde_json::json!({
                     "repo_url": repo_url,
-                    "host_cli_binary": host_cli_binary,
-                    "cli_binary_name": cli_name,
                 }),
             })
             .await?;
@@ -1349,8 +1399,9 @@ impl CoderClient {
             }
         };
 
-        // Create chat with OpenFlows labels
-        let labels = build_chat_labels(ticket_id, role, "openflows");
+        // Create chat with OpenFlows labels (includes tenant)
+        let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+        let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
         let chat_req = CreateChatRequest {
             organization_id,
             workspace_id: workspace.id.clone(),

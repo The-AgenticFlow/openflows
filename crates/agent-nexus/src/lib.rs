@@ -1,5 +1,4 @@
 // crates/agent-nexus/src/lib.rs
-use agent_client::{AgentDecision, AgentPersona, AgentRunner};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use coder_client::{
@@ -12,7 +11,7 @@ use config::{
         KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
         KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider, ACTION_MERGE_PRS,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
     ACTION_NO_WORK,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
@@ -23,6 +22,26 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+/// Persona loaded from a `.agent.md` YAML frontmatter block.
+/// (Inlined from the deleted agent-client crate.)
+#[derive(Debug, Clone)]
+pub struct AgentPersona {
+    pub id: String,
+    pub role: String,
+    pub system_prompt: String,
+}
+
+/// The final output of the orchestration decision.
+/// (Inlined from the deleted agent-client crate.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDecision {
+    pub action: String,
+    pub notes: String,
+    pub assign_to: Option<String>,
+    pub ticket_id: Option<String>,
+    pub issue_url: Option<String>,
+}
 
 const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
@@ -66,7 +85,7 @@ fn ci_setup_ticket_active(tickets: &[Ticket]) -> bool {
 fn remap_unrecognized_status(raw: &str) -> Option<&'static str> {
     let upper = raw.trim().to_uppercase();
 
-    // Same priority ordering as pair_harness::normalize_status keyword matching.
+    // Same priority ordering as provisioner::normalize_status keyword matching.
     // More-specific matches checked before less-specific ones.
 
     // PR-related keywords
@@ -258,16 +277,26 @@ impl NexusNode {
         Registry::load(&self.registry_path)
     }
 
-    async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
+async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
         if owner.is_empty() || repo_name.is_empty() {
             return Ok(());
         }
 
-        let token = match self.resolve_github_token() {
+let token = match self.resolve_github_token() {
             Ok(t) => t,
             Err(_) => {
-                warn!("GitHub token not configured, skipping issue sync");
-                return Ok(());
+                match std::env::var("GITHUB_TOKEN") {
+                    Ok(t) => t,
+                    Err(_) => {
+                        match std::fs::read_to_string("/tmp/github_token") {
+                            Ok(t) => t.trim().to_string(),
+                            Err(_) => {
+                                warn!("GitHub token not configured, skipping issue sync");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -318,8 +347,24 @@ impl NexusNode {
         let token = match self.resolve_github_token() {
             Ok(t) => t,
             Err(_) => {
-                warn!("GitHub token not configured, skipping PR sync");
-                return Ok(());
+                match std::env::var("GITHUB_TOKEN") {
+                    Ok(t) => {
+                        info!("Using GITHUB_TOKEN env var for PR sync");
+                        t
+                    }
+                    Err(_) => {
+                        match std::fs::read_to_string("/tmp/github_token") {
+                            Ok(t) => {
+                                info!("Using /tmp/github_token file for PR sync");
+                                t.trim().to_string()
+                            }
+                            Err(_) => {
+                                warn!("GitHub token not configured, skipping PR sync");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -600,30 +645,18 @@ impl NexusNode {
         }
 
         for slot_id in &all_slot_ids {
-            let provider = registry
-                .resolve_workspace_provider(slot_id)
-                .unwrap_or(config::WorkspaceProvider::Local);
-
             match slots.get_mut(slot_id) {
                 Some(slot) => {
-                    // Update provider if it changed
-                    if slot.workspace_provider != provider {
-                        info!(slot = %slot_id, old_provider = ?slot.workspace_provider, new_provider = ?provider, "Updating workspace provider for existing slot");
-                        slot.workspace_provider = provider.clone();
-                        slot.workspace_id = None;
-                        slot.status = WorkerStatus::Idle;
-                        changed = true;
-                    }
+                    // Coder is the only provider — no provider field to update.
                 }
                 None => {
-                    info!(slot = %slot_id, provider = ?provider, "Adding new worker slot from registry");
+                    info!(slot = %slot_id, "Adding new worker slot from registry");
                     slots.insert(
                         slot_id.clone(),
                         WorkerSlot {
                             id: slot_id.clone(),
                             status: WorkerStatus::Idle,
                             workspace_id: None,
-                            workspace_provider: provider,
                         },
                     );
                     changed = true;
@@ -663,14 +696,11 @@ impl NexusNode {
     ) -> Result<Option<String>> {
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let (workspace_provider, existing_workspace_id) = match slots.get(worker_id) {
-            Some(slot) => (slot.workspace_provider.clone(), slot.workspace_id.clone()),
+        let existing_workspace_id = match slots.get(worker_id) {
+            Some(slot) => slot.workspace_id.clone(),
             None => return Ok(None),
         };
 
-        if workspace_provider != WorkspaceProvider::Coder {
-            return Ok(existing_workspace_id);
-        }
         if let Some(ref existing) = existing_workspace_id {
             // Re-verify that the existing workspace is actually ready before
             // treating it as provisioned.  If readiness was never confirmed
@@ -973,10 +1003,6 @@ impl NexusNode {
             None => return,
         };
 
-        if slot.workspace_provider != WorkspaceProvider::Coder {
-            return;
-        }
-
         let workspace_id = match &slot.workspace_id {
             Some(ws) => ws.clone(),
             None => {
@@ -1069,7 +1095,8 @@ impl NexusNode {
         );
 
         use coder_client::types::{build_chat_labels, ChatInputPart, CreateChatRequest};
-        let labels = build_chat_labels(ticket_id, role, "openflows");
+        let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+        let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
 
         // Resolve the default organization ID required by the Coder chats API.
         let organization_id = match client.get_default_organization_id().await {
@@ -1476,17 +1503,30 @@ impl NexusNode {
         for ticket in tickets.iter_mut() {
             match &ticket.status {
                 TicketStatus::Assigned { worker_id } | TicketStatus::InProgress { worker_id } => {
-                    let worker_idle = slots
-                        .get(worker_id)
-                        .is_none_or(|s| matches!(s.status, WorkerStatus::Idle));
+                    // Only recover when the worker slot is *entirely missing* — a
+                    // genuinely orphaned ticket. Resetting merely because the slot is
+                    // Idle fed the runaway nexus <-> forge_pair cycle: forge_pair
+                    // reports the chat as still building while the slot flips to Idle,
+                    // recover_orphans reset the ticket to Open, and nexus re-assigned
+                    // the same ticket on the next pass. Idle-slot reconciliation of a
+                    // still-assigned ticket is left to forge_pair's chat monitoring.
                     let worker_missing = !slots.contains_key(worker_id);
-                    if worker_idle || worker_missing {
+                    if worker_missing {
                         info!(
                             ticket_id = ticket.id,
-                            worker_id, "Recovering orphaned ticket — resetting to Open"
+                            worker_id, "Recovering orphaned ticket (worker slot missing) — resetting to Open"
                         );
                         ticket.status = TicketStatus::Open;
                         changed_tickets = true;
+                    } else if slots
+                        .get(worker_id)
+                        .is_some_and(|s| matches!(s.status, WorkerStatus::Idle))
+                    {
+                        debug!(
+                            ticket_id = ticket.id,
+                            worker_id,
+                            "Ticket still assigned to idle worker — leaving for forge_pair monitoring (no reset)"
+                        );
                     }
                 }
                 _ => {}
@@ -1835,9 +1875,6 @@ impl NexusNode {
             let Some(workspace_id) = slot.workspace_id.as_deref() else {
                 continue;
             };
-            if slot.workspace_provider != WorkspaceProvider::Coder {
-                continue;
-            }
 
             let ticket_id = match &slot.status {
                 WorkerStatus::Assigned { ticket_id, .. }
@@ -2138,19 +2175,15 @@ impl Node for NexusNode {
             warn!("Failed to sync registry: {}", e);
         }
 
-        let repository = store.get("repository").await.unwrap_or(json!(""));
+        let repository = if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
+            repo
+        } else {
+            store.get("repository").await.unwrap_or(json!("")).as_str().unwrap_or("").to_string()
+        };
 
-        let (owner, repo_name) = repository
-            .as_str()
-            .and_then(|r| {
-                let parts: Vec<&str> = r.split('/').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((String::new(), String::new()));
+        let mut parts = repository.splitn(2, '/');
+        let owner = parts.next().unwrap_or("").to_string();
+        let repo_name = parts.next().unwrap_or("").to_string();
 
         if let Err(e) = self.sync_issues(store, &owner, &repo_name).await {
             warn!("Failed to sync issues from GitHub: {}", e);
@@ -2224,9 +2257,6 @@ impl Node for NexusNode {
         }
 
         for (worker_id, slot) in &worker_slots_map {
-            if slot.workspace_provider != WorkspaceProvider::Coder {
-                continue;
-            }
             let ticket_id = match &slot.status {
                 WorkerStatus::Assigned { ticket_id, .. }
                 | WorkerStatus::Working { ticket_id, .. }
@@ -2281,20 +2311,85 @@ impl Node for NexusNode {
     }
 
     async fn exec(&self, context: Value) -> Result<Value> {
-        info!("Nexus calling AgentRunner for orchestration...");
+        // Phase 5 will replace this with Coder Agents (Chats API) coordination.
+        // For now, return a rule-based decision so the flow compiles and runs structurally.
+        info!("Nexus exec: rule-based decision (LLM runner removed for Coder-only redesign)");
 
-        let registry = self.load_registry()?;
-        let model_backend = registry.get("nexus").and_then(|e| e.model_backend.clone());
+        let tickets: Vec<Value> = context
+            .get("assignable_tickets")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let pending_prs: Vec<Value> = context
+            .get("open_prs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
-        let github_token = self.resolve_github_token()?;
+        // Idle *forge* workers, parsed from the worker_slots map provided by prep.
+        // We only ever hand a ticket to a worker that is actually Idle, so a worker
+        // that is already Assigned/Working can never be re-handed the same ticket.
+        let idle_forge_workers: Vec<String> = context
+            .get("worker_slots")
+            .and_then(|v| v.as_object())
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter_map(|v| serde_json::from_value::<WorkerSlot>(v.clone()).ok())
+                    .filter(|slot| {
+                        matches!(slot.status, WorkerStatus::Idle)
+                            && Self::worker_role(&slot.id) == "forge"
+                    })
+                    .map(|slot| slot.id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let mut runner =
-            AgentRunner::from_env_with_token(model_backend.as_deref(), &github_token).await?;
-        let persona = self.load_persona().await?;
+        if !pending_prs.is_empty() {
+            return Ok(json!(AgentDecision {
+                action: ACTION_MERGE_PRS.to_string(),
+                notes: "Pending PRs found — route to vessel".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
+        }
 
-        let decision: AgentDecision = runner.run(&persona, context, 10).await?;
+        // Do not dispatch new work when no forge worker is idle. Previously exec
+        // hard-coded "forge-1" and dispatched even while forge-1 was busy, so each
+        // forge_pair "empty" bounce returned to a nexus that re-assigned the same
+        // ticket — exhausting max_steps in the nexus <-> forge_pair ping-pong.
+        if tickets.is_empty() || idle_forge_workers.is_empty() {
+            info!(
+                assignable_tickets = tickets.len(),
+                idle_forge_workers = idle_forge_workers.len(),
+                "Nexus: no dispatch possible this pass (no idle forge worker or no assignable ticket)"
+            );
+            return Ok(json!(AgentDecision {
+                action: ACTION_NO_WORK.to_string(),
+                notes: "No idle forge worker available or no assignable tickets".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
+        }
 
-        Ok(json!(decision))
+        let ticket = &tickets[0];
+        let assign_to = idle_forge_workers[0].clone();
+        info!(
+            ticket_id = ?ticket.get("id").and_then(|v| v.as_str()),
+            assign_to = %assign_to,
+            assignable = tickets.len(),
+            idle_workers = idle_forge_workers.len(),
+            "Nexus: dispatching assignable ticket to an idle forge worker"
+        );
+        Ok(json!(AgentDecision {
+            action: "work_assigned".to_string(),
+            notes: "Assignable ticket + idle forge worker — route to forge".to_string(),
+            assign_to: Some(assign_to),
+            ticket_id: ticket.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            issue_url: ticket.get("issue_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        }))
     }
 
     async fn post(&self, store: &SharedStore, result: Value) -> Result<Action> {
@@ -2377,9 +2472,7 @@ impl Node for NexusNode {
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let mut should_provision_coder = false;
                     if let Some(slot) = slots.get_mut(worker_id) {
-                        should_provision_coder =
-                            matches!(slot.workspace_provider, WorkspaceProvider::Coder)
-                                && slot.workspace_id.is_none();
+                        should_provision_coder = slot.workspace_id.is_none();
                         slot.status = WorkerStatus::Assigned {
                             ticket_id: ticket_id.clone(),
                             issue_url: decision.issue_url.clone(),
@@ -2431,6 +2524,12 @@ impl Node for NexusNode {
             let count: u32 = store.get_typed(KEY_NO_WORK_COUNT).await.unwrap_or(0);
             let new_count = count + 1;
             store.set(KEY_NO_WORK_COUNT, json!(new_count)).await;
+
+            info!(
+                consecutive_no_work = new_count,
+                threshold = NO_WORK_THRESHOLD,
+                "Nexus: no new work to dispatch this pass"
+            );
 
             if new_count >= NO_WORK_THRESHOLD {
                 info!(

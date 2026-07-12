@@ -7,12 +7,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::CoderClient;
 use config::{
-    state::{KEY_PENDING_PRS, KEY_TICKETS, KEY_WORKER_SLOTS},
-    Ticket, TicketStatus, WorkerSlot, WorkerStatus, WorkspaceProvider, ACTION_CI_FIX_NEEDED,
+    state::{full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKET_DEPLOYMENT, KEY_TICKETS, KEY_WORKER_SLOTS},
+    Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_CI_FIX_NEEDED,
     ACTION_CONFLICTS_DETECTED,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use pair_harness::transport::{CoderTransport, WorkspaceTransport};
+use provisioner::transport::{CoderTransport, WorkspaceTransport};
 use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -189,9 +189,6 @@ impl VesselNode {
         pr_info: &PrInfo,
     ) -> Option<(String, CoderTransport)> {
         let (worker_id, slot) = self.worker_slot_for_pr(store, pr_info).await?;
-        if slot.workspace_provider != WorkspaceProvider::Coder {
-            return None;
-        }
         let workspace_id = slot.workspace_id?;
         let client = Self::coder_client_from_store(store).await?;
         Some((worker_id, CoderTransport::new(client, &workspace_id)))
@@ -716,6 +713,17 @@ impl Node for VesselNode {
                     )
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, ticket_id).await;
+
+                    // Write deployment key to SharedStore (§6.1 schema)
+                    {
+                        let dep_key = full_ticket_key_flat(ticket_id, KEY_TICKET_DEPLOYMENT);
+                        store.set(&dep_key, json!({
+                            "merged": true,
+                            "pr_number": *pr_number,
+                            "sha": sha,
+                        })).await;
+                        info!(ticket_id, pr_number, "Wrote deployment key to SharedStore");
+                    }
 
                     // Destroy Coder workspace (archive chats + delete) for this worker
                     self.destroy_coder_workspace_for_pr(store, &pending_prs, *pr_number)

@@ -2,18 +2,17 @@
 resolver = "2"
 members = [
     "crates/pocketflow-core",
-    "crates/agent-client",
     "crates/github",
     "crates/config",
     "crates/agent-nexus",
     "crates/agent-forge",
     "crates/agent-vessel",
+    "crates/agent-sentinel",
     "crates/agent-lore",
-    "crates/pair-harness",
+    "crates/provisioner",
     "crates/coder-client",
+    "crates/openflows-harness",
     "binary",
-    "crates/anthropic-mock",
-    "crates/agentflow-tui",
     "crates/notifier",
 ]
 

@@ -110,3 +110,6 @@ worktrees/
 # Kilo runtime data (plans, sessions, node_modules)
 .kilo/
 orchestration/
+
+# Dev binary mount for Coder workspace templates (built artifacts)
+.dev-binaries/
