@@ -158,7 +158,28 @@ impl CoderBootstrapper {
             .with_session_token(&session_token);
         info!("  ✓ API token generated");
 
-        // 4. Push workspace templates (bundled in binary)
+        // 4. Resolve the .dev-binaries host path so workspace templates can
+        //    bind-mount the local openflows binary for local dev/testing.
+        //    Set as a TF_VAR_* env var — `coder templates push` runs Terraform
+        //    under the hood and inherits the parent environment.
+        if std::env::var("TF_VAR_dev_binary_host_path").is_err() {
+            if let Ok(cwd) = std::env::current_dir() {
+                let dev_bin = cwd.join(".dev-binaries");
+                if dev_bin.is_dir() {
+                    let canonical = std::fs::canonicalize(&dev_bin)
+                        .unwrap_or(dev_bin)
+                        .to_string_lossy()
+                        .into_owned();
+                    info!(
+                        host_path = %canonical,
+                        "Setting TF_VAR_dev_binary_host_path for template push"
+                    );
+                    std::env::set_var("TF_VAR_dev_binary_host_path", &canonical);
+                }
+            }
+        }
+
+        // 5. Push workspace templates (bundled in binary)
         push_template_silently(
             &client,
             "openflows-forge",
@@ -171,7 +192,7 @@ impl CoderBootstrapper {
             include_bytes!("../templates/openflows-sentinel.tar.gz"),
         )
         .await;
-        push_template_silently(
+        let nexus_template_updated = push_template_silently(
             &client,
             "openflows-nexus",
             include_bytes!("../templates/openflows-nexus.tar.gz"),
@@ -190,7 +211,34 @@ impl CoderBootstrapper {
         )
         .await;
 
-        // 5. Create or refresh the long-lived Nexus workspace outside Coder.
+        // If the nexus template was re-pushed, the existing workspace is stale
+        // (it still runs the old template version). Delete and recreate it so
+        // the new template (e.g. fixed bind-mount path) takes effect.
+        if nexus_template_updated {
+            let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
+                .unwrap_or_else(|_| "openflows-nexus".to_string());
+            if let Ok(me) = client.get_me().await {
+                if let Ok(workspaces) = client.list_workspaces(&me.id).await {
+                    if let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) {
+                        info!(
+                            workspace_id = %existing.id,
+                            workspace_name = %existing.name,
+                            "  → Nexus template updated — deleting stale workspace for recreation"
+                        );
+                        // Stop first (required before delete in Coder)
+                        let _ = client.stop_workspace(&existing.id).await;
+                        match client.delete_workspace(&existing.id).await {
+                            Ok(()) => info!("  ✓ Stale nexus workspace deleted"),
+                            Err(e) => warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway"),
+                        }
+                        // Give Coder a moment to clean up
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+
+        // 6. Create or refresh the long-lived Nexus workspace outside Coder.
         //
         // This is the bootstrapper's "first mover" responsibility: seed the
         // persistent control-plane workspace that runs the orchestration loop.
@@ -495,23 +543,96 @@ impl CoderBootstrapper {
     }
 }
 
-async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) {
-    // Skip if template already exists (idempotent bootstrap).
-    // To force-update templates, delete them from Coder first
-    // or run `openflows bootstrap --force` (future feature).
-    if let Ok(templates) = client.list_templates().await {
-        if templates.iter().any(|t| t.name == name) {
-            info!("  ✓ Template '{}' already exists — skipping push", name);
-            return;
-        }
+/// Compute a hex SHA-256 fingerprint of the template archive bytes.
+fn template_hash(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex_encode(&hasher.finalize())
+}
+
+/// Minimal hex encoder (avoids pulling in another crate just for this).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
+    out
+}
+
+/// Load the persisted template hash store from `~/.openflows/template-hashes.json`.
+/// Returns an empty map if the file doesn't exist or can't be parsed.
+fn load_template_hashes() -> std::collections::HashMap<String, String> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Default::default();
+    };
+    let path = format!("{}/.openflows/template-hashes.json", home);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => Default::default(),
+    }
+}
+
+/// Persist the template hash store to `~/.openflows/template-hashes.json`.
+fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let dir = format!("{}/.openflows", home);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{}/template-hashes.json", dir);
+    if let Ok(json) = serde_json::to_string_pretty(hashes) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Push a template only when its content hash has changed (or it doesn't exist
+/// on the Coder server yet). After a successful push, the hash is persisted so
+/// subsequent bootstrap calls skip unchanged templates.
+///
+/// Returns `true` if the template was (re)pushed, `false` if it was skipped
+/// because the content hash matched the last-pushed version.
+async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> bool {
+    let current_hash = template_hash(data);
+
+    // Check whether the template exists on the Coder server.
+    let exists = if let Ok(templates) = client.list_templates().await {
+        templates.iter().any(|t| t.name == name)
+    } else {
+        false
+    };
+
+    // Compare against the last-pushed hash stored locally.
+    let mut hashes = load_template_hashes();
+    let last_hash = hashes.get(name).map(String::as_str);
+
+    if exists && last_hash == Some(current_hash.as_str()) {
+        info!("  ✓ Template '{}' unchanged — skipping push (hash matches)", name);
+        return false;
+    }
+
+    let reason = if !exists {
+        "new template"
+    } else {
+        "content changed"
+    };
+    info!("  → Pushing template '{}' ({})", name, reason);
+
     match client.push_template(name, data).await {
-        Ok(t) => info!("  ✓ Template '{}' pushed", t.name),
+        Ok(t) => {
+            hashes.insert(name.to_string(), current_hash);
+            save_template_hashes(&hashes);
+            info!("  ✓ Template '{}' pushed (version updated)", t.name);
+            true
+        }
         Err(e) => {
             warn!(
                 "  ⚠ Template '{}' push failed: {}",
                 name, e
             );
+            false
         }
     }
 }

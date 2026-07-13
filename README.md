@@ -21,10 +21,10 @@ cp .env.example .env   # edit .env with your GitHub OAuth app credentials
 docker compose up -d
 
 # 2. Bootstrap OpenFlows (creates admin, pushes templates, verifies config)
-cargo run -p openflows -- bootstrap
+cargo run -p openflows --bin openflows -- bootstrap
 
 # 3. Add a tenant (links GitHub via Coder external auth, creates nexus workspace)
-cargo run -p openflows -- tenant add owner/repo --name my-team
+cargo run -p openflows --bin openflows -- tenant add owner/repo --name my-team
 
 # 4. Create a GitHub issue in your repo — OpenFlows picks it up automatically
 ```

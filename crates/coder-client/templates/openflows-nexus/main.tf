@@ -5,6 +5,15 @@ terraform {
   }
 }
 
+# TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
+# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
+# (Remove when switching to GitHub releases for the openflows binary.)
+variable "dev_binary_host_path" {
+  description = "Absolute host path to the .dev-binaries directory"
+  type        = string
+  default     = ""
+}
+
 # Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
@@ -125,10 +134,13 @@ resource "docker_container" "workspace" {
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
-  volumes {
-    container_path = "/opt/openflows-dev"
-    host_path      = "/home/christian/sandbox/openflows/.dev-binaries"
-    read_only      = true
+  dynamic "volumes" {
+    for_each = var.dev_binary_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows-dev"
+      host_path      = var.dev_binary_host_path
+      read_only      = true
+    }
   }
 
   env = [
