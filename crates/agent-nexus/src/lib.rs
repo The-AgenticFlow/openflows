@@ -667,8 +667,9 @@ impl NexusNode {
             .await
             .or_else(|| std::env::var("CODER_URL").ok());
         let coder_token: Option<String> = store
-            .get_typed("coder_api_token")
+            .get_typed("coder_session_token")
             .await
+            .or_else(|| std::env::var("CODER_SESSION_TOKEN").ok())
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
         match (coder_url, coder_token) {
             (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
@@ -2401,6 +2402,23 @@ impl Node for NexusNode {
             return Ok(json!(AgentDecision {
                 action: PAUSE_SIGNAL.to_string(),
                 notes: "No idle forge worker; workers will be checked on the next poll".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
+        }
+
+        if tickets.is_empty() {
+            // Idle workers exist but no assignable tickets — pause until next poll.
+            info!(
+                assignable_tickets = tickets.len(),
+                idle_forge_workers = idle_forge_workers.len(),
+                busy_forge_workers = busy_forge_workers.len(),
+                "Nexus: idle forge workers available but no assignable tickets — pausing"
+            );
+            return Ok(json!(AgentDecision {
+                action: PAUSE_SIGNAL.to_string(),
+                notes: "Idle forge workers available but no assignable tickets".to_string(),
                 assign_to: None,
                 ticket_id: None,
                 issue_url: None,

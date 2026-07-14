@@ -271,6 +271,11 @@ impl CoderBootstrapper {
                 }
             };
 
+            // Convert localhost URLs to Docker service names for workspace-to-service communication.
+            // When creating workspaces from the host (where CODER_URL=http://localhost:7080),
+            // the workspace containers cannot reach "localhost" — they need the Docker service name.
+            let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
+
             match client
                 .create_workspace(&CreateWorkspaceRequest {
                     template_name: "openflows-nexus".to_string(),
@@ -278,9 +283,9 @@ impl CoderBootstrapper {
                     parameters: json!({
                         "repo_url": repo_url,
                         "redis_url": redis_url,
-                        "coder_url": client.base_url(),
-                        "coder_api_token": nexus_api_token,
-                        "openflows_tenant": tenant,
+                        "coder_url": coder_url_for_workspace,
+                        "coder_session_token": nexus_api_token,
+                        "tenant": tenant,
                         "github_repository": repository,
                         "registry_json": registry_json,
                     }),

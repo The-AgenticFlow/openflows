@@ -31,6 +31,8 @@ cargo run -p openflows --bin openflows -- tenant add owner/repo --name my-team
 
 **Prerequisites:** Docker 24+, Git 2.x+, a GitHub OAuth App (for external auth), and at least one LLM provider configured in the Coder dashboard (AI Settings → Coder Agents → Models).
 
+> **Development Note:** After code changes, run `./update-binaries.sh` to rebuild and update all workspaces with fresh binaries. See [`DEV_BINARY_UPDATE_GUIDE.md`](DEV_BINARY_UPDATE_GUIDE.md).
+
 ## How It Works
 
 OpenFlows runs a team of AI agents that collaborate just like a real engineering team:
