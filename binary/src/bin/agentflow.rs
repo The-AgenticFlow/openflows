@@ -10,7 +10,10 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+
+const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
 #[command(name = "openflows")]
@@ -77,8 +80,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -96,14 +98,17 @@ async fn main() -> Result<()> {
 
 async fn run_controller() -> Result<()> {
     // ── Fail-fast environment validation (no fallback) ──────────────────
-    let coder_url = std::env::var("CODER_URL")
-        .context("CODER_URL is not set. The Controller must run inside an openflows-nexus workspace.")?;
+    let coder_url = std::env::var("CODER_URL").context(
+        "CODER_URL is not set. The Controller must run inside an openflows-nexus workspace.",
+    )?;
     let _coder_token = std::env::var("CODER_SESSION_TOKEN")
         .context("CODER_SESSION_TOKEN is not set. The Controller must run inside an openflows-nexus workspace.")?;
-    let redis_url = std::env::var("REDIS_URL")
-        .context("REDIS_URL is not set. The Controller must run inside an openflows-nexus workspace.")?;
-    let tenant = std::env::var("OPENFLOWS_TENANT")
-        .context("OPENFLOWS_TENANT is not set. The Controller must run inside an openflows-nexus workspace.")?;
+    let redis_url = std::env::var("REDIS_URL").context(
+        "REDIS_URL is not set. The Controller must run inside an openflows-nexus workspace.",
+    )?;
+    let tenant = std::env::var("OPENFLOWS_TENANT").context(
+        "OPENFLOWS_TENANT is not set. The Controller must run inside an openflows-nexus workspace.",
+    )?;
     let github_repo = std::env::var("GITHUB_REPOSITORY")
         .context("GITHUB_REPOSITORY is not set. The Controller must run inside an openflows-nexus workspace.")?;
 
@@ -136,7 +141,10 @@ async fn run_controller() -> Result<()> {
 
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
-    let nexus = std::sync::Arc::new(openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone()));
+    let nexus = std::sync::Arc::new(openflows::nodes::NexusNode::new(
+        nexus_persona,
+        registry_path.clone(),
+    ));
     let forge_pair = std::sync::Arc::new(openflows::nodes::ForgePairNode::new_with_registry(
         &orch_dir,
         registry_path.clone(),
@@ -150,10 +158,17 @@ async fn run_controller() -> Result<()> {
     ));
     let lore = if registry.get("lore").map(|e| e.enabled).unwrap_or(false) {
         let lore_persona = resolver.persona_path("lore.agent.md");
-        match openflows::nodes::LoreNode::new_with_registry(&orch_dir, lore_persona, registry_path.clone()) {
+        match openflows::nodes::LoreNode::new_with_registry(
+            &orch_dir,
+            lore_persona,
+            registry_path.clone(),
+        ) {
             Ok(node) => Some(std::sync::Arc::new(node)),
             Err(e) => {
-                tracing::warn!("lore agent is active but could not initialize — skipping: {}", e);
+                tracing::warn!(
+                    "lore agent is active but could not initialize — skipping: {}",
+                    e
+                );
                 None
             }
         }
@@ -164,9 +179,9 @@ async fn run_controller() -> Result<()> {
 
     // ── Build flow graph ────────────────────────────────────────────────
     use openflows::state::{
-        ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED,
-        ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS,
-        ACTION_NO_WORK, ACTION_PR_OPENED, ACTION_WORK_ASSIGNED, ACTION_EMPTY,
+        ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
+        ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PR_OPENED,
+        ACTION_WORK_ASSIGNED,
     };
 
     let review_approve = "review_approve";
@@ -179,8 +194,6 @@ async fn run_controller() -> Result<()> {
             vec![
                 (ACTION_WORK_ASSIGNED, "forge_pair"),
                 (ACTION_MERGE_PRS, "vessel"),
-                (ACTION_NO_WORK, "nexus"),
-                (ACTION_EMPTY, "forge_pair"),
                 ("approve_command", "forge_pair"),
                 ("reject_command", "nexus"),
             ],
@@ -191,7 +204,6 @@ async fn run_controller() -> Result<()> {
             vec![
                 (ACTION_PR_OPENED, "sentinel"),
                 (ACTION_FAILED, "nexus"),
-                (ACTION_EMPTY, "nexus"),
                 (pocketflow_core::Action::NO_TICKETS, "nexus"),
                 ("suspended", "nexus"),
             ],
@@ -205,26 +217,22 @@ async fn run_controller() -> Result<()> {
                 ("no_work", "nexus"),
             ],
         )
-        .add_node(
-            "vessel",
-            vessel,
-            {
-                let mut routes = vec![
-                    (ACTION_DEPLOY_FAILED, "nexus"),
-                    (ACTION_CI_FIX_NEEDED, "forge_pair"),
-                    ("merge_blocked", "nexus"),
-                    (ACTION_CONFLICTS_DETECTED, "forge_pair"),
-                    (pocketflow_core::Action::AWAITING_HUMAN, "nexus"),
-                    ("no_work", "nexus"),
-                ];
-                if lore.is_some() {
-                    routes.insert(0, (ACTION_DEPLOYED, "lore"));
-                } else {
-                    routes.insert(0, (ACTION_DEPLOYED, "nexus"));
-                }
-                routes
-            },
-        );
+        .add_node("vessel", vessel, {
+            let mut routes = vec![
+                (ACTION_DEPLOY_FAILED, "nexus"),
+                (ACTION_CI_FIX_NEEDED, "forge_pair"),
+                ("merge_blocked", "nexus"),
+                (ACTION_CONFLICTS_DETECTED, "forge_pair"),
+                (pocketflow_core::Action::AWAITING_HUMAN, "nexus"),
+                ("no_work", "nexus"),
+            ];
+            if lore.is_some() {
+                routes.insert(0, (ACTION_DEPLOYED, "lore"));
+            } else {
+                routes.insert(0, (ACTION_DEPLOYED, "nexus"));
+            }
+            routes
+        });
 
     if let Some(ref lore_node) = lore {
         flow = flow.add_node(
@@ -234,30 +242,35 @@ async fn run_controller() -> Result<()> {
         );
     }
 
-    // Safety cap against genuine infinite loops. 20 was far too low for a controller
-    // that fans work out across forge workers: each pending issue consumes ~2 steps,
-    // so a modest backlog tripped the cap as a false "infinite loop" (the real cycle
-    // is prevented by nexus.exec only dispatching to *idle* workers). 1000 keeps the
-    // safety guarantee while letting real backlogs drain in a single pass.
+    // Safety cap against genuine routing cycles. Idle and in-progress states pause
+    // the flow pass and are handled by the paced controller loop below.
     let flow = flow.max_steps(1000);
 
-    // ── Run flow ────────────────────────────────────────────────────────
-    tracing::info!("Starting Flow execution loop...");
-    let _final_action = flow.run(&store).await?;
-
-    tracing::info!("Controller loop completed.");
-    Ok(())
+    // ── Run controller poll loop ────────────────────────────────────────
+    tracing::info!(
+        poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+        "Starting Controller poll loop"
+    );
+    loop {
+        let final_action = flow.run(&store).await?;
+        tracing::info!(
+            action = final_action.as_str(),
+            poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+            "Controller flow pass completed; waiting for next poll"
+        );
+        tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+    }
 }
 
 async fn run_bootstrap() -> Result<()> {
     let bootstrapper = coder_client::bootstrap::CoderBootstrapper::from_env()
         .context("Failed to create bootstrapper from environment")?;
 
-    let client = bootstrapper.bootstrap().await
-        .context("Bootstrap failed")?;
+    let client = bootstrapper.bootstrap().await.context("Bootstrap failed")?;
 
     // Verify LLM configuration
-    if let Err(e) = coder_client::bootstrap::CoderBootstrapper::verify_llm_configured(&client).await {
+    if let Err(e) = coder_client::bootstrap::CoderBootstrapper::verify_llm_configured(&client).await
+    {
         eprintln!("\n  ⚠ {}", e);
         eprintln!("    Configure at least one model in the Coder dashboard before adding tenants.");
     }
@@ -275,16 +288,20 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     let bootstrapper = coder_client::bootstrap::CoderBootstrapper::from_env()
         .context("Failed to create bootstrapper from environment")?;
 
-    let client = bootstrapper.bootstrap().await
+    let client = bootstrapper
+        .bootstrap()
+        .await
         .context("Bootstrap required before tenant operations")?;
 
     match action {
         TenantCommands::Add { repo, name } => {
-            let tenant_name = name.unwrap_or_else(|| {
-                repo.split('/').next().unwrap_or(&repo).to_string()
-            });
+            let tenant_name =
+                name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
 
-            println!("Adding tenant '{}' for repository '{}'...", tenant_name, repo);
+            println!(
+                "Adding tenant '{}' for repository '{}'...",
+                tenant_name, repo
+            );
             let workspace_id = bootstrapper
                 .ensure_tenant(&client, &tenant_name, &repo)
                 .await
@@ -297,8 +314,8 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
         TenantCommands::List => {
             println!("Tenants (from Redis namespaces):");
             // Read all ns:* keys from Redis and list unique tenants
-            let redis_url = std::env::var("REDIS_URL")
-                .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+            let redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
             match pocketflow_core::SharedStore::new_redis(&redis_url).await {
                 Ok(store) => {
                     let keys: Vec<String> = store.keys("ns:*").await;
@@ -355,10 +372,11 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
 }
 
 async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
-    let store = pocketflow_core::SharedStore::new_redis(&redis_url).await
+    let store = pocketflow_core::SharedStore::new_redis(&redis_url)
+        .await
         .context("Redis not reachable")?;
 
     let tenants: Vec<String> = match tenant {
@@ -409,9 +427,21 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
     } else {
         for data in &all_data {
             println!("Tenant: {}", data["tenant"].as_str().unwrap_or("?"));
-            println!("  Tickets: {}", data["tickets"].as_array().map(|v| v.len()).unwrap_or(0));
-            println!("  Worker slots: {}", data["worker_slots"].as_object().map(|v| v.len()).unwrap_or(0));
-            println!("  Pending PRs: {}", data["pending_prs"].as_array().map(|v| v.len()).unwrap_or(0));
+            println!(
+                "  Tickets: {}",
+                data["tickets"].as_array().map(|v| v.len()).unwrap_or(0)
+            );
+            println!(
+                "  Worker slots: {}",
+                data["worker_slots"]
+                    .as_object()
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+            );
+            println!(
+                "  Pending PRs: {}",
+                data["pending_prs"].as_array().map(|v| v.len()).unwrap_or(0)
+            );
             println!();
         }
     }
@@ -422,6 +452,9 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
 async fn run_reset() -> Result<()> {
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.reset_orchestration_dir()?;
-    println!("Orchestration files reset to bundled defaults at: {}", orch_dir.display());
+    println!(
+        "Orchestration files reset to bundled defaults at: {}",
+        orch_dir.display()
+    );
     Ok(())
 }

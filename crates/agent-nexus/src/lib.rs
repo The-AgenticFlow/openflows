@@ -11,11 +11,10 @@ use config::{
         KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
         KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
-    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS,
-    ACTION_NO_WORK, ACTION_EMPTY,
+    Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use pocketflow_core::{node::STOP_SIGNAL, Action, Node, SharedStore};
+use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -43,7 +42,6 @@ pub struct AgentDecision {
     pub issue_url: Option<String>,
 }
 
-const NO_WORK_THRESHOLD: u32 = 3;
 const KEY_NO_WORK_COUNT: &str = "_no_work_count";
 const KEY_CI_READINESS: &str = "ci_readiness";
 const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
@@ -277,27 +275,23 @@ impl NexusNode {
         Registry::load(&self.registry_path)
     }
 
-async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
+    async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
         if owner.is_empty() || repo_name.is_empty() {
             return Ok(());
         }
 
-let token = match self.resolve_github_token() {
+        let token = match self.resolve_github_token() {
             Ok(t) => t,
-            Err(_) => {
-                match std::env::var("GITHUB_TOKEN") {
-                    Ok(t) => t,
+            Err(_) => match std::env::var("GITHUB_TOKEN") {
+                Ok(t) => t,
+                Err(_) => match std::fs::read_to_string("/tmp/github_token") {
+                    Ok(t) => t.trim().to_string(),
                     Err(_) => {
-                        match std::fs::read_to_string("/tmp/github_token") {
-                            Ok(t) => t.trim().to_string(),
-                            Err(_) => {
-                                warn!("GitHub token not configured, skipping issue sync");
-                                return Ok(());
-                            }
-                        }
+                        warn!("GitHub token not configured, skipping issue sync");
+                        return Ok(());
                     }
-                }
-            }
+                },
+            },
         };
 
         let client = github::GithubRestClient::new(&token);
@@ -346,26 +340,22 @@ let token = match self.resolve_github_token() {
 
         let token = match self.resolve_github_token() {
             Ok(t) => t,
-            Err(_) => {
-                match std::env::var("GITHUB_TOKEN") {
+            Err(_) => match std::env::var("GITHUB_TOKEN") {
+                Ok(t) => {
+                    info!("Using GITHUB_TOKEN env var for PR sync");
+                    t
+                }
+                Err(_) => match std::fs::read_to_string("/tmp/github_token") {
                     Ok(t) => {
-                        info!("Using GITHUB_TOKEN env var for PR sync");
-                        t
+                        info!("Using /tmp/github_token file for PR sync");
+                        t.trim().to_string()
                     }
                     Err(_) => {
-                        match std::fs::read_to_string("/tmp/github_token") {
-                            Ok(t) => {
-                                info!("Using /tmp/github_token file for PR sync");
-                                t.trim().to_string()
-                            }
-                            Err(_) => {
-                                warn!("GitHub token not configured, skipping PR sync");
-                                return Ok(());
-                            }
-                        }
+                        warn!("GitHub token not configured, skipping PR sync");
+                        return Ok(());
                     }
-                }
-            }
+                },
+            },
         };
 
         let client = github::GithubRestClient::new(&token);
@@ -1514,7 +1504,8 @@ let token = match self.resolve_github_token() {
                     if worker_missing {
                         info!(
                             ticket_id = ticket.id,
-                            worker_id, "Recovering orphaned ticket (worker slot missing) — resetting to Open"
+                            worker_id,
+                            "Recovering orphaned ticket (worker slot missing) — resetting to Open"
                         );
                         ticket.status = TicketStatus::Open;
                         changed_tickets = true;
@@ -2178,7 +2169,13 @@ impl Node for NexusNode {
         let repository = if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
             repo
         } else {
-            store.get("repository").await.unwrap_or(json!("")).as_str().unwrap_or("").to_string()
+            store
+                .get("repository")
+                .await
+                .unwrap_or(json!(""))
+                .as_str()
+                .unwrap_or("")
+                .to_string()
         };
 
         let mut parts = repository.splitn(2, '/');
@@ -2394,16 +2391,16 @@ impl Node for NexusNode {
 
         if idle_forge_workers.is_empty() {
             // No idle workers, but forge workers are busy or tickets are pending.
-            // Cycle to forge_pair to monitor in-progress work instead of stopping.
+            // End this pass; the controller will poll again after its interval.
             info!(
                 assignable_tickets = tickets.len(),
                 idle_forge_workers = idle_forge_workers.len(),
                 busy_forge_workers = busy_forge_workers.len(),
-                "Nexus: no idle forge worker — cycling to forge_pair to monitor busy workers"
+                "Nexus: no idle forge worker — pausing until the next controller poll"
             );
             return Ok(json!(AgentDecision {
-                action: ACTION_EMPTY.to_string(),
-                notes: "No idle forge worker; busy workers monitored via forge_pair".to_string(),
+                action: PAUSE_SIGNAL.to_string(),
+                notes: "No idle forge worker; workers will be checked on the next poll".to_string(),
                 assign_to: None,
                 ticket_id: None,
                 issue_url: None,
@@ -2423,8 +2420,14 @@ impl Node for NexusNode {
             action: "work_assigned".to_string(),
             notes: "Assignable ticket + idle forge worker — route to forge".to_string(),
             assign_to: Some(assign_to),
-            ticket_id: ticket.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            issue_url: ticket.get("issue_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ticket_id: ticket
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            issue_url: ticket
+                .get("issue_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         }))
     }
 
@@ -2557,23 +2560,9 @@ impl Node for NexusNode {
         }
 
         if decision.action == "no_work" {
-            let count: u32 = store.get_typed(KEY_NO_WORK_COUNT).await.unwrap_or(0);
-            let new_count = count + 1;
-            store.set(KEY_NO_WORK_COUNT, json!(new_count)).await;
-
-            info!(
-                consecutive_no_work = new_count,
-                threshold = NO_WORK_THRESHOLD,
-                "Nexus: no new work to dispatch this pass"
-            );
-
-            if new_count >= NO_WORK_THRESHOLD {
-                info!(
-                    consecutive = new_count,
-                    "No work found after {} consecutive checks — stopping", NO_WORK_THRESHOLD
-                );
-                return Ok(Action::new(STOP_SIGNAL));
-            }
+            store.set(KEY_NO_WORK_COUNT, json!(0)).await;
+            info!("Nexus: no new work to dispatch this pass — pausing until the next poll");
+            return Ok(Action::new(PAUSE_SIGNAL));
         }
 
         if decision.action == "approve_command" || decision.action == "reject_command" {

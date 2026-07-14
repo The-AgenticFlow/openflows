@@ -75,8 +75,8 @@ impl Flow {
         self
     }
 
-    /// Run the flow until a node returns the STOP_SIGNAL action or
-    /// the step limit is reached. Returns the final Action.
+    /// Run the flow until a node returns a stop or pause signal, or the step
+    /// limit is reached. Returns the final Action.
     pub async fn run(&self, store: &SharedStore) -> Result<Action> {
         let mut current = self.start.clone();
         let mut steps = 0usize;
@@ -99,9 +99,13 @@ impl Flow {
 
             let action = flow_node.node.run(store).await?;
 
-            // Check for stop
+            // Check for a terminal signal before attempting to route it.
             if action.as_str() == crate::node::STOP_SIGNAL {
                 info!(node = %current, "flow received stop signal");
+                return Ok(action);
+            }
+            if action.as_str() == crate::node::PAUSE_SIGNAL {
+                info!(node = %current, "flow pass paused");
                 return Ok(action);
             }
 
@@ -178,6 +182,36 @@ mod tests {
 
         let count: u64 = store.get_typed("count").await.unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_flow_pauses_without_routing() {
+        struct PauseNode;
+
+        #[async_trait]
+        impl Node for PauseNode {
+            fn name(&self) -> &str {
+                "pause"
+            }
+
+            async fn prep(&self, _: &SharedStore) -> Result<Value> {
+                Ok(Value::Null)
+            }
+
+            async fn exec(&self, _: Value) -> Result<Value> {
+                Ok(Value::Null)
+            }
+
+            async fn post(&self, _: &SharedStore, _: Value) -> Result<Action> {
+                Ok(Action::new(crate::node::PAUSE_SIGNAL))
+            }
+        }
+
+        let store = SharedStore::new_in_memory();
+        let flow = Flow::new("pause").add_node("pause", Arc::new(PauseNode), vec![]);
+
+        let action = flow.run(&store).await.unwrap();
+        assert_eq!(action.as_str(), crate::node::PAUSE_SIGNAL);
     }
 
     #[tokio::test]

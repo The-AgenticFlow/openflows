@@ -9,14 +9,12 @@ use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
 use config::{
     state::{
-        full_ticket_key, full_ticket_key_flat,
-        KEY_PENDING_PRS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
-        KEY_TICKET_STATUS, KEY_TICKETS,
-        KEY_WORKER_SLOTS,
+        full_ticket_key, full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
     },
-    Ticket, TicketStatus, WorkerSlot, ACTION_EMPTY, ACTION_FAILED, ACTION_PR_OPENED,
+    Ticket, TicketStatus, WorkerSlot, ACTION_FAILED, ACTION_PR_OPENED,
 };
-use pocketflow_core::{Action, BatchNode, SharedStore};
+use pocketflow_core::{node::PAUSE_SIGNAL, Action, BatchNode, SharedStore};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,43 +83,43 @@ impl ForgePairNode {
             ChatStatus::Running => {
                 let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
                 let current: Option<String> = store.get_typed(&status_key).await;
-                if current.as_deref() != Some("building") && current.as_deref() != Some("planning") {
+                if current.as_deref() != Some("building") && current.as_deref() != Some("planning")
+                {
                     store.set(&status_key, json!("building")).await;
                 }
             }
-            ChatStatus::Waiting => {
-                match last_action.as_deref() {
-                    Some("completed") | None => {
-                        info!(
-                            ticket_id,
-                            role,
-                            "Chat waiting with chat_action=completed|null — forge work done"
-                        );
-                    }
-                    Some("interrupted") => {
-                        info!(
-                            ticket_id,
-                            role,
-                            "Chat waiting after interruption — needs recovery"
-                        );
-                    }
-                    Some("created") | Some("follow_up_sent") => {
-                        info!(
-                            ticket_id,
-                            role,
-                            ?last_action,
-                            "Chat waiting after initial prompt — agent may need follow-up"
-                        );
-                    }
-                    _ => {}
+            ChatStatus::Waiting => match last_action.as_deref() {
+                Some("completed") | None => {
+                    info!(
+                        ticket_id,
+                        role, "Chat waiting with chat_action=completed|null — forge work done"
+                    );
                 }
-            }
+                Some("interrupted") => {
+                    info!(
+                        ticket_id,
+                        role, "Chat waiting after interruption — needs recovery"
+                    );
+                }
+                Some("created") | Some("follow_up_sent") => {
+                    info!(
+                        ticket_id,
+                        role,
+                        ?last_action,
+                        "Chat waiting after initial prompt — agent may need follow-up"
+                    );
+                }
+                _ => {}
+            },
             ChatStatus::Error => {
                 warn!(ticket_id, role, "Forge chat entered error status");
                 store.set(&action_key, json!("interrupted")).await;
             }
             ChatStatus::RequiresAction => {
-                info!(ticket_id, role, "Forge chat requires_action — setting awaiting_human");
+                info!(
+                    ticket_id,
+                    role, "Forge chat requires_action — setting awaiting_human"
+                );
             }
             ChatStatus::Pending => {
                 debug!(ticket_id, role, "Forge chat pending");
@@ -155,9 +153,7 @@ impl BatchNode for ForgePairNode {
                     return None;
                 }
 
-                let workspace_id = slots
-                    .get(&worker_id)
-                    .and_then(|s| s.workspace_id.clone());
+                let workspace_id = slots.get(&worker_id).and_then(|s| s.workspace_id.clone());
 
                 Some(json!({
                     "ticket_id": ticket.id,
@@ -174,15 +170,14 @@ impl BatchNode for ForgePairNode {
     async fn exec_one(&self, item: Value) -> Result<Value> {
         let ticket_id = item["ticket_id"].as_str().unwrap_or("");
         let worker_id = item["worker_id"].as_str().unwrap_or("");
-        info!(ticket_id, worker_id, "ForgePairNode monitoring forge worker");
+        info!(
+            ticket_id,
+            worker_id, "ForgePairNode monitoring forge worker"
+        );
         Ok(item)
     }
 
-    async fn post_batch(
-        &self,
-        store: &SharedStore,
-        results: Vec<Result<Value>>,
-    ) -> Result<Action> {
+    async fn post_batch(&self, store: &SharedStore, results: Vec<Result<Value>>) -> Result<Action> {
         if results.is_empty() {
             return Ok(Action::new(Action::NO_TICKETS));
         }
@@ -212,13 +207,8 @@ impl BatchNode for ForgePairNode {
             if let (Some(ref client), Some(chat_id)) = (&client, chat_id) {
                 match client.get_chat(&chat_id).await {
                     Ok(chat) => {
-                        Self::sync_chat_status_to_store(
-                            store,
-                            ticket_id,
-                            role,
-                            chat.status(),
-                        )
-                        .await;
+                        Self::sync_chat_status_to_store(store, ticket_id, role, chat.status())
+                            .await;
                     }
                     Err(e) => {
                         warn!(
@@ -276,10 +266,7 @@ impl BatchNode for ForgePairNode {
 
         info!(
             monitored = results.len(),
-            has_pr_opened,
-            has_failed,
-            has_in_progress,
-            "ForgePairNode post_batch summary"
+            has_pr_opened, has_failed, has_in_progress, "ForgePairNode post_batch summary"
         );
 
         if has_pr_opened {
@@ -289,10 +276,10 @@ impl BatchNode for ForgePairNode {
             info!("Forge: failure detected — routing back to nexus");
             Ok(Action::new(ACTION_FAILED))
         } else if has_in_progress {
-            info!("Forge: work still in progress — returning empty to cycle");
-            Ok(Action::new(ACTION_EMPTY))
+            info!("Forge: work still in progress — pausing until the next controller poll");
+            Ok(Action::new(PAUSE_SIGNAL))
         } else {
-            Ok(Action::new(ACTION_EMPTY))
+            Ok(Action::new(PAUSE_SIGNAL))
         }
     }
 }
@@ -328,11 +315,7 @@ impl BatchNode for ForgeNode {
         self.inner.exec_one(item).await
     }
 
-    async fn post_batch(
-        &self,
-        store: &SharedStore,
-        results: Vec<Result<Value>>,
-    ) -> Result<Action> {
+    async fn post_batch(&self, store: &SharedStore, results: Vec<Result<Value>>) -> Result<Action> {
         self.inner.post_batch(store, results).await
     }
 }

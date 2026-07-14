@@ -597,19 +597,32 @@ impl CoderClient {
 
         // Push the template via coder CLI
         // The CLI reads the directory and pushes it to the Coder server
-        let output = tokio::process::Command::new("coder")
-            .args([
-                "templates",
-                "push",
-                "--yes",
-                name,
-                "-d",
-                temp_dir.to_str().unwrap(),
-            ])
-            .env("CODER_URL", &self.base_url)
-            .env("CODER_SESSION_TOKEN", self.session_token())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let mut cmd = tokio::process::Command::new("coder");
+        cmd.args([
+            "templates",
+            "push",
+            "--yes",
+            name,
+            "-d",
+            temp_dir.to_str().unwrap(),
+        ])
+        .env("CODER_URL", &self.base_url)
+        .env("CODER_SESSION_TOKEN", self.session_token())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+        // Pass TF_VAR_dev_binary_host_path as a --variable flag so the Coder
+        // server stores it and applies it when creating workspaces. Setting it
+        // as an env var in the Rust process does NOT reach the server's
+        // Terraform execution — the CLI only uploads the template files.
+        if let Ok(path) = std::env::var("TF_VAR_dev_binary_host_path") {
+            if !path.is_empty() {
+                cmd.arg("--variable")
+                    .arg(format!("dev_binary_host_path={}", path));
+            }
+        }
+
+        let output = cmd
             .output()
             .await
             .context("Failed to run coder templates push")?;
