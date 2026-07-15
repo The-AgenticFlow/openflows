@@ -14,39 +14,46 @@ variable "dev_binary_host_path" {
   default     = ""
 }
 
-variable "role" {
-  type        = string
-  default     = "forge"
-  description = "Agent role name"
-}
-
-variable "ticket_id" {
-  type        = string
-  default     = ""
-  description = "Ticket identifier"
-}
-
-variable "redis_url" {
-  type    = string
-  default = "redis://redis:6379"
-}
-
-variable "repo_url" {
-  type        = string
-  default     = ""
-  description = "Git repository URL to clone into the workspace"
-}
-
-variable "tenant" {
-  type        = string
-  default     = ""
-  description = "OpenFlows tenant identifier"
-}
-
 variable "harness_version" {
   type        = string
   default     = "1.1.6"
   description = "openflows-harness binary version to download"
+}
+
+# Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
+data "coder_parameter" "role" {
+  name        = "role"
+  description  = "Agent role name"
+  default     = "forge"
+  type        = "string"
+}
+
+data "coder_parameter" "ticket_id" {
+  name        = "ticket_id"
+  description  = "Ticket identifier"
+  default     = ""
+  type        = "string"
+}
+
+data "coder_parameter" "redis_url" {
+  name        = "redis_url"
+  description  = "Redis SharedStore URL"
+  default     = "redis://redis:6379"
+  type        = "string"
+}
+
+data "coder_parameter" "repo_url" {
+  name        = "repo_url"
+  description  = "Git repository URL to clone into the workspace"
+  default     = ""
+  type        = "string"
+}
+
+data "coder_parameter" "tenant" {
+  name        = "tenant"
+  description  = "OpenFlows tenant identifier"
+  default     = ""
+  type        = "string"
 }
 
 resource "coder_agent" "main" {
@@ -77,26 +84,26 @@ resource "coder_agent" "main" {
     # git pull or clone (creds via Coder external auth)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
-    elif [ -n "${var.repo_url}" ]; then
-      git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
+    elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
+      git clone ${data.coder_parameter.repo_url.value} /home/coder/workspace 2>/dev/null || true
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace)
-    export REDIS_URL="${var.redis_url}"
-    export OPENFLOWS_TENANT="${var.tenant}"
-    export OPENFLOWS_TICKET="${var.ticket_id}"
-    export OPENFLOWS_ROLE="${var.role}"
+    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
+    export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
+    export OPENFLOWS_ROLE="${data.coder_parameter.role.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
 }
 
 resource "docker_volume" "workspace" {
-  name = "openflows-${var.role}-${data.coder_workspace.me.id}"
+  name = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
 }
 
 resource "docker_container" "workspace" {
-  name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
+  name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
 
   volumes {
@@ -115,10 +122,10 @@ resource "docker_container" "workspace" {
   }
 
   env = [
-    "REDIS_URL=${var.redis_url}",
-    "OPENFLOWS_TENANT=${var.tenant}",
-    "OPENFLOWS_TICKET=${var.ticket_id}",
-    "OPENFLOWS_ROLE=${var.role}",
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
+    "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
+    "OPENFLOWS_ROLE=${data.coder_parameter.role.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

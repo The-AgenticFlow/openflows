@@ -1412,13 +1412,17 @@ impl CoderClient {
             }
         };
 
+        // Let Coder use the workspace's default model.
+        // model_config_id expects a UUID, not a model name, so we pass None.
+        let model_config_id = None;
+
         // Create chat with OpenFlows labels (includes tenant)
         let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
         let chat_req = CreateChatRequest {
             organization_id,
             workspace_id: workspace.id.clone(),
-            model_config_id: None,
+            model_config_id,
             content: vec![ChatInputPart::text(prompt)],
             labels: Some(labels),
         };

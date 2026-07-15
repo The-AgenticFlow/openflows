@@ -751,7 +751,11 @@ impl NexusNode {
         let repo_url = repository
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(|repo| format!("https://github.com/{}.git", repo))
+            .map(|repo| {
+                // Strip any extra quotes that might have been added during JSON serialization
+                let clean_repo = repo.trim_matches('"');
+                format!("https://github.com/{}.git", clean_repo)
+            })
             .unwrap_or_default();
         let template_name = Self::template_name_for_worker(worker_id);
         let workspace_name = Self::workspace_name_for_ticket(worker_id, ticket_id);
@@ -779,7 +783,15 @@ impl NexusNode {
             .create_workspace(&CreateWorkspaceRequest {
                 template_name,
                 name: workspace_name,
-                parameters: json!({ "repo_url": repo_url, "host_cli_binary": host_cli_binary, "cli_binary_name": cli_name }),
+                parameters: json!({ 
+                    "repo_url": repo_url, 
+                    "role": worker_id,
+                    "ticket_id": ticket_id,
+                    "redis_url": "redis://redis:6379",
+                    "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
+                    "host_cli_binary": host_cli_binary, 
+                    "cli_binary_name": cli_name 
+                }),
             })
             .await?;
 
@@ -1103,10 +1115,14 @@ impl NexusNode {
             }
         };
 
+        // Let Coder use the workspace's default model.
+        // model_config_id expects a UUID, not a model name, so we pass None.
+        let model_config_id = None;
+
         let chat_req = CreateChatRequest {
             organization_id,
             workspace_id: workspace_id.clone(),
-            model_config_id: None, // Let Coder use its default model
+            model_config_id,
             content: vec![ChatInputPart::text(&prompt)],
             labels: Some(labels),
         };
@@ -2173,11 +2189,14 @@ impl Node for NexusNode {
             store
                 .get("repository")
                 .await
-                .unwrap_or(json!(""))
-                .as_str()
-                .unwrap_or("")
-                .to_string()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default()
         };
+
+        // Store repository in Redis so workspace provisioning can use it
+        if !repository.is_empty() {
+            store.set("repository", json!(repository)).await;
+        }
 
         let mut parts = repository.splitn(2, '/');
         let owner = parts.next().unwrap_or("").to_string();
