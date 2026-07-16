@@ -80,6 +80,9 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
+    # Fix orchestration directory ownership (shared volume is created as root)
+    sudo chown -R coder:coder /home/coder/.openflows
+
     # TEMPORARY: Use mounted dev binary for local testing
     # (In production, download from GitHub releases instead)
     if [ -f /opt/openflows-dev/openflows ]; then
@@ -137,6 +140,11 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
+# Shared orchestration volume - Nexus writes, forge/sentinel/etc read
+resource "docker_volume" "orchestration" {
+  name = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+}
+
 resource "docker_container" "workspace" {
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
@@ -144,6 +152,12 @@ resource "docker_container" "workspace" {
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
+  }
+
+  # Orchestration files volume (written by Nexus, read by other agents)
+  volumes {
+    container_path = "/home/coder/.openflows/orchestration"
+    volume_name    = docker_volume.orchestration.name
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)

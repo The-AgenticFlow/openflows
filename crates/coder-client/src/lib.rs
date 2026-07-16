@@ -704,23 +704,35 @@ impl CoderClient {
             let obj = req.parameters.as_object().unwrap();
             serde_json::Value::Array(
                 obj.iter()
-                    .map(|(k, v)| serde_json::json!({"name": k, "value": v.as_str().unwrap_or("")}))
+                    .map(|(k, v)| {
+                        let value_str = if v.is_string() {
+                            v.as_str().unwrap_or("").to_string()
+                        } else {
+                            // For non-string values, convert to JSON string representation
+                            v.to_string().trim_matches('"').to_string()
+                        };
+                        serde_json::json!({"name": k, "value": value_str})
+                    })
                     .collect(),
             )
         } else {
             serde_json::Value::Array(vec![])
         };
 
+        let payload = serde_json::json!({
+            "template_id": template_id,
+            "name": req.name,
+            "rich_parameter_values": rich_parameter_values,
+        });
+        
+        info!("Creating workspace with payload: {}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
                 &format!("/api/v2/users/{}/workspaces", user_id),
             )
-            .json(&serde_json::json!({
-                "template_id": template_id,
-                "name": req.name,
-                "rich_parameter_values": rich_parameter_values,
-            }))
+            .json(&payload)
             .send()
             .await
             .context("Failed to create workspace")?;

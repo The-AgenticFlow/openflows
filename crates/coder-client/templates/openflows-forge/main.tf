@@ -85,7 +85,14 @@ resource "coder_agent" "main" {
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
-      git clone ${data.coder_parameter.repo_url.value} /home/coder/workspace 2>/dev/null || true
+      # Clone into a temp dir first, then move contents
+      TEMP_DIR=$(mktemp -d)
+      if git clone "${data.coder_parameter.repo_url.value}" "$TEMP_DIR" 2>/dev/null; then
+        # Move all files (including .git) to workspace
+        sudo chown -R coder:coder /home/coder/workspace
+        mv "$TEMP_DIR"/* "$TEMP_DIR"/.* /home/coder/workspace/ 2>/dev/null || true
+        rmdir "$TEMP_DIR"
+      fi
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace)
@@ -109,6 +116,14 @@ resource "docker_container" "workspace" {
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
+  }
+
+  # Mount shared orchestration files (agent definitions, skills, standards)
+  # This volume is created by the Nexus workspace
+  volumes {
+    container_path = "/home/coder/.openflows/orchestration"
+    volume_name    = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+    read_only      = true
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
