@@ -86,6 +86,19 @@ resource "coder_agent" "main" {
       echo "Using mounted dev binary..."
       sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
       sudo chmod +x /usr/local/bin/openflows
+
+      # Self-healing: if the workspace has a git checkout, warn when the
+      # mounted binary is older than the latest source commit.  This catches
+      # the case where someone forgot to run 'make dev-sync' before starting
+      # the workspace.
+      if [ -d /home/coder/workspace/.git ]; then
+        BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
+        LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
+        if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
+          echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
+          echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
+        fi
+      fi
     else
       echo "WARNING: Dev binary not found at /opt/openflows-dev/openflows"
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"

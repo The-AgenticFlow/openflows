@@ -244,7 +244,9 @@ async fn run_controller() -> Result<()> {
 
     // Safety cap against genuine routing cycles. Idle and in-progress states pause
     // the flow pass and are handled by the paced controller loop below.
-    let flow = flow.max_steps(1000);
+    // The per-node cycle detector catches tight ping-pong (nexus→forge_pair→nexus→…)
+    // within ~40 steps instead of burning all 1000.
+    let flow = flow.max_steps(1000).max_visits_per_node(20);
 
     // ── Run controller poll loop ────────────────────────────────────────
     tracing::info!(
@@ -252,12 +254,26 @@ async fn run_controller() -> Result<()> {
         "Starting Controller poll loop"
     );
     loop {
-        let final_action = flow.run(&store).await?;
-        tracing::info!(
-            action = final_action.as_str(),
-            poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
-            "Controller flow pass completed; waiting for next poll"
-        );
+        match flow.run(&store).await {
+            Ok(final_action) => {
+                tracing::info!(
+                    action = final_action.as_str(),
+                    poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+                    "Controller flow pass completed; waiting for next poll"
+                );
+            }
+            Err(e) => {
+                // Self-healing: never let a flow error kill the controller.
+                // Log the error, back off, and retry on the next poll cycle.
+                // Transient errors (Redis drops, Coder API timeouts, GitHub
+                // rate limits) should not stop the orchestration loop.
+                tracing::error!(
+                    error = %e,
+                    poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+                    "Controller flow pass failed — will retry on next poll (self-healing)"
+                );
+            }
+        }
         tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
     }
 }

@@ -61,6 +61,9 @@ coverage/
 *.temp
 .cache/
 
+# Exception: Keep dev-sync.sh tracked (build/deploy automation)
+!scripts/dev-sync.sh
+
 # Compiled files
 *.com
 *.class
