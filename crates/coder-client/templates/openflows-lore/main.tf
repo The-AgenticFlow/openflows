@@ -103,7 +103,7 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
+  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]
 }
 
 data "coder_workspace" "me" {}
