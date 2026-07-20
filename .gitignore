@@ -3,8 +3,6 @@ node_modules/
 vendor/
 .pnp/
 .pnp.js
-*.md
-*.sh
 
 # Build outputs
 dist/

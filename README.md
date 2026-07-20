@@ -1,5 +1,5 @@
 # OpenFlows — Autonomous AI Development Team on Coder
-
+![alt text](image-1.png)
 > Official site: [openflows.dev](https://openflows.dev)
 
 **OpenFlows is an autonomous software development team orchestrator that runs on your self-hosted Coder deployment.**
@@ -12,26 +12,73 @@ AI can generate code against a spec, but it can't write the spec. As models make
 
 ## Quick Start
 
+### Prerequisites
+
+- Docker 24+
+- Rust 1.70+ (build system)
+- GitHub personal access token
+
+### Setup
+
 ```bash
-git clone https://github.com/The-AgenticFlow/openflows.git
-cd openflows
-cp .env.example .env   # edit .env with your GitHub OAuth app credentials
-
-# 1. Start the infrastructure stack
-docker compose up -d
-
-# 2. Bootstrap OpenFlows (creates admin, pushes templates, verifies config)
-cargo run -p openflows --bin openflows -- bootstrap
-
-# 3. Add a tenant (links GitHub via Coder external auth, creates nexus workspace)
-cargo run -p openflows --bin openflows -- tenant add owner/repo --name my-team
-
-# 4. Create a GitHub issue in your repo — OpenFlows picks it up automatically
+cp .env.example .env
+# Edit .env: set GITHUB_TOKEN but leave CODER_SESSION_TOKEN empty
 ```
 
-**Prerequisites:** Docker 24+, Git 2.x+, a GitHub OAuth App (for external auth), and at least one LLM provider configured in the Coder dashboard (AI Settings → Coder Agents → Models).
+### One-time Bootstrap
 
-> **Development Note:** After code changes, run `./update-binaries.sh` to rebuild and update all workspaces with fresh binaries. See [`DEV_BINARY_UPDATE_GUIDE.md`](DEV_BINARY_UPDATE_GUIDE.md).
+```bash
+./scripts/prod.sh bootstrap
+```
+
+This creates admin user in Coder, pushes workspace templates, and verifies LLM/GitHub auth.
+
+### Start the Controller
+
+```bash
+./scripts/prod.sh run
+```
+
+This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue → OpenFlows automatically assigns, provisions a workspace, and starts working.
+
+**Monitor:**
+```bash
+tail -f /tmp/openflows-controller.log
+```
+
+### Add a Tenant
+
+```bash
+./scripts/prod.sh tenant owner/repo --name my-team
+```
+
+### Health Check
+
+```bash
+./scripts/prod.sh doctor
+```
+
+---
+
+## Production Architecture
+
+In production, the controller runs inside a **Nexus workspace** provisioned by Coder. The workspace auto-starts the controller via startup_script.
+
+```
+Coder provisions nexus workspace from template
+    ↓
+Workspace startup script runs
+    ↓
+Line 1: Installs openflows-harness binary
+    ↓
+Line 2: Starts heartbeat daemon
+    ↓
+Line 3: Executes: openflows run
+    ↓
+Controller auto-starts inside workspace
+```
+
+The nexus workspace template is in `crates/coder-client/templates/openflows-nexus/`. It receives all env vars from Coder and auto-starts the controller.
 
 ## How It Works
 
@@ -70,10 +117,7 @@ Each worker workspace gets a small `openflows-harness` binary. The Coder Agent i
 
 One Coder server serves many teams. Each tenant = a real Coder user + a repo binding + an `openflows-nexus` workspace. Tenants are isolated by Coder RBAC and per-tenant Redis keyspace prefixes (`ns:{tenant}:...`).
 
-```bash
-# Add a new tenant
-openflows tenant add another-org/another-repo --name team-b
-```
+Configure multiple tenants via environment variables or the control plane API (documented in `docs/`).
 
 ## Plug-and-Play Extension
 
@@ -87,11 +131,13 @@ See [`docs/extending.md`](docs/extending.md) for details.
 
 | Guide | What it covers |
 |-------|---------------|
+| [QUICK_START.md](QUICK_START.md) | Detailed setup walkthrough |
+| [TOKEN_GUIDE.md](TOKEN_GUIDE.md) | Token acquisition step-by-step |
+| [BUILD.md](BUILD.md) | Building from source |
 | [INSTALL.md](INSTALL.md) | Full installation and configuration |
 | [RUN.md](RUN.md) | Running and configuration reference |
 | [TUTORIAL.md](TUTORIAL.md) | Step-by-step walkthrough |
 | [DEMO.md](DEMO.md) | Quick demo walkthrough (requires a real LLM key) |
-| [BUILD.md](BUILD.md) | Building from source |
 | [docs/coder-compatibility.md](docs/coder-compatibility.md) | Coder version compatibility and verification |
 | [docs/tenancy.md](docs/tenancy.md) | Multi-tenant model and Redis namespacing |
 | [docs/governance.md](docs/governance.md) | AI governance controls and network policy |

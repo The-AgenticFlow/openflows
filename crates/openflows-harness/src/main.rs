@@ -83,6 +83,8 @@ enum StatusAction {
         /// Phase: planning, building, testing, review_ready, blocked
         phase: String,
     },
+    /// Read the current status JSON for this ticket (empty JSON if unset)
+    Get,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +100,8 @@ enum HandoffAction {
 
 #[derive(Subcommand)]
 enum PrAction {
+    /// Read the recorded PR info for this ticket (empty JSON if unset)
+    Get,
     /// Record that a PR was opened
     Opened {
         #[arg(long)]
@@ -172,11 +176,17 @@ async fn main() -> Result<()> {
         Commands::Status { action: StatusAction::Set { phase } } => {
             store.status_set(&ticket, &role, &phase).await?;
         }
+        Commands::Status { action: StatusAction::Get } => {
+            store.status_get(&ticket).await?;
+        }
         Commands::Handoff { action: HandoffAction::Write { contract, notes } } => {
             store.handoff_write(&ticket, &contract, notes.as_deref()).await?;
         }
         Commands::Pr { action: PrAction::Opened { pr, branch, title } } => {
             store.pr_opened(&ticket, &pr, &branch, &title).await?;
+        }
+        Commands::Pr { action: PrAction::Get } => {
+            store.pr_get(&ticket).await?;
         }
         Commands::Review { action: ReviewAction::Submit { verdict, report, pr } } => {
             store.review_submit(&ticket, &role, &verdict, &report, pr).await?;

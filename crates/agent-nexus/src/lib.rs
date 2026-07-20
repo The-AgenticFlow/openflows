@@ -281,12 +281,12 @@ impl NexusNode {
         }
 
         let token = match self.resolve_github_token() {
-            Ok(t) => t,
-            Err(_) => match std::env::var("GITHUB_TOKEN") {
-                Ok(t) => t,
-                Err(_) => match std::fs::read_to_string("/tmp/github_token") {
-                    Ok(t) => t.trim().to_string(),
-                    Err(_) => {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) | Err(_) => match std::env::var("GITHUB_TOKEN") {
+                Ok(t) if !t.is_empty() => t,
+                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
+                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    Ok(_) | Err(_) => {
                         warn!("GitHub token not configured, skipping issue sync");
                         return Ok(());
                     }
@@ -341,16 +341,16 @@ impl NexusNode {
         let token = match self.resolve_github_token() {
             Ok(t) => t,
             Err(_) => match std::env::var("GITHUB_TOKEN") {
-                Ok(t) => {
+                Ok(t) if !t.is_empty() => {
                     info!("Using GITHUB_TOKEN env var for PR sync");
                     t
                 }
-                Err(_) => match std::fs::read_to_string("/tmp/github_token") {
-                    Ok(t) => {
+                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
+                    Ok(t) if !t.trim().is_empty() => {
                         info!("Using /tmp/github_token file for PR sync");
                         t.trim().to_string()
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         warn!("GitHub token not configured, skipping PR sync");
                         return Ok(());
                     }
@@ -899,7 +899,6 @@ impl NexusNode {
     ///
     /// Used during merge/cleanup to tear down ephemeral workspaces.
     /// Archives chats via `archive_ticket_chats()` before destroying the workspace.
-    #[allow(dead_code)]
     async fn destroy_coder_workspace(&self, store: &SharedStore, workspace_id: &str) -> Result<()> {
         let client = match Self::coder_client_from_store(store).await {
             Some(client) => client,
@@ -1043,9 +1042,13 @@ impl NexusNode {
                     if chat.status() == ChatStatus::Waiting {
                         let last_action: Option<String> = store.get_typed(&action_key).await;
                         if matches!(last_action.as_deref(), None | Some("completed")) {
+                            // Send a minimal follow-up that leverages harness state
+                            // instead of a generic "continue" prompt. The agent uses
+                            // openflows-harness to understand where it left off.
                             let follow_up_prompt = format!(
-                                "Continue work on ticket {} from the latest repository state. \
-                                 Review the current branch, the dispatch payload, and pick up where the previous pass left off.",
+                                "Resume work on ticket {}. Check your phase with \
+                                 `openflows-harness status get` and dispatch with \
+                                 `openflows-harness dispatch read`. Continue from there.",
                                 ticket_id
                             );
                             if let Ok(message) = client
@@ -1062,7 +1065,7 @@ impl NexusNode {
                                     worker_id,
                                     ticket_id,
                                     message_id = %message.id,
-                                    "Sent follow-up message to running Coder chat"
+                                    "Sent harness-aware follow-up message to resume work"
                                 );
                                 store.set(&action_key, json!("follow_up_sent")).await;
                                 return;
@@ -1091,13 +1094,13 @@ impl NexusNode {
             }
         }
 
-        // Create the chat with an initial prompt
-        let prompt = format!(
-            "Work on ticket {}: Review the dispatch payload and begin implementation.",
-            ticket_id
-        );
-
-        use coder_client::types::{build_chat_labels, ChatInputPart, CreateChatRequest};
+        // Create the chat with NO initial prompt — the workspace's SessionStart hook
+        // will fire and provide the real bootstrap context (dispatch, phase, harness
+        // commands, next steps). This ensures the agent starts with accurate task
+        // context instead of a generic template message, and prevents confusion
+        // when the hook rewrites or overrides initial prompts.
+        // The hook's stdout becomes the session context automatically in Claude Code.
+        use coder_client::types::{build_chat_labels, CreateChatRequest};
         let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
 
@@ -1119,11 +1122,26 @@ impl NexusNode {
         // model_config_id expects a UUID, not a model name, so we pass None.
         let model_config_id = None;
 
+        // Initial prompt to kick off the agent. The agent uses openflows-harness
+        // to understand the task context: dispatch read → get ticket details,
+        // status get → check current phase (usually "planning").
+        let initial_prompt = format!(
+            "You are the {} agent. Begin work on ticket {} immediately.\n\
+             \n\
+             First, read the dispatch: `openflows-harness dispatch read`\n\
+             Then check your phase: `openflows-harness status get`\n\
+             \n\
+             If no phase is set, start with `openflows-harness status set planning`\n\
+             and begin analyzing the task and planning the implementation.\n\
+             Report your progress by updating the phase as you advance.",
+            role, ticket_id
+        );
+
         let chat_req = CreateChatRequest {
             organization_id,
             workspace_id: workspace_id.clone(),
             model_config_id,
-            content: vec![ChatInputPart::text(&prompt)],
+            content: vec![coder_client::types::ChatInputPart::text(initial_prompt)],
             labels: Some(labels),
         };
 
@@ -1139,8 +1157,8 @@ impl NexusNode {
                 // Store chat ID in SharedStore
                 store.set(&chat_key, json!(chat.id)).await;
 
-                // Store chat_action as "created" for tracking
-                store.set(&action_key, json!("created")).await;
+                // Store chat_action as "started" for tracking
+                store.set(&action_key, json!("started")).await;
 
                 // Update dispatch payload with actual chat ID
                 let mut updated_dispatch = dispatch_payload.clone();
@@ -1180,11 +1198,17 @@ impl NexusNode {
         }
 
         let token = match self.resolve_github_token() {
-            Ok(t) => t,
-            Err(_) => {
-                warn!("GitHub token not configured, assuming CI is ready");
-                return CiReadiness::Ready;
-            }
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) | Err(_) => match std::env::var("GITHUB_TOKEN") {
+                Ok(t) if !t.is_empty() => t,
+                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
+                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    Ok(_) | Err(_) => {
+                        warn!("GitHub token not configured, assuming CI is ready");
+                        return CiReadiness::Ready;
+                    }
+                },
+            },
         };
 
         let client = github::GithubRestClient::new(&token);
@@ -1776,6 +1800,16 @@ impl NexusNode {
 
         for ticket in tickets.iter_mut() {
             if ticket.id == ticket_id {
+                if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
+                    // Already escalated — do not re-notify or bump attempts on
+                    // every controller poll.
+                    debug!(
+                        ticket_id,
+                        worker_id, "Ticket already awaiting human; skipping re-escalation"
+                    );
+                    self.release_worker_slot(store, worker_id).await;
+                    return;
+                }
                 github_link = ticket.issue_url.clone();
                 let attempts = ticket.attempts + 1;
                 ticket.attempts = attempts;
@@ -1795,8 +1829,51 @@ impl NexusNode {
                 json!("awaiting_human"),
             )
             .await;
+
+        // Reset the recovery counter so a human-triggered retry starts fresh.
+        self.reset_recovery_attempts(store, ticket_id).await;
+
+        // Free the worker slot: keeping the slot Assigned/Working while the
+        // ticket is AwaitingHuman deadlocks the fleet — the ticket is no
+        // longer assignable, yet the worker never returns to Idle, so Nexus
+        // pauses forever with "no idle forge worker".
+        self.release_worker_slot(store, worker_id).await;
+
         self.notify_awaiting_human(store, ticket_id, Some(worker_id), reason, github_link)
             .await;
+    }
+
+    /// Return a worker slot to Idle and detach (best-effort destroy) any
+    /// workspace still associated with it.
+    async fn release_worker_slot(&self, store: &SharedStore, worker_id: &str) {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let Some(slot) = slots.get_mut(worker_id) else {
+            return;
+        };
+        if matches!(slot.status, WorkerStatus::Idle) && slot.workspace_id.is_none() {
+            return;
+        }
+        let workspace_id = slot.workspace_id.take();
+        slot.status = WorkerStatus::Idle;
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        info!(worker_id, workspace_id = ?workspace_id, "Released worker slot back to Idle");
+
+        if let Some(workspace_id) = workspace_id {
+            if let Err(e) = self.destroy_coder_workspace(store, &workspace_id).await {
+                warn!(
+                    worker_id,
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "Failed to destroy workspace while releasing worker slot"
+                );
+            }
+        }
+    }
+
+    async fn reset_recovery_attempts(&self, store: &SharedStore, ticket_id: &str) {
+        let key = full_ticket_key_flat(ticket_id, KEY_TICKET_RECOVERY_ATTEMPTS);
+        store.set(&key, json!(0)).await;
     }
 
     async fn inspect_coder_recovery(
@@ -1990,6 +2067,15 @@ impl NexusNode {
                     reason,
                     recovery_attempts,
                 });
+            } else if recovery_attempts > 0 {
+                // Workspace and heartbeat are healthy again — clear the
+                // recovery counter so a later, unrelated crash gets a full
+                // retry budget instead of instantly escalating.
+                self.reset_recovery_attempts(store, &ticket_id).await;
+                info!(
+                    workspace_id,
+                    ticket_id, "Workspace recovered — recovery attempt counter reset"
+                );
             }
         }
 
@@ -2253,7 +2339,6 @@ impl Node for NexusNode {
             store.set(KEY_WORKER_SLOTS, json!(worker_slots)).await;
         }
 
-        let worker_slots = store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({}));
         let open_prs = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
         let command_gate = store.get(KEY_COMMAND_GATE).await.unwrap_or(json!({}));
 
@@ -2273,6 +2358,11 @@ impl Node for NexusNode {
             }
         }
 
+        // Re-read the slots: recovery repair may have released workers or
+        // re-provisioned workspaces, and this loop must act on fresh state.
+        let worker_slots_map: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+
         for (worker_id, slot) in &worker_slots_map {
             let ticket_id = match &slot.status {
                 WorkerStatus::Assigned { ticket_id, .. }
@@ -2282,6 +2372,59 @@ impl Node for NexusNode {
             };
 
             if let Some(ticket_id) = ticket_id {
+                // A busy slot without a workspace means the original
+                // provisioning attempt failed (or was never made). Retry the
+                // provisioning here — bounded by the recovery counter — so the
+                // slot cannot stay busy-but-empty forever.
+                if slot.workspace_id.is_none() {
+                    let attempts = self.increment_recovery_attempts(store, ticket_id).await;
+                    if attempts >= Ticket::MAX_ATTEMPTS {
+                        let reason = format!(
+                            "workspace provisioning failed {} times for worker {}",
+                            attempts, worker_id
+                        );
+                        warn!(
+                            worker_id,
+                            ticket_id,
+                            attempts,
+                            "Provisioning retry limit reached — escalating to human intervention"
+                        );
+                        self.mark_ticket_awaiting_human(store, ticket_id, worker_id, &reason)
+                            .await;
+                        continue;
+                    }
+                    info!(
+                        worker_id,
+                        ticket_id,
+                        attempt = attempts,
+                        "Busy slot has no workspace — retrying Coder workspace provisioning"
+                    );
+                    match self
+                        .provision_coder_workspace(store, worker_id, ticket_id)
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            self.reset_recovery_attempts(store, ticket_id).await;
+                        }
+                        Ok(None) => {
+                            warn!(
+                                worker_id,
+                                ticket_id,
+                                "Provisioning retry made no progress (no Coder client or missing slot)"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                worker_id,
+                                ticket_id,
+                                error = %e,
+                                "Provisioning retry failed — will retry on next poll"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 self.create_chat_for_assignment(store, worker_id, ticket_id)
                     .await;
             }
@@ -2311,6 +2454,10 @@ impl Node for NexusNode {
         } else {
             tickets.iter().filter(|t| t.is_assignable()).collect()
         };
+
+        // Use the freshest slot state so exec sees workers released or
+        // provisioned during this pass instead of waiting an extra poll.
+        let worker_slots = store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({}));
 
         Ok(json!({
             "tickets": tickets,

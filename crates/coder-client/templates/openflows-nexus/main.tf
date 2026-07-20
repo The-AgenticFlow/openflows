@@ -115,7 +115,13 @@ resource "coder_agent" "main" {
     fi
 
     # Start the OpenFlows Controller
-    export CODER_URL="${data.coder_parameter.coder_url.value}"
+    # Detect Coder URL: use internal 'coder' hostname when running inside workspace,
+    # otherwise use the passed-in external URL (for bootstrap/provisioning from host)
+    if curl -sf http://coder:7080/api/v2/buildinfo >/dev/null 2>&1; then
+      export CODER_URL="http://coder:7080"
+    else
+      export CODER_URL="${data.coder_parameter.coder_url.value}"
+    fi
     export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
     export REDIS_URL="${data.coder_parameter.redis_url.value}"
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
@@ -171,7 +177,8 @@ resource "docker_container" "workspace" {
   }
 
   env = [
-    "CODER_URL=${data.coder_parameter.coder_url.value}",
+    # Always use internal 'coder' hostname - Coder is reachable as 'coder' from workspace containers
+    "CODER_URL=http://coder:7080",
     "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
     "REDIS_URL=${data.coder_parameter.redis_url.value}",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
@@ -186,7 +193,7 @@ resource "docker_container" "workspace" {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "172.17.0.1")]
+  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]
 }
 
 data "coder_workspace" "me" {}

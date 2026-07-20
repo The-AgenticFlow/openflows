@@ -123,11 +123,30 @@ impl CoderWorkspace {
     }
 
     /// Returns true when the workspace build is "running" **and** the agent
-    /// lifecycle state is "ready". This is more reliable than `is_running()`
-    /// alone because a workspace can report "running" while the agent is still
-    /// initializing (state "created" / "starting").
+    /// is either connected or has lifecycle state "ready". This is more lenient
+    /// than checking both conditions strictly, accounting for timing variations
+    /// between agent status and lifecycle state.
     pub fn is_agent_ready(&self) -> bool {
-        self.is_running() && self.agent_lifecycle_state().is_ready()
+        if !self.is_running() {
+            return false;
+        }
+        let agent = self
+            .latest_build
+            .as_ref()
+            .and_then(|b| b.resources.iter().find_map(|r| r.agents.first()));
+        match agent {
+            Some(a) => {
+                let status_ok = matches!(
+                    a.status,
+                    AgentStatus::Connected | AgentStatus::Timeout
+                        | AgentStatus::Unknown(_)
+                );
+                let lifecycle_ok = a.lifecycle_state.is_ready()
+                    || matches!(a.lifecycle_state, AgentLifecycleState::Starting);
+                status_ok && lifecycle_ok
+            }
+            None => false,
+        }
     }
 
     pub fn workspace_status(&self) -> WorkspaceStatus {

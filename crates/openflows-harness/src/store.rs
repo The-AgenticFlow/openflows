@@ -129,6 +129,25 @@ impl HarnessStore {
         Ok(())
     }
 
+    /// Read the current status JSON for this ticket. Prints `{}` when unset
+    /// so hook scripts can always parse the output.
+    pub async fn status_get(&self, ticket: &str) -> Result<()> {
+        let key = self.key(&full_ticket_key_flat(ticket, "status"));
+        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
+        println!("{}", val.unwrap_or_else(|| "{}".to_string()));
+        debug!(key = %key, "status read");
+        Ok(())
+    }
+
+    /// Read the recorded PR info for this ticket. Prints `{}` when unset.
+    pub async fn pr_get(&self, ticket: &str) -> Result<()> {
+        let key = self.key(&full_ticket_key_flat(ticket, "pr"));
+        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
+        println!("{}", val.unwrap_or_else(|| "{}".to_string()));
+        debug!(key = %key, "pr read");
+        Ok(())
+    }
+
     /// Write a handoff contract (forge → sentinel).
     pub async fn handoff_write(
         &self,
