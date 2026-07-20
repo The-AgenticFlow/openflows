@@ -275,6 +275,21 @@ impl NexusNode {
         Registry::load(&self.registry_path)
     }
 
+    fn load_agent_persona(&self, role: &str) -> Option<String> {
+        let orch_dir = std::env::var("ORCHESTRATOR_DIR").ok()?;
+        let persona_path = std::path::PathBuf::from(orch_dir)
+            .join("agent")
+            .join("agents")
+            .join(format!("{}.agent.md", role));
+        
+        if persona_path.exists() {
+            std::fs::read_to_string(&persona_path).ok()
+        } else {
+            debug!(role, persona_path = ?persona_path, "Agent persona file not found");
+            None
+        }
+    }
+
     async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
         if owner.is_empty() || repo_name.is_empty() {
             return Ok(());
@@ -1122,20 +1137,47 @@ impl NexusNode {
         // model_config_id expects a UUID, not a model name, so we pass None.
         let model_config_id = None;
 
-        // Initial prompt to kick off the agent. The agent uses openflows-harness
-        // to understand the task context: dispatch read → get ticket details,
-        // status get → check current phase (usually "planning").
-        let initial_prompt = format!(
-            "You are the {} agent. Begin work on ticket {} immediately.\n\
-             \n\
-             First, read the dispatch: `openflows-harness dispatch read`\n\
-             Then check your phase: `openflows-harness status get`\n\
-             \n\
-             If no phase is set, start with `openflows-harness status set planning`\n\
-             and begin analyzing the task and planning the implementation.\n\
-             Report your progress by updating the phase as you advance.",
-            role, ticket_id
+        // Load agent persona for rich context.
+        // The persona provides the full agent identity, capabilities, and protocols.
+        let persona = self.load_agent_persona(role);
+        
+        // Initial prompt to kick off the agent with full system context.
+        // Includes persona, task dispatch, phase coordination, and coordination commands.
+        let dispatch_info = format!(
+            "## Ticket Assignment\n\n**Ticket ID:** {}\n\nRead the full dispatch with: `openflows-harness dispatch read`\n",
+            ticket_id
         );
+        
+        let coordination_info = r#"## Coordination Protocol
+
+Use `openflows-harness` for all coordination:
+
+| Command | Purpose |
+|---------|---------|
+| `dispatch read` | Get ticket details and requirements |
+| `status get` | Check current phase |
+| `status set <phase>` | Update progress phase |
+| `pr opened --pr N --branch B` | Record PR after opening |
+| `handoff write --contract F` | Prepare for next agent |
+
+### Phase Workflow
+1. `planning` → Analyze task, understand requirements
+2. `building` → Implement solution
+3. `testing` → Run tests, verify functionality
+4. `review_ready` → PR open, awaiting review
+5. `blocked` → Stuck? Explain and pause
+"#;
+
+        let initial_prompt = match persona {
+            Some(p) => format!(
+                "{}\n\n{}\n\n{}\n\n**Begin work immediately.** Read the dispatch, check your phase, and start with `planning` if fresh.",
+                p, dispatch_info, coordination_info
+            ),
+            None => format!(
+                "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized development agent. Begin work on this ticket immediately.\n\n{}\n\n{}\n\n**Begin work immediately.** Read the dispatch, check your phase, and start with `planning` if fresh.",
+                role.to_uppercase(), ticket_id, role, dispatch_info, coordination_info
+            ),
+        };
 
         let chat_req = CreateChatRequest {
             organization_id,

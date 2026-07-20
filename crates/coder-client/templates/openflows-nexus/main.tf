@@ -187,6 +187,8 @@ resource "docker_container" "workspace" {
     "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Path to orchestration files containing agent personas and skills
+    "ORCHESTRATOR_DIR=/home/coder/.openflows/orchestration",
   ]
 
   networks_advanced {

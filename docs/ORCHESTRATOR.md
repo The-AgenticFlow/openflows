@@ -69,6 +69,20 @@ Nexus.loop():
 | `worker_slots` | Map of worker IDs → status + workspace_id |
 | `ns:{tenant}:heartbeat:{worker}` | Last heartbeat timestamp |
 
+### Agent Bootstrapping
+
+When Nexus assigns a ticket to a worker, it:
+
+1. **Provisions the workspace** (forge/sentinel/vessel/lore template)
+2. **Creates a Coder Chat** with the agent's full persona in the initial message
+3. **Agent receives**:
+   - Full agent persona (identity, capabilities, non-negotiables)
+   - Ticket dispatch (via `openflows-harness dispatch read`)
+   - Coordination protocol (harness commands, phase workflow)
+   - Ticket ID assignment
+
+The persona is loaded from `orchestration/agent/agents/{role}.agent.md` and embedded in the chat message, giving the agent complete context about their role and system expectations.
+
 ## The Agents
 
 ### FORGE (Builder)
