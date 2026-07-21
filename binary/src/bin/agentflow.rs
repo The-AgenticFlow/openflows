@@ -121,7 +121,8 @@ async fn run_controller() -> Result<()> {
     );
 
     // ── Initialize SharedStore (Redis required — no in-memory fallback) ─
-    let store = pocketflow_core::SharedStore::new_redis(&redis_url).await?;
+    // Tenant-aware: all keys are prefixed with ns:{tenant}: for isolation
+    let store = pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone())).await?;
 
     // ── Resolve orchestration directory ─────────────────────────────────
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;

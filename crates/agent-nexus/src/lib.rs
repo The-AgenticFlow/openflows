@@ -278,16 +278,45 @@ impl NexusNode {
     fn load_agent_persona(&self, role: &str) -> Option<String> {
         let orch_dir = std::env::var("ORCHESTRATOR_DIR").ok()?;
         let persona_path = std::path::PathBuf::from(orch_dir)
+            .join("orchestration")
             .join("agent")
             .join("agents")
             .join(format!("{}.agent.md", role));
-        
+
         if persona_path.exists() {
             std::fs::read_to_string(&persona_path).ok()
         } else {
             debug!(role, persona_path = ?persona_path, "Agent persona file not found");
             None
         }
+    }
+
+    fn load_skills_for_role(&self, role: &str) -> String {
+        let mut skills = Vec::new();
+
+        if let Ok(reg_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
+            if let Ok(registry) = serde_json::from_str::<config::Registry>(&reg_json) {
+                if let Some(entry) = registry.get(role) {
+                    for skill_name in &entry.skills {
+                        skills.push(skill_name.clone());
+                    }
+                }
+            }
+        }
+
+        if skills.is_empty() {
+            return String::new();
+        }
+
+        let skills_list = skills.join(", ");
+        format!(r#"## Your Skills
+
+Skills are provisioned to `.agents/skills/<name>/SKILL.md` in the workspace.
+
+**Available Skills:** {}.
+
+Before significant work, read the relevant skill file to understand the workflow.
+"#, skills_list)
     }
 
     async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
@@ -997,8 +1026,9 @@ impl NexusNode {
         &self,
         store: &SharedStore,
         worker_id: &str,
-        ticket_id: &str,
+        ticket: &Ticket,
     ) {
+        let ticket_id = &ticket.id;
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1037,14 +1067,13 @@ impl NexusNode {
             .map(|(base, _)| base)
             .unwrap_or(worker_id);
 
-        // Build the ticket dispatch payload for Forge
+        // Build dispatch payload with ticket CONTENT for the harness to read
         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
         let dispatch_payload = json!({
             "ticket_id": ticket_id,
-            "worker_id": worker_id,
-            "chat_id": "pending", // Will be updated after chat creation
-            "workspace_id": workspace_id,
-            "role": role,
+            "title": ticket.title,
+            "body": ticket.body,
+            "branch": ticket.branch,
         });
 
         let chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
@@ -1141,11 +1170,21 @@ impl NexusNode {
         // The persona provides the full agent identity, capabilities, and protocols.
         let persona = self.load_agent_persona(role);
         
-        // Initial prompt to kick off the agent with full system context.
-        // Includes persona, task dispatch, phase coordination, and coordination commands.
+        // Load skills for this role
+        let skills_content = self.load_skills_for_role(role);
+
+        // Build ticket content with full context
+        let ticket_content = format!(
+            "## Task\n\n**Title:** {}\n\n**Description:**\n{}\n",
+            ticket.title,
+            if ticket.body.is_empty() { "No description provided.".to_string() } else { ticket.body.clone() }
+        );
+        
+        // Dispatch info with branch
         let dispatch_info = format!(
-            "## Ticket Assignment\n\n**Ticket ID:** {}\n\nRead the full dispatch with: `openflows-harness dispatch read`\n",
-            ticket_id
+            "## Ticket Assignment\n\n**Ticket ID:** {}\n**Branch:** `{}`\n\nUse `openflows-harness dispatch read` for additional context.\n",
+            ticket_id,
+            ticket.branch.as_deref().unwrap_or("main")
         );
         
         let coordination_info = r#"## Coordination Protocol
@@ -1154,30 +1193,36 @@ Use `openflows-harness` for all coordination:
 
 | Command | Purpose |
 |---------|---------|
-| `dispatch read` | Get ticket details and requirements |
+| `dispatch read` | Get ticket requirements |
 | `status get` | Check current phase |
 | `status set <phase>` | Update progress phase |
-| `pr opened --pr N --branch B` | Record PR after opening |
-| `handoff write --contract F` | Prepare for next agent |
+| `pr opened --pr N --branch B --title T` | Record PR after opening |
+| `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
-1. `planning` → Analyze task, understand requirements
-2. `building` → Implement solution
-3. `testing` → Run tests, verify functionality
-4. `review_ready` → PR open, awaiting review
-5. `blocked` → Stuck? Explain and pause
+1. `planning` → Analyze task, write PLAN.md, set `status set planning`
+2. `building` → Implement, set `status set building`
+3. `testing` → Run tests, verify, set `status set testing`
+4. `review_ready` | OPEN PR, request review, set `status set review_ready`
+5. `blocked` → Stuck? Set status and explain
 "#;
 
-        let initial_prompt = match persona {
+        // Build comprehensive initial prompt with all context
+        let base_prompt = match persona {
             Some(p) => format!(
-                "{}\n\n{}\n\n{}\n\n**Begin work immediately.** Read the dispatch, check your phase, and start with `planning` if fresh.",
-                p, dispatch_info, coordination_info
+                "{}\n\n{}\n\n{}\n\n{}\n\n{}",
+                p, ticket_content, &skills_content, dispatch_info, coordination_info
             ),
             None => format!(
-                "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized development agent. Begin work on this ticket immediately.\n\n{}\n\n{}\n\n**Begin work immediately.** Read the dispatch, check your phase, and start with `planning` if fresh.",
-                role.to_uppercase(), ticket_id, role, dispatch_info, coordination_info
+                "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized agent.\n\n{}\n\n{}\n\n{}\n\n{}",
+                role.to_uppercase(), ticket_id, role, &skills_content, ticket_content, dispatch_info, coordination_info
             ),
         };
+        
+        let initial_prompt = format!(
+            "{}\n\n**Begin work immediately.** Set `openflows-harness status set planning`, then start analyzing the task.\n",
+            base_prompt
+        );
 
         let chat_req = CreateChatRequest {
             organization_id,
@@ -1219,6 +1264,20 @@ Use `openflows-harness` for all coordination:
                     "Failed to create Chat for ticket assignment"
                 );
             }
+        }
+    }
+    
+    async fn create_chat_for_ticket_id(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        ticket_id: &str,
+    ) {
+        let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        if let Some(ticket) = tickets.into_iter().find(|t| t.id == *ticket_id) {
+            self.create_chat_for_assignment(store, worker_id, &ticket).await;
+        } else {
+            warn!(worker_id, ticket_id, "Cannot create chat: ticket not found in store");
         }
     }
 
@@ -2277,7 +2336,7 @@ Use `openflows-harness` for all coordination:
                             continue;
                         }
 
-                        self.create_chat_for_assignment(
+                        self.create_chat_for_ticket_id(
                             store,
                             &crashed_workspace.worker_id,
                             &crashed_workspace.ticket_id,
@@ -2467,7 +2526,7 @@ impl Node for NexusNode {
                         }
                     }
                 }
-                self.create_chat_for_assignment(store, worker_id, ticket_id)
+                self.create_chat_for_ticket_id(store, worker_id, ticket_id)
                     .await;
             }
         }
@@ -2763,7 +2822,7 @@ impl Node for NexusNode {
                     }
 
                     // Create a Coder Chat for this assignment and record it in SharedStore
-                    self.create_chat_for_assignment(store, worker_id, ticket_id)
+self.create_chat_for_ticket_id(store, worker_id, ticket_id)
                         .await;
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
