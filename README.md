@@ -1,9 +1,6 @@
 # OpenFlows — Autonomous AI Development Team on Coder
 
-<video width="100%" height="auto" controls poster="https://cdn.loom.com/sessions/thumbnails/46d47c9e9291445a8eb9cc88b2a26627-with-play.jpg">
-  <source src="https://cdn.loom.com/sessions/thumbnails/46d47c9e9291445a8eb9cc88b2a26627/video.mp4" type="video/mp4">
-  <a href="https://www.loom.com/share/46d47c9e9291445a8eb9cc88b2a26627">Watch the demo video on Loom</a>
-</video>
+[![Watch demo video](https://cdn.loom.com/sessions/thumbnails/46d47c9e9291445a8eb9cc88b2a26627-with-play.jpg)](https://www.loom.com/share/46d47c9e9291445a8eb9cc88b2a26627)
 
 > Official site: [openflows.dev](https://openflows.dev)
 
