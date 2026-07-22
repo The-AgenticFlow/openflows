@@ -113,12 +113,14 @@ async fn main() -> Result<()> {
     };
 
     // 2. Initialise SharedStore (Redis or In-Memory)
+    // Tenant-aware: keys are namespaced as ns:{tenant}:{key} for isolation
+    let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
     let store = if let Ok(url) = std::env::var("REDIS_URL") {
-        info!("Using Redis backend: {}", url);
-        SharedStore::new_redis(&url).await?
+        info!(tenant = %tenant, "Using Redis backend: {}", url);
+        SharedStore::new_redis_with_tenant(&url, Some(tenant.clone())).await?
     } else {
-        info!("REDIS_URL not set - using in-memory store (dev mode)");
-        SharedStore::new_in_memory()
+        info!(tenant = %tenant, "Using in-memory store (dev mode)");
+        SharedStore::new_in_memory_with_tenant(&tenant)
     };
 
     // 3. Dry Run Setup: Inject a test ticket and 2 worker slots
