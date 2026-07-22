@@ -1,6 +1,5 @@
 # OpenFlows — Autonomous AI Development Team on Coder
-
-[![Watch demo video](https://cdn.loom.com/sessions/thumbnails/46d47c9e9291445a8eb9cc88b2a26627-with-play.jpg)](https://www.loom.com/share/46d47c9e9291445a8eb9cc88b2a26627)
+<img src="image-1.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
 > Official site: [openflows.dev](https://openflows.dev)
 
