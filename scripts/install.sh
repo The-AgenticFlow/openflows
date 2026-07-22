@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="The-AgenticFlow/openflows"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
-BINARIES=("openflows" "openflows-setup" "openflows-dashboard" "openflows-doctor")
+BINARIES=("openflows" "openflows-doctor")
 CHANNEL="stable"
 
 RED='\033[0;31m'

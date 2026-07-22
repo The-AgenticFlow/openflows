@@ -4,6 +4,7 @@ pub mod batch;
 pub mod command_gate;
 pub mod flow;
 pub mod node;
+pub mod pair_keys;
 pub mod store;
 pub mod types;
 

@@ -1,7 +1,7 @@
 // crates/github/src/schemas.rs
 //
 // Command helper to spawn the GitHub MCP server.
-// All tool calls are made through agent-client's McpSession.
+// All tool calls are made through the GitHub REST/MCP interface.
 
 /// Returns the default command to spawn the GitHub MCP server via Docker.
 /// The GITHUB_PERSONAL_ACCESS_TOKEN env var must be set in the environment.

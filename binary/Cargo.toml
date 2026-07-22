@@ -1,46 +1,39 @@
 [package]
 name    = "openflows"
-version = "1.1.8"
+version = "1.1.6"
 edition = "2021"
 license = "MIT"
+
+[package.metadata.cargo-machete]
+ignored = ["provisioner"]
 
 [[bin]]
 name = "openflows"
 path = "src/bin/agentflow.rs"
 
 [[bin]]
-name = "openflows-demo"
-path = "src/bin/demo.rs"
-
-[[bin]]
-name = "openflows-setup"
-path = "src/bin/setup.rs"
-
-[[bin]]
-name = "openflows-dashboard"
-path = "src/bin/dashboard.rs"
-
-[[bin]]
 name = "openflows-doctor"
 path = "src/bin/doctor.rs"
 
 [dependencies]
-agentflow-tui = { path = "../crates/agentflow-tui" }
 pocketflow-core = { path = "../crates/pocketflow-core" }
 config          = { path = "../crates/config" }
 agent-nexus     = { path = "../crates/agent-nexus" }
 agent-forge     = { path = "../crates/agent-forge" }
 agent-vessel    = { path = "../crates/agent-vessel" }
+agent-sentinel  = { path = "../crates/agent-sentinel" }
 agent-lore      = { path = "../crates/agent-lore" }
-pair-harness    = { path = "../crates/pair-harness" }
+provisioner    = { path = "../crates/provisioner" }
+coder-client    = { path = "../crates/coder-client" }
+clap            = { version = "4", features = ["derive"] }
 
- anyhow      = { workspace = true }
- serde_json  = { workspace = true }
- tokio       = { workspace = true }
- tracing     = { workspace = true }
- tracing-subscriber = { workspace = true }
- dotenvy     = { workspace = true }
- which       = "7"
+  anyhow      = { workspace = true }
+  serde_json  = { workspace = true }
+  tokio       = { workspace = true }
+  tracing     = { workspace = true }
+  tracing-subscriber = { workspace = true }
+  dotenvy     = { workspace = true }
+  reqwest     = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"

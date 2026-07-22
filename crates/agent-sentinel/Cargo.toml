@@ -1,15 +1,18 @@
 [package]
-name = "agent-sentinel"
-version = "0.1.0"
+name    = "agent-sentinel"
+version = "1.1.6"
 edition = "2021"
 license = "MIT"
 
+[package.metadata.cargo-machete]
+ignored = ["tokio"]
 [dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
 pocketflow-core = { path = "../pocketflow-core" }
-pair-harness = { path = "../pair-harness" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
+config          = { path = "../config" }
+coder-client    = { path = "../coder-client", features = ["chats-api"] }
+  anyhow      = { workspace = true }
+  async-trait = { workspace = true }
+  serde       = { workspace = true }
+  serde_json  = { workspace = true }
+  tokio       = { workspace = true }
+  tracing     = { workspace = true }

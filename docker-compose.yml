@@ -1,20 +1,6 @@
-services:
-  proxy:
-    image: ghcr.io/berriai/litellm:main-latest
-    ports:
-      - "4000:4000"
-    volumes:
-      - ./litellm_config.yaml:/app/config.yaml:ro
-    command: ["--config", "/app/config.yaml", "--port", "4000"]
-    env_file:
-      - .env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+name: openflows
 
+services:
   redis:
     image: redis:7-alpine
     ports:
@@ -24,29 +10,47 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
-  openflows:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: openflows
-    ports:
-      - "3000:3000"
-    volumes:
-      - workspace:/workspace
-      - ./.agent:/workspace/.agent:ro
-      - ./orchestration:/app/orchestration:ro
+  coder-db:
+    image: postgres:16-alpine
     environment:
-      PROXY_URL: http://proxy:4000
-      REDIS_URL: redis://redis:6379
-    env_file:
-      - .env
+      POSTGRES_USER: coder
+      POSTGRES_PASSWORD: ${CODER_PG_PASSWORD:-coder}
+      POSTGRES_DB: coder
+    volumes:
+      - coder_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coder"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  coder:
+    image: ghcr.io/coder/coder:${CODER_IMAGE_TAG:-latest}
+    user: "0:0"
+    ports:
+      - "${CODER_PORT:-7080}:${CODER_INTERNAL_PORT:-7080}"
+    environment:
+      CODER_PG_CONNECTION_URL: postgres://coder:${CODER_PG_PASSWORD:-coder}@coder-db:5432/coder?sslmode=disable
+      CODER_ACCESS_URL: ${CODER_ACCESS_URL:-http://localhost:${CODER_PORT:-7080}}
+      CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
+      CODER_PROVISIONER_DAEMONS: "1"
+      CODER_PROVISIONER_DAEMON_TYPE: "docker"
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)
+      - ./.dev-binaries:/opt/openflows-dev:ro
     depends_on:
-      proxy:
+      coder-db:
         condition: service_healthy
-      redis:
-        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${CODER_INTERNAL_PORT:-7080}/api/v2/buildinfo"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
     restart: unless-stopped
 
 volumes:
   redis_data:
-  workspace:
+  coder_db_data:

@@ -4,18 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[package.metadata.cargo-machete]
+ignored = ["serde", "tokio"]
+
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }
 config = { path = "../config" }
-pair-harness = { path = "../pair-harness" }
+coder-client = { path = "../coder-client", features = ["chats-api"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-reqwest = { workspace = true }
-regex = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

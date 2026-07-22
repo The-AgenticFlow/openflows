@@ -1,146 +1,147 @@
-# OpenFlows - Autonomous AI Development Team
-
+# OpenFlows — Autonomous AI Development Team on Coder
+![alt text](image-1.png)
 > Official site: [openflows.dev](https://openflows.dev)
 
-**OpenFlows is an autonomous software development team that runs itself.**
+**OpenFlows is an autonomous software development team orchestrator that runs on your self-hosted Coder deployment.**
 
-Give it a GitHub repo and some issues, and OpenFlows handles everything — writing code, opening PRs, reviewing changes, merging, and documenting — without you writing a single line of code.
+Give it a GitHub repo and some issues, and OpenFlows orchestrates a team of coordinated AI agents that plan the work, write the code, review it adversarially, and ship reviewed PRs — without you writing a single line of code. Each agent runs as a **Coder Agent** (control-plane AI loop) operating on an ephemeral, governed Coder workspace, with LLM keys kept in the Coder control plane and every action tied to your identity.
+
+## Why architecture-first
+
+AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/articles/architecture-is-the-product.md`](docs/articles/architecture-is-the-product.md).
 
 ## Quick Start
 
-### Binary Install (recommended)
+### Prerequisites
+
+- Docker 24+
+- Rust 1.70+ (build system)
+- GitHub personal access token
+
+### Setup
 
 ```bash
-# Stable release
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash
-
-# Or edge (pre-release from main)
-curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash -s -- --edge
+cp .env.example .env
+# Edit .env: set GITHUB_TOKEN but leave CODER_SESSION_TOKEN empty
 ```
 
-Then set up and run:
+### One-time Bootstrap
 
 ```bash
-openflows-setup   # interactive wizard — configures repo, API keys, CLI backend
-openflows          # start the autonomous team
+./scripts/prod.sh bootstrap
 ```
 
-### npm Install
+This creates admin user in Coder, pushes workspace templates, and verifies LLM/GitHub auth.
+
+### Start the Controller
 
 ```bash
-# Stable release
-npm install -g @the-agenticflow/openflows
-
-# Edge (pre-release)
-npm install -g @the-agenticflow/openflows@next
+./scripts/prod.sh run
 ```
 
-Then:
+This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue → OpenFlows automatically assigns, provisions a workspace, and starts working.
+
+**Monitor:**
+```bash
+tail -f /tmp/openflows-controller.log
+```
+
+### Add a Tenant
 
 ```bash
-openflows-setup
-openflows
+./scripts/prod.sh tenant owner/repo --name my-team
 ```
 
-### Install from Source
+### Health Check
 
 ```bash
-git clone https://github.com/The-AgenticFlow/openflows.git
-cd openflows
-
-# Build and install release binaries
-make install   # installs to ~/.local/bin
-
-openflows-setup
-openflows
+./scripts/prod.sh doctor
 ```
 
-Or build manually with Cargo:
+---
 
-```bash
-cargo build --release -p openflows
-# Binaries at target/release/{openflows,openflows-setup,openflows-dashboard,openflows-doctor}
-# You also need the orchestration/ directory — copy it to ~/.local/bin/ or set OPENFLOWS_HOME
-cp -r orchestration ~/.local/bin/
+## Production Architecture
+
+In production, the controller runs inside a **Nexus workspace** provisioned by Coder. The workspace auto-starts the controller via startup_script.
+
 ```
+Coder provisions nexus workspace from template
+    ↓
+Workspace startup script runs
+    ↓
+Line 1: Installs openflows-harness binary
+    ↓
+Line 2: Starts heartbeat daemon
+    ↓
+Line 3: Executes: openflows run
+    ↓
+Controller auto-starts inside workspace
+```
+
+The nexus workspace template is in `crates/coder-client/templates/openflows-nexus/`. It receives all env vars from Coder and auto-starts the controller.
 
 ## How It Works
 
 OpenFlows runs a team of AI agents that collaborate just like a real engineering team:
 
 ```
-You create a GitHub issue → The team picks it up → Code is written, reviewed, and merged → You get a PR
+You create a GitHub issue → NEXUS picks it up → FORGE writes code → SENTINEL reviews adversarially
+→ VESSEL merges green PRs → LORE documents → you get a merged PR
 ```
 
-You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously.
+You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously, with NEXUS's `reconcile()` detecting orphans, stale workers, and unmerged PRs and recovering automatically.
 
-![OpenFlows Architecture](image.png)
+### Coder governs *where* agents run — OpenFlows governs *how* they coordinate
+
+The integration is deliberate and asymmetrical:
+- **Coder** provides the governed environment: ephemeral workspaces, control-plane AI agents, model governance, identity, audit logging, cost tracking. The workspace has zero AI software and zero LLM keys.
+- **OpenFlows** provides the brain: the flow graph, typed SharedStore contracts, the Node trait's `prep → exec → post` separation, and the FORGE↔SENTINEL planning cycle.
+
+Coder Agents run in the **control plane** (not in workspaces). They execute tool calls by connecting to workspaces over the same secure tunnel as IDEs. You watch agents coding live in the Coder Agents chat UI with diffs, status, and message streaming.
+
+### The `openflows-harness` CLI
+
+Each worker workspace gets a small `openflows-harness` binary. The Coder Agent invokes it via shell (guided by skills) to read/write the Redis SharedStore with typed, validated schemas. Agents never run `redis-cli` directly — the harness is the only Redis client in a workspace.
 
 ## The Team
 
-| Agent | Role | What it does |
-|-------|------|-------------|
-| **NEXUS** | Orchestrator | Assigns issues, coordinates the team, notifies you when needed |
-| **FORGE** | Builder | Writes code, creates branches, opens PRs |
-| **SENTINEL** | Reviewer | Reviews code for security, quality, and test coverage |
-| **VESSEL** | DevOps | Monitors CI, handles merge conflicts, squash-merges green PRs |
-| **LORE** | Writer | Documents decisions, updates changelogs, maintains project history |
+| Agent | Role | Plan mode | What it does |
+|-------|------|-----------|--------------|
+| **NEXUS** | Orchestrator | yes | Assigns issues, coordinates the team, owns `reconcile()` failure recovery, notifies you when needed |
+| **FORGE** | Builder | no | Writes code against an agreed `CONTRACT.md`, creates branches, opens PRs |
+| **SENTINEL** | Reviewer | yes | Adversarially reviews code for security, quality, and test coverage against the contract |
+| **VESSEL** | DevOps | no | Monitors CI, handles merge conflicts, squash-merges green PRs, tears down workspaces on merge |
+| **LORE** | Writer | no | Documents decisions, updates changelogs, maintains project history *(disabled by default — enable in the registry)* |
 
-## Prerequisites
+## Multi-Tenancy
 
-### System Requirements
+One Coder server serves many teams. Each tenant = a real Coder user + a repo binding + an `openflows-nexus` workspace. Tenants are isolated by Coder RBAC and per-tenant Redis keyspace prefixes (`ns:{tenant}:...`).
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| **Git** | 2.x+ | Required for repo cloning, worktree management, and branching |
-| **Node.js** | 18+ | Required for the GitHub MCP server (`npx -y @modelcontextprotocol/server-github`) |
-| **C compiler** | — | `build-essential` (Debian/Ubuntu) or `xcode-select --install` (macOS) |
-| **OpenSSL dev headers** | — | `pkg-config` + `libssl-dev` (Debian/Ubuntu) or `brew install openssl` (macOS) |
-| **Rust** | 1.70+ | Only required if building from source (`cargo install openflows`) |
+Configure multiple tenants via environment variables or the control plane API (documented in `docs/`).
 
-### GitHub
+## Plug-and-Play Extension
 
-- **A GitHub repository** — the repo OpenFlows will work on
-- **A GitHub Personal Access Token** — with `repo` scope (set as `GITHUB_PERSONAL_ACCESS_TOKEN`)
+- **Add a skill**: Drop a directory in `orchestration/plugin/skills/` with a `SKILL.md`, list it in `registry.json` under the role's `skills` array. No code change.
+- **Add an MCP server**: Add it to the role's `mcp` object in `registry.json`, or register it centrally in the Coder dashboard (AI Settings → MCP Servers). Both coexist.
+- **Enable a new model**: Configure it in the Coder dashboard (AI Settings → Coder Agents → Models). Reference it in `registry.json` via the `model` field.
 
-### AI Backend (choose one)
-
-| Mode | CLI | Required API Key | Install |
-|------|-----|-------------------|---------|
-| **Claude + Anthropic** | Claude Code | `ANTHROPIC_API_KEY` | `npm install -g @anthropic-ai/claude-code && claude login` |
-| **Codex + OpenAI** | Codex | `OPENAI_API_KEY` | `npm install -g @openai/codex && codex login --with-api-key` |
-| **Codex + Fireworks** | Codex | `FIREWORKS_API_KEY` | `npm install -g @openai/codex && codex login --with-api-key` |
-
-Set `DEFAULT_CLI` to `claude` or `codex` to select your backend.
-
-### Optional (Recommended for Production)
-
-| Service | Purpose | Default |
-|---------|---------|---------|
-| **Redis 7** | Persistent state across restarts | In-memory (state lost on restart) |
-| **LiteLLM proxy** | Per-agent model routing, cost optimization, rate limits | Direct API calls |
-
-Both are included in the Docker Compose stack (`docker compose up`).
-
-### Environment Setup
-
-```bash
-cp .env.example .env
-# Edit .env with your tokens and API keys
-```
-
-The `openflows-setup` wizard handles configuration interactively. See [.env.example](.env.example) for all available options.
+See [`docs/extending.md`](docs/extending.md) for details.
 
 ## Documentation
 
 | Guide | What it covers |
 |-------|---------------|
-| [INSTALL.md](INSTALL.md) | Full installation options and configuration |
-| [RUN.md](RUN.md) | Running and configuration reference |
-| [TUTORIAL.md](TUTORIAL.md) | Step-by-step walkthrough with logs |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute to OpenFlows |
+| [QUICK_START.md](QUICK_START.md) | Detailed setup walkthrough |
+| [TOKEN_GUIDE.md](TOKEN_GUIDE.md) | Token acquisition step-by-step |
 | [BUILD.md](BUILD.md) | Building from source |
-| [DEMO.md](DEMO.md) | Quick demo (no API keys needed) |
+| [INSTALL.md](INSTALL.md) | Full installation and configuration |
+| [RUN.md](RUN.md) | Running and configuration reference |
+| [TUTORIAL.md](TUTORIAL.md) | Step-by-step walkthrough |
+| [DEMO.md](DEMO.md) | Quick demo walkthrough (requires a real LLM key) |
+| [docs/coder-compatibility.md](docs/coder-compatibility.md) | Coder version compatibility and verification |
+| [docs/tenancy.md](docs/tenancy.md) | Multi-tenant model and Redis namespacing |
+| [docs/governance.md](docs/governance.md) | AI governance controls and network policy |
+| [docs/extending.md](docs/extending.md) | Adding skills, MCP servers, and models |
 
 ## License
 

@@ -1,28 +1,13 @@
 #!/bin/bash
-# Runs on PreCompact - converts compaction to clean context reset
-# This hook fires when the context window is approaching its limit
-#
-# Environment:
-#   SPRINTLESS_SHARED - the shared directory
+# PreCompact hook — persist a progress snapshot before context compaction so
+# work state survives in the SharedStore even if in-context details are lost.
 
-SHARED="${SPRINTLESS_SHARED}"
-
-echo "=============================================="
-echo "  CONTEXT RESET REQUIRED"
-echo "=============================================="
-echo ""
-echo "Your context window is approaching its limit."
-echo "Before this session ends, you must write a handoff."
-echo ""
-echo "Use the /handoff command now. It will:"
-echo "  1. Collect everything needed for the handoff"
-echo "  2. Write ${SHARED}/HANDOFF.md"
-echo "  3. Update WORKLOG.md with current state"
-echo "  4. Exit cleanly"
-echo ""
-echo "A fresh FORGE session will read your handoff and continue."
-echo ""
-echo "DO NOT attempt to continue working - write the handoff now."
-echo ""
-
-exit 2
+if command -v openflows-harness >/dev/null 2>&1; then
+  status=$(openflows-harness status get 2>/dev/null || echo '{}')
+  phase=$(printf '%s' "$status" | sed -n 's/.*"phase"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  # Re-assert the current phase (refreshes the timestamp) so the controller
+  # sees recent activity across the compaction boundary.
+  [ -n "$phase" ] && openflows-harness status set "$phase" >/dev/null 2>&1 || true
+fi
+echo "Context is being compacted. Re-read the dispatch with 'openflows-harness dispatch read' if needed."
+exit 0

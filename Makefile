@@ -1,4 +1,4 @@
-.PHONY: help build release install clean test lint fmt check docker-setup docker-build docker-run cross-linux cross-mac
+.PHONY: help build release install clean test lint fmt check docker-setup docker-build docker-run cross-linux cross-mac dev-sync dev-sync-force dev-sync-watch dev-sync-check dev-sync-template
 
 SHELL := /bin/bash
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -16,6 +16,11 @@ help:
 	@echo "  make lint           Run clippy + fmt check"
 	@echo "  make fmt            Format code"
 	@echo "  make check          Full CI check (fmt + clippy + build + test)"
+	@echo "  make dev-sync        Rebuild + deploy binary if source changed (one-shot)"
+	@echo "  make dev-sync-force  Rebuild + deploy binary unconditionally"
+	@echo "  make dev-sync-watch  Watch for source changes, auto-redeploy (foreground)"
+	@echo "  make dev-sync-check  Exit 1 if binary is stale (CI gate)"
+	@echo "  make dev-sync-template  Rebuild binary + push nexus template to Coder"
 	@echo "  make docker-build   Build Docker image"
 	@echo "  make docker-run     Run via Docker Compose"
 	@echo "  make cross-linux    Cross-compile for Linux (x86_64 + aarch64)"
@@ -68,6 +73,26 @@ check: fmt lint test
 
 docker-build:
 	docker build -t openflows:$(VERSION) .
+
+# ── Dev binary sync ────────────────────────────────────────────────────
+# Keeps the .dev-binaries/openflows binary in sync with source changes.
+# Rebuilds, copies to .dev-binaries/, and hot-deploys into the running
+# nexus container so the controller picks up new code immediately.
+
+dev-sync:
+	@scripts/dev-sync.sh
+
+dev-sync-force:
+	@scripts/dev-sync.sh --force
+
+dev-sync-watch:
+	@scripts/dev-sync.sh --watch
+
+dev-sync-check:
+	@scripts/dev-sync.sh --check
+
+dev-sync-template:
+	@scripts/dev-sync.sh --force --push-template
 
 docker-run:
 	docker compose up -d
