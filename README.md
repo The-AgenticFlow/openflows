@@ -1,5 +1,7 @@
 # OpenFlows — Autonomous AI Development Team on Coder
-![alt text](image-1.png)
+
+[![Watch demo video](https://cdn.loom.com/sessions/thumbnails/46d47c9e9291445a8eb9cc88b2a26627-with-play.jpg)](https://www.loom.com/share/46d47c9e9291445a8eb9cc88b2a26627)
+
 > Official site: [openflows.dev](https://openflows.dev)
 
 **OpenFlows is an autonomous software development team orchestrator that runs on your self-hosted Coder deployment.**
