@@ -1219,11 +1219,11 @@ Use `openflows-harness` for all coordination:
         let base_prompt = match persona {
             Some(p) => format!(
                 "{}\n\n{}\n\n{}\n\n{}\n\n{}",
-                p, ticket_content, &skills_content, dispatch_info, coordination_info
+                p, ticket_content, skills_content, dispatch_info, coordination_info
             ),
             None => format!(
                 "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized agent.\n\n{}\n\n{}\n\n{}\n\n{}",
-                role.to_uppercase(), ticket_id, role, &skills_content, ticket_content, dispatch_info, coordination_info
+                role.to_uppercase(), ticket_id, role, skills_content, ticket_content, dispatch_info, coordination_info
             ),
         };
 

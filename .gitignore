@@ -112,7 +112,9 @@ worktrees/
 
 # Kilo runtime data (plans, sessions, node_modules)
 .kilo/
-orchestration/
+!orchestration/agent/
+!orchestration/plugin/skills/
+!orchestration/plugin/mcp/
 
 # Dev binary mount for Coder workspace templates (built artifacts)
 .dev-binaries/
