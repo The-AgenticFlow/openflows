@@ -1,50 +1,40 @@
 {
-  "default_cli": "claude",
   "team": [
     {
-      "id": "nexus",
-      "cli": "claude",
-      "active": true,
-      "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
-      "routing_key": "nexus-key",
-      "github_token_env": "AGENT_NEXUS_GITHUB_TOKEN"
-    },
-    {
       "id": "forge",
-      "cli": "claude",
       "active": true,
-      "instances": 2,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
-      "routing_key": "forge-key",
-      "github_token_env": "AGENT_FORGE_GITHUB_TOKEN"
+      "model": "claude-sonnet-4-5",
+      "plan_mode": false,
+      "max_instances": 2,
+      "skills": ["forge-coding", "forge-planning", "shared-harness-protocol"],
+      "mcp": {}
     },
     {
       "id": "sentinel",
-      "cli": "claude",
       "active": true,
-      "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
-      "routing_key": "sentinel-key",
-      "github_token_env": "AGENT_SENTINEL_GITHUB_TOKEN"
+      "model": "claude-sonnet-4-5",
+      "plan_mode": true,
+      "max_instances": 1,
+      "skills": ["sentinel-review", "sentinel-criteria", "shared-harness-protocol"],
+      "mcp": {}
     },
-    {                                                                                                           
+    {
       "id": "vessel",
-      "cli": "claude",
       "active": true,
-      "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
-      "routing_key": "vessel-key",
-      "github_token_env": "AGENT_VESSEL_GITHUB_TOKEN"
+      "model": "claude-haiku-4-5",
+      "plan_mode": false,
+      "max_instances": 1,
+      "skills": ["vessel-merge-protocol", "vessel-ci-gate", "shared-harness-protocol"],
+      "mcp": {}
     },
     {
       "id": "lore",
-      "cli": "claude",
-      "active": false,
-      "instances": 1,
-      "model_backend": "anthropic/claude-haiku-4-5-20251001",
-      "routing_key": "lore-key",
-      "github_token_env": "AGENT_LORE_GITHUB_TOKEN"
+      "active": true,
+      "model": "claude-haiku-4-5",
+      "plan_mode": false,
+      "max_instances": 1,
+      "skills": ["lore-documentation", "lore-changelog", "shared-harness-protocol"],
+      "mcp": {}
     }
   ]
 }

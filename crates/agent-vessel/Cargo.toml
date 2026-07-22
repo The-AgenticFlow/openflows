@@ -8,6 +8,9 @@ license = "MIT"
 pocketflow-core = { path = "../pocketflow-core" }
 config = { path = "../config" }
 github = { path = "../github" }
+provisioner = { path = "../provisioner" }
+coder-client = { path = "../coder-client" }
+openflows-notifier = { package = "notifier", path = "../notifier" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

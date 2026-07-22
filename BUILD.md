@@ -23,7 +23,16 @@ This guide walks you through building OpenFlows from source. Whether you're cont
 |------|---------|---------|
 | **Rust** | 1.70+ | Core runtime and build system |
 | **Node.js** | 18+ | GitHub MCP server dependency |
-| **CLI Backend** | Latest | AI agent execution (Claude Code or Codex) |
+| **CLI Backend** | Latest | AI agent execution (Claude Code or Codex). Only needed on the host for Local mode — in Coder mode the CLI installs inside each workspace via the Coder Registry module |
+| **Docker** | 24+ | Required for the Docker Compose Coder stack (`docker compose --profile coder up`). Not needed for Local-mode builds |
+
+### Optional (for the `coder` feature)
+
+The `coder-client` and `pair-harness` crates are feature-gated behind the `coder` Cargo feature, which is enabled by default. It provides the Coder REST/SSH transport (`CoderTransport`, `CoderProcess`) and the `CoderBootstrapper`. To build a Local-only binary with no Coder dependencies, disable default features:
+
+```bash
+cargo build --workspace --no-default-features
+```
 
 ### Installing Prerequisites
 

@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, trace};
 
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
@@ -20,15 +20,6 @@ pub struct StoreEvent {
     pub event_type: String,
     pub payload: Value,
     pub ts: u64, // unix millis
-}
-
-// ── Backend trait (sealed inside this module) ─────────────────────────────
-
-#[async_trait::async_trait]
-trait StoreBackend: Send + Sync {
-    async fn get(&self, key: &str) -> Option<Value>;
-    async fn set(&self, key: &str, value: Value);
-    async fn del(&self, key: &str);
 }
 
 // ── In-memory backend ─────────────────────────────────────────────────────
@@ -43,24 +34,24 @@ impl InMemoryBackend {
             map: RwLock::new(HashMap::new()),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl StoreBackend for InMemoryBackend {
-    async fn get(&self, key: &str) -> Option<Value> {
-        self.map.read().await.get(key).cloned()
-    }
-    async fn set(&self, key: &str, value: Value) {
-        self.map.write().await.insert(key.to_string(), value);
-    }
-    async fn del(&self, key: &str) {
-        self.map.write().await.remove(key);
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        let map = self.map.read().await;
+        map.keys()
+            .filter(|k| {
+                if pattern == "*" || pattern.ends_with('*') {
+                    let prefix = pattern.trim_end_matches('*');
+                    k.starts_with(prefix)
+                } else {
+                    k == &pattern
+                }
+            })
+            .cloned()
+            .collect()
     }
 }
 
 // ── Redis backend ─────────────────────────────────────────────────────────
-// Allow redis as stub for now
-// Allow redis as stub for now
 struct RedisBackend {
     client: fred::clients::Client,
 }
@@ -73,25 +64,82 @@ impl RedisBackend {
         client.init().await?;
         Ok(Self { client })
     }
+
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        use fred::types::scan::Scanner;
+        use futures::StreamExt;
+        let mut keys = Vec::new();
+        let mut stream = self.client.scan(pattern, None, None);
+        while let Some(result) = stream.next().await {
+            if let Ok(mut scan_result) = result {
+                if let Some(page) = scan_result.take_results() {
+                    for key in page {
+                        if let Some(s) = key.into_string() {
+                            keys.push(s);
+                        }
+                    }
+                }
+                if scan_result.has_more() {
+                    scan_result.next();
+                }
+            }
+        }
+        keys
+    }
 }
 
-#[async_trait::async_trait]
-impl StoreBackend for RedisBackend {
+// ── Backend enum ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum Backend {
+    InMemory(Arc<InMemoryBackend>),
+    Redis(Arc<RedisBackend>),
+}
+
+impl Backend {
     async fn get(&self, key: &str) -> Option<Value> {
-        use fred::prelude::*;
-        let raw: Option<String> = self.client.get(key).await.ok()?;
-        raw.and_then(|s| serde_json::from_str(&s).ok())
-    }
-    async fn set(&self, key: &str, value: Value) {
-        use fred::prelude::*;
-        if let Ok(s) = serde_json::to_string(&value) {
-            let _: core::result::Result<(), _> =
-                self.client.set::<(), _, _>(key, s, None, None, false).await;
+        match self {
+            Backend::InMemory(b) => b.map.read().await.get(key).cloned(),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = b.client.get(key).await.ok()?;
+                raw.and_then(|s| serde_json::from_str(&s).ok())
+            }
         }
     }
+
+    async fn set(&self, key: &str, value: Value) {
+        match self {
+            Backend::InMemory(b) => {
+                b.map.write().await.insert(key.to_string(), value);
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                if let Ok(s) = serde_json::to_string(&value) {
+                    let _: core::result::Result<(), _> =
+                        b.client.set::<(), _, _>(key, s, None, None, false).await;
+                }
+            }
+        }
+    }
+
     async fn del(&self, key: &str) {
-        use fred::prelude::*;
-        let _: core::result::Result<i64, _> = self.client.del(key).await;
+        match self {
+            Backend::InMemory(b) => {
+                b.map.write().await.remove(key);
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let _: core::result::Result<i64, _> = b.client.del(key).await;
+            }
+        }
+    }
+
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        match self {
+            Backend::InMemory(b) => b.keys(pattern).await,
+            Backend::Redis(b) => b.keys(pattern).await,
+        }
     }
 }
 
@@ -99,43 +147,79 @@ impl StoreBackend for RedisBackend {
 
 #[derive(Clone)]
 pub struct SharedStore {
-    backend: Arc<dyn StoreBackend>,
+    backend: Backend,
     ring_buffer: Arc<RwLock<Vec<StoreEvent>>>,
+    tenant: String,
 }
 
 impl SharedStore {
     /// In-memory backend — use for dev and tests.
     pub fn new_in_memory() -> Self {
+        Self::new_in_memory_with_tenant("default")
+    }
+
+    /// In-memory backend with explicit tenant — for testing multi-tenancy.
+    pub fn new_in_memory_with_tenant(tenant: impl Into<String>) -> Self {
         Self {
-            backend: Arc::new(InMemoryBackend::new()),
+            backend: Backend::InMemory(Arc::new(InMemoryBackend::new())),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
+            tenant: tenant.into(),
         }
     }
 
     /// Redis backend — use for Docker Compose and production.
+    /// Tenant is derived from the OPENFLOWS_TENANT env var, or "default" if unset.
+    /// This ensures all keys are namespaced as `ns:{tenant}:*` for tenant isolation.
     pub async fn new_redis(url: &str) -> Result<Self> {
+        Self::new_redis_with_tenant(url, None).await
+    }
+
+    /// Redis backend with explicit or derived tenant.
+    /// If tenant is None, reads from OPENFLOWS_TENANT env var.
+    pub async fn new_redis_with_tenant(url: &str, tenant: Option<String>) -> Result<Self> {
+        let resolved_tenant = tenant
+            .or_else(|| std::env::var("OPENFLOWS_TENANT").ok())
+            .unwrap_or_else(|| "default".to_string());
+
         Ok(Self {
-            backend: Arc::new(RedisBackend::new(url).await?),
+            backend: Backend::Redis(Arc::new(RedisBackend::new(url).await?)),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
+            tenant: resolved_tenant,
         })
+    }
+
+    /// Build a tenant-namespaced key: `ns:{tenant}:{key}`.
+    fn ns_key(&self, key: &str) -> String {
+        format!("ns:{}:{}", self.tenant, key)
     }
 
     // ── Core get/set/del ─────────────────────────────────────────────
 
     pub async fn get(&self, key: &str) -> Option<Value> {
-        let v = self.backend.get(key).await;
-        debug!(key, found = v.is_some(), "store.get");
+        let ns_key = self.ns_key(key);
+        let v = self.backend.get(&ns_key).await;
+        trace!(key = %ns_key, found = v.is_some(), "store.get");
         v
     }
 
     pub async fn set(&self, key: &str, value: Value) {
-        debug!(key, "store.set");
-        self.backend.set(key, value).await;
+        let ns_key = self.ns_key(key);
+        debug!(key = %ns_key, "store.set");
+        self.backend.set(&ns_key, value).await;
     }
 
     pub async fn del(&self, key: &str) {
-        debug!(key, "store.del");
-        self.backend.del(key).await;
+        let ns_key = self.ns_key(key);
+        debug!(key = %ns_key, "store.del");
+        self.backend.del(&ns_key).await;
+    }
+
+    pub async fn keys(&self, pattern: &str) -> Vec<String> {
+        // For pattern matching, we need to handle both the namespace prefix
+        // and the fact that SCAN returns full keys. The pattern should match
+        // against the namespaced form: ns:{tenant}:{pattern}
+        let ns_pattern = self.ns_key(pattern);
+        self.backend.keys(&ns_pattern).await
     }
 
     /// Typed get — deserialises JSON into T. Returns None on missing key or type mismatch.

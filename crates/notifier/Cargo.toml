@@ -1,0 +1,15 @@
+[package]
+name = "notifier"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Human notification service for OpenFlows awaiting_human escalations"
+
+[dependencies]
+anyhow = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }

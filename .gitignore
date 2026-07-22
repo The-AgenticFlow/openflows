@@ -59,6 +59,9 @@ coverage/
 *.temp
 .cache/
 
+# Exception: Keep dev-sync.sh tracked (build/deploy automation)
+!scripts/dev-sync.sh
+
 # Compiled files
 *.com
 *.class
@@ -110,3 +113,6 @@ worktrees/
 # Kilo runtime data (plans, sessions, node_modules)
 .kilo/
 orchestration/
+
+# Dev binary mount for Coder workspace templates (built artifacts)
+.dev-binaries/

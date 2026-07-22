@@ -1,0 +1,27 @@
+[package]
+name = "coder-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Client library for the Coder REST API"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = "0.22"
+futures = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.26", optional = true, features = ["rustls-tls-webpki-roots"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+chats-api = ["tokio-tungstenite"]

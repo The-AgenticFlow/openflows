@@ -82,6 +82,9 @@ pub async fn noop_prep(_store: &SharedStore) -> Result<Value> {
 /// Marker to signal to the Flow that a node requests termination.
 pub const STOP_SIGNAL: &str = "__stop__";
 
+/// Marker to end the current flow pass so its caller can poll again later.
+pub const PAUSE_SIGNAL: &str = "__pause__";
+
 /// Helper: wrap a string action for use in post() return sites.
 #[inline]
 pub fn action(s: &str) -> Result<Action> {

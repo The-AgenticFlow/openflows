@@ -1,7 +1,3 @@
 #!/bin/bash
-# VESSEL Stop Hook
-# Logs merge status on exit
-
-echo "VESSEL session ending. Merge status logged."
-
+echo "vessel: merge status"
 exit 0

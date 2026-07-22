@@ -1,0 +1,25 @@
+[package]
+name = "openflows-harness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Typed SharedStore CLI for Coder Agent worker workspaces"
+
+[[bin]]
+name = "openflows-harness"
+path = "src/main.rs"
+
+[dependencies]
+config = { path = "../config" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+fred = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
