@@ -74,7 +74,6 @@ impl CliBackend {
 }
 
 /// Coder Registry module configuration for agent workspace templates.
-
 /// Maps an agent CLI to a Terraform module source with version and parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoderModule {

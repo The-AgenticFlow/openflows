@@ -300,7 +300,7 @@ pub enum ChatStatus {
 
 impl ChatStatus {
     /// Parse a status string from the Coder API response.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_from_str(s: &str) -> Self {
         match s {
             "pending" => ChatStatus::Pending,
             "running" => ChatStatus::Running,
@@ -392,7 +392,7 @@ pub struct Chat {
 impl Chat {
     /// Get the parsed status enum.
     pub fn status(&self) -> ChatStatus {
-        ChatStatus::from_str(&self.status_raw)
+        ChatStatus::parse_from_str(&self.status_raw)
     }
 }
 

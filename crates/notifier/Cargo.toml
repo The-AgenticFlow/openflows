@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Human notification service for OpenFlows awaiting_human escalations"
 
+[package.metadata.cargo-machete]
+ignored = ["url"]
+
 [dependencies]
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }

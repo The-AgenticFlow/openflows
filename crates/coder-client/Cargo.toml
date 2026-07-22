@@ -25,3 +25,5 @@ tempfile = { workspace = true }
 [features]
 default = []
 chats-api = ["tokio-tungstenite"]
+[package.metadata.cargo-machete]
+ignored = ["async-trait"]

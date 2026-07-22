@@ -634,6 +634,7 @@ Before significant work, read the relevant skill file to understand the workflow
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn load_persona(&self) -> Result<AgentPersona> {
         let content = tokio::fs::read_to_string(&self.persona_path)
             .await
@@ -683,7 +684,7 @@ Before significant work, read the relevant skill file to understand the workflow
 
         for slot_id in &all_slot_ids {
             match slots.get_mut(slot_id) {
-                Some(slot) => {
+                Some(_slot) => {
                     // Coder is the only provider — no provider field to update.
                 }
                 None => {

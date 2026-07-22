@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[package.metadata.cargo-machete]
+ignored = ["serde", "tokio"]
+
 [dependencies]
 pocketflow-core = { path = "../pocketflow-core" }
 config = { path = "../config" }

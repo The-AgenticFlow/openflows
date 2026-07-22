@@ -231,7 +231,7 @@ impl CoderClient {
         method: reqwest::Method,
         path: &str,
     ) -> reqwest::RequestBuilder {
-        let mut req = self.http.request(method, &self.url(path));
+        let mut req = self.http.request(method, self.url(path));
         if !self.token.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
@@ -250,7 +250,7 @@ impl CoderClient {
         while start.elapsed() < timeout {
             match self
                 .http
-                .get(&self.url("/api/v2/buildinfo"))
+                .get(self.url("/api/v2/buildinfo"))
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await
@@ -359,7 +359,7 @@ impl CoderClient {
     pub async fn login_with_password(&self, email: &str, password: &str) -> Result<String> {
         let resp = self
             .http
-            .post(&self.url("/api/v2/users/login"))
+            .post(self.url("/api/v2/users/login"))
             .json(&serde_json::json!({
                 "email": email,
                 "password": password,

@@ -6,7 +6,7 @@
 //! cross-workspace coordination when pairs run in Coder workspaces that
 //! don't share a filesystem.
 
-pub mod pair_keys {
+pub mod keys {
     pub fn status(pair_id: &str) -> String {
         format!("pair:{pair_id}:status")
     }
@@ -58,48 +58,42 @@ pub mod pair_keys {
 
 #[cfg(test)]
 mod tests {
-    use super::pair_keys;
+    use super::keys;
 
     #[test]
     fn test_key_format_strings() {
-        assert_eq!(pair_keys::status("pair-1"), "pair:pair-1:status");
-        assert_eq!(pair_keys::worklog("pair-1"), "pair:pair-1:worklog");
-        assert_eq!(pair_keys::ticket("pair-1"), "pair:pair-1:ticket");
-        assert_eq!(pair_keys::task("pair-1"), "pair:pair-1:task");
-        assert_eq!(pair_keys::plan("pair-1"), "pair:pair-1:plan");
-        assert_eq!(pair_keys::contract("pair-1"), "pair:pair-1:contract");
-        assert_eq!(pair_keys::handoff("pair-1"), "pair:pair-1:handoff");
+        assert_eq!(keys::status("pair-1"), "pair:pair-1:status");
+        assert_eq!(keys::worklog("pair-1"), "pair:pair-1:worklog");
+        assert_eq!(keys::ticket("pair-1"), "pair:pair-1:ticket");
+        assert_eq!(keys::task("pair-1"), "pair:pair-1:task");
+        assert_eq!(keys::plan("pair-1"), "pair:pair-1:plan");
+        assert_eq!(keys::contract("pair-1"), "pair:pair-1:contract");
+        assert_eq!(keys::handoff("pair-1"), "pair:pair-1:handoff");
         assert_eq!(
-            pair_keys::segment_eval("pair-1", 3),
+            keys::segment_eval("pair-1", 3),
             "pair:pair-1:segment:3:eval"
         );
+        assert_eq!(keys::final_review("pair-1"), "pair:pair-1:final_review");
+        assert_eq!(keys::error_feedback("pair-1"), "pair:pair-1:error_feedback");
         assert_eq!(
-            pair_keys::final_review("pair-1"),
-            "pair:pair-1:final_review"
-        );
-        assert_eq!(
-            pair_keys::error_feedback("pair-1"),
-            "pair:pair-1:error_feedback"
-        );
-        assert_eq!(
-            pair_keys::conflict_resolution("pair-1"),
+            keys::conflict_resolution("pair-1"),
             "pair:pair-1:conflict_resolution"
         );
-        assert_eq!(pair_keys::ci_fix("pair-1"), "pair:pair-1:ci_fix");
+        assert_eq!(keys::ci_fix("pair-1"), "pair:pair-1:ci_fix");
     }
 
     #[test]
     fn test_no_collisions() {
         let keys = [
-            pair_keys::status("p"),
-            pair_keys::worklog("p"),
-            pair_keys::ticket("p"),
-            pair_keys::task("p"),
-            pair_keys::plan("p"),
-            pair_keys::contract("p"),
-            pair_keys::handoff("p"),
-            pair_keys::segment_eval("p", 1),
-            pair_keys::final_review("p"),
+            keys::status("p"),
+            keys::worklog("p"),
+            keys::ticket("p"),
+            keys::task("p"),
+            keys::plan("p"),
+            keys::contract("p"),
+            keys::handoff("p"),
+            keys::segment_eval("p", 1),
+            keys::final_review("p"),
         ];
         for (i, k1) in keys.iter().enumerate() {
             for (j, k2) in keys.iter().enumerate() {

@@ -87,7 +87,7 @@ impl Node for SentinelNode {
 
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
-        let slots: HashMap<String, WorkerSlot> =
+        let _slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
         let mut reviewable = Vec::new();
@@ -142,15 +142,14 @@ impl Node for SentinelNode {
                                 );
                             }
                             ChatStatus::Waiting => {
-                                if last_action.as_deref() == Some("completed")
-                                    || last_action.is_none()
+                                if (last_action.as_deref() == Some("completed")
+                                    || last_action.is_none())
+                                    && !has_review
                                 {
-                                    if !has_review {
-                                        info!(
-                                            ticket_id = %ticket.id,
-                                            "Sentinel chat waiting but no review written yet — sending follow-up"
-                                        );
-                                    }
+                                    info!(
+                                        ticket_id = %ticket.id,
+                                        "Sentinel chat waiting but no review written yet — sending follow-up"
+                                    );
                                 }
                             }
                             ChatStatus::Error => {

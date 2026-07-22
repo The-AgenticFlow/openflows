@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Typed SharedStore CLI for Coder Agent worker workspaces"
 
+[package.metadata.cargo-machete]
+ignored = ["chrono"]
+
 [[bin]]
 name = "openflows-harness"
 path = "src/main.rs"

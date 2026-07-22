@@ -1,13 +1,8 @@
 //! Workspace transport abstraction for Coder-based operations.
-//!
-//! The `WorkspaceTransport` trait decouples provisioning operations from the
-//! local filesystem, enabling remote Coder workspace operations through a
-//! uniform interface. LocalTransport has been removed — Coder is the only runtime.
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Output from a command executed in a workspace.
 #[derive(Debug, Clone)]

@@ -1,12 +1,5 @@
-//! Provisioning for worker workspaces (Coder-only redesign).
-//!
-//! Materializes `.agents/skills/`, `.mcp.json`, standards files, and the role
-//! persona into a Coder workspace via `CoderTransport`, driven by `registry.json`
-//! schema v2.
-
-use anyhow::{Context, Result};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+use anyhow::Context;
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::transport::WorkspaceTransport;
@@ -36,10 +29,10 @@ impl Provisioner {
         transport: &dyn WorkspaceTransport,
         role: &str,
         registry: &config::Registry,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         let entry = registry
             .get(role)
-            .with_context(|| format!("Role '{}' not found in registry", role))?;
+            .ok_or_else(|| anyhow::anyhow!("Role '{}' not found in registry", role))?;
 
         if !entry.enabled {
             info!(role, "Role is disabled — skipping provisioning");

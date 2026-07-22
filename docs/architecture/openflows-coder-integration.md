@@ -784,7 +784,7 @@ This is a significant improvement over the current model where a crashed local p
 
 **Consequences:**
 - Zero breaking changes to existing users
-- New `CoderTransport` implemention is additive
+- New `CoderTransport` implementation is additive
 - Tests can verify both transports
 
 ### DR-003: Workspace lifecycle in NEXUS, not a separate agent

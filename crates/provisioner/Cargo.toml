@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT"
 description = "Coder workspace provisioning: transport + skill/MCP/standards materialization"
 
+[package.metadata.cargo-machete]
+ignored = ["tokio"]
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
