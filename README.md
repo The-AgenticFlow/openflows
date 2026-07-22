@@ -5,9 +5,11 @@
     style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"
     src="https://www.loom.com/embed/46d47c9e9291445a8eb9cc88b2a26627"
     frameborder="0"
+    allow="autoplay; fullscreen; picture-in-picture"
     webkitallowfullscreen
     mozallowfullscreen
-    allowfullscreen>
+    allowfullscreen
+    title="OpenFlows demo video">
   </iframe>
 </div>
 
