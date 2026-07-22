@@ -101,41 +101,67 @@ impl StoreBackend for RedisBackend {
 pub struct SharedStore {
     backend: Arc<dyn StoreBackend>,
     ring_buffer: Arc<RwLock<Vec<StoreEvent>>>,
+    tenant: String,
 }
 
 impl SharedStore {
     /// In-memory backend — use for dev and tests.
     pub fn new_in_memory() -> Self {
+        Self::new_in_memory_with_tenant("default")
+    }
+
+    /// In-memory backend with explicit tenant — for testing multi-tenancy.
+    pub fn new_in_memory_with_tenant(tenant: impl Into<String>) -> Self {
         Self {
             backend: Arc::new(InMemoryBackend::new()),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
+            tenant: tenant.into(),
         }
     }
 
     /// Redis backend — use for Docker Compose and production.
+    /// Tenant is derived from OPENFLOWS_TENANT env var, or "default" if unset.
     pub async fn new_redis(url: &str) -> Result<Self> {
+        Self::new_redis_with_tenant(url, None).await
+    }
+
+    /// Redis backend with explicit or derived tenant.
+    pub async fn new_redis_with_tenant(url: &str, tenant: Option<String>) -> Result<Self> {
+        let resolved_tenant = tenant
+            .or_else(|| std::env::var("OPENFLOWS_TENANT").ok())
+            .unwrap_or_else(|| "default".to_string());
+
         Ok(Self {
             backend: Arc::new(RedisBackend::new(url).await?),
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
+            tenant: resolved_tenant,
         })
+    }
+
+    /// Build a tenant-namespaced key: `ns:{tenant}:{key}`.
+    fn ns_key(&self, key: &str) -> String {
+        format!("ns:{}:{}", self.tenant, key)
     }
 
     // ── Core get/set/del ─────────────────────────────────────────────
 
     pub async fn get(&self, key: &str) -> Option<Value> {
-        let v = self.backend.get(key).await;
-        debug!(key, found = v.is_some(), "store.get");
+        let ns_key = self.ns_key(key);
+        let v = self.backend.get(&ns_key).await;
+        debug!(key = %ns_key, found = v.is_some(), "store.get");
         v
     }
 
     pub async fn set(&self, key: &str, value: Value) {
-        debug!(key, "store.set");
-        self.backend.set(key, value).await;
+        let ns_key = self.ns_key(key);
+        debug!(key = %ns_key, "store.set");
+        self.backend.set(&ns_key, value).await;
     }
 
     pub async fn del(&self, key: &str) {
-        debug!(key, "store.del");
-        self.backend.del(key).await;
+        let ns_key = self.ns_key(key);
+        debug!(key = %ns_key, "store.del");
+        self.backend.del(&ns_key).await;
     }
 
     /// Typed get — deserialises JSON into T. Returns None on missing key or type mismatch.
