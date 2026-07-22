@@ -7,13 +7,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::CoderClient;
 use config::{
-    state::{full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKET_DEPLOYMENT, KEY_TICKETS, KEY_WORKER_SLOTS},
+    state::{
+        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_DEPLOYMENT, KEY_WORKER_SLOTS,
+    },
     Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_CI_FIX_NEEDED,
     ACTION_CONFLICTS_DETECTED,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use provisioner::transport::{CoderTransport, WorkspaceTransport};
 use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
+use provisioner::transport::{CoderTransport, WorkspaceTransport};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -717,11 +719,16 @@ impl Node for VesselNode {
                     // Write deployment key to SharedStore (§6.1 schema)
                     {
                         let dep_key = full_ticket_key_flat(ticket_id, KEY_TICKET_DEPLOYMENT);
-                        store.set(&dep_key, json!({
-                            "merged": true,
-                            "pr_number": *pr_number,
-                            "sha": sha,
-                        })).await;
+                        store
+                            .set(
+                                &dep_key,
+                                json!({
+                                    "merged": true,
+                                    "pr_number": *pr_number,
+                                    "sha": sha,
+                                }),
+                            )
+                            .await;
                         info!(ticket_id, pr_number, "Wrote deployment key to SharedStore");
                     }
 

@@ -4,9 +4,7 @@
 //! All writes are validated against serde schemas from `config::state`.
 
 use anyhow::{bail, Context, Result};
-use config::state::{
-    full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord,
-};
+use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -155,8 +153,10 @@ impl HarnessStore {
         contract_path: &Path,
         notes: Option<&str>,
     ) -> Result<()> {
-        let contract_md = std::fs::read_to_string(contract_path)
-            .context(format!("Failed to read contract file: {}", contract_path.display()))?;
+        let contract_md = std::fs::read_to_string(contract_path).context(format!(
+            "Failed to read contract file: {}",
+            contract_path.display()
+        ))?;
         let payload = HandoffPayload {
             contract_md,
             notes: notes.map(|s| s.to_string()),
@@ -173,13 +173,7 @@ impl HarnessStore {
     }
 
     /// Record that a PR was opened.
-    pub async fn pr_opened(
-        &self,
-        ticket: &str,
-        pr: &u64,
-        branch: &str,
-        title: &str,
-    ) -> Result<()> {
+    pub async fn pr_opened(&self, ticket: &str, pr: &u64, branch: &str, title: &str) -> Result<()> {
         let payload = PrInfo {
             pr_number: *pr,
             branch: branch.to_string(),
@@ -212,8 +206,10 @@ impl HarnessStore {
                 VALID_VERDICTS.join(", ")
             );
         }
-        let report = std::fs::read_to_string(report_path)
-            .context(format!("Failed to read report file: {}", report_path.display()))?;
+        let report = std::fs::read_to_string(report_path).context(format!(
+            "Failed to read report file: {}",
+            report_path.display()
+        ))?;
         let payload = ReviewPayload {
             verdict: verdict.to_string(),
             report,
@@ -255,14 +251,23 @@ impl HarnessStore {
 
         loop {
             let record = HeartbeatRecord {
-                ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                ts: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
                 ws_id: std::env::var("CODER_WORKSPACE_ID").unwrap_or_default(),
                 status: "running".to_string(),
             };
             let json = serde_json::to_string(&record)?;
             let _: Result<(), _> = self
                 .client
-                .set::<(), _, _>(&key, &json, Some(fred::types::Expiration::EX(120)), None, false)
+                .set::<(), _, _>(
+                    &key,
+                    &json,
+                    Some(fred::types::Expiration::EX(120)),
+                    None,
+                    false,
+                )
                 .await;
             debug!(key = %key, "heartbeat written");
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -316,7 +321,11 @@ mod tests {
     fn test_key_namespacing() {
         let tenant = "acme";
         let ticket = "T-42";
-        let key = format!("ns:{}:{}", tenant, full_ticket_key(ticket, "dispatch", "forge"));
+        let key = format!(
+            "ns:{}:{}",
+            tenant,
+            full_ticket_key(ticket, "dispatch", "forge")
+        );
         assert_eq!(key, "ns:acme:ticket:T-42:dispatch:forge");
     }
 }

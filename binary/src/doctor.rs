@@ -25,7 +25,11 @@ pub async fn run_checks() -> Result<()> {
                     println!("  ✓ Coder server reachable at {}", url);
                 }
                 Ok(resp) => {
-                    println!("  ✗ Coder server returned HTTP {} at {}", resp.status(), url);
+                    println!(
+                        "  ✗ Coder server returned HTTP {} at {}",
+                        resp.status(),
+                        url
+                    );
                     println!("    Fix: Ensure Coder is running (docker compose up -d)");
                     all_pass = false;
                 }
@@ -57,7 +61,10 @@ pub async fn run_checks() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?;
             let resp = client
-                .get(format!("{}/api/experimental/chats/models", url.trim_end_matches('/')))
+                .get(format!(
+                    "{}/api/experimental/chats/models",
+                    url.trim_end_matches('/')
+                ))
                 .header("Coder-Session-Token", &token)
                 .send()
                 .await;
@@ -67,12 +74,19 @@ pub async fn run_checks() -> Result<()> {
                     if body.contains("\"id\"") {
                         println!("  ✓ LLM models configured in Coder");
                     } else {
-                        println!("  ⚠ Could not verify LLM models — check Coder dashboard → AI Settings");
+                        println!(
+                            "  ⚠ Could not verify LLM models — check Coder dashboard → AI Settings"
+                        );
                     }
                 }
                 Ok(r) => {
-                    println!("  ⚠ Chats API returned {} — ensure AI Agents are enabled", r.status());
-                    println!("    Fix: Go to Coder dashboard → AI Settings → Coder Agents → Models");
+                    println!(
+                        "  ⚠ Chats API returned {} — ensure AI Agents are enabled",
+                        r.status()
+                    );
+                    println!(
+                        "    Fix: Go to Coder dashboard → AI Settings → Coder Agents → Models"
+                    );
                 }
                 Err(_) => {
                     println!("  ⚠ Could not reach Chats API — Coder may not support it yet");
@@ -99,16 +113,14 @@ pub async fn run_checks() -> Result<()> {
 
     // 5. Redis reachable
     match std::env::var("REDIS_URL") {
-        Ok(url) => {
-            match pocketflow_core::SharedStore::new_redis(&url).await {
-                Ok(_) => println!("  ✓ Redis SharedStore reachable at {}", url),
-                Err(e) => {
-                    println!("  ✗ Redis not reachable at {}: {}", url, e);
-                    println!("    Fix: Start Redis (docker compose up -d redis)");
-                    all_pass = false;
-                }
+        Ok(url) => match pocketflow_core::SharedStore::new_redis(&url).await {
+            Ok(_) => println!("  ✓ Redis SharedStore reachable at {}", url),
+            Err(e) => {
+                println!("  ✗ Redis not reachable at {}: {}", url, e);
+                println!("    Fix: Start Redis (docker compose up -d redis)");
+                all_pass = false;
             }
-        }
+        },
         Err(_) => {
             println!("  ✗ REDIS_URL is not set");
             println!("    Fix: Set REDIS_URL in .env (e.g., redis://localhost:6379)");

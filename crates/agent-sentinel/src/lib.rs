@@ -8,8 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
 use config::state::{
-    full_ticket_key, full_ticket_key_flat, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
-    KEY_TICKET_STATUS, KEY_TICKETS, KEY_WORKER_SLOTS,
+    full_ticket_key, full_ticket_key_flat, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
+    KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
 };
 use config::{Ticket, TicketStatus, WorkerSlot};
 use pocketflow_core::{Action, Node, SharedStore};
@@ -188,7 +188,10 @@ impl Node for SentinelNode {
             return Ok(json!({ "verdicts": [], "has_reviews": false }));
         }
 
-        info!(count = reviewable.len(), "Sentinel: processing review verdicts");
+        info!(
+            count = reviewable.len(),
+            "Sentinel: processing review verdicts"
+        );
 
         let mut verdicts = Vec::new();
         for review in &reviewable {
@@ -236,7 +239,10 @@ impl Node for SentinelNode {
                     any_approved = true;
                 }
                 "reject" => {
-                    info!(ticket_id, "Sentinel: review REJECTED — routing back to forge");
+                    info!(
+                        ticket_id,
+                        "Sentinel: review REJECTED — routing back to forge"
+                    );
 
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
                     let review_json: Option<String> = store.get_typed(&review_key).await;
@@ -261,8 +267,7 @@ impl Node for SentinelNode {
                         }
                     }
 
-                    let sentinel_chat_key =
-                        full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                    let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
                     if let Some(ref client) = &client {
                         if let Some(sentinel_chat_id) =
                             store.get_typed::<String>(&sentinel_chat_key).await
@@ -277,8 +282,7 @@ impl Node for SentinelNode {
                         }
                     }
 
-                    let action_key =
-                        full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                    let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
 
                     any_rejected = true;

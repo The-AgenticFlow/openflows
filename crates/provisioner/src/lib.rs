@@ -10,4 +10,4 @@ pub mod transport;
 pub mod types;
 
 pub use provision::Provisioner;
-pub use transport::{CommandOutput, DirEntry, CoderTransport, WorkspaceTransport};
+pub use transport::{CoderTransport, CommandOutput, DirEntry, WorkspaceTransport};

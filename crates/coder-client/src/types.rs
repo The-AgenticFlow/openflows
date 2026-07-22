@@ -138,8 +138,7 @@ impl CoderWorkspace {
             Some(a) => {
                 let status_ok = matches!(
                     a.status,
-                    AgentStatus::Connected | AgentStatus::Timeout
-                        | AgentStatus::Unknown(_)
+                    AgentStatus::Connected | AgentStatus::Timeout | AgentStatus::Unknown(_)
                 );
                 let lifecycle_ok = a.lifecycle_state.is_ready()
                     || matches!(a.lifecycle_state, AgentLifecycleState::Starting);

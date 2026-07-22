@@ -219,7 +219,9 @@ impl CoderBootstrapper {
                 .unwrap_or_else(|_| "openflows-nexus".to_string());
             if let Ok(me) = client.get_me().await {
                 if let Ok(workspaces) = client.list_workspaces(&me.id).await {
-                    if let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) {
+                    if let Some(existing) =
+                        workspaces.iter().find(|w| w.name == nexus_workspace_name)
+                    {
                         info!(
                             workspace_id = %existing.id,
                             workspace_name = %existing.name,
@@ -229,7 +231,9 @@ impl CoderBootstrapper {
                         let _ = client.stop_workspace(&existing.id).await;
                         match client.delete_workspace(&existing.id).await {
                             Ok(()) => info!("  ✓ Stale nexus workspace deleted"),
-                            Err(e) => warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway"),
+                            Err(e) => {
+                                warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway")
+                            }
                         }
                         // Give Coder a moment to clean up
                         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -252,16 +256,15 @@ impl CoderBootstrapper {
             let nexus_api_token = std::env::var("OPENFLOWS_NEXUS_API_TOKEN")
                 .or_else(|_| std::env::var("NEXUS_CODER_API_TOKEN"))
                 .unwrap_or_else(|_| client.token().to_string());
-            let repository = std::env::var("GITHUB_REPOSITORY")
-                .unwrap_or_else(|_| String::new());
+            let repository = std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| String::new());
             let repo_url = if repository.is_empty() {
                 String::new()
             } else {
                 format!("https://github.com/{}.git", repository)
             };
             let redis_url = "redis://redis:6379".to_string();
-            let tenant = std::env::var("OPENFLOWS_TENANT")
-                .unwrap_or_else(|_| "default".to_string());
+            let tenant =
+                std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
             let registry_json = match std::env::var("OPENFLOWS_REGISTRY_JSON") {
                 Ok(json) => json,
                 Err(_) => {
@@ -392,15 +395,18 @@ impl CoderBootstrapper {
     }
 
     fn tenant_state_file() -> Option<std::path::PathBuf> {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| std::path::PathBuf::from(h).join(".openflows").join("tenants.json"))
+        std::env::var("HOME").ok().map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".openflows")
+                .join("tenants.json")
+        })
     }
 
     fn load_tenant_password(tenant_name: &str) -> Option<String> {
         let path = Self::tenant_state_file()?;
         let content = std::fs::read_to_string(&path).ok()?;
-        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&content).ok()?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&content).ok()?;
         map.get(tenant_name)
             .and_then(|v| v.get("password"))
             .and_then(|v| v.as_str())
@@ -410,14 +416,21 @@ impl CoderBootstrapper {
     fn save_tenant_password(tenant_name: &str, password: &str) {
         if let Some(path) = Self::tenant_state_file() {
             let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-            let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
+            let mut map: serde_json::Map<String, serde_json::Value> =
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
             let mut entry = serde_json::Map::new();
-            entry.insert("password".to_string(), serde_json::Value::String(password.to_string()));
+            entry.insert(
+                "password".to_string(),
+                serde_json::Value::String(password.to_string()),
+            );
             map.insert(tenant_name.to_string(), serde_json::Value::Object(entry));
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&map).unwrap_or_default());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&map).unwrap_or_default(),
+            );
         }
     }
 
@@ -431,12 +444,11 @@ impl CoderBootstrapper {
 
         // 1. Create tenant-owner user (idempotent — login if exists)
         let tenant_email = format!("{}@tenant.openflows.dev", tenant_name);
-        let tenant_password = Self::load_tenant_password(tenant_name)
-            .unwrap_or_else(|| {
-                let pwd = Self::tenant_password(tenant_name);
-                Self::save_tenant_password(tenant_name, &pwd);
-                pwd
-            });
+        let tenant_password = Self::load_tenant_password(tenant_name).unwrap_or_else(|| {
+            let pwd = Self::tenant_password(tenant_name);
+            Self::save_tenant_password(tenant_name, &pwd);
+            pwd
+        });
 
         // Try to create the user; if it exists, we just proceed
         let _ = client
@@ -449,8 +461,13 @@ impl CoderBootstrapper {
         eprintln!();
         eprintln!("  ─── GitHub OAuth Setup Required ───");
         eprintln!("  1. Log in to the Coder dashboard: {}", coder_url);
-        eprintln!("  2. Configure GitHub OAuth (Deployment → External Authentication → Add GitHub)");
-        eprintln!("  3. As tenant user '{}', complete the GitHub OAuth flow in the dashboard", tenant_name);
+        eprintln!(
+            "  2. Configure GitHub OAuth (Deployment → External Authentication → Add GitHub)"
+        );
+        eprintln!(
+            "  3. As tenant user '{}', complete the GitHub OAuth flow in the dashboard",
+            tenant_name
+        );
         eprintln!("  4. Once linked, press Enter below to continue");
         eprintln!();
         eprintln!("  Note: For testing, you can skip OAuth and press Enter now");
@@ -614,7 +631,10 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     let last_hash = hashes.get(name).map(String::as_str);
 
     if exists && last_hash == Some(current_hash.as_str()) {
-        info!("  ✓ Template '{}' unchanged — skipping push (hash matches)", name);
+        info!(
+            "  ✓ Template '{}' unchanged — skipping push (hash matches)",
+            name
+        );
         return false;
     }
 
@@ -633,10 +653,7 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             true
         }
         Err(e) => {
-            warn!(
-                "  ⚠ Template '{}' push failed: {}",
-                name, e
-            );
+            warn!("  ⚠ Template '{}' push failed: {}", name, e);
             false
         }
     }

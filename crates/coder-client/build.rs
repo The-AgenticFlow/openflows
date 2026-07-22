@@ -23,8 +23,7 @@ fn main() {
     let templates_dir = manifest.join("templates");
     let roles = ["forge", "sentinel", "nexus", "vessel", "lore"];
 
-    let tar = std::env::var("OPENFLOWS_TAR")
-        .unwrap_or_else(|_| "tar".to_string());
+    let tar = std::env::var("OPENFLOWS_TAR").unwrap_or_else(|_| "tar".to_string());
 
     let mut any_rebuilt = false;
     for role in roles {
@@ -66,9 +65,7 @@ fn main() {
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                panic!(
-                    "cargo: failed to pack template 'openflows-{role}' via {tar}: {stderr}"
-                );
+                panic!("cargo: failed to pack template 'openflows-{role}' via {tar}: {stderr}");
             }
             Err(e) => {
                 panic!(

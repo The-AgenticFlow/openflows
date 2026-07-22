@@ -24,7 +24,7 @@ struct FlowNode {
 pub struct Flow {
     start: String,
     nodes: HashMap<String, FlowNode>,
-    max_steps: usize,          // safety cap to avoid infinite loops in production
+    max_steps: usize,           // safety cap to avoid infinite loops in production
     max_visits_per_node: usize, // per-node cycle detection threshold
 }
 
@@ -415,9 +415,11 @@ mod tests {
         let node = Arc::new(CountdownNode);
         // Each pass visits the node once. 10 passes → 10 visits.
         // max_visits_per_node(20) should allow this.
-        let flow = Flow::new("countdown")
-            .max_visits_per_node(20)
-            .add_node("countdown", node, vec![("loop", "countdown")]);
+        let flow = Flow::new("countdown").max_visits_per_node(20).add_node(
+            "countdown",
+            node,
+            vec![("loop", "countdown")],
+        );
 
         let action = flow.run(&store).await.unwrap();
         assert_eq!(action.as_str(), crate::node::STOP_SIGNAL);

@@ -309,14 +309,17 @@ impl NexusNode {
         }
 
         let skills_list = skills.join(", ");
-        format!(r#"## Your Skills
+        format!(
+            r#"## Your Skills
 
 Skills are provisioned to `.agents/skills/<name>/SKILL.md` in the workspace.
 
 **Available Skills:** {}.
 
 Before significant work, read the relevant skill file to understand the workflow.
-"#, skills_list)
+"#,
+            skills_list
+        )
     }
 
     async fn sync_issues(&self, store: &SharedStore, owner: &str, repo_name: &str) -> Result<()> {
@@ -827,14 +830,14 @@ Before significant work, read the relevant skill file to understand the workflow
             .create_workspace(&CreateWorkspaceRequest {
                 template_name,
                 name: workspace_name,
-                parameters: json!({ 
-                    "repo_url": repo_url, 
+                parameters: json!({
+                    "repo_url": repo_url,
                     "role": worker_id,
                     "ticket_id": ticket_id,
                     "redis_url": "redis://redis:6379",
                     "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
-                    "host_cli_binary": host_cli_binary, 
-                    "cli_binary_name": cli_name 
+                    "host_cli_binary": host_cli_binary,
+                    "cli_binary_name": cli_name
                 }),
             })
             .await?;
@@ -1169,7 +1172,7 @@ Before significant work, read the relevant skill file to understand the workflow
         // Load agent persona for rich context.
         // The persona provides the full agent identity, capabilities, and protocols.
         let persona = self.load_agent_persona(role);
-        
+
         // Load skills for this role
         let skills_content = self.load_skills_for_role(role);
 
@@ -1177,16 +1180,20 @@ Before significant work, read the relevant skill file to understand the workflow
         let ticket_content = format!(
             "## Task\n\n**Title:** {}\n\n**Description:**\n{}\n",
             ticket.title,
-            if ticket.body.is_empty() { "No description provided.".to_string() } else { ticket.body.clone() }
+            if ticket.body.is_empty() {
+                "No description provided.".to_string()
+            } else {
+                ticket.body.clone()
+            }
         );
-        
+
         // Dispatch info with branch
         let dispatch_info = format!(
             "## Ticket Assignment\n\n**Ticket ID:** {}\n**Branch:** `{}`\n\nUse `openflows-harness dispatch read` for additional context.\n",
             ticket_id,
             ticket.branch.as_deref().unwrap_or("main")
         );
-        
+
         let coordination_info = r#"## Coordination Protocol
 
 Use `openflows-harness` for all coordination:
@@ -1218,7 +1225,7 @@ Use `openflows-harness` for all coordination:
                 role.to_uppercase(), ticket_id, role, &skills_content, ticket_content, dispatch_info, coordination_info
             ),
         };
-        
+
         let initial_prompt = format!(
             "{}\n\n**Begin work immediately.** Set `openflows-harness status set planning`, then start analyzing the task.\n",
             base_prompt
@@ -1266,7 +1273,7 @@ Use `openflows-harness` for all coordination:
             }
         }
     }
-    
+
     async fn create_chat_for_ticket_id(
         &self,
         store: &SharedStore,
@@ -1275,9 +1282,13 @@ Use `openflows-harness` for all coordination:
     ) {
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         if let Some(ticket) = tickets.into_iter().find(|t| t.id == *ticket_id) {
-            self.create_chat_for_assignment(store, worker_id, &ticket).await;
+            self.create_chat_for_assignment(store, worker_id, &ticket)
+                .await;
         } else {
-            warn!(worker_id, ticket_id, "Cannot create chat: ticket not found in store");
+            warn!(
+                worker_id,
+                ticket_id, "Cannot create chat: ticket not found in store"
+            );
         }
     }
 
@@ -2822,7 +2833,7 @@ impl Node for NexusNode {
                     }
 
                     // Create a Coder Chat for this assignment and record it in SharedStore
-self.create_chat_for_ticket_id(store, worker_id, ticket_id)
+                    self.create_chat_for_ticket_id(store, worker_id, ticket_id)
                         .await;
 
                     // Sync assignment to GitHub: assign issue, add comment, and label

@@ -109,7 +109,11 @@ impl WorkspaceTransport for CoderTransport {
     async fn write_file(&self, path: &str, content: &str) -> Result<()> {
         let content_len = content.len();
         self.verbose_log(&format!("write_file: {} ({} bytes)", path, content_len));
-        match self.client.workspace_write_file(&self.workspace_id, path, content).await {
+        match self
+            .client
+            .workspace_write_file(&self.workspace_id, path, content)
+            .await
+        {
             Ok(_) => {
                 self.verbose_log(&format!("write_file success: {}", path));
                 Ok(())
@@ -153,7 +157,10 @@ impl WorkspaceTransport for CoderTransport {
         } else if source.is_file() {
             self.copy_file(source, target).await
         } else {
-            anyhow::bail!("symlink_or_copy: source does not exist: {}", source.display());
+            anyhow::bail!(
+                "symlink_or_copy: source does not exist: {}",
+                source.display()
+            );
         }
     }
 
@@ -198,15 +205,31 @@ impl WorkspaceTransport for CoderTransport {
         let content = std::fs::read_to_string(source_local)
             .map_err(|e| anyhow::anyhow!("copy_file: failed to read local file: {}", e))?;
         let content_len = content.len();
-        self.verbose_log(&format!("copy_file: {} -> {} ({} bytes)", source_local.display(), target, content_len));
-        match self.client.workspace_write_file(&self.workspace_id, target, &content).await {
+        self.verbose_log(&format!(
+            "copy_file: {} -> {} ({} bytes)",
+            source_local.display(),
+            target,
+            content_len
+        ));
+        match self
+            .client
+            .workspace_write_file(&self.workspace_id, target, &content)
+            .await
+        {
             Ok(_) => {
-                self.verbose_log(&format!("copy_file success: {} -> {}", source_local.display(), target));
+                self.verbose_log(&format!(
+                    "copy_file success: {} -> {}",
+                    source_local.display(),
+                    target
+                ));
                 Ok(())
             }
             Err(e) => {
                 tracing::error!(source = %source_local.display(), target = %target, error = %e, "copy_file failed");
-                Err(anyhow::anyhow!("copy_file: workspace_write_file failed: {}", e))
+                Err(anyhow::anyhow!(
+                    "copy_file: workspace_write_file failed: {}",
+                    e
+                ))
             }
         }
     }

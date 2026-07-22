@@ -170,34 +170,63 @@ async fn main() -> Result<()> {
     let store = store::HarnessStore::new(&redis_url, &tenant).await?;
 
     match cli.command {
-        Commands::Dispatch { action: DispatchAction::Read } => {
+        Commands::Dispatch {
+            action: DispatchAction::Read,
+        } => {
             store.dispatch_read(&ticket, &role).await?;
         }
-        Commands::Status { action: StatusAction::Set { phase } } => {
+        Commands::Status {
+            action: StatusAction::Set { phase },
+        } => {
             store.status_set(&ticket, &role, &phase).await?;
         }
-        Commands::Status { action: StatusAction::Get } => {
+        Commands::Status {
+            action: StatusAction::Get,
+        } => {
             store.status_get(&ticket).await?;
         }
-        Commands::Handoff { action: HandoffAction::Write { contract, notes } } => {
-            store.handoff_write(&ticket, &contract, notes.as_deref()).await?;
+        Commands::Handoff {
+            action: HandoffAction::Write { contract, notes },
+        } => {
+            store
+                .handoff_write(&ticket, &contract, notes.as_deref())
+                .await?;
         }
-        Commands::Pr { action: PrAction::Opened { pr, branch, title } } => {
+        Commands::Pr {
+            action: PrAction::Opened { pr, branch, title },
+        } => {
             store.pr_opened(&ticket, &pr, &branch, &title).await?;
         }
-        Commands::Pr { action: PrAction::Get } => {
+        Commands::Pr {
+            action: PrAction::Get,
+        } => {
             store.pr_get(&ticket).await?;
         }
-        Commands::Review { action: ReviewAction::Submit { verdict, report, pr } } => {
-            store.review_submit(&ticket, &role, &verdict, &report, pr).await?;
+        Commands::Review {
+            action:
+                ReviewAction::Submit {
+                    verdict,
+                    report,
+                    pr,
+                },
+        } => {
+            store
+                .review_submit(&ticket, &role, &verdict, &report, pr)
+                .await?;
         }
-        Commands::Merge { action: MergeAction::Done { pr, sha } } => {
+        Commands::Merge {
+            action: MergeAction::Done { pr, sha },
+        } => {
             store.merge_done(&ticket, &pr, &sha).await?;
         }
-        Commands::Heartbeat { action: HeartbeatAction::Start } => {
+        Commands::Heartbeat {
+            action: HeartbeatAction::Start,
+        } => {
             store.heartbeat_start(&ticket, &role).await?;
         }
-        Commands::Heartbeat { action: HeartbeatAction::Stop } => {
+        Commands::Heartbeat {
+            action: HeartbeatAction::Stop,
+        } => {
             store.heartbeat_stop(&ticket, &role).await?;
         }
     }

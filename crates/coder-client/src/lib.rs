@@ -724,8 +724,11 @@ impl CoderClient {
             "name": req.name,
             "rich_parameter_values": rich_parameter_values,
         });
-        
-        info!("Creating workspace with payload: {}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+
+        info!(
+            "Creating workspace with payload: {}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
 
         let resp = self
             .authenticated_request(
@@ -1386,8 +1389,8 @@ impl CoderClient {
 
         // Build naming convention: {role}-{ticket_id} — ticket_id already includes "T-" prefix
         let workspace_name = format!("{}-{}", role, ticket_id);
-        let repository: String = std::env::var("GITHUB_REPOSITORY")
-            .unwrap_or_else(|_| "openflows/target".to_string());
+        let repository: String =
+            std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| "openflows/target".to_string());
         let repo_url = format!("https://github.com/{}.git", repository);
         let template_name = format!("openflows-{}", role);
 

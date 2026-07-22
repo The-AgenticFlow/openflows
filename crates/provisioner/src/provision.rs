@@ -58,11 +58,12 @@ impl Provisioner {
             let skill_md = skill_dir.join("SKILL.md");
             if skill_md.exists() {
                 let target = format!(".agents/skills/{}/SKILL.md", skill_name);
-                transport.create_dir_all(&format!(".agents/skills/{}", skill_name)).await?;
                 transport
-                    .copy_file(&skill_md, &target)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to provision skill {}: {}", skill_name, e))?;
+                    .create_dir_all(&format!(".agents/skills/{}", skill_name))
+                    .await?;
+                transport.copy_file(&skill_md, &target).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to provision skill {}: {}", skill_name, e)
+                })?;
                 info!(skill = skill_name, role, "Provisioned skill");
             } else {
                 warn!(skill = skill_name, "Skill directory not found — skipping");
