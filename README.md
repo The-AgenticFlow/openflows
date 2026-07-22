@@ -1,5 +1,5 @@
 # OpenFlows — Autonomous AI Development Team on Coder
-![alt text](image-1.png)
+<img src="image-1.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
 > Official site: [openflows.dev](https://openflows.dev)
 
