@@ -5,19 +5,11 @@
 All production operations use `./scripts/prod.sh`:
 
 ```bash
+./scripts/prod.sh bootstrap                      # One-time: Setup Coder + push templates
+./scripts/prod.sh tenant owner/repo --name team  # Add a tenant (required before run)
 ./scripts/prod.sh run                            # Start controller (always resets Redis first)
-./scripts/prod.sh bootstrap                      # Setup Coder + push templates
-./scripts/prod.sh tenant owner/repo --name team  # Add a tenant
 ./scripts/prod.sh doctor                         # Health check
 ```
-
-### `run` — Start Controller
-
-```bash
-./scripts/prod.sh run
-```
-
-**Always resets Redis to a clean slate first**, then starts the controller. This ensures no zombie tickets or stale state from previous runs.
 
 ### `bootstrap` — One-time Setup
 
@@ -34,6 +26,16 @@ All production operations use `./scripts/prod.sh`:
 ```bash
 ./scripts/prod.sh tenant owner/repo --name my-team
 ```
+
+Binds a GitHub repo to the controller. **You must add at least one tenant before starting the controller.**
+
+### `run` — Start Controller
+
+```bash
+./scripts/prod.sh run
+```
+
+**Always resets Redis to a clean slate first**, then starts the controller. This ensures no zombie tickets or stale state from previous runs. OpenFlows will process issues in bound repos.
 
 ### `doctor` — Health Check
 
@@ -90,8 +92,8 @@ Controller starts inside workspace
 
 | Command | Description |
 |---------|-------------|
+| `./scripts/prod.sh bootstrap` | One-time: Setup Coder + templates |
+| `./scripts/prod.sh tenant owner/repo --name team` | Add tenant (required before run) |
 | `./scripts/prod.sh run` | Clean slate + start controller |
-| `./scripts/prod.sh bootstrap` | Setup Coder + templates |
-| `./scripts/prod.sh tenant owner/repo --name team` | Add tenant |
 | `./scripts/prod.sh doctor` | Health check |
 | `./scripts/reset-controller-state.sh --confirm` | Clean Redis state |

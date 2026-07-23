@@ -34,23 +34,25 @@ cp .env.example .env
 
 This creates admin user in Coder, pushes workspace templates, and verifies LLM/GitHub auth.
 
+### Add a Tenant
+
+```bash
+./scripts/prod.sh tenant owner/repo --name my-team
+```
+
+This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller.
+
 ### Start the Controller
 
 ```bash
 ./scripts/prod.sh run
 ```
 
-This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue → OpenFlows automatically assigns, provisions a workspace, and starts working.
+This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
 
 **Monitor:**
 ```bash
 tail -f /tmp/openflows-controller.log
-```
-
-### Add a Tenant
-
-```bash
-./scripts/prod.sh tenant owner/repo --name my-team
 ```
 
 ### Health Check
