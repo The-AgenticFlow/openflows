@@ -1713,6 +1713,12 @@ Use `openflows-harness` for all coordination:
 
                     // Check if gate already approved — if so, notify FORGE to resume.
                     if Self::gate_approved(store, &ticket.id, "planning").await {
+                        // The Sentinel review for this ticket is complete. Recycle the
+                        // Sentinel worker slot back to Idle (clearing its workspace) so
+                        // later tickets can get a plan review. Without this, the single
+                        // sentinel slot stays Assigned forever, deadlocking every ticket
+                        // that enters planning afterwards (issue #215).
+                        Self::recycle_sentinel_slot(store, &ticket.id).await;
                         // Deduplication: skip if we already notified FORGE about
                         // this gate approval on a previous poll cycle.
                         let notification_key = format!("ticket:{}:planning_notified", ticket.id);
@@ -2901,6 +2907,46 @@ Use `openflows-harness` for all coordination:
         });
     }
 
+    /// Recycle the Sentinel worker slot back to `Idle` once the planning gate it
+    /// reviewed has been approved. Also clears its workspace so the next review
+    /// provisions a fresh (healthy) workspace rather than reusing a possibly
+    /// crashed/stale one. Without this the single sentinel slot stays `Assigned`
+    /// forever and every later planning ticket deadlocks (issue #215).
+    async fn recycle_sentinel_slot(store: &SharedStore, ticket_id: &str) {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut changed = false;
+        for slot in slots.values_mut() {
+            if Self::worker_role(&slot.id) != "sentinel" {
+                continue;
+            }
+            let slot_ticket = match &slot.status {
+                WorkerStatus::Assigned { ticket_id, .. }
+                | WorkerStatus::Working { ticket_id, .. } => ticket_id,
+                _ => continue,
+            };
+            if slot_ticket != ticket_id {
+                continue;
+            }
+            info!(
+                worker_id = %slot.id,
+                ticket_id,
+                "Planning gate approved — recycling sentinel slot to Idle"
+            );
+            slot.status = WorkerStatus::Idle;
+            slot.workspace_id = None;
+            changed = true;
+        }
+        if changed {
+            store
+                .set(
+                    KEY_WORKER_SLOTS,
+                    serde_json::to_value(slots).unwrap_or_default(),
+                )
+                .await;
+        }
+    }
+
     async fn recover_orphans(store: &SharedStore) -> Result<()> {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
@@ -2974,6 +3020,21 @@ Use `openflows-harness` for all coordination:
                             "Recovering stale worker — ticket reset to Open, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        changed_slots = true;
+                    } else if Self::worker_role(&slot.id) == "sentinel"
+                        && Self::gate_approved(store, ticket_id, "planning").await
+                    {
+                        // Safety net (issue #215): a sentinel slot that reviewed a
+                        // planning gate which is now approved may have been left
+                        // Assigned (e.g. after a controller restart). Recycle it so
+                        // later tickets aren't deadlocked by the single sentinel.
+                        info!(
+                            worker_id = slot.id,
+                            ticket_id,
+                            "Recovering sentinel slot — planning gate approved, recycling to Idle"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -4425,6 +4486,78 @@ mod tests {
         let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
             .expect("nexus exec returns an AgentDecision");
         assert_eq!(decision.action, "sentinel_spawned");
+    }
+
+    #[tokio::test]
+    async fn test_recycle_sentinel_slot_recycles_on_approved_gate() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "sentinel": {
+                        "id": "sentinel",
+                        "status": {
+                            "type": "assigned",
+                            "ticket_id": "T-001",
+                            "issue_url": "https://github.com/owner/repo/issues/1"
+                        },
+                        "workspace_id": "ws-crashed"
+                    },
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "assigned", "ticket_id": "T-002" },
+                        "workspace_id": "ws-forge"
+                    }
+                }),
+            )
+            .await;
+
+        // Recycle the slot for a ticket whose planning gate is approved.
+        NexusNode::recycle_sentinel_slot(&store, "T-001").await;
+
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let sentinel = slots.get("sentinel").expect("sentinel slot present");
+        assert!(matches!(sentinel.status, WorkerStatus::Idle));
+        assert!(
+            sentinel.workspace_id.is_none(),
+            "workspace cleared for fresh review"
+        );
+
+        // A different ticket's slot must be untouched.
+        let forge = slots.get("forge-1").expect("forge slot present");
+        assert!(matches!(forge.status, WorkerStatus::Assigned { .. }));
+        assert_eq!(forge.workspace_id.as_deref(), Some("ws-forge"));
+    }
+
+    #[tokio::test]
+    async fn test_recycle_sentinel_slot_ignores_unapproved_ticket() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "sentinel": {
+                        "id": "sentinel",
+                        "status": {
+                            "type": "assigned",
+                            "ticket_id": "T-003",
+                            "issue_url": null
+                        },
+                        "workspace_id": "ws-active"
+                    }
+                }),
+            )
+            .await;
+
+        // No gate approval for T-003 — recycling for a different ticket must not
+        // disturb an in-flight review.
+        NexusNode::recycle_sentinel_slot(&store, "T-999").await;
+
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let sentinel = slots.get("sentinel").expect("sentinel slot present");
+        assert!(matches!(sentinel.status, WorkerStatus::Assigned { .. }));
+        assert_eq!(sentinel.workspace_id.as_deref(), Some("ws-active"));
     }
 
     #[test]
