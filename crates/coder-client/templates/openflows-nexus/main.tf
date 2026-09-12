@@ -114,6 +114,19 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
+    # Setup git credentials from Coder external auth (GitHub App).
+    # Declared via data "coder_external_auth" -> this also surfaces the
+    # "Login with GitHub" button in the workspace UI.
+    GITHUB_TOKEN="${data.coder_external_auth.github.access_token}"
+    if [ -n "$GITHUB_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://x-access-token:$${GITHUB_TOKEN}@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      echo "Configured git credentials for GitHub"
+    else
+      echo "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth)"
+    fi
+
     # git pull or clone (creds via Coder external auth)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
@@ -221,3 +234,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

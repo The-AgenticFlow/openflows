@@ -57,29 +57,18 @@ resource "coder_agent" "main" {
 
     log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 
-    # Setup git credentials: get token from workspace owner via Coder API
-    # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
-    CODER_URL="${var.coder_url}"
-    OWNER_ID="${data.coder_workspace_owner.me.id}"
-    
-    if [ -n "$CODER_URL" ] && [ -n "$CODER_AGENT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
-      API_TOKEN=$(curl -s \
-        -H "Coder-Session-Token: $CODER_AGENT_TOKEN" \
-        "$CODER_URL/api/v2/users/$OWNER_ID/gitauths/github" 2>/dev/null \
-        | jq -r '.access_token // empty')
-
-      # Fall back to the injected GITHUB_TOKEN env var if the API returned nothing
-      GITHUB_TOKEN="$${API_TOKEN:-$GITHUB_TOKEN}"
-      
-      # Configure git with token for HTTPS push auth
-      if [ -n "$GITHUB_TOKEN" ]; then
-        git config --global credential.helper store
-        echo "https://git:$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
-        chmod 600 /home/coder/.git-credentials
-        log "Configured git credentials for GitHub push auth"
-      else
-        log "WARNING: No GitHub token available — git push may fail"
-      fi
+    # Setup git credentials from Coder external auth (GitHub App).
+    # Declared via data "coder_external_auth" -> this also surfaces the
+    # "Login with GitHub" button in the workspace UI, which is how the
+    # workspace owner links the GitHub App and grants repo access.
+    GITHUB_TOKEN="${data.coder_external_auth.github.access_token}"
+    if [ -n "$GITHUB_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://x-access-token:$${GITHUB_TOKEN}@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      log "Configured git credentials for GitHub push auth"
+    else
+      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi
 
     # git pull or clone (creds via Coder external auth or configured above)
@@ -174,3 +163,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

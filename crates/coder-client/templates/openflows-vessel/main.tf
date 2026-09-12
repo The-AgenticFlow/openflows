@@ -48,6 +48,21 @@ resource "coder_agent" "main" {
   startup_script = <<-EOT
     #!/bin/bash
     set -e
+    log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
+
+    # Setup git credentials from Coder external auth (GitHub App).
+    # Declared via data "coder_external_auth" -> this also surfaces the
+    # "Login with GitHub" button in the workspace UI, which is how the
+    # workspace owner links the GitHub App and grants repo access.
+    GITHUB_TOKEN="${data.coder_external_auth.github.access_token}"
+    if [ -n "$GITHUB_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://x-access-token:$${GITHUB_TOKEN}@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      log "Configured git credentials for GitHub push auth"
+    else
+      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
+    fi
 
     # git pull or clone (creds via Coder external auth)
     if [ -d /home/coder/workspace/.git ]; then
@@ -141,3 +156,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

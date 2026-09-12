@@ -141,15 +141,17 @@ pub async fn run_checks() -> Result<()> {
 
     // 4. GitHub external auth configured (needed for agent authentication)
     let has_github_auth = std::env::var("CODER_EXTERNAL_AUTH_0_ID").is_ok()
-        && std::env::var("CODER_EXTERNAL_AUTH_0_SECRET").is_ok();
+        && std::env::var("CODER_EXTERNAL_AUTH_0_CLIENT_SECRET").is_ok();
     if has_github_auth {
-        println!("  ✓ GitHub external auth configured (CODER_EXTERNAL_AUTH_0_ID/SECRET)");
+        println!("  ✓ GitHub external auth configured (CODER_EXTERNAL_AUTH_0_ID/CLIENT_SECRET)");
     } else {
         println!(
             "  ⚠ GitHub external auth not configured — optional, only needed for private repos"
         );
         println!("    If agents must push to private repos, create a GitHub App and set");
-        println!("         CODER_EXTERNAL_AUTH_0_ID and CODER_EXTERNAL_AUTH_0_SECRET in .env");
+        println!(
+            "         CODER_EXTERNAL_AUTH_0_ID and CODER_EXTERNAL_AUTH_0_CLIENT_SECRET in .env"
+        );
     }
 
     // 5. Redis reachable
