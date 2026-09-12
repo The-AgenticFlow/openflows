@@ -1741,8 +1741,14 @@ Use `openflows-harness` for all coordination:
                             }
                         };
 
+                        // Forge chats are keyed by the BASE role (e.g. "forge"),
+                        // not the full worker id ("forge-2"). Using the worker id
+                        // here made forge_chat_id always None, so forge was never
+                        // notified of gate approval and stayed stuck in planning
+                        // forever (issue #215, symptom 2).
+                        let forge_role = Self::worker_role(&forge_worker_id);
                         let forge_chat_key =
-                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT, &forge_worker_id);
+                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT, forge_role);
                         let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
                         if let Some(ref forge_chat_id) = forge_chat_id {
@@ -2901,6 +2907,31 @@ Use `openflows-harness` for all coordination:
         });
     }
 
+    /// Recycle any worker slot back to `Idle`, clearing its workspace. Used to
+    /// free capacity (forge/sentinel/etc.) when a ticket is escalated to
+    /// `awaiting_human` after its workspace repeatedly crashed — otherwise the
+    /// slot stays `Assigned` to a dead workspace forever and blocks the whole
+    /// pipeline (issue #215, symptom 4).
+    async fn recycle_worker_slot(store: &SharedStore, worker_id: &str) {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let Some(slot) = slots.get_mut(worker_id) else {
+            return;
+        };
+        info!(
+            worker_id,
+            "Recovering worker slot after exhausted crash recovery — recycling to Idle"
+        );
+        slot.status = WorkerStatus::Idle;
+        slot.workspace_id = None;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                serde_json::to_value(slots).unwrap_or_default(),
+            )
+            .await;
+    }
+
     async fn recover_orphans(store: &SharedStore) -> Result<()> {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
@@ -2974,6 +3005,24 @@ Use `openflows-harness` for all coordination:
                             "Recovering stale worker — ticket reset to Open, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        changed_slots = true;
+                    } else if tickets.iter().any(|t| {
+                        t.id == *ticket_id
+                            && matches!(
+                                t.status,
+                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
+                            )
+                    }) {
+                        // A ticket whose PR was merged/completed no longer needs its
+                        // worker, but the slot was never recycled (issue #215 /
+                        // #222). Free the slot so queued tickets can start.
+                        info!(
+                            worker_id = slot.id,
+                            ticket_id,
+                            "Recovering worker slot — ticket completed/merged, recycling to Idle"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -3602,6 +3651,11 @@ Use `openflows-harness` for all coordination:
                     attempts,
                     "Recovery limit reached — escalating to human intervention"
                 );
+                // Free the worker slot so it can pick up other work — an
+                // awaiting-human ticket must not keep consuming a (crashed)
+                // worker/workspace, which would saturate forge capacity and
+                // block every queued ticket (issue #215, symptom 4).
+                Self::recycle_worker_slot(store, &crashed_workspace.worker_id).await;
                 continue;
             }
 
@@ -4425,6 +4479,87 @@ mod tests {
         let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
             .expect("nexus exec returns an AgentDecision");
         assert_eq!(decision.action, "sentinel_spawned");
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_slot_frees_capacity_on_exhausted_recovery() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "assigned",
+                            "ticket_id": "T-001",
+                            "issue_url": "https://github.com/owner/repo/issues/1"
+                        },
+                        "workspace_id": "ws-crashed"
+                    }
+                }),
+            )
+            .await;
+
+        // After exhausted crash recovery the slot must be recycled so capacity
+        // is freed for other tickets (issue #215, symptom 4).
+        NexusNode::recycle_worker_slot(&store, "forge-1").await;
+
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge = slots.get("forge-1").expect("forge slot present");
+        assert!(matches!(forge.status, WorkerStatus::Idle));
+        assert!(forge.workspace_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_slot_ignores_missing_slot() {
+        let store = SharedStore::new_in_memory();
+        NexusNode::recycle_worker_slot(&store, "forge-9").await;
+        // Must not panic when the slot doesn't exist.
+        let _: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+    }
+
+    #[tokio::test]
+    async fn test_recover_orphans_recycles_slot_when_ticket_merged() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-001",
+                    "title": "t",
+                    "body": "",
+                    "priority": 0,
+                    "status": { "type": "merged", "worker_id": "forge-1", "pr_number": 7 }
+                }]),
+            )
+            .await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "assigned",
+                            "ticket_id": "T-001",
+                            "issue_url": "https://github.com/owner/repo/issues/1"
+                        },
+                        "workspace_id": "ws-merged"
+                    }
+                }),
+            )
+            .await;
+
+        // Ticket T-001 is merged but forge-1 was never recycled → recover_orphans
+        // must free the slot so queued tickets can start (issue #215 / #222).
+        NexusNode::recover_orphans(&store).await.unwrap();
+
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge = slots.get("forge-1").expect("forge slot present");
+        assert!(matches!(forge.status, WorkerStatus::Idle));
+        assert!(forge.workspace_id.is_none());
     }
 
     #[test]
