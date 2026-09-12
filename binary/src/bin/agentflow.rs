@@ -58,6 +58,11 @@ enum Commands {
     },
     /// Reset orchestration files to bundled defaults
     ResetOrchestration,
+    /// Manually manage/clean the shared Redis store
+    Store {
+        #[command(subcommand)]
+        action: StoreCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -87,6 +92,35 @@ enum TenantCommands {
         /// Also purge ns:{tenant}:* from Redis
         #[arg(long)]
         purge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommands {
+    /// List tenants in the shared store and how many keys each holds (read-only)
+    List,
+    /// Purge a tenant's entire keyspace (ns:{tenant}:*) from the shared store
+    Purge {
+        /// Tenant name
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Clear a tenant's controller-owned orchestration state (tickets,
+    /// worker_slots, pending_prs, registry_json) without touching worker keys
+    Reset {
+        /// Tenant name
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Purge the ENTIRE shared store — every key across all tenants (global reset)
+    Wipe {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -173,6 +207,7 @@ async fn main() -> Result<()> {
         Commands::Gate { action } => run_gate(action).await,
         Commands::Hooks { action } => run_hooks(action).await,
         Commands::ResetOrchestration => run_reset().await,
+        Commands::Store { action } => run_store(action).await,
     }
 }
 
@@ -219,29 +254,9 @@ async fn run_controller() -> Result<()> {
         }
     };
 
-    // ── Coder Agent Lifecycle Hooks (experimental) ──────────────────────
-    // OpenFlows consumes Coder's deployment-wide `agent-lifecycle-hooks`
-    // webhook so we can observe (and later centrally policy) every agent
-    // lifecycle event. Gated by CODER_EXPERIMENTS=agent-lifecycle-hooks +
-    // CODER_CHAT_HOOK_URL; no-op otherwise.
-    match agent_nexus::hooks::start_lifecycle_hook_server(
-        std::sync::Arc::new(store.clone()),
-        cfg.hooks.clone(),
-    )
-    .await
-    {
-        Ok(Some(())) => tracing::info!("Coder lifecycle hook consumer started"),
-        Ok(None) => tracing::debug!("Coder lifecycle hook consumer disabled"),
-        Err(e) => {
-            // Experimental: warn but do not fail the controller boot.
-            tracing::warn!(
-                error = %e,
-                "Failed to start Coder lifecycle hook consumer; continuing without hooks"
-            );
-        }
-    }
-
     // ── Resolve orchestration directory ─────────────────────────────────
+    // Do this before the hook server so Slice A can hand the consumer the
+    // persona/skills/command paths resolved here.
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
@@ -256,6 +271,57 @@ async fn run_controller() -> Result<()> {
     store
         .set("registry_json", serde_json::json!(registry_json))
         .await;
+
+    // Build the experimental hook-driver context: the reactive kick channel
+    // (Slice B/D, Redis pub/sub) and the bootstrap context (Slice A).
+    let hook_kick_bus = pocketflow_core::build_kick_bus(Some(&redis_url), &tenant)
+        .await
+        .map(|(publisher, receiver)| (publisher, receiver))
+        .ok();
+    let (hook_publisher, mut hook_kick_rx) = match hook_kick_bus {
+        Some((p, r)) => (Some(p), Some(r)),
+        None => {
+            tracing::warn!("Failed to build hook kick bus; reactive wake disabled");
+            (None, None)
+        }
+    };
+
+    let hook_bootstrap = {
+        let mut persona_by_role = std::collections::HashMap::new();
+        for role in ["forge", "sentinel", "vessel", "lore", "nexus"] {
+            let path = resolver.persona_path(&format!("{role}.agent.md"));
+            persona_by_role.insert(role.to_string(), path);
+        }
+        Some(agent_nexus::hooks::HookBootstrapContext {
+            persona_by_role,
+            skills_dir: Some(orch_dir.join("plugin/skills")),
+            commands_dir: Some(orch_dir.join("plugin/commands")),
+        })
+    };
+
+    // ── Coder Agent Lifecycle Hooks (experimental) ──────────────────────
+    // OpenFlows consumes Coder's deployment-wide `agent-lifecycle-hooks`
+    // webhook so we can observe (and later centrally policy) every agent
+    // lifecycle event. Gated by CODER_EXPERIMENTS=agent-lifecycle-hooks +
+    // CODER_CHAT_HOOK_URL; no-op otherwise.
+    match agent_nexus::hooks::start_lifecycle_hook_server(
+        std::sync::Arc::new(store.clone()),
+        cfg.hooks.clone(),
+        hook_publisher,
+        hook_bootstrap,
+    )
+    .await
+    {
+        Ok(Some(())) => tracing::info!("Coder lifecycle hook consumer started"),
+        Ok(None) => tracing::debug!("Coder lifecycle hook consumer disabled"),
+        Err(e) => {
+            // Experimental: warn but do not fail the controller boot.
+            tracing::warn!(
+                error = %e,
+                "Failed to start Coder lifecycle hook consumer; continuing without hooks"
+            );
+        }
+    }
 
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
@@ -376,6 +442,7 @@ async fn run_controller() -> Result<()> {
         poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
         "Starting Controller poll loop"
     );
+    let mut last_pass;
     loop {
         match flow.run(&store).await {
             Ok(final_action) => {
@@ -397,7 +464,37 @@ async fn run_controller() -> Result<()> {
                 );
             }
         }
-        tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+        last_pass = std::time::Instant::now();
+
+        // Wait either for the full poll interval or for a hook kick to wake us
+        // early (Slice B/D). The reconciliation pass is idempotent, so an early
+        // wake only shortens latency. Guard against a kick-in-every-pass
+        // livelock by only honoring a kick if the last pass was >1s ago.
+        if let Some(rx) = &mut hook_kick_rx {
+            let too_soon = last_pass.elapsed().as_secs() < 1;
+            let kick = tokio::select! {
+                _ = tokio::time::sleep(CONTROLLER_POLL_INTERVAL) => None,
+                k = rx.recv() => k,
+            };
+            match kick {
+                Some(k) if !too_soon => {
+                    tracing::info!(
+                        event = %k.event,
+                        hint = %k.hint,
+                        "Hook kick woke the Controller early"
+                    );
+                    continue; // re-run the reconciliation pass immediately
+                }
+                Some(_) => {
+                    tracing::debug!("Hook kick arrived too soon after last pass; waiting full interval");
+                    tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+                    continue;
+                }
+                None => {} // poll interval elapsed; fall through to next pass
+            }
+        } else {
+            tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -605,6 +702,143 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     Ok(())
 }
 
+async fn run_store(action: StoreCommands) -> Result<()> {
+    let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
+    let store = pocketflow_core::SharedStore::new_redis(&redis_url)
+        .await
+        .context("Redis not reachable")?;
+
+    match action {
+        StoreCommands::List => {
+            // raw_keys scans full Redis keys (`ns:*`) without re-applying the
+            // tenant namespace, so we can enumerate every tenant and count keys.
+            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(ns) = key.strip_prefix("ns:") {
+                    if let Some(tenant) = ns.split(':').next() {
+                        *counts.entry(tenant.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            if counts.is_empty() {
+                println!("  (shared store is empty — no tenants found)");
+            } else {
+                for (tenant, count) in &counts {
+                    println!("  - {}: {} key(s)", tenant, count);
+                }
+            }
+        }
+        StoreCommands::Purge { name, yes } => {
+            let pattern = format!("ns:{}:*", name);
+            let keys: Vec<String> = store.raw_keys(&pattern).await;
+            if keys.is_empty() {
+                println!("  ✗ No keys found for tenant '{}'", name);
+                return Ok(());
+            }
+            println!(
+                "  Purging {} key(s) for tenant '{}' from the shared store...",
+                keys.len(),
+                name
+            );
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+            for key in &keys {
+                store.raw_del(key).await;
+            }
+            println!("  ✓ Purged {} key(s) for tenant '{}'", keys.len(), name);
+            println!("  (Restart the controller to pick up changes)");
+        }
+        StoreCommands::Reset { name, yes } => {
+            // Clear only the orchestration state the Controller (re)writes on a
+            // fresh run, so a clean controller starts from an empty ledger without
+            // disturbing worker gate/review/handoff keys.
+            let tenant_store = match pocketflow_core::SharedStore::new_redis_with_tenant(
+                &redis_url,
+                Some(name.clone()),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  ✗ Redis error: {}", e);
+                    return Ok(());
+                }
+            };
+
+            let keys_to_clear = [
+                "tickets",
+                "worker_slots",
+                "pending_prs",
+                "registry_json",
+                "ci_readiness",
+                "repository",
+                "documentation_queue",
+            ];
+            let mut cleared = 0usize;
+            for key in keys_to_clear {
+                if tenant_store.get(key).await.is_some() {
+                    if cleared == 0 {
+                        println!(
+                            "  Resetting orchestration state for tenant '{}':",
+                            name
+                        );
+                        if !yes && !confirm()? {
+                            println!("  Aborted — no keys were removed.");
+                            return Ok(());
+                        }
+                    }
+                    tenant_store.del(key).await;
+                    cleared += 1;
+                }
+            }
+            if cleared > 0 {
+                println!("  ✓ Cleared {} orchestration key(s) for tenant '{}'", cleared, name);
+            } else {
+                println!("  (no orchestration state found for tenant '{}')", name);
+            }
+            println!("  (Restart the controller to pick up changes)");
+        }
+        StoreCommands::Wipe { yes } => {
+            // raw_keys("ns:*") matches every tenant namespace plus any other
+            // shared keys, so this is a true whole-store global reset.
+            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            if keys.is_empty() {
+                println!("  (shared store is already empty — nothing to wipe)");
+                return Ok(());
+            }
+            println!(
+                "  Wiping the ENTIRE shared store: {} key(s) across all tenants / namespaces.",
+                keys.len()
+            );
+            println!("  This is destructive and cannot be undone. All tenants' state is removed.");
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+            for key in &keys {
+                store.raw_del(key).await;
+            }
+            println!("  ✓ Wiped {} key(s) from the shared store", keys.len());
+            println!("  (Restart any controller to pick up the clean state)");
+        }
+    }
+
+    Ok(())
+}
+
+fn confirm() -> Result<bool> {
+    use std::io::Write;
+    print!("  Confirm: type 'yes' to continue: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
 async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
 
@@ -789,11 +1023,23 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
             )?;
             let store =
                 std::sync::Arc::new(pocketflow_core::SharedStore::new_in_memory());
+            // In-memory kick bus so slice B/D wake behaviour can be exercised
+            // locally even without Redis.
+            let kick_publisher = pocketflow_core::build_kick_bus(None, "default")
+                .await
+                .map(|(p, _r)| p)
+                .ok();
             tracing::info!(
                 hook_url = %hook_url,
                 "Starting standalone lifecycle hook consumer (in-memory store)"
             );
-            match agent_nexus::hooks::start_lifecycle_hook_server(store, cfg.hooks.clone()).await
+            match agent_nexus::hooks::start_lifecycle_hook_server(
+                store,
+                cfg.hooks.clone(),
+                kick_publisher,
+                None,
+            )
+            .await
             {
                 Ok(Some(())) => {
                     println!("Listening on {}", cfg.hooks.hook_addr);

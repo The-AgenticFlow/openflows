@@ -60,21 +60,23 @@ impl CoderConfig {
 /// These mirror the `coder server` flags that power the `agent-lifecycle-hooks`
 /// experiment (see coder/coder `docs/admin/setup/chat-lifecycle-hooks.md`).
 /// The OpenFlows Controller is the **consumer** of the deployment-wide webhook:
-/// Coder `chatd` POSTs a JWT-signed lifecycle event to `CODER_CHAT_HOOK_URL`
-/// for each `session_start` / `user_prompt_submit` / `pre_tool_use` /
-/// `post_tool_use` / `pre_compact` / `post_compact` / `stop` event, and this
-/// side verifies the signature and observes (or denies/rewrites) the event.
+/// Coder `chatd` POSTs a JWT-signed lifecycle event to the hook URL for each
+/// `session_start` / `user_prompt_submit` / `pre_tool_use` / `post_tool_use` /
+/// `pre_compact` / `post_compact` / `stop` event, and this side verifies the
+/// signature and observes (or denies/rewrites) the event.
+///
+/// The hook endpoint is a purely internal detail: the consumer derives it from
+/// its bind address + the internal host label Coder must use to reach it (in a
+/// single-host Docker dev topology that is `host.docker.internal`). Operators
+/// control only the port (`OPENFLOWS_HOOK_ADDR`); they never type the internal
+/// URL, and it is not exposed as an operator-facing variable.
 ///
 /// On Coder's side, enabling the experiment looks like:
 ///   CODER_EXPERIMENTS=agent-lifecycle-hooks
-///   CODER_CHAT_HOOK_URL=http://<openflows-host>/hooks/chat
+///   CODER_CHAT_HOOK_URL=<derived internal URL>
 ///   CODER_CHAT_HOOK_SECRET=<at least 32 random bytes, HS256>
 #[derive(Debug, Clone, Envconfig)]
 pub struct CoderHooksConfig {
-    /// Where Coder POSTs lifecycle hook events (the OpenFlows consumer).
-    #[envconfig(from = "CODER_CHAT_HOOK_URL")]
-    pub chat_hook_url: Option<String>,
-
     /// Shared HS256 secret used to sign/verify hook JWTs (>= 32 bytes).
     #[envconfig(from = "CODER_CHAT_HOOK_SECRET")]
     pub chat_hook_secret: Option<String>,
@@ -91,20 +93,44 @@ pub struct CoderHooksConfig {
     #[envconfig(from = "CODER_CHAT_HOOK_ALLOW_INSECURE", default = "false")]
     pub chat_hook_allow_insecure: bool,
 
-    /// Local bind address for the OpenFlows hook consumer endpoint.
+    /// Bind address for the OpenFlows hook consumer endpoint.
     #[envconfig(from = "OPENFLOWS_HOOK_ADDR", default = "127.0.0.1:3001")]
     pub hook_addr: String,
+
+    /// Internal host label Coder must use to reach the consumer. Defaults to
+    /// `host.docker.internal` (single-host Docker dev topology). Advanced
+    /// deployments with a different topology override this; it is NOT a
+    /// user-facing value.
+    #[envconfig(from = "OPENFLOWS_HOOK_HOST", default = "host.docker.internal")]
+    pub hook_host: String,
 }
 
 impl CoderHooksConfig {
-    /// Whether the OpenFlows consumer should be started at all: only when a
-    /// hook URL is configured AND the experiment flag is on.
+    /// Whether the OpenFlows consumer should be started at all: only when the
+    /// experiment flag is on (the URL is derived, so no URL check is needed).
     pub fn enabled(&self) -> bool {
         self.chat_hook_enabled
-            && self.chat_hook_url.is_some()
             && std::env::var("CODER_EXPERIMENTS")
                 .map(|v| v.split(',').any(|e| e.trim() == "agent-lifecycle-hooks"))
                 .unwrap_or(false)
+    }
+
+    /// The port component of the bind address (e.g. `3001` from `0.0.0.0:3001`).
+    pub fn port(&self) -> Option<String> {
+        self.hook_addr.rsplit(':').next().map(|p| p.to_string())
+    }
+
+    /// The internal hook URL Coder must POST to. Derived from the internal host
+    /// label and the bind port, path `/experimental/hooks/chat` (the route the
+    /// consumer registers). This is both what the consumer listens as its
+    /// expected `aud` and what compose forwards to Coder — an internal detail
+    /// the operator does not type.
+    pub fn hook_public_url(&self) -> Option<String> {
+        let port = self.port()?;
+        Some(format!(
+            "http://{}:{}/experimental/hooks/chat",
+            self.hook_host, port
+        ))
     }
 }
 

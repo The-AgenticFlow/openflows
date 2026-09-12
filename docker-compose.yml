@@ -45,18 +45,19 @@ services:
       # client_id/client_secret are empty. To enable: uncomment the block below and
       # set the credentials (create a GitHub App, callback URL
       # ${CODER_ACCESS_URL}/external-auth/primary-github/callback).
-      # CODER_EXTERNAL_AUTH_0_ID: ${CODER_EXTERNAL_AUTH_0_ID:-primary-github}
-      # CODER_EXTERNAL_AUTH_0_TYPE: ${CODER_EXTERNAL_AUTH_0_TYPE:-github}
-      # CODER_EXTERNAL_AUTH_0_CLIENT_ID: ${CODER_EXTERNAL_AUTH_0_CLIENT_ID:-}
-      # CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
-      # CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
-      #       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
+      CODER_EXTERNAL_AUTH_0_ID: ${CODER_EXTERNAL_AUTH_0_ID:-primary-github}
+      CODER_EXTERNAL_AUTH_0_TYPE: ${CODER_EXTERNAL_AUTH_0_TYPE:-github}
+      CODER_EXTERNAL_AUTH_0_CLIENT_ID: ${CODER_EXTERNAL_AUTH_0_CLIENT_ID:-}
+      CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
+      CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
+      CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
       # Agent lifecycle hooks — Coder POSTs JWT-signed lifecycle events to the
-      # OpenFlows hook consumer. These vars are forwarded from .env so Coder's
-      # server process actually dispatches hooks (the controller only reads them
-      # to host the consumer endpoint).
+      # OpenFlows hook consumer. The hook URL is an internal detail: compose
+      # derives it from OPENFLOWS_HOOK_PORT and the internal host label Coder
+      # uses to reach the host (host.docker.internal). Operators set only the
+      # port, secret, and (dev) allow-insecure switch — never the raw URL.
       CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-}
-      CODER_CHAT_HOOK_URL: ${CODER_CHAT_HOOK_URL:-}
+      CODER_CHAT_HOOK_URL: "http://host.docker.internal:${OPENFLOWS_HOOK_PORT:-3001}/experimental/hooks/chat"
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-}
       # Dev-only: allow the plain-http hook URL above. Remove in production.
       CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-false}

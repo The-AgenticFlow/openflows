@@ -17,6 +17,7 @@
 //! reference consumer. It lets us turn the experiment on and *observe behaviour*
 //! before we decide how much policy to centralize.
 
+use super::bootstrap::HookBootstrapContext;
 use super::jwt::verify_hook_jwt;
 use super::types::{HookDecision, HookEvent, HookPayload};
 use anyhow::{anyhow, Context, Result};
@@ -28,7 +29,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use pocketflow_core::SharedStore;
+use pocketflow_core::{HookKickPublisher, SharedStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -38,14 +39,30 @@ use tracing::{debug, info, warn};
 pub struct HookServerState {
     pub store: Arc<SharedStore>,
     pub config: CoderHooksConfig,
+    /// Publisher for the reactive kick channel (Slice B). `None` when the kick
+    /// feature is disabled or the channel could not be built (fail-open).
+    pub publisher: Option<HookKickPublisher>,
+    /// Resolved persona/skills/commands paths for `session_start` bootstrap
+    /// (Slice A). `None` when bootstrap is disabled or not provided.
+    pub bootstrap: Option<HookBootstrapContext>,
 }
 
 /// Build the router serving the webhook endpoint.
-pub fn create_router(store: Arc<SharedStore>, config: CoderHooksConfig) -> Router {
+pub fn create_router(
+    store: Arc<SharedStore>,
+    config: CoderHooksConfig,
+    publisher: Option<HookKickPublisher>,
+    bootstrap: Option<HookBootstrapContext>,
+) -> Router {
     Router::new()
-        .route("/hooks/chat", post(handle_hook))
-        .route("/hooks/health", axum::routing::get(handle_health))
-        .with_state(HookServerState { store, config })
+        .route("/experimental/hooks/chat", post(handle_hook))
+        .route("/experimental/hooks/health", axum::routing::get(handle_health))
+        .with_state(HookServerState {
+            store,
+            config,
+            publisher,
+            bootstrap,
+        })
 }
 
 async fn handle_health() -> &'static str {
@@ -58,12 +75,12 @@ async fn handle_hook(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let hook_url = match state.config.chat_hook_url.clone() {
+    let hook_url = match state.config.hook_public_url() {
         Some(u) => u,
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "hook consumer not enabled (CODER_CHAT_HOOK_URL unset)",
+                "hook consumer not enabled (bind address has no usable port)",
             )
                 .into_response();
         }
@@ -131,17 +148,104 @@ async fn handle_hook(
     // Persist a durable audit trail (best-effort; never fail the dispatch).
     let _ = persist_audit(&state.store, &payload).await;
 
-    // Apply policy, then serialize the decision into Coder's response schema:
-    //   allow/deny via permission.decision, rewrite via permission.input_override,
-    //   human/machine explanation via user_message / model_context.
+    // Apply experimental hook-driven behaviour (slices A–D), then serialize the
+    // decision into Coder's response schema.
     //
-    // A policy decision (deny or rewrite) is carried in the JSON body and
-    // returned with a 200 so Coder reads it as a deliberate decision, NOT a
-    // dispatch failure. Non-2xx is reserved for real dispatch failures
-    // (bad JWT / malformed body) earlier in this handler, which fail closed.
-    let decision = apply_policy(&payload);
-    let body = decision_to_response(&decision);
+    // A policy decision (deny/rewrite/model_context) is carried in the JSON body
+    // and returned with a 200 so Coder reads it as a deliberate decision, NOT a
+    // dispatch failure. Non-2xx is reserved for real dispatch failures (bad JWT /
+    // malformed body) earlier in this handler, which fail closed.
+    let body = route_event(&state, &payload).await;
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Route a single verified dispatch to the experimental slice behaviour and
+/// return the Coder response body. Falls back to the generic `apply_policy`
+/// decision for everything not covered by a slice.
+async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_json::Value {
+    let chat_id = payload.meta.chat_id.clone();
+    let dispatch_id = payload.meta.dispatch_id.clone();
+
+    match payload.event {
+        HookEvent::SessionStart => {
+            // Slice A: bootstrap context via `model_context` (persona + skills +
+            // command paths + resume state). If bootstrap context is unavailable
+            // or the chat isn't resolvable, fall back to observation-only.
+            if let Some(ctx) = &state.bootstrap {
+                if let Some(context) =
+                    super::bootstrap::build_bootstrap_context(&state.store, &chat_id, &payload.data, ctx).await
+                {
+                    return json!({ "model_context": context });
+                }
+            }
+            decision_to_response(&HookDecision::observe())
+        }
+
+        HookEvent::PostToolUse => {
+            // Slice B: reactive wake when a harness state mutation lands, so the
+            // Controller can re-run its reconciliation pass without waiting the
+            // full poll interval (e.g. a sentinel verdict → resume paused forge).
+            if let Some(publisher) = &state.publisher {
+                super::kick::maybe_publish_kick(
+                    publisher,
+                    &state.store,
+                    &chat_id,
+                    &dispatch_id,
+                    HookEvent::PostToolUse,
+                    &payload.data,
+                )
+                .await;
+            }
+            decision_to_response(&HookDecision::observe())
+        }
+
+        HookEvent::Stop => {
+            // Slice D: status-aware, authorized stop monitoring. Classify why the
+            // agent wants to stop against durable state; persist the record and,
+            // for a planned handoff, kick Nexus to reconcile the paused agent.
+            let (classification, detail) = super::stop::classify_stop(&state.store, &chat_id).await;
+            if let (Some(ticket), Some(publisher)) =
+                (detail.get("ticket_id").and_then(|v| v.as_str()), &state.publisher)
+            {
+                let _ = state
+                    .store
+                    .set(
+                        &format!("ticket:{ticket}:hooks:stop"),
+                        super::stop::stop_audit_record(&classification, &detail),
+                    )
+                    .await;
+                if classification == super::stop::StopClassification::PlannedHandoff {
+                    let kick = pocketflow_core::HookKick {
+                        chat_id: chat_id.clone(),
+                        dispatch_id: dispatch_id.clone(),
+                        event: "stop".to_string(),
+                        role: detail.get("role").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        ticket_id: ticket.to_string(),
+                        hint: "stop_planned_handoff".to_string(),
+                        data: detail.clone(),
+                    };
+                    publisher.publish(&kick).await;
+                }
+            }
+            decision_to_response(&HookDecision::observe())
+        }
+
+        HookEvent::PreToolUse => {
+            // Generic policy (rm -rf, force-push, redis-cli, workspace escape)
+            // layered with Slice C's stateful, phase-aware write guard.
+            let base = apply_policy(payload);
+            let role = super::context::resolve_chat(&state.store, &chat_id).await.role.unwrap_or_default();
+            let tool_name = payload.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let input = payload.data.get("tool_input").unwrap_or(&Value::Null);
+            decision_to_response(
+                &super::guard::phase_guard(&state.store, &chat_id, &role, tool_name, input, base).await,
+            )
+        }
+
+        HookEvent::UserPromptSubmit | HookEvent::PreCompact | HookEvent::PostCompact => {
+            decision_to_response(&apply_policy(payload))
+        }
+    }
 }
 
 /// Convert the internal [`HookDecision`] into Coder's response-body schema.
@@ -363,11 +467,13 @@ async fn persist_audit(store: &SharedStore, payload: &HookPayload) -> Result<()>
 pub async fn start_lifecycle_hook_server(
     store: Arc<SharedStore>,
     config: CoderHooksConfig,
+    publisher: Option<HookKickPublisher>,
+    bootstrap: Option<HookBootstrapContext>,
 ) -> Result<Option<()>> {
     if !config.enabled() {
         info!(
             "Coder agent lifecycle hooks experiment not enabled; hook consumer not started \
-             (set CODER_EXPERIMENTS=agent-lifecycle-hooks and CODER_CHAT_HOOK_URL)"
+             (set CODER_EXPERIMENTS=agent-lifecycle-hooks)"
         );
         return Ok(None);
     }
@@ -377,14 +483,14 @@ pub async fn start_lifecycle_hook_server(
         ));
     }
 
-    let router = create_router(store, config.clone());
+    let router = create_router(store, config.clone(), publisher, bootstrap);
     let addr = config.hook_addr.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind hook consumer on {addr}"))?;
     info!(
         addr = %addr,
-        hook_url = %config.chat_hook_url.clone().unwrap_or_default(),
+        hook_url = %config.hook_public_url().unwrap_or_default(),
         "OpenFlows lifecycle hook consumer starting"
     );
 

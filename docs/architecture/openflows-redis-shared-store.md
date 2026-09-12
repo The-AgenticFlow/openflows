@@ -85,7 +85,7 @@ The resolved tenant is baked into the store instance, so every operation on that
 | **Namespaced** | `get`/`set`/`del`/`keys`/`get_typed`/`set_typed` | Yes — always | The Controller flow and the harness |
 | **Raw (admin-only)** | `raw_keys` / `raw_del` | No — full key strings | Tenant enumerate / list / purge admin commands only |
 
-`raw_keys("ns:*")` scans all tenants (used by `openflows status` / `tenant list`); `raw_del` is how `tenant remove --purge` wipes a whole `ns:{tenant}:*` keyspace. Raw mode is never used in the normal Controller loop.
+`raw_keys("ns:*")` scans all tenants (used by `openflows status` / `tenant list` / `store list`); `raw_del` is how `tenant remove --purge` and `store purge` wipe a whole `ns:{tenant}:*` keyspace. Raw mode is never used in the normal Controller loop. The `openflows store` command group exposes an explicit manual-cleanup surface: `store list` (per-tenant key counts), `store purge <tenant>` (delete a tenant's whole keyspace), and `store reset <tenant>` (clear only the Controller-owned orchestration keys — `tickets`, `worker_slots`, `pending_prs`, `registry_json`, `ci_readiness`, `repository`, `documentation_queue` — leaving worker gate/review/handoff keys intact), and `store wipe` (delete **every** `ns:*` key across all tenants — a global reset; requires confirmation unless `--yes`).
 
 ### 3.3 Why this is sufficient isolation
 

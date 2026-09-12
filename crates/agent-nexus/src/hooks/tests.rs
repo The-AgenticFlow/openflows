@@ -240,19 +240,22 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let hook_url = format!("http://{addr}/hooks/chat");
+    let hook_url = format!("http://{addr}/experimental/hooks/chat");
 
+    // The consumer derives its audience from hook_addr + hook_host. Set both so
+    // the derived URL matches what the (reachable) listener is bound to.
     let config = CoderHooksConfig {
-        chat_hook_url: Some(hook_url.clone()),
         chat_hook_secret: Some(SECRET.to_string()),
         chat_hook_timeout_ms: 1500,
         chat_hook_enabled: true,
         chat_hook_allow_insecure: true,
-        hook_addr: "127.0.0.1:0".to_string(),
+        hook_addr: addr.to_string(),
+        hook_host: "127.0.0.1".to_string(),
     };
+    assert_eq!(config.hook_public_url().as_deref(), Some(hook_url.as_str()));
 
     let store = Arc::new(SharedStore::new_in_memory());
-    let router = create_router(store, config);
+    let router = create_router(store, config, None, None);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

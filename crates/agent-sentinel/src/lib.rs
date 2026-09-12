@@ -308,6 +308,21 @@ impl Node for SentinelNode {
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
                     store.del(&review_key).await;
 
+                    // Release the sentinel slot so it's available for future
+                    // reviews; otherwise Nexus sees an active sentinel worker and
+                    // keeps routing nexus→sentinel, stalling Forge/Vessel.
+                    let worker_id = verdict["worker_id"].as_str().unwrap_or("");
+                    if !worker_id.is_empty() {
+                        let mut slots: HashMap<String, WorkerSlot> =
+                            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                        if let Some(slot) = slots.get_mut(worker_id) {
+                            slot.status = WorkerStatus::Idle;
+                        }
+                        store
+                            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                            .await;
+                    }
+
                     any_approved = true;
                 }
                 "reject" => {
@@ -365,6 +380,21 @@ impl Node for SentinelNode {
                             }
                         }
                     }
+
+                    // Remove the sentinel chat binding; leaving it makes Nexus
+                    // treat the archived chat as orphaned and re-spawn a reviewer.
+                    store.del(&sentinel_chat_key).await;
+
+                    // Move the ticket out of review_ready so Nexus won't re-spawn
+                    // a reviewer until Forge re-arms it via `status set review_ready`.
+                    let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    store
+                        .set(&status_key, json!({ "phase": "building", "role": "forge", "ts": ts }))
+                        .await;
 
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
