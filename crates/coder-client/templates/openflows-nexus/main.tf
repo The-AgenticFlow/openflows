@@ -114,11 +114,55 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
+    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
+    # (github_pat) because a PAT can be scoped to the target repo/org and works
+    # regardless of GitHub App install scope. Fall back to the Coder GitHub App
+    # external-auth token (surfaces the "Login with GitHub" button in the UI).
+    # A persistent store is a deliberate fallback over Coder's automatic
+    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
+    # environment without GIT_ASKPASS, so we pin the token once here.
+    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
+    if [ -z "$GIT_TOKEN" ]; then
+      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    fi
+    if [ -n "$GIT_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      echo "Configured git credentials for GitHub"
+    else
+      echo "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth)"
+    fi
+
     # git pull or clone (creds via Coder external auth)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       git clone ${data.coder_parameter.repo_url.value} /home/coder/workspace 2>/dev/null || true
+    fi
+
+    # Maintain a golden repo checkout on the shared artifacts volume so worker
+    # workspaces (forge/sentinel/vessel/lore) seed from an offline copy instead
+    # of a per-spawn network clone (see docs §3.2 "Repo acquisition: the golden
+    # mount clone"). Nexus owns the artifacts volume (writable here) and holds
+    # the git credentials / network egress, so the expensive fetch happens once.
+    # The golden tree is refreshed (fetch + reset) before any worker copies it.
+    GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    if [ -n "${data.coder_parameter.repo_url.value}" ]; then
+      if [ -d "$GOLDEN_REPO/.git" ]; then
+        cd "$GOLDEN_REPO" && git fetch --prune 2>/dev/null || true
+        git reset --hard "origin/HEAD" 2>/dev/null || git reset --hard 2>/dev/null || true
+        echo "Refreshed golden repo at $GOLDEN_REPO" >&2
+      else
+        mkdir -p "$(dirname "$GOLDEN_REPO")"
+        sudo chown -R coder:coder /home/coder/.openflows/artifacts
+        if git clone "${data.coder_parameter.repo_url.value}" "$GOLDEN_REPO" 2>/dev/null; then
+          echo "Seeded golden repo at $GOLDEN_REPO" >&2
+        else
+          echo "WARNING: could not seed golden repo at $GOLDEN_REPO — workers will not get an offline repo seed" >&2
+        fi
+      fi
+      sudo chown -R coder:coder "$GOLDEN_REPO" 2>/dev/null || true
     fi
 
     # Start the OpenFlows Controller
@@ -221,3 +265,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

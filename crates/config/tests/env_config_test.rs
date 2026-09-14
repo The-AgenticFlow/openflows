@@ -55,7 +55,7 @@ fn coder_config_parses_defaults_and_overrides() {
     assert_eq!(cfg.admin_email, "admin@openflows.dev");
     assert_eq!(cfg.admin_password, None);
     assert_eq!(cfg.admin_username, "admin");
-    assert_eq!(cfg.image_tag, "v2.37.0");
+    assert_eq!(cfg.image_tag, "v2.37.1");
     assert_eq!(cfg.external_auth_client_id.as_deref(), Some("github-app"));
 }
 

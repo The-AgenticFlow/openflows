@@ -40,11 +40,15 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://localhost:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
-      # GitHub external auth (Git App) — OPTIONAL. Lets agents push/pull against
-      # PRIVATE repos. Disabled by default because it crashes `coder server` when
-      # client_id/client_secret are empty. To enable: uncomment the block below and
-      # set the credentials (create a GitHub App, callback URL
-      # ${CODER_ACCESS_URL}/external-auth/primary-github/callback).
+      # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
+      # repos via OIDC. Values come from .env (see quick_start.md Step 2).
+      # IMPORTANT: `coder server` fails to start if client_id/client_secret are
+      # EMPTY, so these MUST be populated in .env BEFORE `docker compose up -d`.
+      # A fresh setup is covered by `.env.example` (which ships these populated
+      # with placeholders) + quick_start Step 2. If your existing `.env` predates
+      # this block, add the CODER_EXTERNAL_AUTH_0_* vars (or start from
+      # `.env.example`) or Coder will not come up.
+      # Callback URL: ${CODER_ACCESS_URL}/external-auth/primary-github/callback
       CODER_EXTERNAL_AUTH_0_ID: ${CODER_EXTERNAL_AUTH_0_ID:-primary-github}
       CODER_EXTERNAL_AUTH_0_TYPE: ${CODER_EXTERNAL_AUTH_0_TYPE:-github}
       CODER_EXTERNAL_AUTH_0_CLIENT_ID: ${CODER_EXTERNAL_AUTH_0_CLIENT_ID:-}

@@ -5,7 +5,7 @@
 
 **OpenFlows is an autonomous AI software team that turns GitHub issues into reviewed, production-ready pull requests inside your self-hosted Coder environment.** For developers, it handles planning, coding, testing, and adversarial review while keeping them in control of architecture and final decisions. For companies, it brings governed, auditable AI delivery into existing engineering workflows without exposing LLM keys or weakening security boundaries. For stakeholders, it creates a faster, more transparent path from product intent to shipped software.
 
-> **Getting started?** All setup, startup, and troubleshooting steps live in [**QUICK_START.md**](QUICK_START.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
+> **Getting started?** All setup, startup, and troubleshooting steps live in [**quick_start.md**](quick_start.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
 
 ## Why architecture-first
 
@@ -54,7 +54,7 @@ OpenFlows is an actively developed, functioning system that already ships merged
 - Production controller deployment inside a Nexus workspace (auto-start via startup script).
 - A pluggable skill / MCP / model registry.
 
-See [QUICK_START.md](QUICK_START.md) to run it, and the planning-gate / architecture docs for the intended end state.
+See [quick_start.md](quick_start.md) to run it, and the planning-gate / architecture docs for the intended end state.
 
 ## Plug-and-Play Extension
 
@@ -68,9 +68,9 @@ See [`docs/architecture/openflows-system-architecture.md` §10](docs/architectur
 
 | Guide | What it covers |
 |-------|---------------|
-| [QUICK_START.md](QUICK_START.md) | Complete setup, startup, and troubleshooting |
-| [TOKEN_GUIDE.md](TOKEN_GUIDE.md) | Token acquisition step-by-step |
-| [TESTING_QUICK_START.md](TESTING_QUICK_START.md) | Testing & debugging walkthrough |
+| [quick_start.md](quick_start.md) | Complete setup, startup, and troubleshooting |
+| [token_guide.md](token_guide.md) | Token acquisition step-by-step |
+| [testing_quick_start.md](testing_quick_start.md) | Testing & debugging walkthrough |
 | [docs/architecture/openflows-system-architecture.md](docs/architecture/openflows-system-architecture.md) | Complete system architecture (authoritative) |
 | [docs/architecture/openflows-controller.md](docs/architecture/openflows-controller.md) | Controller deep-dive (Subsystem 01) |
 | [docs/architecture/openflows-worker-workspace.md](docs/architecture/openflows-worker-workspace.md) | Worker workspaces, bootstrap, and executor setup (Subsystem 03) |

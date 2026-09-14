@@ -904,6 +904,10 @@ Before significant work, read the relevant skill file to understand the workflow
                         .map(|e| e.coder.url)
                         .unwrap_or_default()
                 }),
+                // Prefer a PAT for git in the workspace so clones/pushes work on
+                // any accessible repo regardless of GitHub App install scope.
+                // Falls back inside the template to the Coder GitHub App token.
+                "github_pat": self.resolve_github_token_from_env_or_file(),
             }),
         };
         // Inject the Terraform variable the template reads.

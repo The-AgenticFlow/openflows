@@ -46,6 +46,13 @@ variable "harness_version" {
   description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
 }
 
+data "coder_parameter" "github_pat" {
+  name        = "github_pat"
+  description = "GitHub Personal Access Token for git clone/push in the workspace"
+  default     = ""
+  type        = "string"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -57,36 +64,53 @@ resource "coder_agent" "main" {
 
     log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 
-    # Setup git credentials: get token from workspace owner via Coder API
-    # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
-    CODER_URL="${var.coder_url}"
-    OWNER_ID="${data.coder_workspace_owner.me.id}"
-    
-    if [ -n "$CODER_URL" ] && [ -n "$CODER_AGENT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
-      API_TOKEN=$(curl -s \
-        -H "Coder-Session-Token: $CODER_AGENT_TOKEN" \
-        "$CODER_URL/api/v2/users/$OWNER_ID/gitauths/github" 2>/dev/null \
-        | jq -r '.access_token // empty')
-
-      # Fall back to the injected GITHUB_TOKEN env var if the API returned nothing
-      GITHUB_TOKEN="$${API_TOKEN:-$GITHUB_TOKEN}"
-      
-      # Configure git with token for HTTPS push auth
-      if [ -n "$GITHUB_TOKEN" ]; then
-        git config --global credential.helper store
-        echo "https://git:$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
-        chmod 600 /home/coder/.git-credentials
-        log "Configured git credentials for GitHub push auth"
-      else
-        log "WARNING: No GitHub token available — git push may fail"
-      fi
+    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
+    # (github_pat) because a PAT can be scoped to the target repo/org and works
+    # regardless of GitHub App install scope. Fall back to the Coder GitHub App
+    # external-auth token (surfaces the "Login with GitHub" button in the UI).
+    # A persistent store is a deliberate fallback over Coder's automatic
+    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
+    # environment without GIT_ASKPASS, so we pin the token once here.
+    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
+    if [ -z "$GIT_TOKEN" ]; then
+      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    fi
+    if [ -n "$GIT_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      log "Configured git credentials for GitHub push auth"
+    else
+      log "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi
 
-    # git pull or clone (creds via Coder external auth or configured above)
+    # Acquire the repository. Prefer the golden offline seed from the shared
+    # artifacts volume (docs §3.2): copy -> refresh -> checkout -> work.
+    # Fall back to a direct network clone when no golden seed exists, and fail
+    # LOUDLY (WARNING) rather than silently leaving an empty workspace.
+    GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    # The fresh workspace volume is root-owned initially, so any copy/clone
+    # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
+    elif [ -d "$GOLDEN_REPO/.git" ]; then
+      sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/dev/null || true
+      sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
+      log "Copied golden repo seed into /home/coder/workspace"
+      # Refresh to latest before checkout (design: copy -> refresh -> checkout).
+      cd /home/coder/workspace
+      git fetch --all --prune 2>/dev/null || true
+      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     elif [ -n "${var.repo_url}" ]; then
-      git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
+      log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
+      if sudo git clone ${var.repo_url} /home/coder/workspace 2>/tmp/lore_clone_err.log; then
+        sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
+        log "Cloned repository into /home/coder/workspace"
+      else
+        log "WARNING: git clone failed — $(tail -5 /tmp/lore_clone_err.log 2>/dev/null)"
+      fi
+    else
+      log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
     fi
 
     # Download and install openflows-harness from GitHub releases.
@@ -153,6 +177,14 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
+  # Mount shared artifact files (repo golden seed, plans, skills).
+  # This volume is created by the Nexus workspace and is read-only here.
+  volumes {
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = "openflows-artifacts-${var.tenant}"
+    read_only      = true
+  }
+
   env = [
     "REDIS_URL=${var.redis_url}",
     "OPENFLOWS_TENANT=${var.tenant}",
@@ -174,3 +206,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

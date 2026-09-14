@@ -69,6 +69,13 @@ data "coder_parameter" "coder_url" {
   type        = "string"
 }
 
+data "coder_parameter" "github_pat" {
+  name        = "github_pat"
+  description  = "GitHub Personal Access Token for git clone/push in the workspace"
+  default     = ""
+  type        = "string"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -184,44 +191,57 @@ resource "coder_agent" "main" {
     print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
     PYEOF
 
-    # Setup git credentials: get token from workspace owner via Coder API
-    # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
-    CODER_URL="${data.coder_parameter.coder_url.value}"
-    OWNER_ID="${data.coder_workspace_owner.me.id}"
-    
-    # Fetch GitHub token via Coder API (uses the agent's own token)
-    if [ -n "$CODER_AGENT_TOKEN" ]; then
-      API_TOKEN=$(curl -s \
-        -H "Coder-Session-Token: $CODER_AGENT_TOKEN" \
-        "$CODER_URL/api/v2/users/$OWNER_ID/gitauths/github" 2>/dev/null \
-        | jq -r '.access_token // empty')
+    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
+    # (github_pat, e.g. from CODER_GITHUB_TOKEN) because a PAT can be scoped to
+    # the target repo/org and works regardless of GitHub App install scope.
+    # Fall back to the Coder GitHub App external-auth token (surfaces the
+    # "Login with GitHub" button in the workspace UI). A persistent store is a
+    # deliberate fallback over Coder's automatic GIT_ASKPASS auth: agent-executed
+    # git (push) can run in a subprocess environment without GIT_ASKPASS, so we
+    # pin the token once here.
+    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
+    if [ -z "$GIT_TOKEN" ]; then
+      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
     fi
-
-    # Fall back to the injected GITHUB_TOKEN env var if the API returned nothing
-    GITHUB_TOKEN="$${API_TOKEN:-$GITHUB_TOKEN}"
-    
-    # Configure git with token for HTTPS push auth
-    if [ -n "$GITHUB_TOKEN" ]; then
+    if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
-      echo "https://git:$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
+      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
       chmod 600 /home/coder/.git-credentials
       log "Configured git credentials for GitHub push auth"
     else
-      log "WARNING: No GitHub token available — git push may fail"
+      log "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi
 
-    # git pull or clone (creds via Coder external auth or configured above)
+    # Acquire the repository. Prefer the golden offline seed from the shared
+    # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
+    # Fall back to a direct network clone when no golden seed exists. Either
+    # path FAILS LOUDLY (with a WARNING) instead of silently leaving an empty
+    # workspace, because an agent with no repo cannot do useful work and the
+    # old silent `2>/dev/null` clone was the root cause of empty workspaces.
+    GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    # The fresh workspace volume is root-owned initially, so any copy/clone
+    # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
+    elif [ -d "$GOLDEN_REPO/.git" ]; then
+      sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
+      sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
+      log "Copied golden repo seed into /home/coder/workspace"
+      # Refresh to latest before checkout (design: copy -> refresh -> checkout).
+      cd /home/coder/workspace
+      git fetch --all --prune 2>/dev/null || true
+      # Checkout the default branch head so work never begins on a stale tree.
+      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
-      # Clone into a temp dir first, then move contents
-      TEMP_DIR=$(mktemp -d)
-      if git clone "${data.coder_parameter.repo_url.value}" "$TEMP_DIR" 2>/dev/null; then
-        # Move all files (including .git) to workspace
-        sudo chown -R coder:coder /home/coder/workspace
-        mv "$TEMP_DIR"/* "$TEMP_DIR"/.* /home/coder/workspace/ 2>/dev/null || true
-        rmdir "$TEMP_DIR"
+      log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
+      if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
+        sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
+        log "Cloned repository into /home/coder/workspace"
+      else
+        log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
+    else
+      log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
@@ -333,3 +353,6 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
+data "coder_external_auth" "github" {
+  id = "primary-github"
+}

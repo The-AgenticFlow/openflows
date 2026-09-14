@@ -10,12 +10,14 @@ pub async fn run_checks() -> Result<()> {
     println!("openflows-doctor — Coder integration health check");
     println!();
 
+    let coder = config::CoderConfig::init_from_env()?;
+
     // 1. Coder server reachable
-    let coder_url = config::CoderConfig::init_from_env()?.url;
+    let coder_url = coder.url.clone();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let pinned = config::CoderConfig::init_from_env()?.image_tag;
+    let pinned = coder.image_tag.clone();
     let semver = is_semver_tag(&pinned);
     let pinned = match &pinned[..] {
         _ if !semver => pinned,
@@ -74,13 +76,14 @@ pub async fn run_checks() -> Result<()> {
     }
 
     // 2. Coder image tag
-    let tag = config::CoderConfig::init_from_env()?.image_tag;
+    let tag = coder.image_tag.clone();
     println!("  ℹ Coder image tag: {} (pin for production)", tag);
 
     // 3. LLM provider/model configured
     {
-        let token = config::CoderConfig::init_from_env()?
+        let token = coder
             .session_token
+            .clone()
             .or(std::env::var("CODER_API_TOKEN").ok())
             .unwrap_or_default();
         if !token.is_empty() {
@@ -140,16 +143,19 @@ pub async fn run_checks() -> Result<()> {
     }
 
     // 4. GitHub external auth configured (needed for agent authentication)
-    let has_github_auth = std::env::var("CODER_EXTERNAL_AUTH_0_ID").is_ok()
-        && std::env::var("CODER_EXTERNAL_AUTH_0_SECRET").is_ok();
+    let has_github_auth = has_github_auth(&coder);
     if has_github_auth {
-        println!("  ✓ GitHub external auth configured (CODER_EXTERNAL_AUTH_0_ID/SECRET)");
+        println!(
+            "  ✓ GitHub external auth configured (CODER_EXTERNAL_AUTH_0_ID/CLIENT_ID/CLIENT_SECRET)"
+        );
     } else {
         println!(
             "  ⚠ GitHub external auth not configured — optional, only needed for private repos"
         );
         println!("    If agents must push to private repos, create a GitHub App and set");
-        println!("         CODER_EXTERNAL_AUTH_0_ID and CODER_EXTERNAL_AUTH_0_SECRET in .env");
+        println!(
+            "         CODER_EXTERNAL_AUTH_0_ID, CODER_EXTERNAL_AUTH_0_CLIENT_ID and CODER_EXTERNAL_AUTH_0_CLIENT_SECRET in .env"
+        );
     }
 
     // 5. Redis reachable
@@ -213,4 +219,54 @@ fn is_semver_tag(tag: &str) -> bool {
         i += 1;
     }
     i > 0 && i < bytes.len() && bytes[i] == b'.'
+}
+
+/// True when the Coder GitHub external-auth provider is fully configured:
+/// the provider ID plus both the GitHub App client ID and client secret.
+fn has_github_auth(cfg: &config::CoderConfig) -> bool {
+    cfg.external_auth_id.is_some()
+        && cfg.external_auth_client_id.is_some()
+        && cfg.external_auth_client_secret.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(id: Option<&str>, client_id: Option<&str>, secret: Option<&str>) -> config::CoderConfig {
+        config::CoderConfig {
+            url: "http://localhost:7080".to_string(),
+            session_token: None,
+            admin_email: "admin@openflows.dev".to_string(),
+            admin_password: None,
+            admin_username: "admin".to_string(),
+            image_tag: "v2.37.0".to_string(),
+            github_token: None,
+            external_auth_id: id.map(str::to_string),
+            external_auth_client_id: client_id.map(str::to_string),
+            external_auth_client_secret: secret.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn has_github_auth_true_only_when_fully_configured() {
+        assert!(has_github_auth(&cfg(
+            Some("primary-github"),
+            Some("id"),
+            Some("secret")
+        )));
+        // Provider ID alone is not enough — client ID and secret are required too.
+        assert!(!has_github_auth(&cfg(
+            Some("primary-github"),
+            None,
+            Some("secret")
+        )));
+        assert!(!has_github_auth(&cfg(
+            Some("primary-github"),
+            Some("id"),
+            None
+        )));
+        assert!(!has_github_auth(&cfg(Some("primary-github"), None, None)));
+        assert!(!has_github_auth(&cfg(None, Some("id"), Some("secret"))));
+    }
 }

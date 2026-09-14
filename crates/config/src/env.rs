@@ -35,11 +35,14 @@ pub struct CoderConfig {
     #[envconfig(from = "CODER_ADMIN_USERNAME", default = "admin")]
     pub admin_username: String,
 
-    #[envconfig(from = "CODER_IMAGE_TAG", default = "v2.37.0")]
+    #[envconfig(from = "CODER_IMAGE_TAG", default = "v2.37.1")]
     pub image_tag: String,
 
     #[envconfig(from = "CODER_GITHUB_TOKEN")]
     pub github_token: Option<String>,
+
+    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_ID")]
+    pub external_auth_id: Option<String>,
 
     #[envconfig(from = "CODER_EXTERNAL_AUTH_0_CLIENT_ID")]
     pub external_auth_client_id: Option<String>,
@@ -144,6 +147,7 @@ impl fmt::Debug for CoderConfig {
             .field("admin_username", &self.admin_username)
             .field("image_tag", &self.image_tag)
             .field("github_token", &redact(&self.github_token))
+            .field("external_auth_id", &self.external_auth_id)
             .field("external_auth_client_id", &self.external_auth_client_id)
             .field(
                 "external_auth_client_secret",
@@ -478,7 +482,7 @@ mod tests {
         assert_eq!(cfg.coder.admin_email, "admin@openflows.dev");
         assert_eq!(cfg.coder.admin_username, "admin");
         assert_eq!(cfg.coder.admin_password, None);
-        assert_eq!(cfg.coder.image_tag, "v2.37.0");
+        assert_eq!(cfg.coder.image_tag, "v2.37.1");
         assert_eq!(cfg.infra.effective_redis_url(), "redis://localhost:6379");
         assert_eq!(cfg.infra.a2a_relay_addr, "127.0.0.1:3000");
         assert_eq!(cfg.tenant.effective_tenant(), "default");

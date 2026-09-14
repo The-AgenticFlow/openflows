@@ -28,7 +28,7 @@ the new centralized `crates/config/src/env.rs` layer.
 | `CODER_ADMIN_EMAIL` | coder-client/bootstrap | in-use | `CoderConfig.admin_email` (default `admin@openflows.dev`) |
 | `CODER_ADMIN_PASSWORD` | coder-client/bootstrap | in-use | `CoderConfig.admin_password` (Option; no baked-in default — bootstrapper applies a secure fallback only when absent/weak) |
 | `CODER_GITHUB_TOKEN` | agent-vessel/types | in-use | `CoderConfig.github_token` |
-| `CODER_IMAGE_TAG` | binary/doctor | in-use | `CoderConfig.image_tag` (default `v2.37.0`) |
+| `CODER_IMAGE_TAG` | binary/doctor | in-use | `CoderConfig.image_tag` (default `v2.37.1`) |
 | `CODER_TRANSPORT_VERBOSE` | provisioner/transport | confusing | **Excluded from centralized layer** |
 | `CODER_WORKSPACE_ID` | openflows-harness/store | confusing | **Excluded from centralized layer** (read inline with default only) |
 | `CODER_EXTERNAL_AUTH_0_CLIENT_ID` | .env.example, docker-compose | in-use | `CoderConfig.external_auth_client_id` (canonical; `CODER_EXTERNAL_AUTH_0_ID` remains an inline read in binary/doctor) |
