@@ -37,6 +37,61 @@ pub struct TicketState {
     pub flags: Value,
 }
 
+/// Key under which per-ticket pre-tool guidance/denials accumulate, drained by
+/// `post_tool_use` and fed back to the model as a safety net.
+pub const GUIDANCE_KEY: &str = "hooks:guidance";
+/// Max guidance records kept per ticket before the tail is trimmed.
+const GUIDANCE_TAIL: usize = 8;
+
+/// Append a guidance/error record produced by a `pre_tool_use` policy check to
+/// the ticket's guidance tail, drained by `post_tool_use` to relay to the model.
+pub async fn record_guidance(store: &SharedStore, ticket_id: &str, guidance: Value) {
+    let key = format!("ticket:{ticket_id}:{GUIDANCE_KEY}");
+    let mut tail: Vec<Value> = store.get_typed(&key).await.unwrap_or_default();
+    tail.push(guidance);
+    if tail.len() > GUIDANCE_TAIL {
+        let drop = tail.len() - GUIDANCE_TAIL;
+        tail.drain(0..drop);
+    }
+    store.set_typed(&key, &tail).await.ok();
+}
+
+/// Read and clear the ticket's pending guidance tail. Returns the drained
+/// records so a caller (`post_tool_use`) can relay them to the model, and an
+/// empty vec when there is nothing pending. Clearing is best-effort.
+pub async fn drain_guidance(store: &SharedStore, ticket_id: &str) -> Vec<Value> {
+    let key = format!("ticket:{ticket_id}:{GUIDANCE_KEY}");
+    let tail: Vec<Value> = store.get_typed(&key).await.unwrap_or_default();
+    if !tail.is_empty() {
+        store.del(&key).await;
+    }
+    tail
+}
+
+/// Key tracking that SENTINEL wrote its evaluation report for the active PR
+/// review; cleared when a fresh review cycle begins.
+const REVIEW_REPORT_KEY: &str = "hooks:review_report";
+
+/// True when SENTINEL has written an evaluation report (observed via
+/// `post_tool_use`) that must precede a `review submit`.
+pub async fn review_report_exists(store: &SharedStore, ticket_id: &str) -> bool {
+    store
+        .get(&format!("ticket:{ticket_id}:{REVIEW_REPORT_KEY}"))
+        .await
+        .is_some()
+}
+
+/// Mark that a review report was written. Called by `post_tool_use` after a
+/// SENTINEL write to a `*-eval.md` / `final-review.md` path.
+pub async fn record_review_report_marker(store: &SharedStore, ticket_id: &str) {
+    store
+        .set(
+            &format!("ticket:{ticket_id}:{REVIEW_REPORT_KEY}"),
+            Value::Bool(true),
+        )
+        .await;
+}
+
 /// Resolve role + ticket from a chat id by scanning the chat keys.
 pub async fn resolve_chat(store: &SharedStore, chat_id: &str) -> HookContext {
     if chat_id.is_empty() {
@@ -98,7 +153,10 @@ pub async fn read_ticket_state(store: &SharedStore, ticket_id: &str) -> TicketSt
         .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(str::to_string));
 
     let plan_key = format!("pair:{ticket_id}:plan");
-    let plan_exists = store.get(&plan_key).await.is_some();
+    // `openflows-harness plan write` stores the plan as raw markdown, not JSON.
+    // SharedStore::get() parses Redis values as JSON, so a real raw plan can
+    // look "missing" if we deserialize it here. Key presence is the contract.
+    let plan_exists = !store.keys(&plan_key).await.is_empty();
 
     let gate_key = format!("ticket:{ticket_id}:gate:planning");
     let gate_approved = store.get(&gate_key).await.is_some();

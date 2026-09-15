@@ -27,7 +27,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the Controller orchestration loop (default inside nexus workspace)
-    Run,
+    Run {
+        /// Clear this tenant's runtime SharedStore state before starting
+        #[arg(long)]
+        reset_store: bool,
+    },
     /// Bootstrap Coder: admin, templates, LLM check, external auth check
     Bootstrap,
     /// Tenant management
@@ -107,8 +111,8 @@ enum StoreCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Clear a tenant's controller-owned orchestration state (tickets,
-    /// worker_slots, pending_prs, registry_json) without touching worker keys
+    /// Clear a tenant's runtime orchestration state, including ticket-scoped
+    /// worker keys such as status/chat/review/gate/handoff
     Reset {
         /// Tenant name
         name: String,
@@ -174,13 +178,12 @@ enum HooksCommands {
         /// Chat ID to tag the event with (defaults to a generated id)
         #[arg(long)]
         chat_id: Option<String>,
-    /// Optional dispatch ID (defaults to a generated one)
-    #[arg(long)]
-    dispatch_id: Option<String>,
+        /// Optional dispatch ID (defaults to a generated one)
+        #[arg(long)]
+        dispatch_id: Option<String>,
     },
     /// Run the hook consumer standalone (dev/test). Uses an in-memory store so
-    /// it needs no Redis or Coder. Require CODER_EXPERIMENTS=agent-lifecycle-hooks,
-    /// CODER_CHAT_HOOK_URL and CODER_CHAT_HOOK_SECRET at startup.
+    /// it needs no Redis or Coder. Requires CODER_CHAT_HOOK_SECRET at startup.
     Serve,
 }
 
@@ -198,8 +201,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run) {
-        Commands::Run => run_controller().await,
+    match cli.command.unwrap_or(Commands::Run { reset_store: false }) {
+        Commands::Run { reset_store } => run_controller(reset_store).await,
         Commands::Bootstrap => run_bootstrap().await,
         Commands::Tenant { action } => run_tenant(action).await,
         Commands::Status { tenant, json } => run_status(tenant, json).await,
@@ -211,7 +214,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_controller() -> Result<()> {
+async fn run_controller(reset_store: bool) -> Result<()> {
     let cfg = config::EnvConfig::from_env().context("failed to load environment configuration")?;
     cfg.validate_controller()?;
     let coder_url = cfg.coder.url.clone();
@@ -237,6 +240,14 @@ async fn run_controller() -> Result<()> {
     let store =
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
+    if reset_store {
+        let cleared = reset_tenant_runtime_state(&store).await;
+        tracing::info!(
+            tenant,
+            cleared,
+            "Reset tenant runtime SharedStore state before controller start"
+        );
+    }
 
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
@@ -300,10 +311,10 @@ async fn run_controller() -> Result<()> {
     };
 
     // ── Coder Agent Lifecycle Hooks (experimental) ──────────────────────
-    // OpenFlows consumes Coder's deployment-wide `agent-lifecycle-hooks`
-    // webhook so we can observe (and later centrally policy) every agent
-    // lifecycle event. Gated by CODER_EXPERIMENTS=agent-lifecycle-hooks +
-    // CODER_CHAT_HOOK_URL; no-op otherwise.
+    // OpenFlows consumes Coder's deployment-wide lifecycle webhook so we can
+    // observe and centrally policy agent events. Coder's experiment flag and URL
+    // are wired by compose; this process starts the consumer when it has the
+    // shared hook secret.
     match agent_nexus::hooks::start_lifecycle_hook_server(
         std::sync::Arc::new(store.clone()),
         cfg.hooks.clone(),
@@ -312,8 +323,16 @@ async fn run_controller() -> Result<()> {
     )
     .await
     {
-        Ok(Some(())) => tracing::info!("Coder lifecycle hook consumer started"),
-        Ok(None) => tracing::debug!("Coder lifecycle hook consumer disabled"),
+        Ok(Some(())) => {
+            if cfg.hooks.hook_logs {
+                tracing::info!("Coder lifecycle hook consumer started");
+            }
+        }
+        Ok(None) => {
+            if cfg.hooks.hook_logs {
+                tracing::debug!("Coder lifecycle hook consumer disabled");
+            }
+        }
         Err(e) => {
             // Experimental: warn but do not fail the controller boot.
             tracing::warn!(
@@ -478,15 +497,21 @@ async fn run_controller() -> Result<()> {
             };
             match kick {
                 Some(k) if !too_soon => {
-                    tracing::info!(
-                        event = %k.event,
-                        hint = %k.hint,
-                        "Hook kick woke the Controller early"
-                    );
+                    if cfg.hooks.hook_logs {
+                        tracing::info!(
+                            event = %k.event,
+                            hint = %k.hint,
+                            "Hook kick woke the Controller early"
+                        );
+                    }
                     continue; // re-run the reconciliation pass immediately
                 }
                 Some(_) => {
-                    tracing::debug!("Hook kick arrived too soon after last pass; waiting full interval");
+                    if cfg.hooks.hook_logs {
+                        tracing::debug!(
+                            "Hook kick arrived too soon after last pass; waiting full interval"
+                        );
+                    }
                     tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
                     continue;
                 }
@@ -702,6 +727,43 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     Ok(())
 }
 
+async fn runtime_state_keys(
+    store: &pocketflow_core::SharedStore,
+) -> std::collections::BTreeSet<String> {
+    let exact_keys = [
+        "tickets",
+        "worker_slots",
+        "pending_prs",
+        "open_prs",
+        "command_gate",
+        "_no_work_count",
+        "_hook_events_tail",
+        "registry_json",
+        "ci_readiness",
+        "repository",
+        "documentation_queue",
+    ];
+    let patterns = ["ticket:*", "pair:*", "heartbeat:*", "audit:*"];
+
+    let mut keys = std::collections::BTreeSet::new();
+    for key in exact_keys {
+        keys.extend(store.keys(key).await);
+    }
+    for pattern in patterns {
+        keys.extend(store.keys(pattern).await);
+    }
+    keys
+}
+
+async fn reset_tenant_runtime_state(store: &pocketflow_core::SharedStore) -> usize {
+    let keys = runtime_state_keys(store).await;
+    let count = keys.len();
+    for key in keys {
+        store.raw_del(&key).await;
+    }
+    count
+}
+
 async fn run_store(action: StoreCommands) -> Result<()> {
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
     let store = pocketflow_core::SharedStore::new_redis(&redis_url)
@@ -753,9 +815,6 @@ async fn run_store(action: StoreCommands) -> Result<()> {
             println!("  (Restart the controller to pick up changes)");
         }
         StoreCommands::Reset { name, yes } => {
-            // Clear only the orchestration state the Controller (re)writes on a
-            // fresh run, so a clean controller starts from an empty ledger without
-            // disturbing worker gate/review/handoff keys.
             let tenant_store = match pocketflow_core::SharedStore::new_redis_with_tenant(
                 &redis_url,
                 Some(name.clone()),
@@ -769,34 +828,32 @@ async fn run_store(action: StoreCommands) -> Result<()> {
                 }
             };
 
-            let keys_to_clear = [
-                "tickets",
-                "worker_slots",
-                "pending_prs",
-                "registry_json",
-                "ci_readiness",
-                "repository",
-                "documentation_queue",
-            ];
-            let mut cleared = 0usize;
-            for key in keys_to_clear {
-                if tenant_store.get(key).await.is_some() {
-                    if cleared == 0 {
-                        println!(
-                            "  Resetting orchestration state for tenant '{}':",
-                            name
-                        );
-                        if !yes && !confirm()? {
-                            println!("  Aborted — no keys were removed.");
-                            return Ok(());
-                        }
-                    }
-                    tenant_store.del(key).await;
-                    cleared += 1;
-                }
+            let matching = runtime_state_keys(&tenant_store).await;
+            if matching.is_empty() {
+                println!(
+                    "  (no runtime orchestration state found for tenant '{}')",
+                    name
+                );
+                println!("  (Restart the controller to pick up changes)");
+                return Ok(());
             }
+
+            println!(
+                "  Resetting {} runtime orchestration key(s) for tenant '{}'",
+                matching.len(),
+                name
+            );
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+
+            let cleared = reset_tenant_runtime_state(&tenant_store).await;
             if cleared > 0 {
-                println!("  ✓ Cleared {} orchestration key(s) for tenant '{}'", cleared, name);
+                println!(
+                    "  ✓ Cleared {} orchestration key(s) for tenant '{}'",
+                    cleared, name
+                );
             } else {
                 println!("  (no orchestration state found for tenant '{}')", name);
             }
@@ -964,22 +1021,19 @@ async fn run_gate(action: GateCommands) -> Result<()> {
 }
 
 async fn run_hooks(action: HooksCommands) -> Result<()> {
-    // The consumer reads these from the environment at startup, matching Coder.
-    let hook_url = std::env::var("CODER_CHAT_HOOK_URL").context(
-        "CODER_CHAT_HOOK_URL is not set. Point it at the OpenFlows hook consumer \
-         (e.g. http://127.0.0.1:3001/hooks/chat).",
-    )?;
-    let secret = std::env::var("CODER_CHAT_HOOK_SECRET").context(
-        "CODER_CHAT_HOOK_SECRET is not set. It must match the consumer's.\n\
-         Generate one with: openssl rand -hex 32",
-    )?;
-
     match action {
         HooksCommands::Simulate {
             event,
             chat_id,
             dispatch_id,
         } => {
+            let cfg = config::EnvConfig::from_env()
+                .context("failed to load environment configuration")?;
+            let hook_url = hook_simulate_url(&cfg.hooks)?;
+            let secret = cfg.hooks.chat_hook_secret.clone().context(
+                "CODER_CHAT_HOOK_SECRET is not set. It must match the consumer's.\n\
+                 Generate one with: openssl rand -hex 32",
+            )?;
             // Generate stable-ish test ids from the process id + timestamp (no
             // extra dependency needed in the binary crate).
             let ts = std::time::SystemTime::now()
@@ -987,8 +1041,8 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
             let pid = std::process::id();
-            let dispatch_id = dispatch_id
-                .unwrap_or_else(|| format!("sim-{}-{}", event.replace('_', "-"), pid));
+            let dispatch_id =
+                dispatch_id.unwrap_or_else(|| format!("sim-{}-{}", event.replace('_', "-"), pid));
             let chat_id = chat_id.unwrap_or_else(|| format!("chat-sim-{}-{}", pid, ts));
 
             println!(
@@ -1016,13 +1070,17 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
         HooksCommands::Serve => {
             // Standalone consumer for local testing: in-memory store (no Redis),
             // so `openflows hooks simulate` can fire events at it end-to-end.
-            let cfg = config::EnvConfig::from_env().context(
-                "failed to load environment configuration (CODER_CHAT_HOOK_URL and \
-                 CODER_CHAT_HOOK_SECRET must be exported alongside \
-                 CODER_EXPERIMENTS=agent-lifecycle-hooks)",
+            let mut cfg = config::EnvConfig::from_env().context(
+                "failed to load environment configuration (CODER_CHAT_HOOK_SECRET must be exported)",
             )?;
-            let store =
-                std::sync::Arc::new(pocketflow_core::SharedStore::new_in_memory());
+            if std::env::var("OPENFLOWS_HOOK_HOST")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_none()
+            {
+                cfg.hooks.hook_host = "127.0.0.1".to_string();
+            }
+            let store = std::sync::Arc::new(pocketflow_core::SharedStore::new_in_memory());
             // In-memory kick bus so slice B/D wake behaviour can be exercised
             // locally even without Redis.
             let kick_publisher = pocketflow_core::build_kick_bus(None, "default")
@@ -1030,7 +1088,7 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
                 .map(|(p, _r)| p)
                 .ok();
             tracing::info!(
-                hook_url = %hook_url,
+                hook_url = %cfg.hooks.hook_public_url().unwrap_or_default(),
                 "Starting standalone lifecycle hook consumer (in-memory store)"
             );
             match agent_nexus::hooks::start_lifecycle_hook_server(
@@ -1043,16 +1101,16 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
             {
                 Ok(Some(())) => {
                     println!("Listening on {}", cfg.hooks.hook_addr);
-                    println!("Configure `openflows hooks simulate` with the same CODER_CHAT_HOOK_URL and CODER_CHAT_HOOK_SECRET.");
+                    println!(
+                        "Run `openflows hooks simulate` with the same CODER_CHAT_HOOK_SECRET."
+                    );
                     // Keep the process alive serving requests.
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                     }
                 }
                 Ok(None) => {
-                    anyhow::bail!(
-                        "consumer not started: set CODER_EXPERIMENTS=agent-lifecycle-hooks and CODER_CHAT_HOOK_URL"
-                    );
+                    anyhow::bail!("consumer not started: set CODER_CHAT_HOOK_SECRET");
                 }
                 Err(e) => anyhow::bail!("failed to start consumer: {e:#}"),
             }
@@ -1060,6 +1118,19 @@ async fn run_hooks(action: HooksCommands) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn hook_simulate_url(hooks: &config::env::CoderHooksConfig) -> Result<String> {
+    if let Ok(url) = std::env::var("CODER_CHAT_HOOK_URL") {
+        if !url.trim().is_empty() {
+            return Ok(url);
+        }
+    }
+
+    let port = hooks
+        .port()
+        .context("OPENFLOWS_HOOK_ADDR has no usable port for hook simulation")?;
+    Ok(format!("http://127.0.0.1:{port}/experimental/hooks/chat"))
 }
 
 async fn run_reset() -> Result<()> {

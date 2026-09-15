@@ -72,10 +72,7 @@ pub async fn classify_stop(store: &SharedStore, chat_id: &str) -> (StopClassific
 /// Build the durable audit record for a stop. Persists under
 /// `ticket:{T}:hooks:stop`. Returns the HookKick to publish if the stop is a
 /// planned handoff, else `None`.
-pub fn stop_audit_record(
-    classification: &StopClassification,
-    detail: &Value,
-) -> serde_json::Value {
+pub fn stop_audit_record(classification: &StopClassification, detail: &Value) -> serde_json::Value {
     json!({
         "classification": classification.as_str(),
         "detail": detail,

@@ -114,12 +114,10 @@ impl ForgePairNode {
 
         match chat_status {
             ChatStatus::Running => {
-                let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
-                let current: Option<String> = store.get_typed(&status_key).await;
-                if current.as_deref() != Some("building") && current.as_deref() != Some("planning")
-                {
-                    store.set(&status_key, json!("building")).await;
-                }
+                debug!(
+                    ticket_id,
+                    role, "Forge chat running — preserving harness phase"
+                );
             }
             ChatStatus::Waiting => match last_action.as_deref() {
                 Some("completed") | None => {

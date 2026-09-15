@@ -12,8 +12,8 @@
 
 use super::context::resolve_chat;
 use crate::hooks::types::HookEvent;
-use pocketflow_core::{HookKick, HookKickPublisher};
 use pocketflow_core::SharedStore;
+use pocketflow_core::{HookKick, HookKickPublisher};
 use serde_json::Value;
 
 /// Harness coordination substrings that mutate durable orchestration state and

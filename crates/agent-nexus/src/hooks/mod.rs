@@ -12,17 +12,17 @@
 //! `pre_tool_use` — the centralized analogue of the in-workspace
 //! `orchestration/plugin/hooks/{role}/` shell hooks.
 //!
-//! Enablement (Coder side, deployment config):
-//!   CODER_EXPERIMENTS=agent-lifecycle-hooks
-//!   CODER_CHAT_HOOK_URL=http://<host>:3001/hooks/chat
-//!   CODER_CHAT_HOOK_SECRET=<>=32 random bytes>
-//! The OpenFlows consumer binds on `OPENFLOWS_HOOK_ADDR` (default 127.0.0.1:3001).
+//! Enablement is wired by the bundled deployment: Coder runs the
+//! `agent-lifecycle-hooks` experiment and posts to the OpenFlows-owned internal
+//! URL. The controller starts its consumer when `CODER_CHAT_HOOK_SECRET` is
+//! present, and binds on `OPENFLOWS_HOOK_ADDR` (default `0.0.0.0:3001`).
 
 mod bootstrap;
 mod context;
 mod guard;
 mod jwt;
 mod kick;
+mod sentinel;
 mod server;
 mod simulate;
 mod stop;
@@ -30,15 +30,16 @@ mod types;
 
 pub use bootstrap::{build_bootstrap_context, HookBootstrapContext};
 pub use context::{read_ticket_state, resolve_chat, HookContext, TicketState};
-pub use guard::phase_guard;
+pub use guard::{is_valid_phase, phase_guard, phase_guidance};
 pub use jwt::verify_hook_jwt;
 pub use kick::maybe_publish_kick;
+pub use sentinel::{sentinel_guidance, sentinel_job, sentinel_phase_guard, SentinelJob};
 pub use server::{create_router, start_lifecycle_hook_server};
 pub use simulate::dispatch_simulated_event;
 pub use stop::{classify_stop, stop_audit_record, StopClassification};
 pub use types::{HookDecision, HookEvent, HookPayload};
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod slice_tests;
+#[cfg(test)]
+mod tests;

@@ -103,22 +103,30 @@ For every PR, SENTINEL goes through these steps in order:
 3. **Static analysis** — Run Semgrep and any relevant linters. Attach findings to relevant lines.
 4. **Logic review** — Read the implementation for correctness, edge cases, and error handling.
 5. **Test review** — Verify that tests exist and actually test the right thing.
-6. **Decision** — `approved` (merge) or `changes_requested` (NEXUS reassigns to FORGE).
+6. **Decision** — `approve` (merge) or `reject` (request changes; FORGE reworks in its own chat session).
 
-Output `STATUS.json`:
-```json
-{
-  "outcome": "approved | changes_requested",
-  "pr_id": 42,
-  "spec_verified": true,
-  "blockers": [
-    {
-      "file": "src/api/handler.rs",
-      "line": 78,
-      "kind": "SpecMismatch | MissingTest | SecurityFlaw | LogicError",
-      "description": "Ticket required pagination support but handler returns all records unconditionally.",
-      "fix": "Add `limit` and `offset` query params matching the spec in TASK.md section 3."
-    }
-  ]
-}
+### Machine-readable handshake (REQUIRED)
+
+The controller does **not** read a `STATUS.json` file. The only thing that records your
+verdict for the orchestrator is the harness command `openflows-harness review submit`.
+After you reach a decision, write your full evaluation to a markdown report file
+(`segment-N-eval.md` / `final-review.md`) and then **run the harness command**:
+
+```bash
+# Approve the PR (routes to vessel/merge)
+openflows-harness review submit --verdict approve --report /path/to/final-review.md
+
+# Reject the PR (loops back to FORGE for rework in the SAME chat session)
+openflows-harness review submit --verdict reject --report /path/to/final-review.md
 ```
+
+Your markdown report remains human/FORGE-facing — keep the `blockers[]` shape with
+`file`, `line`, `kind`, and a concrete `fix` for each issue, and it is fine for a
+`reject` to include a `changes` follow-up with inline `file:line` guidance. But the
+machine-readable result that the controller consumes is the harness command's Redis
+write, **not** a `STATUS.json` file. Do NOT write a `STATUS.json` expecting the
+controller to read it.
+
+A `reject` verdict loops back to FORGE, which continues in its existing Coder chat
+session (it is not re-provisioned). When FORGE re-signals `status set review_ready`
+after addressing your report, you will be asked to re-review the updated PR.

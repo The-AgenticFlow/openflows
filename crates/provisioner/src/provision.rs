@@ -170,8 +170,12 @@ impl Provisioner {
                 for base in [".agents/hooks", ".claude/hooks"] {
                     let target = format!("{base}/{role}/{name}");
                     match transport.copy_file(&entry.path(), &target).await {
-                        Ok(_) => info!(role, script = %name, target = %target, "Provisioned hook script"),
-                        Err(e) => warn!(role, script = %name, error = %e, "Failed to copy hook script"),
+                        Ok(_) => {
+                            info!(role, script = %name, target = %target, "Provisioned hook script")
+                        }
+                        Err(e) => {
+                            warn!(role, script = %name, error = %e, "Failed to copy hook script")
+                        }
                     }
                     // Also drop an extensionless alias for backends that map
                     // event names without `.sh` (e.g. `.agents/hooks/{role}/SessionStart`).
@@ -187,7 +191,11 @@ impl Provisioner {
                 if let Ok(json) = serde_json::to_string_pretty(&settings) {
                     let _ = transport.write_file(".claude/settings.json", &json).await;
                     let _ = transport.write_file(".agents/settings.json", &json).await;
-                    info!(role, count = script_entries.len(), "Provisioned client hook settings");
+                    info!(
+                        role,
+                        count = script_entries.len(),
+                        "Provisioned client hook settings"
+                    );
                 }
             }
         } else {
@@ -201,10 +209,7 @@ impl Provisioner {
 /// Map OpenFlows role hook scripts to Claude Code / Codex hook event names and
 /// build a `settings.json` that the client agent executes. Unknown event names
 /// are preserved as custom hooks so nothing is silently dropped.
-fn build_hook_settings(
-    role: &str,
-    scripts: &[(String, std::path::PathBuf)],
-) -> serde_json::Value {
+fn build_hook_settings(role: &str, scripts: &[(String, std::path::PathBuf)]) -> serde_json::Value {
     use serde_json::{json, Map, Value};
 
     // Canonical Claude Code event names.
@@ -436,7 +441,10 @@ mod tests {
         let scripts = vec![
             ("pre_bash_guard.sh".to_string(), PathBuf::from("unused")),
             ("session_start.sh".to_string(), PathBuf::from("unused")),
-            ("stop_require_artifact.sh".to_string(), PathBuf::from("unused")),
+            (
+                "stop_require_artifact.sh".to_string(),
+                PathBuf::from("unused"),
+            ),
         ];
         let settings = build_hook_settings("forge", &scripts);
         let hooks = settings["hooks"].as_object().unwrap();
@@ -470,8 +478,12 @@ mod tests {
             .unwrap();
 
         // Scripts copied into both discovery conventions.
-        assert!(transport.written(".agents/hooks/forge/pre_bash_guard.sh").is_some());
-        assert!(transport.written(".claude/hooks/forge/pre_bash_guard.sh").is_some());
+        assert!(transport
+            .written(".agents/hooks/forge/pre_bash_guard.sh")
+            .is_some());
+        assert!(transport
+            .written(".claude/hooks/forge/pre_bash_guard.sh")
+            .is_some());
 
         // settings.json written for the client agent.
         let settings = transport

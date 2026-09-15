@@ -71,6 +71,14 @@ data "coder_parameter" "github_pat" {
   type        = "string"
 }
 
+data "coder_parameter" "coder_chat_hook_secret" {
+  name        = "coder_chat_hook_secret"
+  description = "Shared OpenFlows/Coder lifecycle hook signing secret"
+  default     = "openflows-local-hook-secret-change-me-000000000000000000"
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "start_controller" {
   name        = "start_controller"
   description  = "Whether to auto-start the OpenFlows controller on workspace startup"
@@ -178,6 +186,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
     export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
+    export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
     # GitHub PAT for issue sync - export as env var so controller picks it up automatically
     export GITHUB_TOKEN="${data.coder_parameter.github_pat.value}"
     echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
@@ -243,6 +252,7 @@ resource "docker_container" "workspace" {
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
     "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
+    "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can

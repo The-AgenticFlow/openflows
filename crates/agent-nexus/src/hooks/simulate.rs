@@ -49,9 +49,7 @@ pub fn build_event_body(event: &str, chat_id: &str, dispatch_id: &str) -> Result
         .map_err(|_| anyhow!("unknown hook event `{event}`"))?;
 
     let (data, schema) = match parsed {
-        HookEvent::SessionStart => {
-            (json!({"source": "startup"}), json!({"schema_version": 1}))
-        }
+        HookEvent::SessionStart => (json!({"source": "startup"}), json!({"schema_version": 1})),
         HookEvent::UserPromptSubmit => (
             json!({"prompt": "Implement the ticket and open a PR.", "parts": []}),
             json!({"schema_version": 1}),

@@ -50,6 +50,23 @@ When writing `segment-N-eval.md` with `CHANGES_REQUESTED`:
 - Do NOT write vague feedback like "improve error handling"
 - DO write: `src/auth/session.ts line 47: throws raw Error. Required: throw new AppError('SESSION_EXPIRED', 401) per CODING.md rule 3`
 
+### Machine-readable handshake (REQUIRED)
+
+`CONTRACT.md`, `segment-N-eval.md`, and `final-review.md` are **working artifacts FORGE reads**.
+They are **not** what the controller consumes. The controller reads the Redis write made by
+the harness command, so after you finalize your evaluation you MUST run:
+
+```bash
+# Reject → route rework back to FORGE in its same chat session
+openflows-harness review submit --verdict reject --report segment-N-eval.md
+
+# Approve → route to vessel/merge
+openflows-harness review submit --verdict approve --report final-review.md
+```
+
+Do NOT write a `STATUS.json` file expecting the controller to read it. Keep your verdict's
+machine-readable record in the harness Redis key via the command above.
+
 ### Example segment eval
 
 ```markdown
@@ -76,6 +93,8 @@ When all segments are approved, run the complete verification:
 2. Full linter across entire project
 3. Check every CONTRACT criterion is satisfied
 4. Write `final-review.md` with `APPROVED` verdict and PR description
+5. Submit the verdict to the controller:
+   `openflows-harness review submit --verdict approve --report final-review.md`
 
 Your PR description becomes the actual PR body - make it informative.
 

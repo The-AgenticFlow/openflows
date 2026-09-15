@@ -22,8 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${PROJECT_ROOT}/target/debug/openflows"
 
-PORT="${OPENFLOWS_HOOK_ADDR:-3921}"
-HOOK_URL="http://127.0.0.1:${PORT}/hooks/chat"
+PORT="${OPENFLOWS_HOOK_PORT:-3921}"
+HOOK_URL="http://127.0.0.1:${PORT}/experimental/hooks/chat"
 SECRET="${CODER_CHAT_HOOK_SECRET:-$(openssl rand -hex 32)}"
 
 # Colours
@@ -44,10 +44,9 @@ if [ ! -x "${BIN}" ]; then
 fi
 
 # Environment for both the consumer and the simulator.
-export CODER_EXPERIMENTS=agent-lifecycle-hooks
-export CODER_CHAT_HOOK_URL="${HOOK_URL}"
 export CODER_CHAT_HOOK_SECRET="${SECRET}"
 export OPENFLOWS_HOOK_ADDR="127.0.0.1:${PORT}"
+export OPENFLOWS_HOOK_HOST="127.0.0.1"
 export CODER_CHAT_HOOK_ALLOW_INSECURE=true
 export CODER_CHAT_HOOK_ENABLED=true
 # Optional audit persistence: if REDIS_URL is set, the consumer writes the tail
@@ -61,7 +60,7 @@ trap 'kill "${CONSUMER_PID}" 2>/dev/null || true; rm -f "${LOGFILE}"' EXIT
 
 # Wait for the consumer to accept connections.
 for _ in $(seq 1 50); do
-  if curl -sf "http://127.0.0.1:${PORT}/hooks/health" >/dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:${PORT}/experimental/hooks/health" >/dev/null 2>&1; then
     ok "consumer healthy on :${PORT}"
     break
   fi

@@ -12,6 +12,12 @@ use envconfig::Envconfig;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Local-stack default shared hook secret. Production deployments should
+/// override `CODER_CHAT_HOOK_SECRET`; the default exists so the bundled compose
+/// stack and Nexus workspace agree without operator plumbing.
+pub const DEFAULT_CODER_CHAT_HOOK_SECRET: &str =
+    "openflows-local-hook-secret-change-me-000000000000000000";
+
 /// Coder-related configuration.
 ///
 /// `Debug` is implemented manually to redact credentials.
@@ -69,10 +75,11 @@ impl CoderConfig {
 /// signature and observes (or denies/rewrites) the event.
 ///
 /// The hook endpoint is a purely internal detail: the consumer derives it from
-/// its bind address + the internal host label Coder must use to reach it (in a
-/// single-host Docker dev topology that is `host.docker.internal`). Operators
-/// control only the port (`OPENFLOWS_HOOK_ADDR`); they never type the internal
-/// URL, and it is not exposed as an operator-facing variable.
+/// its bind address + the internal host label Coder must use to reach it. In
+/// the bundled Docker topology the Nexus workspace has the stable network alias
+/// `openflows-nexus`. The bundled stack sets the Coder-side URL/experiment
+/// values; operators only override the shared secret for production or the bind
+/// address/host for unusual topology.
 ///
 /// On Coder's side, enabling the experiment looks like:
 ///   CODER_EXPERIMENTS=agent-lifecycle-hooks
@@ -96,25 +103,31 @@ pub struct CoderHooksConfig {
     #[envconfig(from = "CODER_CHAT_HOOK_ALLOW_INSECURE", default = "false")]
     pub chat_hook_allow_insecure: bool,
 
-    /// Bind address for the OpenFlows hook consumer endpoint.
-    #[envconfig(from = "OPENFLOWS_HOOK_ADDR", default = "127.0.0.1:3001")]
+    /// Bind address for the OpenFlows hook consumer endpoint. The default is
+    /// Docker-reachable because the bundled Coder service posts from a container.
+    #[envconfig(from = "OPENFLOWS_HOOK_ADDR", default = "0.0.0.0:3001")]
     pub hook_addr: String,
 
-    /// Internal host label Coder must use to reach the consumer. Defaults to
-    /// `host.docker.internal` (single-host Docker dev topology). Advanced
-    /// deployments with a different topology override this; it is NOT a
-    /// user-facing value.
-    #[envconfig(from = "OPENFLOWS_HOOK_HOST", default = "host.docker.internal")]
+    /// Internal host label Coder must use to reach the consumer. Defaults to the
+    /// Nexus workspace network alias in the bundled Docker topology.
+    #[envconfig(from = "OPENFLOWS_HOOK_HOST", default = "openflows-nexus")]
     pub hook_host: String,
+
+    /// Emit routine hook lifecycle logs. Warnings/errors remain visible.
+    #[envconfig(from = "OPENFLOWS_HOOK_LOGS", default = "false")]
+    pub hook_logs: bool,
 }
 
 impl CoderHooksConfig {
-    /// Whether the OpenFlows consumer should be started at all: only when the
-    /// experiment flag is on (the URL is derived, so no URL check is needed).
+    /// Whether the OpenFlows consumer should be started at all. Coder's
+    /// experiment flag is configured on the Coder service; this process only
+    /// needs a shared secret to verify signed dispatches.
     pub fn enabled(&self) -> bool {
         self.chat_hook_enabled
-            && std::env::var("CODER_EXPERIMENTS")
-                .map(|v| v.split(',').any(|e| e.trim() == "agent-lifecycle-hooks"))
+            && self
+                .chat_hook_secret
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
                 .unwrap_or(false)
     }
 
@@ -472,6 +485,11 @@ mod tests {
             "CODER_IMAGE_TAG",
             "REDIS_URL",
             "A2A_RELAY_ADDR",
+            "CODER_CHAT_HOOK_SECRET",
+            "CODER_CHAT_HOOK_ENABLED",
+            "OPENFLOWS_HOOK_ADDR",
+            "OPENFLOWS_HOOK_HOST",
+            "OPENFLOWS_HOOK_LOGS",
             "OPENFLOWS_TENANT",
             "OPENFLOWS_TAR",
             "USE_AI_GATEWAY",
@@ -485,6 +503,10 @@ mod tests {
         assert_eq!(cfg.coder.image_tag, "v2.37.1");
         assert_eq!(cfg.infra.effective_redis_url(), "redis://localhost:6379");
         assert_eq!(cfg.infra.a2a_relay_addr, "127.0.0.1:3000");
+        assert_eq!(cfg.hooks.hook_addr, "0.0.0.0:3001");
+        assert_eq!(cfg.hooks.hook_host, "openflows-nexus");
+        assert!(!cfg.hooks.hook_logs);
+        assert!(!cfg.hooks.enabled());
         assert_eq!(cfg.tenant.effective_tenant(), "default");
         assert_eq!(cfg.tenant.tar, "tar");
         assert_eq!(cfg.agent.use_ai_gateway, None);
@@ -536,6 +558,38 @@ mod tests {
                 "USE_AI_GATEWAY={v}"
             );
         }
+    }
+
+    #[test]
+    fn hook_consumer_enablement_uses_secret_not_coder_experiment_flag() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_EXPERIMENTS",
+            "CODER_CHAT_HOOK_SECRET",
+            "CODER_CHAT_HOOK_ENABLED",
+        ]);
+        guard.unset_all();
+
+        std::env::set_var("CODER_EXPERIMENTS", "agent-lifecycle-hooks");
+        assert!(!EnvConfig::from_env().unwrap().hooks.enabled());
+
+        std::env::set_var("CODER_CHAT_HOOK_SECRET", DEFAULT_CODER_CHAT_HOOK_SECRET);
+        assert!(EnvConfig::from_env().unwrap().hooks.enabled());
+
+        std::env::set_var("CODER_CHAT_HOOK_ENABLED", "false");
+        assert!(!EnvConfig::from_env().unwrap().hooks.enabled());
+    }
+
+    #[test]
+    fn hook_logs_are_opt_in() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&["OPENFLOWS_HOOK_LOGS"]);
+        guard.unset_all();
+
+        assert!(!EnvConfig::from_env().unwrap().hooks.hook_logs);
+
+        std::env::set_var("OPENFLOWS_HOOK_LOGS", "true");
+        assert!(EnvConfig::from_env().unwrap().hooks.hook_logs);
     }
 
     #[test]

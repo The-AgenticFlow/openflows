@@ -75,23 +75,23 @@ If you receive a "CONTEXT RESET REQUIRED" message:
 2. This writes `HANDOFF.md` with your current state
 3. Exit cleanly - a fresh FORGE will continue from your handoff
 
-## Valid STATUS.json Status Values
+## Harness Phases (authoritative)
 
-When writing `STATUS.json`, you MUST use one of these exact status strings.
-Any other value will be treated as `BLOCKED` and your work will be wasted.
+Coordination is tracked through the `openflows-harness` CLI, not a local `STATUS.json`
+file. Use exactly one of these phases via `openflows-harness status set <phase>`; any other
+value is rejected by the harness and your work is wasted.
 
-| Status | When to use |
+| Phase | When to use |
 |---|---|
-| `PR_OPENED` | Work complete and PR created (include `pr_url`, `pr_number`, `branch`) |
-| `COMPLETE` | All work done but PR creation deferred to harness |
-| `BLOCKED` | Cannot proceed (include `reason` and `blockers`) |
-| `FUEL_EXHAUSTED` | Budget/tokens exhausted |
-| `PENDING_REVIEW` | Work paused, waiting for review |
-| `AWAITING_SENTINEL_REVIEW` | Segment done, waiting for SENTINEL evaluation |
-| `APPROVED_READY` | Changes requested by SENTINEL have been addressed |
-| `SEGMENT_N_DONE` | Segment N complete (e.g. `SEGMENT_1_DONE`) |
+| `planning` | Analyzing the ticket and writing `PLAN.md`; wait for SENTINEL gate approval |
+| `building` | Implementing after SENTINEL approves the plan |
+| `testing` | Running the test suite and verifying behavior |
+| `review_ready` | PR is open and SENTINEL is reviewing the completed work |
+| `blocked` | Cannot proceed — include an exact, answerable question |
 
-Do NOT invent status values. If you need review use `PENDING_REVIEW`. If you need help use `BLOCKED`.
+Do NOT invent other phase values and do NOT write a `STATUS.json` file expecting the
+controller to read it. If you need review use `status set review_ready`. If you need help
+use `status set blocked`.
 
 ## When work is complete
 
@@ -116,39 +116,28 @@ When SENTINEL approves all segments and you're ready to finish:
    - Set head: `forge-${SPRINTLESS_PAIR_ID}/${SPRINTLESS_TICKET_ID}`
    - Set base: `main`
 
-3. **Write STATUS.json with PR_OPENED:**
-   ```json
-   {
-     "status": "PR_OPENED",
-     "pair": "${SPRINTLESS_PAIR_ID}",
-     "ticket_id": "${SPRINTLESS_TICKET_ID}",
-     "branch": "forge-${SPRINTLESS_PAIR_ID}/${SPRINTLESS_TICKET_ID}",
-     "pr_url": "https://github.com/owner/repo/pull/42",
-     "pr_number": 42,
-     "files_changed": ["list", "of", "files"],
-     "segments_completed": N,
-     "timestamp": "2025-03-24T10:00:00Z"
-   }
+3. **Signal review-ready via the harness:**
+   ```bash
+   openflows-harness status set review_ready
+   # (with the opened PR recorded):
+   openflows-harness pr opened --pr <N> --branch <branch> --title <title>
    ```
 
-4. **Exit** - The harness will detect STATUS.json and complete the lifecycle.
+4. **Exit** - NEXUS reads the harness status and spawns SENTINEL to review the PR.
+   SENTINEL's verdict (`approve`/`reject`) is submitted via
+   `openflows-harness review submit`. If rejected, stay in this chat, address the
+   report, and re-run `openflows-harness status set review_ready`.
 
 ## If you cannot create a PR
 
 If you encounter issues pushing or creating a PR:
 
-1. Write STATUS.json with `BLOCKED` status:
-   ```json
-   {
-     "status": "BLOCKED",
-     "pair": "${SPRINTLESS_PAIR_ID}",
-     "ticket_id": "${SPRINTLESS_TICKET_ID}",
-     "branch": "forge-${SPRINTLESS_PAIR_ID}/${SPRINTLESS_TICKET_ID}",
-     "reason": "Could not push/create PR: <specific error>",
-     "blockers": [],
-     "files_changed": ["list", "of", "files"]
-   }
+1. Set `status set blocked` via the harness with an exact, answerable reason:
+   ```bash
+   openflows-harness status set blocked
    ```
+   Describe the specific barrier (push/PR creation error) precisely in your next
+   message so NEXUS / a human can unblock you.
 
 2. Exit - NEXUS will be alerted for human intervention.
 

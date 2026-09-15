@@ -21,7 +21,6 @@ use super::bootstrap::HookBootstrapContext;
 use super::jwt::verify_hook_jwt;
 use super::types::{HookDecision, HookEvent, HookPayload};
 use anyhow::{anyhow, Context, Result};
-use config::env::CoderHooksConfig;
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -29,6 +28,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use config::env::CoderHooksConfig;
 use pocketflow_core::{HookKickPublisher, SharedStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -56,7 +56,10 @@ pub fn create_router(
 ) -> Router {
     Router::new()
         .route("/experimental/hooks/chat", post(handle_hook))
-        .route("/experimental/hooks/health", axum::routing::get(handle_health))
+        .route(
+            "/experimental/hooks/health",
+            axum::routing::get(handle_health),
+        )
         .with_state(HookServerState {
             store,
             config,
@@ -113,11 +116,13 @@ async fn handle_hook(
 
     // Build the audit key BEFORE verifying so a failed signature is still
     // observable (we only persist after verification, below).
-    debug!(
-        dispatch_id = %dispatch_id,
-        event = ?payload.event,
-        "Hook consumer: received dispatch"
-    );
+    if state.config.hook_logs {
+        debug!(
+            dispatch_id = %dispatch_id,
+            event = ?payload.event,
+            "Hook consumer: received dispatch"
+        );
+    }
 
     // Verify the JWT.
     let auth = headers
@@ -137,13 +142,15 @@ async fn handle_hook(
         return (StatusCode::UNAUTHORIZED, format!("{e:#}")).into_response();
     }
 
-    info!(
-        dispatch_id = %dispatch_id,
-        chat_id = %chat_id,
-        event = ?payload.event,
-        client = ?payload.meta.client,
-        "OpenFlows observed Coder lifecycle hook event"
-    );
+    if state.config.hook_logs {
+        info!(
+            dispatch_id = %dispatch_id,
+            chat_id = %chat_id,
+            event = ?payload.event,
+            client = ?payload.meta.client,
+            "OpenFlows observed Coder lifecycle hook event"
+        );
+    }
 
     // Persist a durable audit trail (best-effort; never fail the dispatch).
     let _ = persist_audit(&state.store, &payload).await;
@@ -172,8 +179,13 @@ async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_js
             // command paths + resume state). If bootstrap context is unavailable
             // or the chat isn't resolvable, fall back to observation-only.
             if let Some(ctx) = &state.bootstrap {
-                if let Some(context) =
-                    super::bootstrap::build_bootstrap_context(&state.store, &chat_id, &payload.data, ctx).await
+                if let Some(context) = super::bootstrap::build_bootstrap_context(
+                    &state.store,
+                    &chat_id,
+                    &payload.data,
+                    ctx,
+                )
+                .await
                 {
                     return json!({ "model_context": context });
                 }
@@ -196,7 +208,10 @@ async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_js
                 )
                 .await;
             }
-            decision_to_response(&HookDecision::observe())
+            // Safety net: relay any guidance/errors accumulated by pre_tool_use
+            // policy checks back to the model so it can self-correct.
+            let decision = post_tool_use_feedback(&state.store, &chat_id, &payload.data).await;
+            decision_to_response(&decision)
         }
 
         HookEvent::Stop => {
@@ -204,9 +219,10 @@ async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_js
             // agent wants to stop against durable state; persist the record and,
             // for a planned handoff, kick Nexus to reconcile the paused agent.
             let (classification, detail) = super::stop::classify_stop(&state.store, &chat_id).await;
-            if let (Some(ticket), Some(publisher)) =
-                (detail.get("ticket_id").and_then(|v| v.as_str()), &state.publisher)
-            {
+            if let (Some(ticket), Some(publisher)) = (
+                detail.get("ticket_id").and_then(|v| v.as_str()),
+                &state.publisher,
+            ) {
                 let _ = state
                     .store
                     .set(
@@ -219,7 +235,11 @@ async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_js
                         chat_id: chat_id.clone(),
                         dispatch_id: dispatch_id.clone(),
                         event: "stop".to_string(),
-                        role: detail.get("role").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        role: detail
+                            .get("role")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         ticket_id: ticket.to_string(),
                         hint: "stop_planned_handoff".to_string(),
                         data: detail.clone(),
@@ -234,47 +254,197 @@ async fn route_event(state: &HookServerState, payload: &HookPayload) -> serde_js
             // Generic policy (rm -rf, force-push, redis-cli, workspace escape)
             // layered with Slice C's stateful, phase-aware write guard.
             let base = apply_policy(payload);
-            let role = super::context::resolve_chat(&state.store, &chat_id).await.role.unwrap_or_default();
-            let tool_name = payload.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let hc = super::context::resolve_chat(&state.store, &chat_id).await;
+            let role = hc.role.clone().unwrap_or_default();
+            let tool_name = payload
+                .data
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             let input = payload.data.get("tool_input").unwrap_or(&Value::Null);
-            decision_to_response(
-                &super::guard::phase_guard(&state.store, &chat_id, &role, tool_name, input, base).await,
-            )
+
+            let decision = if role.eq_ignore_ascii_case("sentinel") {
+                // Sentinel lifecycle: read-only + review-ordering checks.
+                if let Some(ticket) = &hc.ticket_id {
+                    let st = super::context::read_ticket_state(&state.store, ticket).await;
+                    super::sentinel::sentinel_phase_guard(
+                        &state.store,
+                        ticket,
+                        &st,
+                        tool_name,
+                        input,
+                        base,
+                    )
+                    .await
+                } else {
+                    base
+                }
+            } else {
+                super::guard::phase_guard(&state.store, &chat_id, &role, tool_name, input, base)
+                    .await
+            };
+
+            // Record any denial/guidance so post_tool_use can feed it back.
+            if let Some(ticket) = &hc.ticket_id {
+                super::context::record_guidance(
+                    &state.store,
+                    ticket,
+                    serde_json::json!({
+                        "deny": decision.deny,
+                        "reason": decision.reason,
+                        "model_context": decision.model_context,
+                        "tool_name": tool_name,
+                        "ts": chrono::Utc::now().timestamp(),
+                    }),
+                )
+                .await;
+            }
+            decision_to_response(&decision)
         }
 
-        HookEvent::UserPromptSubmit | HookEvent::PreCompact | HookEvent::PostCompact => {
+        HookEvent::UserPromptSubmit => {
+            // Feed the agent's current lifecycle status back to the model before
+            // it processes the user prompt, so it knows what phase it is in.
+            let base = apply_policy(payload);
+            let decision = prompt_submit_context(&state.store, &chat_id, base).await;
+            decision_to_response(&decision)
+        }
+
+        HookEvent::PreCompact | HookEvent::PostCompact => {
             decision_to_response(&apply_policy(payload))
         }
     }
 }
 
-/// Convert the internal [`HookDecision`] into Coder's response-body schema.
-/// A denial carries `permission.decision=deny`; a rewrite carries
-/// `permission.decision=allow` with `permission.input_override`; an
-/// observation yields an empty JSON object (equivalent to an empty body).
-fn decision_to_response(decision: &HookDecision) -> serde_json::Value {
-    if !decision.deny && decision.rewrite.is_none() {
-        // No-op: Coder accepts an empty JSON object.
-        return serde_json::json!({});
+/// Build the `post_tool_use` feedback decision: drain pending pre_tool_use
+/// guidance, and (for SENTINEL) mark that an evaluation report was written.
+/// Returns the drained guidance as `model_context` so the agent can self-correct.
+async fn post_tool_use_feedback(
+    store: &pocketflow_core::SharedStore,
+    chat_id: &str,
+    data: &Value,
+) -> HookDecision {
+    let hc = super::context::resolve_chat(store, chat_id).await;
+    let Some(ticket) = hc.ticket_id else {
+        return HookDecision::observe();
+    };
+
+    // SENTINEL wrote a review report → record it so a later `review submit`
+    // passes the ordering gate.
+    if hc
+        .role
+        .as_deref()
+        .map(|r| r.eq_ignore_ascii_case("sentinel"))
+        .unwrap_or(false)
+    {
+        let path = data
+            .get("tool_input")
+            .and_then(|i| i.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_eval = path.ends_with("-eval.md")
+            || path.ends_with("eval.md")
+            || path.ends_with("final-review.md")
+            || path.ends_with("review.md")
+            || path.contains("review-report");
+        if is_eval {
+            super::context::record_review_report_marker(store, &ticket).await;
+        }
     }
+
+    let pending = super::context::drain_guidance(store, &ticket).await;
+    if pending.is_empty() {
+        return HookDecision::observe();
+    }
+    let reasons: Vec<String> = pending
+        .iter()
+        .filter_map(|g| {
+            g.get("reason")
+                .and_then(|r| r.as_str())
+                .or_else(|| g.get("model_context").and_then(|m| m.as_str()))
+                .map(str::to_string)
+        })
+        .collect();
+    if reasons.is_empty() {
+        return HookDecision::observe();
+    }
+    let context = format!("[openflows hook policy]\n{}", reasons.join("\n"));
+    HookDecision::observe().with_model_context(context)
+}
+
+/// Feed the agent's current lifecycle status to the model ahead of a prompt.
+async fn prompt_submit_context(
+    store: &pocketflow_core::SharedStore,
+    chat_id: &str,
+    base: HookDecision,
+) -> HookDecision {
+    let hc = super::context::resolve_chat(store, chat_id).await;
+    if let Some(ticket) = &hc.ticket_id {
+        let st = super::context::read_ticket_state(store, ticket).await;
+        let role = hc.role.clone().unwrap_or_default();
+        let phase = st.phase.clone().unwrap_or_else(|| "unset".to_string());
+        let mut lines = format!(
+            "Current ticket phase: {phase}\nPlan present: {}",
+            st.plan_exists
+        );
+        if st.gate_approved {
+            lines.push_str("\nPlanning gate: approved");
+        }
+        if st.pr_recorded {
+            lines.push_str("\nPR: recorded");
+        }
+        if st.handoff_exists {
+            lines.push_str("\nHandoff: present");
+        }
+        // Role-specific reminder so the agent acts within its lifecycle.
+        if role.eq_ignore_ascii_case("forge") && phase == "planning" && !st.plan_exists {
+            lines.push_str(
+                "\nReminder: you must run `/plan` and write PLAN.md before touching source.",
+            );
+        }
+        return base.with_model_context(lines);
+    }
+    base
+}
+
+/// Convert the internal [`HookDecision`] into Coder's response-body schema.
+///
+/// - A denial carries `permission.decision=deny` (+ `permission.reason`).
+/// - A rewrite carries `permission.decision=allow` with `permission.input_override`.
+/// - `model_context` (status / post-tool guidance fed back to the model) is
+///   always emitted as the top-level field when present, even alongside an
+///   otherwise-empty observation (the pre-existing slice-A bootstrap shape is
+///   `{ "model_context": "..." }`).
+fn decision_to_response(decision: &HookDecision) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+
+    if let Some(context) = &decision.model_context {
+        out.insert(
+            "model_context".to_string(),
+            serde_json::Value::String(context.clone()),
+        );
+    }
+
     if decision.deny {
         let mut permission = serde_json::json!({ "decision": "deny" });
         if let Some(reason) = &decision.reason {
-            permission["user_message"] = serde_json::Value::String(reason.clone());
+            permission["reason"] = serde_json::Value::String(reason.clone());
         }
-        return serde_json::json!({ "permission": permission });
-    }
-    // allow + input_override (rewrite). input_override must carry the full,
-    // canonical replacement for the tool input or prompt.
-    if let Some(rewrite) = &decision.rewrite {
-        return serde_json::json!({
-            "permission": {
+        out.insert("permission".to_string(), permission);
+    } else if let Some(rewrite) = &decision.rewrite {
+        // allow + input_override (rewrite). input_override must carry the full,
+        // canonical replacement for the tool input or prompt.
+        out.insert(
+            "permission".to_string(),
+            serde_json::json!({
                 "decision": "allow",
                 "input_override": rewrite
-            }
-        });
+            }),
+        );
     }
-    serde_json::json!({})
+
+    serde_json::Value::Object(out)
 }
 
 /// Centralized policy seam. Mutable events can be denied or rewritten here.
@@ -332,7 +502,10 @@ fn decide_pre_tool_use(data: &Value) -> HookDecision {
         _ => {
             // Unknown / MCP / dynamic tool: no built-in duplicate-key precheck
             // exists server-side (D4), so allow and rely on the workspace.
-            debug!(tool = tool_name, "Hook consumer: ungated tool passed through");
+            debug!(
+                tool = tool_name,
+                "Hook consumer: ungated tool passed through"
+            );
             HookDecision::observe()
         }
     }
@@ -391,14 +564,19 @@ fn classify_command(cmd: &str) -> HookDecision {
         return deny("recursive delete of filesystem root".into());
     }
     if (cmd.contains("git push") && cmd.contains("--force") && cmd.contains("main"))
-        || (cmd.contains("git push") && (cmd.contains("-f") || cmd.contains("--force")) && cmd.contains("master"))
+        || (cmd.contains("git push")
+            && (cmd.contains("-f") || cmd.contains("--force"))
+            && cmd.contains("master"))
     {
         return deny("force-push to default branch".into());
     }
     if cmd.contains("redis-cli") {
         return deny("direct Redis access — use openflows-harness for all coordination".into());
     }
-    if cmd.contains("coder templates") || cmd.contains("coder delete") || cmd.contains("coder server") {
+    if cmd.contains("coder templates")
+        || cmd.contains("coder delete")
+        || cmd.contains("coder server")
+    {
         return deny("control-plane mutation from a worker workspace".into());
     }
 
@@ -413,6 +591,7 @@ fn classify_command(cmd: &str) -> HookDecision {
             deny: false,
             reason: None,
             rewrite: Some(serde_json::json!({ "command": override_cmd })),
+            model_context: None,
         };
     }
 
@@ -441,7 +620,10 @@ fn is_outside_workspace(path: &str) -> bool {
 
 /// Write a tenant-namespaced, durable audit record for a hook event.
 async fn persist_audit(store: &SharedStore, payload: &HookPayload) -> Result<()> {
-    let mut events: Vec<Value> = store.get_typed("_hook_events_tail").await.unwrap_or_default();
+    let mut events: Vec<Value> = store
+        .get_typed("_hook_events_tail")
+        .await
+        .unwrap_or_default();
     events.push(json!({
         "dispatch_id": payload.meta.dispatch_id,
         "event": payload.event,
@@ -456,14 +638,16 @@ async fn persist_audit(store: &SharedStore, payload: &HookPayload) -> Result<()>
         let drop = events.len() - 500;
         events.drain(0..drop);
     }
-    store.set("_hook_events_tail", serde_json::to_value(events)?).await;
+    store
+        .set("_hook_events_tail", serde_json::to_value(events)?)
+        .await;
     Ok(())
 }
 
 /// Start the hook consumer HTTP server as a background task.
 ///
-/// Only binds when the experiment + config indicate it is enabled. Returns
-/// `Ok(None)` when disabled so the controller startup stays explicit.
+/// Only binds when hook config indicates it is enabled. Returns `Ok(None)` when
+/// disabled so the controller startup stays explicit.
 pub async fn start_lifecycle_hook_server(
     store: Arc<SharedStore>,
     config: CoderHooksConfig,
@@ -471,13 +655,20 @@ pub async fn start_lifecycle_hook_server(
     bootstrap: Option<HookBootstrapContext>,
 ) -> Result<Option<()>> {
     if !config.enabled() {
-        info!(
-            "Coder agent lifecycle hooks experiment not enabled; hook consumer not started \
-             (set CODER_EXPERIMENTS=agent-lifecycle-hooks)"
-        );
+        if config.hook_logs {
+            info!(
+                "Coder lifecycle hook consumer not started; set CODER_CHAT_HOOK_SECRET to enable it"
+            );
+        }
         return Ok(None);
     }
-    if config.chat_hook_secret.as_deref().map(str::len).unwrap_or(0) < 32 {
+    if config
+        .chat_hook_secret
+        .as_deref()
+        .map(str::len)
+        .unwrap_or(0)
+        < 32
+    {
         return Err(anyhow!(
             "CODER_CHAT_HOOK_SECRET must be at least 32 bytes to verify HS256 hook JWTs"
         ));
@@ -488,11 +679,13 @@ pub async fn start_lifecycle_hook_server(
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind hook consumer on {addr}"))?;
-    info!(
-        addr = %addr,
-        hook_url = %config.hook_public_url().unwrap_or_default(),
-        "OpenFlows lifecycle hook consumer starting"
-    );
+    if config.hook_logs {
+        info!(
+            addr = %addr,
+            hook_url = %config.hook_public_url().unwrap_or_default(),
+            "OpenFlows lifecycle hook consumer starting"
+        );
+    }
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
@@ -514,7 +707,10 @@ mod tests {
 
     #[test]
     fn allows_safe_command() {
-        let data = tool("Bash", json!({ "command": "openflows-harness status set building" }));
+        let data = tool(
+            "Bash",
+            json!({ "command": "openflows-harness status set building" }),
+        );
         let d = decide_pre_tool_use(&data);
         assert!(!d.deny);
         assert!(d.rewrite.is_none());
@@ -560,7 +756,10 @@ mod tests {
 
     #[test]
     fn allows_workspace_write() {
-        let data = tool("Write", json!({ "path": "/home/coder/workspace/src/main.rs" }));
+        let data = tool(
+            "Write",
+            json!({ "path": "/home/coder/workspace/src/main.rs" }),
+        );
         let d = decide_pre_tool_use(&data);
         assert!(!d.deny);
     }
@@ -570,7 +769,8 @@ mod tests {
         let d = HookDecision::deny("blocked");
         let v = decision_to_response(&d);
         assert_eq!(v["permission"]["decision"], "deny");
-        assert_eq!(v["permission"]["user_message"], "blocked");
+        assert_eq!(v["permission"]["reason"], "blocked");
+        assert!(v["permission"].get("user_message").is_none());
     }
 
     #[test]
@@ -579,6 +779,7 @@ mod tests {
             deny: false,
             reason: None,
             rewrite: Some(json!({ "command": "echo hi" })),
+            model_context: None,
         };
         let v = decision_to_response(&d);
         assert_eq!(v["permission"]["decision"], "allow");

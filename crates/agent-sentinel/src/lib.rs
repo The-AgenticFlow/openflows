@@ -8,8 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
 use config::state::{
-    full_ticket_key, full_ticket_key_flat, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
-    KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
+    full_ticket_key, full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+    KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
 };
 use config::{Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
@@ -82,6 +82,72 @@ impl SentinelNode {
             .await?;
         info!(chat_id, ticket_id, "Sent rejection follow-up to forge chat");
         Ok(())
+    }
+
+    /// Reduce a worker id (`forge-1`) to its role name (`forge`), used for
+    /// looking up chat bindings stored under the role name. Matches
+    /// `ForgePairNode::worker_role` / `NexusNode::worker_role`.
+    fn worker_role(worker_id: &str) -> &str {
+        worker_id
+            .rsplit_once('-')
+            .map(|(base, _)| base)
+            .unwrap_or(worker_id)
+    }
+
+    async fn release_sentinel_slots_for_ticket(store: &SharedStore, ticket_id: &str) -> Result<()> {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut changed = false;
+
+        for slot in slots.values_mut() {
+            if Self::worker_role(&slot.id) != "sentinel" {
+                continue;
+            }
+            let assigned_ticket = match &slot.status {
+                WorkerStatus::Assigned { ticket_id, .. }
+                | WorkerStatus::Working { ticket_id, .. }
+                | WorkerStatus::Done { ticket_id, .. }
+                | WorkerStatus::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
+                WorkerStatus::Idle => None,
+            };
+            if assigned_ticket == Some(ticket_id) {
+                slot.status = WorkerStatus::Idle;
+                changed = true;
+            }
+        }
+
+        if changed {
+            store
+                .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn remove_rejected_pr_from_pending(
+        store: &SharedStore,
+        ticket_id: &str,
+        pr_number: Option<u64>,
+    ) {
+        let mut pending_prs: Vec<Value> =
+            store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        let before = pending_prs.len();
+        pending_prs.retain(|pr| {
+            let same_ticket = pr.get("ticket_id").and_then(|v| v.as_str()) == Some(ticket_id);
+            let same_pr = pr_number
+                .and_then(|n| pr.get("number").and_then(|v| v.as_u64()).map(|m| m == n))
+                .unwrap_or(false);
+            !(same_ticket || same_pr)
+        });
+
+        if pending_prs.len() != before {
+            let removed = before - pending_prs.len();
+            store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
+            info!(
+                ticket_id,
+                pr_number, removed, "Removed rejected PR from pending_prs so Forge can rework"
+            );
+        }
     }
 }
 
@@ -240,10 +306,12 @@ impl Node for SentinelNode {
         let mut verdicts = Vec::new();
         for review in &reviewable {
             let ticket_id = review["ticket_id"].as_str().unwrap_or("");
+            let worker_id = review["worker_id"].as_str().unwrap_or("");
             let verdict = review["verdict"].as_str().unwrap_or("");
             let review_type = review["review_type"].as_str().unwrap_or("pr_review");
             verdicts.push(json!({
                 "ticket_id": ticket_id,
+                "worker_id": worker_id,
                 "verdict": verdict,
                 "review_type": review_type,
             }));
@@ -256,8 +324,10 @@ impl Node for SentinelNode {
         // detected in post() via the gate key in SharedStore.
         for gate in &planning_gate_pending {
             let ticket_id = gate["ticket_id"].as_str().unwrap_or("");
+            let worker_id = gate["worker_id"].as_str().unwrap_or("");
             verdicts.push(json!({
                 "ticket_id": ticket_id,
+                "worker_id": worker_id,
                 "verdict": "planning_gate_pending",
                 "review_type": "planning_gate",
             }));
@@ -308,20 +378,9 @@ impl Node for SentinelNode {
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
                     store.del(&review_key).await;
 
-                    // Release the sentinel slot so it's available for future
-                    // reviews; otherwise Nexus sees an active sentinel worker and
-                    // keeps routing nexus→sentinel, stalling Forge/Vessel.
-                    let worker_id = verdict["worker_id"].as_str().unwrap_or("");
-                    if !worker_id.is_empty() {
-                        let mut slots: HashMap<String, WorkerSlot> =
-                            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                        if let Some(slot) = slots.get_mut(worker_id) {
-                            slot.status = WorkerStatus::Idle;
-                        }
-                        store
-                            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
-                            .await;
-                    }
+                    // Release the SENTINEL reviewer slot, not the Forge owner
+                    // carried in `worker_id`.
+                    Self::release_sentinel_slots_for_ticket(store, ticket_id).await?;
 
                     any_approved = true;
                 }
@@ -332,18 +391,27 @@ impl Node for SentinelNode {
                     );
 
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
-                    let report = store
-                        .get_typed::<ReviewPayload>(&review_key)
-                        .await
-                        .map(|r| r.report)
+                    let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
+                    let report = review_payload
+                        .as_ref()
+                        .map(|r| r.report.clone())
                         .unwrap_or_default();
+                    let pr_number = review_payload.as_ref().and_then(|r| r.pr_number);
 
-                    // Look up the FORGE chat via the assigned worker_id, not the
-                    // literal role string "forge". The chat key is stored as
-                    // `ticket:{id}:chat:{worker_id}` (e.g. `forge-1`).
+                    // Look up the FORGE chat via its role name (e.g. `forge`), not
+                    // the literal worker id (`forge-1`). The chat bindings are stored
+                    // under the role name as `ticket:{id}:chat:{role}`, so looking up
+                    // by worker_id always misses and the rejection follow-up never
+                    // lands in FORGE's existing chat.
                     let worker_id = verdict["worker_id"].as_str().unwrap_or("");
-                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, worker_id);
+                    let role = if worker_id.is_empty() {
+                        "forge"
+                    } else {
+                        Self::worker_role(worker_id)
+                    };
+                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
                     let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
+                    let forge_action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
 
                     if let (Some(ref client), Some(ref chat_id)) = (&client, &forge_chat_id) {
                         if let Err(e) =
@@ -355,6 +423,9 @@ impl Node for SentinelNode {
                                 error = %e,
                                 "Failed to send rejection follow-up to forge"
                             );
+                            store.set(&forge_action_key, json!("resume_failed")).await;
+                        } else {
+                            store.set(&forge_action_key, json!("follow_up_sent")).await;
                         }
                     } else {
                         warn!(
@@ -364,7 +435,10 @@ impl Node for SentinelNode {
                             has_chat_id = forge_chat_id.is_some(),
                             "Cannot send rejection follow-up — missing Coder client or forge chat"
                         );
+                        store.set(&forge_action_key, json!("resume_needed")).await;
                     }
+
+                    Self::remove_rejected_pr_from_pending(store, ticket_id, pr_number).await;
 
                     let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
                     if let Some(ref client) = &client {
@@ -392,8 +466,25 @@ impl Node for SentinelNode {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
+                    let rework_key = full_ticket_key_flat(ticket_id, "rework");
                     store
-                        .set(&status_key, json!({ "phase": "building", "role": "forge", "ts": ts }))
+                        .set(
+                            &rework_key,
+                            json!({
+                                "source": "sentinel",
+                                "verdict": "reject",
+                                "report": report,
+                                "pr_number": pr_number,
+                                "phase": "building",
+                                "ts": ts,
+                            }),
+                        )
+                        .await;
+                    store
+                        .set(
+                            &status_key,
+                            json!({ "phase": "building", "role": "forge", "ts": ts }),
+                        )
                         .await;
 
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
@@ -402,6 +493,12 @@ impl Node for SentinelNode {
                     // Consume the review verdict so it is not replayed on the
                     // next poll cycle.
                     store.del(&review_key).await;
+
+                    // Release only the SENTINEL reviewer slot. The `worker_id`
+                    // carried on a PR verdict is the FORGE worker that owns the
+                    // ticket; freeing it would make Nexus lose the active rework
+                    // session instead of resuming it.
+                    Self::release_sentinel_slots_for_ticket(store, ticket_id).await?;
 
                     any_rejected = true;
                 }
@@ -485,18 +582,9 @@ impl Node for SentinelNode {
                                 }
                             }
 
-                            // Release the sentinel slot so it's available for future reviews
-                            let worker_id = verdict["worker_id"].as_str().unwrap_or("");
-                            if !worker_id.is_empty() {
-                                let mut slots: HashMap<String, WorkerSlot> =
-                                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                                if let Some(slot) = slots.get_mut(worker_id) {
-                                    slot.status = WorkerStatus::Idle;
-                                }
-                                store
-                                    .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
-                                    .await;
-                            }
+                            // Release the SENTINEL reviewer slot, not the Forge
+                            // owner carried in `worker_id`.
+                            Self::release_sentinel_slots_for_ticket(store, ticket_id).await?;
 
                             any_planning_approved = true;
                         }
@@ -534,5 +622,189 @@ impl Node for SentinelNode {
             // Pause and let the next poll check again.
             Ok(Action::new(PAUSE_SIGNAL))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> SentinelNode {
+        SentinelNode::new("sentinel.agent.md")
+    }
+
+    #[test]
+    fn worker_role_strips_numeric_suffix() {
+        assert_eq!(SentinelNode::worker_role("forge-1"), "forge");
+        assert_eq!(SentinelNode::worker_role("forge-42"), "forge");
+        assert_eq!(SentinelNode::worker_role("sentinel"), "sentinel");
+        assert_eq!(SentinelNode::worker_role("vessel-1"), "vessel");
+    }
+
+    #[tokio::test]
+    async fn exec_preserves_worker_id_for_pr_review_and_planning_gate() {
+        let prep = json!({
+            "reviewable": [{
+                "ticket_id": "T-1",
+                "worker_id": "forge-1",
+                "verdict": "reject",
+                "report": "fix it",
+                "review_type": "pr_review",
+            }],
+            "planning_gate_pending": [{
+                "ticket_id": "T-2",
+                "worker_id": "forge-2",
+                "review_type": "planning_gate",
+            }],
+        });
+
+        let out = node().exec(prep).await.unwrap();
+        let verdicts = out["verdicts"].as_array().unwrap();
+
+        let pr = verdicts
+            .iter()
+            .find(|v| v["review_type"] == "pr_review")
+            .unwrap();
+        assert_eq!(pr["worker_id"], "forge-1");
+        assert_eq!(pr["verdict"], "reject");
+
+        let gate = verdicts
+            .iter()
+            .find(|v| v["review_type"] == "planning_gate")
+            .unwrap();
+        assert_eq!(gate["worker_id"], "forge-2");
+        assert_eq!(gate["verdict"], "planning_gate_pending");
+    }
+
+    #[tokio::test]
+    async fn post_reject_resolves_forge_chat_by_role_and_resets_state() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-9";
+
+        // Seed the sentinel review payload (reject).
+        let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+        let payload = ReviewPayload {
+            verdict: "reject".to_string(),
+            report: "src/api.rs:78 — missing pagination; required per spec".to_string(),
+            pr_number: Some(42),
+        };
+        store
+            .set(&review_key, serde_json::to_value(&payload).unwrap())
+            .await;
+
+        // Seed a sentinel chat binding (archived + removed on reject).
+        let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+        store
+            .set(&sentinel_chat_key, json!("chat-sentinel-1"))
+            .await;
+
+        // Seed the forge chat binding under the ROLE name (`forge`), not the
+        // worker id (`forge-1`). The reject path must resolve to this key.
+        let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+        store.set(&forge_chat_key, json!("chat-forge-1")).await;
+
+        // Seed busy worker slots so we can observe that rejection releases the
+        // reviewer but keeps the Forge owner active for rework.
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Working {
+                    ticket_id: ticket_id.to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: ticket_id.to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        store
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(&slots).unwrap())
+            .await;
+        store
+            .set(
+                "pending_prs",
+                json!([{
+                    "number": 42,
+                    "ticket_id": ticket_id,
+                    "head_branch": "feature/T-9",
+                    "worker_id": "forge-1",
+                }]),
+            )
+            .await;
+
+        let exec = json!({
+            "verdicts": [{
+                "ticket_id": ticket_id,
+                "worker_id": "forge-1",
+                "verdict": "reject",
+                "review_type": "pr_review",
+            }],
+            "has_reviews": true,
+            "has_planning_gates": false,
+        });
+
+        let action = node().post(&store, exec).await.unwrap();
+        assert_eq!(action.as_str(), ACTION_REVIEW_REJECT);
+
+        // Review verdict consumed.
+        let consumed: Option<ReviewPayload> = store.get_typed(&review_key).await;
+        assert!(
+            consumed.is_none(),
+            "review key should be deleted after reject"
+        );
+
+        // Sentinel chat binding removed so Nexus won't re-spawn the reviewer.
+        let sentinel_chat: Option<String> = store.get_typed(&sentinel_chat_key).await;
+        assert!(
+            sentinel_chat.is_none(),
+            "sentinel chat binding should be deleted"
+        );
+
+        // Status reset to building/forge so Nexus won't re-spawn from review_ready.
+        let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
+        let status: Option<Value> = store.get_typed(&status_key).await;
+        let status = status.expect("status should be written on reject");
+        assert_eq!(status["phase"], "building");
+        assert_eq!(status["role"], "forge");
+
+        let pending_prs: Vec<Value> = store.get_typed("pending_prs").await.unwrap();
+        assert!(
+            pending_prs.is_empty(),
+            "rejected PR should be removed from pending_prs"
+        );
+
+        let rework_key = full_ticket_key_flat(ticket_id, "rework");
+        let rework: Option<Value> = store.get_typed(&rework_key).await;
+        let rework = rework.expect("rework marker should be written");
+        assert_eq!(rework["verdict"], "reject");
+        assert_eq!(rework["pr_number"], 42);
+
+        let forge_action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "forge");
+        let forge_action: Option<String> = store.get_typed(&forge_action_key).await;
+        assert_eq!(forge_action.as_deref(), Some("resume_needed"));
+
+        // Sentinel slot is released; Forge remains active for rework.
+        let updated: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge_slot = updated.get("forge-1").unwrap();
+        assert!(matches!(forge_slot.status, WorkerStatus::Working { .. }));
+        let sentinel_slot = updated.get("sentinel").unwrap();
+        assert!(matches!(sentinel_slot.status, WorkerStatus::Idle));
+    }
+
+    #[test]
+    fn action_constants_match_expected_action_names() {
+        assert_eq!(ACTION_REVIEW_APPROVE, "review_approve");
+        assert_eq!(ACTION_REVIEW_REJECT, "review_reject");
     }
 }

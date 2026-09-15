@@ -7,7 +7,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
 
 const SECRET: &str = "a-very-long-secret-of-at-least-thirty-two-bytes!";
-const URL: &str = "http://localhost:3001/hooks/chat";
+const URL: &str = "http://localhost:3001/experimental/hooks/chat";
 const CHAT: &str = "chat-abc";
 const EVENT: &str = "session_start";
 
@@ -251,6 +251,7 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
         chat_hook_allow_insecure: true,
         hook_addr: addr.to_string(),
         hook_host: "127.0.0.1".to_string(),
+        hook_logs: false,
     };
     assert_eq!(config.hook_public_url().as_deref(), Some(hook_url.as_str()));
 
@@ -266,5 +267,8 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
         dispatch_simulated_event(&hook_url, SECRET, "session_start", CHAT, "dis-abc")
             .await
             .expect("dispatch should succeed");
-    assert_eq!(status, 200, "consumer should accept a valid signed dispatch: {body}");
+    assert_eq!(
+        status, 200,
+        "consumer should accept a valid signed dispatch: {body}"
+    );
 }

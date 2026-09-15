@@ -7,6 +7,14 @@
 
 > **Getting started?** All setup, startup, and troubleshooting steps live in [**quick_start.md**](quick_start.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
 
+## Operator Quick Path
+
+1. Copy `.env.example` to `.env`.
+2. Fill only the required operator values: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `CODER_SESSION_TOKEN` after Coder starts, and the `CODER_EXTERNAL_AUTH_0_*` GitHub App fields.
+3. Run `docker compose up -d`, then `./scripts/prod.sh bootstrap`, `./scripts/prod.sh tenant <owner/repo> --name <team>`, and `./scripts/prod.sh run`.
+
+Lifecycle hooks are wired by the bundled stack. Do not set `CODER_EXPERIMENTS`, `CODER_CHAT_HOOK_URL`, or hook bind addresses unless you are running a custom deployment; optionally override `CODER_CHAT_HOOK_SECRET` for production.
+
 ## Why architecture-first
 
 AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/architecture/openflows-system-architecture.md`](docs/architecture/openflows-system-architecture.md) for the full design.

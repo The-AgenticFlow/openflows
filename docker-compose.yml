@@ -55,19 +55,15 @@ services:
       CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
       CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
-      # Agent lifecycle hooks — Coder POSTs JWT-signed lifecycle events to the
-      # OpenFlows hook consumer. The hook URL is an internal detail: compose
-      # derives it from OPENFLOWS_HOOK_PORT and the internal host label Coder
-      # uses to reach the host (host.docker.internal). Operators set only the
-      # port, secret, and (dev) allow-insecure switch — never the raw URL.
-      CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-}
-      CODER_CHAT_HOOK_URL: "http://host.docker.internal:${OPENFLOWS_HOOK_PORT:-3001}/experimental/hooks/chat"
-      CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-}
-      # Dev-only: allow the plain-http hook URL above. Remove in production.
-      CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-false}
+      # Agent lifecycle hooks are wired by OpenFlows. Operators do not need to
+      # configure Coder's raw hook URL/experiment flags for the bundled stack.
+      CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks}
+      CODER_CHAT_HOOK_URL: "http://openflows-nexus:${OPENFLOWS_HOOK_PORT:-3001}/experimental/hooks/chat"
+      CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-openflows-local-hook-secret-change-me-000000000000000000}
+      # Dev-only: allow the plain-http hook URL above.
+      CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-true}
     extra_hosts:
-      # Make the host reachable from inside the container so Coder can POST to
-      # the OpenFlows lifecycle hook consumer running on the host.
+      # Keep host-gateway available for local integrations that need the host.
       - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

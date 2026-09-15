@@ -108,6 +108,14 @@ pub struct HookDecision {
     /// Optional rewritten context/message body returned to the agent loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewrite: Option<Value>,
+    /// Optional model-only context injected back into the agent loop. Capped
+    /// at ~16 KiB (D9). Populated by `user_prompt_submit` (feed current
+    /// status to the model before it answers) and by `post_tool_use` (feed
+    /// back guidance/errors accumulated by `pre_tool_use` policy checks).
+    /// Serialized as the top-level Coder `model_context` field, independent
+    /// of `deny`/`rewrite`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context: Option<String>,
 }
 
 impl HookDecision {
@@ -122,6 +130,15 @@ impl HookDecision {
             deny: true,
             reason: Some(reason.into()),
             rewrite: None,
+            model_context: None,
         }
+    }
+
+    /// Attach model-only context to this decision (any deny/rewrite state is
+    /// preserved). Used when the consumer wants to inject status/guidance into
+    /// the model even for an otherwise-allowed action.
+    pub fn with_model_context(mut self, context: impl Into<String>) -> Self {
+        self.model_context = Some(context.into());
+        self
     }
 }
