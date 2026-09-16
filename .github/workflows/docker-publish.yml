@@ -63,6 +63,8 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/openflows-${{ steps.version.outputs.version }}
 
       # Enable QEMU so the buildx builder can produce linux/arm64 images on the
       # amd64 GitHub-hosted runner.

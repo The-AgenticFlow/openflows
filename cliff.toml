@@ -101,6 +101,11 @@ commit_preprocessors = [
 commit_parsers = [
   # release-plz adds 0000000 as a placeholder for release commits
   { field = "id", pattern = "0000000", skip = true },
+  # Suppress internal release-tooling and CI-only commits from the user changelog.
+  # Any conventional-commit type scoped to (release) or (ci) is infrastructure-only
+  # and should not appear as user-facing features/fixes in GitHub Release notes.
+  { message = "^[a-zA-Z]+\\(release\\):", skip = true },
+  { message = "^[a-zA-Z]+\\(ci\\):",      skip = true },
   { message = "^feat", group = "<!-- 00 -->Features" },
   { message = "^[fF]ix", group = "<!-- 01 -->Bug Fixes" },
   { message = "^refactor", group = "<!-- 02 -->Refactor" },
@@ -118,11 +123,7 @@ commit_parsers = [
   { message = "^build\\(deps\\)", skip = true },
   { message = "^build\\(release\\)", skip = true },
   { message = "^build", group = "<!-- 08 -->Build" },
-  # Suppress internal release-tooling and CI-only commits from the user changelog.
-  # Any conventional-commit type scoped to (release) or (ci) is infrastructure-only
-  # and should not appear as user-facing features/fixes in GitHub Release notes.
-  { message = "^[a-zA-Z]+\\(release\\):", skip = true },
-  { message = "^[a-zA-Z]+\\(ci\\):",      skip = true },
+
   { body = ".*security", group = "<!-- 09 -->Security" },
   { message = "^ci", group = "<!-- 10 -->Continuous Integration" },
   { message = "^revert", group = "<!-- 11 -->Reverted Commits" },
