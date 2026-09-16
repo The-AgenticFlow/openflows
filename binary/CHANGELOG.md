@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0](https://github.com/The-AgenticFlow/openflows/compare/openflows-1.2.1...openflows-1.3.0) - 2026-09-16
+
+### Added
+
+- prefer GitHub PAT for workspace git, fix repo acquisition
+- *(coder)* pin Coder to v2.37.0 and validate version in doctor ([#186](https://github.com/The-AgenticFlow/openflows/pull/186))
+- *(config)* centralize remaining env reads incl GITHUB_API_BASE (#185, #204)
+- *(config)* centralize environment configuration with envconfig ([#185](https://github.com/The-AgenticFlow/openflows/pull/185))
+
+### Fixed
+
+- *(hooks)* harden lifecycle hooks per review feedback
+- *(ci)* resolve clippy warnings and unused dependency in hook consumer
+- *(lifecycle-hooks)* recover hook orchestration and replay pending events
+- *(doctor)* require external-auth client ID; centralize via CoderConfig ([#219](https://github.com/The-AgenticFlow/openflows/pull/219))
+- *(coder)* use Coder external-auth token for workspace git access
+- *(doctor)* only compare semantic-version Coder tags, skip floating tags
+- *(config)* address PR review feedback ([#204](https://github.com/The-AgenticFlow/openflows/pull/204))
+
+### Other
+
+- *(doctor)* wrap long println to satisfy rustfmt
+- *(coder)* update non-code refs to org-scoped v2 models ([#186](https://github.com/The-AgenticFlow/openflows/pull/186))
+- Merge branch 'develop' into issue-185-centralize-envconfig
+
 ## [1.2.1](https://github.com/The-AgenticFlow/openflows/releases/tag/openflows-1.2.1) - 2026-08-24
 
 ### Added
