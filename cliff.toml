@@ -118,6 +118,11 @@ commit_parsers = [
   { message = "^build\\(deps\\)", skip = true },
   { message = "^build\\(release\\)", skip = true },
   { message = "^build", group = "<!-- 08 -->Build" },
+  # Suppress internal release-tooling and CI-only commits from the user changelog.
+  # Any conventional-commit type scoped to (release) or (ci) is infrastructure-only
+  # and should not appear as user-facing features/fixes in GitHub Release notes.
+  { message = "^[a-zA-Z]+\\(release\\):", skip = true },
+  { message = "^[a-zA-Z]+\\(ci\\):",      skip = true },
   { body = ".*security", group = "<!-- 09 -->Security" },
   { message = "^ci", group = "<!-- 10 -->Continuous Integration" },
   { message = "^revert", group = "<!-- 11 -->Reverted Commits" },

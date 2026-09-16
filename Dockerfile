@@ -16,8 +16,8 @@ COPY crates ./crates
 COPY binary ./binary
 COPY orchestration ./orchestration
 
-# Build release binaries
-RUN cargo build --release -p openflows
+# Build all release binaries
+RUN cargo build --release --bin openflows --bin openflows-doctor --bin openflows-harness
 
 # ──────────────────────────────────────────────
 # Stage 2: Runtime
@@ -40,10 +40,9 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN groupadd -r openflows && useradd -r -g openflows -m -d /home/openflows openflows
 
 # Copy binaries from builder
-COPY --from=builder /app/target/release/openflows /usr/local/bin/
-COPY --from=builder /app/target/release/openflows-setup /usr/local/bin/
-COPY --from=builder /app/target/release/openflows-dashboard /usr/local/bin/
-COPY --from=builder /app/target/release/openflows-doctor /usr/local/bin/
+COPY --from=builder /app/target/release/openflows         /usr/local/bin/
+COPY --from=builder /app/target/release/openflows-doctor  /usr/local/bin/
+COPY --from=builder /app/target/release/openflows-harness /usr/local/bin/
 
 # Set permissions
 RUN chmod +x /usr/local/bin/openflows*
