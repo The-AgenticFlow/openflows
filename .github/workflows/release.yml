@@ -68,12 +68,6 @@ jobs:
     name: release-plz (release)
     runs-on: ubuntu-latest
     needs: [gate, release-plz]
-    # Only fire when the push that landed on main is the release-plz bump commit itself,
-    # or a merge commit from a release-plz branch. A develop→main merge may carry that
-    # bump commit somewhere in its ancestry, but the HEAD commit will be a "Merge pull
-    # request #N from …/develop" message — so this guard correctly skips the release step
-    # and lets release-pr update or create a fresh bump PR with the full commit set.
-    if: startsWith(github.event.head_commit.message, 'chore(openflows): release') || (startsWith(github.event.head_commit.message, 'Merge pull request') && contains(github.event.head_commit.message, 'release-plz'))
     permissions:
       contents: write
     steps:
