@@ -26,7 +26,11 @@ resolve_version() {
   local end_at="$2"
   local run_start_epoch run_end_epoch t tag_epoch best_epoch="" version=""
   run_start_epoch="$(date -d "${start_at}" +%s)"
-  run_end_epoch="$(date -d "${end_at}" +%s)"
+  # Add a 60-second grace period beyond completed_at to absorb clock skew
+  # between the tag creator date and the timestamp GitHub records for the run.
+  # release-plz can push the tag just as the run is finishing, and the tag's
+  # creator timestamp can land fractionally after completed_at on GitHub's clock.
+  run_end_epoch="$(( $(date -d "${end_at}" +%s) + 60 ))"
   for t in $(git tag --list 'openflows-*'); do
     # Only exact openflows-X.Y.Z tags are candidates; reject any tag with a
     # suffix (e.g. openflows-1.2.3-beta, openflows-1.2.3.4) up front.
