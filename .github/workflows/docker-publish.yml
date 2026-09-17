@@ -21,7 +21,6 @@ name: Docker Publish
 # `github.event.workflow_run.conclusion == "success"`, so an upstream failure or
 # untrusted branch can never drive a build/push. The annotation sits above `on:`
 # because zizmor attributes the trigger finding to the `on:` block.
-
 on:
   push:
     tags:
