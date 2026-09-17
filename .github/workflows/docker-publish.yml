@@ -15,11 +15,33 @@ name: Docker Publish
 # Platforms: linux/amd64 and linux/arm64 (published as a multi-platform manifest).
 #
 # Manual dispatch requires the `version` input (e.g. 1.3.1).
-
+#
+# Security note for the `workflow_run` trigger below: it is used deliberately
+# with `types: [completed]` restricted to `branches: [main]`. The `resolve` job
+# is gated on `github.event.workflow_run.conclusion == "success"` and only
+# resolves a version when the triggering run points at an `openflows-X.Y.Z`
+# tag; the `build-and-push` job depends on `resolve` and only runs on a
+# resolved version. So an upstream failure or untrusted branch can never drive
+# a build/push. This is the file zizmor flags as `dangerous-triggers`; the
+# suppression is declared in `.github/zizmor.yml` (zizmor's inline comment
+# form does not suppress this rule).
 on:
   push:
     tags:
       - 'openflows-[0-9]*.[0-9]*.[0-9]*'
+  # The release tag is created by release-plz using GITHUB_TOKEN, and GitHub
+  # deliberately does NOT dispatch tag-push events for commits/tags created by
+  # GITHUB_TOKEN (an anti-recursion safeguard). As a result the `push: tags`
+  # trigger alone never fires for release-plz tags. Reliably react to each new
+  # release by also running when the `Release` workflow completes successfully:
+  # the version is then derived from the newest `openflows-*.*.*` tag.
+  workflow_run:
+    workflows:
+      - 'Release'
+    types:
+      - completed
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
@@ -35,25 +57,55 @@ env:
   IMAGE_NAME: the-agenticflow/openflows
 
 jobs:
-  build-and-push:
-    name: Build & push Docker image
+  # Resolves the version to build. Kept as its own job so that a
+  # not-applicable trigger (failed/cancelled Release run, or a successful run
+  # that did not actually create a release tag) skips cleanly at the job level
+  # instead of cascading into a broken downstream build.
+  resolve:
+    name: Resolve release version
     runs-on: ubuntu-latest
+    # Failed/cancelled Release completions are skipped at the job level, so they
+    # do not spawn a noisy docker-publish failure.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: read
-      packages: write
-      # Required for image attestation (sigstore/cosign provenance).
-      id-token: write
-
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
+      # Resolving a version from git tags requires the repo (and tags) to exist,
+      # so this resolution job checks out first. The build job below then
+      # re-checks out the exact release tag it resolved.
+      - name: Checkout repository (history + tags)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
       - name: Resolve version
         id: version
         env:
           MANUAL_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
+          GITHUB_EVENT: ${{ github.event_name }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           if [ -n "${MANUAL_VERSION}" ]; then
+            # Explicit version from a manual dispatch.
             VERSION="${MANUAL_VERSION}"
+          elif [ "${GITHUB_EVENT}" = "workflow_run" ]; then
+            # Triggered by the `Release` workflow completing. github.ref_name is
+            # the default branch here, not a version. release_always=false means
+            # most successful Release runs create no tag, so only publish when
+            # THIS run actually produced an openflows-X.Y.Z tag — otherwise we
+            # would rebuild/republish the previous release from its tags.
+            VERSION="$(git tag --points-at "${WORKFLOW_RUN_HEAD_SHA}" | grep -E '^openflows-[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 | sed 's/^openflows-//')"
+            if [ -z "${VERSION}" ]; then
+              echo "::notice::Skipping: triggering Release run did not create an openflows-X.Y.Z tag"
+              exit 0
+            fi
           else
+            # Tag push: derive the version from the ref name.
             VERSION="${REF_NAME#openflows-}"
           fi
           if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -62,9 +114,24 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+  build-and-push:
+    name: Build & push Docker image
+    needs: resolve
+    # Only build when a version was actually resolved (otherwise the version was
+    # empty because the run was skipped or created no release tag).
+    if: needs.resolve.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Required for image attestation (sigstore/cosign provenance).
+      id-token: write
+
+    steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: refs/tags/openflows-${{ steps.version.outputs.version }}
+          ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
+          persist-credentials: false
 
       # Enable QEMU so the buildx builder can produce linux/arm64 images on the
       # amd64 GitHub-hosted runner.
@@ -90,18 +157,18 @@ jobs:
           tags: |
             # Exact semver tag from the resolved version (not github.ref_name directly,
             # so manual dispatch works correctly too).
-            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ needs.resolve.outputs.version }}
             # Floating minor tag (e.g. 1.3)
-            type=raw,value=${{ steps.version.outputs.version }},enable=true,suffix=,prefix=
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ needs.resolve.outputs.version }},enable=true,suffix=,prefix=
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve.outputs.version }}
             # Floating major tag (e.g. 1)
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.resolve.outputs.version }}
             # latest
             type=raw,value=latest
           labels: |
             org.opencontainers.image.title=openflows
             org.opencontainers.image.description=Openflows — agentic workflow orchestrator
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
             org.opencontainers.image.source=https://github.com/The-AgenticFlow/openflows
             org.opencontainers.image.licenses=MIT
 
@@ -117,4 +184,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ needs.resolve.outputs.version }}
