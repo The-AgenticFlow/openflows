@@ -31,15 +31,16 @@ body = """
 
 {% macro mention(commit) -%}
 {%- if commit.author -%}
-{%- if commit.author.email is ending_with("users.noreply.github.com") -%}
+{%- set acct = commit.author -%}
+{%- if acct.email is ending_with("users.noreply.github.com") -%}
 {# GitHub noreply emails are `NNNNNNN+<login>@users.noreply.github.com`, so the#}
 {# `<login>` is an exact GitHub username that makes a valid mention.          #}
-  by @{{ commit.author.email | split(pat="+") | last | split(pat="@") | first }}{%- endif -%}
-{%- if not commit.author.email is ending_with("users.noreply.github.com") -%}
+  by @{{ acct.email | split(pat="+") | last | split(pat="@") | first }}{%- endif -%}
+{%- if not acct.email is ending_with("users.noreply.github.com") -%}
 {# Non-noreply (e.g. personal) emails have no reliable login: fall back to the#}
-{# author display name, which equals the GitHub login for releases by         #}
-{# name=login authors (NkwaTambe, Ngha-Boris, ...).                            #}
-  by @{{ commit.author.name }}{%- endif -%}
+{# commit author's display name, which equals the GitHub login for releases   #}
+{# by name=login authors (NkwaTambe, Ngha-Boris, ...).                         #}
+  by @{{ acct.name }}{%- endif -%}
 {%- endif -%}
 {% endmacro -%}
 
