@@ -500,7 +500,14 @@ impl CoderBootstrapper {
         // keep their original `start_controller` value and must be recreated once
         // to pick up `start_controller=true` (new tenants get it automatically).
         if let Ok(workspaces) = client.list_workspaces(&tenant_user.id).await {
-            if workspaces.iter().any(|w| w.name == nexus_workspace_name) {
+            // The workspace listing is deployment-wide (list_workspaces ignores
+            // the user id), so match BOTH the owner and the name — as the other
+            // bootstrap lookups do — to avoid a false migration warning from
+            // another owner's same-named workspace.
+            if workspaces
+                .iter()
+                .any(|w| w.name == nexus_workspace_name && w.owner_name == tenant_user.username)
+            {
                 println!(
                     "  ⚠ Tenant workspace '{}' already exists — its build parameters are unchanged. \
                      Recreate it once to enable the in-workspace controller \
