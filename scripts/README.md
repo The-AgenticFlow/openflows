@@ -6,9 +6,8 @@ All production operations use `./scripts/prod.sh`:
 
 ```bash
 ./scripts/prod.sh bootstrap                      # One-time: Setup Coder + push templates
-./scripts/prod.sh tenant owner/repo --name team  # Add a tenant (required before run)
-./scripts/prod.sh run                            # Start controller (always resets Redis first)
-./scripts/prod.sh doctor                         # Health check
+./scripts/prod.sh tenant owner/repo --name team  # Add a tenant (runs its own in-workspace controller)
+./scripts/prod.sh run                            # Start controller on host (DEV/DEBUG only)
 ```
 
 ### `bootstrap` — One-time Setup
@@ -27,7 +26,7 @@ All production operations use `./scripts/prod.sh`:
 ./scripts/prod.sh tenant owner/repo --name my-team
 ```
 
-Binds a GitHub repo to the controller. **You must add at least one tenant before starting the controller.**
+Binds a GitHub repo to a tenant. Each tenant is scoped to one `owner/repo` and gets its own nexus workspace; that workspace's controller auto-starts with `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` injected from this command.
 
 ### `run` — Start Controller
 
@@ -35,7 +34,7 @@ Binds a GitHub repo to the controller. **You must add at least one tenant before
 ./scripts/prod.sh run
 ```
 
-**Always resets Redis to a clean slate first**, then starts the controller. This ensures no zombie tickets or stale state from previous runs. OpenFlows will process issues in bound repos.
+**Always resets Redis to a clean slate first**, then starts the controller on the host. This is **not the production path** (production runs the controller inside each tenant's nexus workspace) — it exists for local development/debugging, and the controller no longer requires `GITHUB_REPOSITORY` in `.env` to boot (it resolves the repo per-tenant). OpenFlows will process issues in bound repos.
 
 ### `doctor` — Health Check
 
@@ -109,7 +108,7 @@ Controller starts inside workspace
 |---------|-------------|
 | `./scripts/dev-sync.sh` | Build and mount dev binary to Coder |
 | `./scripts/prod.sh bootstrap` | One-time: Setup Coder + templates (includes dev-sync) |
-| `./scripts/prod.sh tenant owner/repo --name team` | Add tenant (required before run) |
-| `./scripts/prod.sh run` | Clean slate + start controller |
+| `./scripts/prod.sh tenant owner/repo --name team` | Add tenant (runs its own in-workspace controller) |
+| `./scripts/prod.sh run` | Start controller on host (dev/debug; resets Redis state) |
 | `./scripts/prod.sh doctor` | Health check |
 | `./scripts/reset-controller-state.sh --confirm` | Clean Redis state |

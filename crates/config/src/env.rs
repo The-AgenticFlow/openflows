@@ -423,18 +423,6 @@ impl EnvConfig {
                  openflows-nexus workspace."
             );
         }
-        if self
-            .github
-            .repository
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty()
-        {
-            anyhow::bail!(
-                "GITHUB_REPOSITORY is not set. The Controller must run inside an \
-                 openflows-nexus workspace."
-            );
-        }
         Ok(())
     }
 

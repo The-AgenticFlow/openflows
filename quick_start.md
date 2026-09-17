@@ -66,9 +66,10 @@ Fill in the required values:
 | Variable | What to put |
 |----------|-------------|
 | `GITHUB_TOKEN` | GitHub PAT with `repo` scope. |
-| `GITHUB_REPOSITORY` | The repo the controller watches, as `owner/repo`. |
 | `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
+
+> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
 
 Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
 
@@ -174,23 +175,25 @@ Confirm the templates were pushed at **http://localhost:7080/templates**.
 
 ## Step 9 — Add a tenant
 
-Bind a GitHub repo to the controller:
+Bind a GitHub repo to OpenFlows. A tenant is scoped to a single `owner/repo` and provisions its own nexus workspace + controller:
 
 ```bash
 ./scripts/prod.sh tenant <owner/repo> --name <my-team>
 ```
 
-You'll see the tenant under **http://localhost:7080/workspaces**.
+You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces**.
+
+> **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
+
+> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). New tenants get this automatically — nothing extra to do.
 
 ---
 
-## Step 10 — Run the controller
+## Step 10 — Let the controller run
 
-Open a **separate terminal** (the controller runs in the foreground and streams logs) and run:
+The controller runs **inside the tenant's nexus workspace** and auto-starts when the workspace is ready. You don't run it on your machine — the workspace was created with `start_controller` enabled, and its `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` are injected from the tenant you added.
 
-```bash
-./scripts/prod.sh run
-```
+> For local development/debugging only, you can still run the controller manually on the host with `./scripts/prod.sh run` (this is not the production path).
 
 Create a GitHub issue in the bound repo → OpenFlows automatically assigns it, provisions a workspace, and starts working.
 

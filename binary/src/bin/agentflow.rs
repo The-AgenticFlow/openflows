@@ -221,19 +221,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let _coder_token = cfg.coder.effective_token();
     let redis_url = cfg.infra.effective_redis_url();
     let tenant = cfg.tenant.effective_tenant().to_string();
-    let github_repo = cfg
-        .github
-        .repository
-        .clone()
-        .context("GITHUB_REPOSITORY is not set. The Controller must run inside an openflows-nexus workspace.")?;
-
-    tracing::info!(
-        coder_url,
-        redis_url,
-        tenant,
-        github_repo,
-        "OpenFlows Controller starting (Coder-only mode)"
-    );
 
     // ── Initialize SharedStore (Redis required — no in-memory fallback) ─
     // Tenant-aware: all keys are prefixed with ns:{tenant}: for isolation
@@ -248,6 +235,31 @@ async fn run_controller(reset_store: bool) -> Result<()> {
             "Reset tenant runtime SharedStore state before controller start"
         );
     }
+
+    // Resolve the target repository: prefer the environment (injected per-tenant
+    // by the nexus template as GITHUB_REPOSITORY), then fall back to the tenant's
+    // Redis `repository` key. Fail fast if neither is available so the controller
+    // never runs silently without a repo to process.
+    let github_repo = match cfg.github.repository.clone() {
+        Some(repo) if !repo.is_empty() => repo,
+        _ => store
+            .get("repository")
+            .await
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+            .context(
+                "No target repository configured: set GITHUB_REPOSITORY (host/dev run) or add a \
+                 tenant first with `openflows tenant add <owner/repo>`.",
+            )?,
+    };
+
+    tracing::info!(
+        coder_url,
+        redis_url,
+        tenant,
+        github_repo,
+        "OpenFlows Controller starting (Coder-only mode)"
+    );
 
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
@@ -661,6 +673,34 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                 .ensure_tenant(&client, &tenant_name, &repo)
                 .await
                 .context("Tenant setup failed")?;
+
+            // Persist the tenant's repository into its Redis namespace so a host /
+            // dev controller run without GITHUB_REPOSITORY can resolve the repo
+            // from the tenant store (the same `repository` key the Nexus node
+            // writes once its flow starts running). Without this, a controller
+            // started right after `tenant add` aborts telling the operator to add
+            // a tenant even though one was just added.
+            let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
+            match pocketflow_core::SharedStore::new_redis_with_tenant(
+                &redis_url,
+                Some(tenant_name.clone()),
+            )
+            .await
+            {
+                Ok(store) => {
+                    store.set("repository", serde_json::json!(&repo)).await;
+                    println!(
+                        "  ✓ Repository '{}' persisted for tenant '{}'",
+                        repo, tenant_name
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  ⚠ Could not persist repository '{}' to Redis for tenant '{}': {}",
+                        repo, tenant_name, e
+                    );
+                }
+            }
 
             println!("\n  ✓ Tenant '{}' added", tenant_name);
             println!("  ✓ Nexus workspace: {}", workspace_id);

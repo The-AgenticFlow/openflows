@@ -20,8 +20,8 @@ name: Docker Publish
 # with `types: [completed]` restricted to `branches: [main]`. The `resolve` job
 # is gated on `github.event.workflow_run.conclusion == "success"` and only
 # resolves a version when the triggering run actually created an
-# `openflows-X.Y.Z` tag (newest exact-version tag that is an ancestor of the
-# run's head and created within the run's [created_at, completed_at] window);
+# `openflows-X.Y.Z` tag (newest exact-version tag created within the run's
+# [created_at, completed_at] window);
 # the `build-and-push` job depends on `resolve` and only runs on a resolved
 # version. So an upstream failure or untrusted branch can never drive a
 # build/push. This is the file zizmor flags
@@ -90,7 +90,6 @@ jobs:
           MANUAL_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
           GITHUB_EVENT: ${{ github.event_name }}
-          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
           WORKFLOW_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
         run: |
@@ -99,32 +98,14 @@ jobs:
             VERSION="${MANUAL_VERSION}"
           elif [ "${GITHUB_EVENT}" = "workflow_run" ]; then
             # Triggered by the `Release` workflow completing. github.ref_name is
-            # the default branch here, not a version. release-plz tags the
-            # release commit (an ancestor of the triggering run's head), NOT the
-            # head commit itself, so a plain `git tag --points-at` never matches.
-            # Resolve the newest openflows-X.Y.Z tag whose commit is an ancestor
-            # of the triggering run's head AND whose creator date falls within
-            # this run's window ([created_at, completed_at]): a real release
-            # resolves to its exact tag, while tagless runs (release_always=false,
-            # no new tag in the window) are skipped so we never rebuild/republish
-            # the previous release.
-            RUN_START_EPOCH="$(date -d "${WORKFLOW_RUN_CREATED_AT}" +%s)"
-            RUN_END_EPOCH="$(date -d "${WORKFLOW_RUN_COMPLETED_AT}" +%s)"
-            VERSION=""
-            for t in $(git tag --list 'openflows-*' --sort=-v:refname); do
-              # Only exact openflows-X.Y.Z tags are candidates; reject any tag with
-              # a suffix (e.g. openflows-1.2.3-beta, openflows-1.2.3.4) up front.
-              if ! printf '%s' "${t#openflows-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-                continue
-              fi
-              if git merge-base --is-ancestor "${t}^{}" "${WORKFLOW_RUN_HEAD_SHA}" 2>/dev/null; then
-                tag_epoch="$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/${t}")"
-                if [ -n "${tag_epoch}" ] && [ "${tag_epoch}" -ge "${RUN_START_EPOCH}" ] && [ "${tag_epoch}" -le "${RUN_END_EPOCH}" ]; then
-                  VERSION="${t#openflows-}"
-                  break
-                fi
-              fi
-            done
+            # the default branch here, not a version. release-plz creates the
+            # `openflows-X.Y.Z` tag during the run, so the tag that THIS release
+            # produced is selected by its creator date falling within the run's
+            # [created_at, completed_at] window (see `.github/scripts/resolve-version.sh`).
+            # A tagless run (release_always=false, no new tag in the window)
+            # resolves to nothing and is skipped so we never rebuild/republish the
+            # previous release.
+            VERSION="$(bash .github/scripts/resolve-version.sh "${WORKFLOW_RUN_CREATED_AT}" "${WORKFLOW_RUN_COMPLETED_AT}")"
             if [ -z "${VERSION}" ]; then
               echo "::notice::Skipping: triggering Release run did not create an openflows-X.Y.Z tag"
               exit 0
