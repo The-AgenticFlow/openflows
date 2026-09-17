@@ -25,8 +25,22 @@ body = """
 
 {% macro commit(commit) -%}
 - *({{ commit.scope | default(value = "uncategorized") | lower }})* {{ commit.message | upper_first | trim }}\
-  {% if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}\
+  {{ self::mention(commit=commit) }}\
 {%- if commit.breaking %} [**breaking**]{% endif %}
+{% endmacro -%}
+
+{% macro mention(commit) -%}
+{%- if commit.author -%}
+{%- if commit.author.email is ending_with("users.noreply.github.com") -%}
+{# GitHub noreply emails are `NNNNNNN+<login>@users.noreply.github.com`, so the#}
+{# `<login>` is an exact GitHub username that makes a valid mention.          #}
+  by @{{ commit.author.email | split(pat="+") | last | split(pat="@") | first }}{%- endif -%}
+{%- if not commit.author.email is ending_with("users.noreply.github.com") -%}
+{# Non-noreply (e.g. personal) emails have no reliable login: fall back to the#}
+{# author display name, which equals the GitHub login for releases by         #}
+{# name=login authors (NkwaTambe, Ngha-Boris, ...).                            #}
+  by @{{ commit.author.name }}{%- endif -%}
+{%- endif -%}
 {% endmacro -%}
 
 {% for group, commits in commits | group_by(attribute="group") %}
