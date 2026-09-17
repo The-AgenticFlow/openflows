@@ -4,8 +4,20 @@ use config::Envconfig;
 use pocketflow_core::SharedStore;
 use std::collections::HashMap;
 
+/// Return the compiled binary version (from `CARGO_PKG_VERSION`).
+pub fn binary_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Return the configured workspace provider, falling back to a readable marker
+/// when unset so the debug dump always shows an explicit value.
+pub fn workspace_provider() -> String {
+    std::env::var("WORKSPACE_PROVIDER").unwrap_or_else(|_| "not-set".to_string())
+}
+
 pub async fn debug_system() -> Result<()> {
     println!("=== AgentFlow Debug Info ===");
+    println!("OpenFlows version: {}", binary_version());
 
     // Check Redis / Store
     let store = if let Some(url) = config::InfraConfig::init_from_env()?.redis_url {
@@ -42,9 +54,9 @@ pub async fn debug_system() -> Result<()> {
     }
 
     println!("\n--- Environment ---");
+    println!("WORKSPACE_PROVIDER: {}", workspace_provider());
     for var in &[
         "USE_AI_GATEWAY",
-        "WORKSPACE_PROVIDER",
         "CODER_URL",
         "ANTHROPIC_MODEL",
         "OPENAI_MODEL",
@@ -57,4 +69,22 @@ pub async fn debug_system() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_provider;
+
+    #[test]
+    fn workspace_provider_reports_set_value() {
+        unsafe { std::env::set_var("WORKSPACE_PROVIDER", "coder") };
+        assert_eq!(workspace_provider(), "coder");
+        unsafe { std::env::remove_var("WORKSPACE_PROVIDER") };
+    }
+
+    #[test]
+    fn workspace_provider_falls_back_when_unset() {
+        unsafe { std::env::remove_var("WORKSPACE_PROVIDER") };
+        assert_eq!(workspace_provider(), "not-set");
+    }
 }
