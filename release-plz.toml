@@ -48,22 +48,17 @@ changelog_path = "./CHANGELOG.md"
 name = "openflows"
 release = true
 git_tag_name = "openflows-{{ version }}"
-# Release notes = the grouped changelog (from cliff.toml) plus a contributor
-# acknowledgement list. `remote.contributors` is populated by release-plz from
-# the `/pull/N` links present in the rendered CHANGELOG.md last entry (see
-# `prs_from_text`), which are generated only from `(#N)` trailers in commit
-# messages (see `commit_preprocessors` in cliff.toml). Therefore every squash-
-# merge commit that should appear under Contributors must retain its `(#N)`
-# PR trailer in the subject. GitHub's "automatically add a (#<number>) suffix
-# to squash commits" repo setting (or a CI/commitlint rule) is what guarantees
-# this; commits without a `(#N)` trailer are invisible to the contributor
-# lookup and to `remote.contributors`.
+# Release notes = the grouped changelog (from cliff.toml). Contributor
+# attribution is rendered per-change in the changelog by git commit author (see
+# the `commit` macro and `commit_preprocessors` in cliff.toml), so every
+# contributor is credited regardless of whether the commit subject carried a
+# `(#N)` PR trailer. Mentions are rendered from an exact GitHub username when a
+# commit is authored with a GitHub noreply email (`NNNNNNN+<login>@users.noreply
+# .github.com`) and fall back to the author display name otherwise. We do not
+# render a separate Contributors list from `remote.contributors`: that
+# release-plz lookup is driven only by `/pull/N` links embedded from `(#N)`
+# trailers in commit subjects, so contributors whose commits lack such a trailer
+# (e.g. merge-style workflows) would otherwise be silently dropped.
 git_release_body = """
 {{ changelog }}
-{% if remote.contributors %}
-### Contributors
-{% for contributor in remote.contributors %}
-* @{{ contributor.username }}
-{% endfor %}
-{% endif %}
 """
