@@ -197,7 +197,12 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Layer cache keyed per branch/tag so re-runs are fast.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Use an explicit shared `scope` (type=gha defaults the scope to
+          # github.ref, so tag-push/workflow_run/dispatch each got their own
+          # cold cache and the expensive multi-arch Rust build recompiled from
+          # scratch on every release). A single scope lets every build mode
+          # reuse one accumulated cache.
+          cache-from: type=gha,scope=openflows-docker
+          cache-to: type=gha,mode=max,scope=openflows-docker
           build-args: |
             VERSION=${{ needs.resolve.outputs.version }}
