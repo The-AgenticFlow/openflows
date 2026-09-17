@@ -221,11 +221,14 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let _coder_token = cfg.coder.effective_token();
     let redis_url = cfg.infra.effective_redis_url();
     let tenant = cfg.tenant.effective_tenant().to_string();
+    // The repo is no longer required at boot: it is derived per-tenant and
+    // injected into the tenant's nexus workspace as GITHUB_REPOSITORY (or
+    // resolved from the tenant Redis `repository` key by agent-nexus::prep).
     let github_repo = cfg
         .github
         .repository
         .clone()
-        .context("GITHUB_REPOSITORY is not set. The Controller must run inside an openflows-nexus workspace.")?;
+        .unwrap_or_else(|| "<unset; resolved per-tenant>".to_string());
 
     tracing::info!(
         coder_url,

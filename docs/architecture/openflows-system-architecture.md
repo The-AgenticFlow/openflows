@@ -92,7 +92,8 @@ The Controller requires all of these (injected by the Coder template — no fall
 | `CODER_SESSION_TOKEN` | Scoped tenant-owner token (chat + workspace CRUD only, never admin) |
 | `REDIS_URL` | SharedStore connection |
 | `OPENFLOWS_TENANT` | Tenant identifier (namespaces every Redis key) |
-| `GITHUB_REPOSITORY` | Target repo in `owner/repo` form |
+
+> `GITHUB_REPOSITORY` is not a controller startup requirement: it is derived per-tenant and injected into the tenant's nexus workspace (`github_repository` coder parameter → template env).
 
 ### 3.3 The Orchestration Engine
 

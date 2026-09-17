@@ -39,9 +39,9 @@ usage() {
 OpenFlows Production Commands
 
 Usage:
-  ./scripts/prod.sh run                                Clean slate + start controller
+  ./scripts/prod.sh run                                Start controller on host (DEV/DEBUG only; production runs in-workspace)
   ./scripts/prod.sh bootstrap                          Setup Coder + push templates
-  ./scripts/prod.sh tenant owner/repo --name team-name  Add a tenant
+  ./scripts/prod.sh tenant owner/repo --name team-name  Add a tenant (each tenant runs its own in-workspace controller)
   ./scripts/prod.sh doctor                             Health check
 
 Options:
@@ -56,13 +56,14 @@ nothing changed). This guarantees the controller never silently runs on a
 stale binary after a code fix.
 
 Examples:
-  # Start controller (always resets state first):
+  # Start controller on host (DEV/DEBUG only — in production the controller
+  # runs inside each tenant's nexus workspace and auto-starts):
   ./scripts/prod.sh run
 
   # First-time setup:
   ./scripts/prod.sh bootstrap
 
-  # Add a team:
+  # Add a team (provisions the tenant's nexus workspace + controller):
   ./scripts/prod.sh tenant my-org/my-repo --name my-team
 
   # Health check:

@@ -806,7 +806,7 @@ impl CoderBootstrapper {
                         "github_pat": github_pat,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
-                        "start_controller": false,
+                        "start_controller": true,
                     }),
                 },
             )

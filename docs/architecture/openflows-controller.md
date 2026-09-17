@@ -37,12 +37,12 @@ The Controller is fail-fast on required environment (injected by the Coder templ
 | `REDIS_URL` | SharedStore connection |
 | `OPENFLOWS_TENANT` | Tenant identifier (namespaces every Redis key) |
 
-> **Note:** `GITHUB_TOKEN` has been **removed from startup environment**. It is no longer a startup variable. The GitHub repository URL is set as an environment variable but is **not a startup var** — it (along with the values below) is passed in through the **web UI** at provision time, after the Controller has booted.
+> **Note:** `GITHUB_TOKEN` has been **removed from startup environment**. It is no longer a startup variable. The GitHub repository URL is injected per-tenant by the nexus template (from the `github_repository` coder parameter set during `tenant add`), not supplied by the operator and **not** a startup var.
 
-Runtime-supplied (configured **after boot via the web UI**, not as startup env):
+Runtime-supplied (injected per-tenant by the nexus workspace template, not operator-set startup env):
 | Variable | Purpose |
 |----------|---------|
-| `GITHUB_REPOSITORY` | Target repo in `owner/repo` form (set via web UI) |
+| `GITHUB_REPOSITORY` | Target repo in `owner/repo` form (derived from tenant config, injected into the tenant's nexus workspace) |
 | `OPENFLOWS_HOME` | Orchestration files root |
 | `A2A_RELAY_ADDR` | A2A relay bind address (default `127.0.0.1:3000`) |
 | `OPENFLOWS_REGISTRY_PATH` / `OPENFLOWS_REGISTRY_JSON` | Registry resolution |

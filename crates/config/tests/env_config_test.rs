@@ -104,10 +104,12 @@ fn env_config_from_env_and_controller_validation() {
     guard.unset_all();
     std::env::set_var("CODER_SESSION_TOKEN", "fake-token");
     std::env::set_var("OPENFLOWS_TENANT", "acme");
-    std::env::set_var("GITHUB_REPOSITORY", "acme/repo");
     let env = EnvConfig::from_env().unwrap();
+    // GITHUB_REPOSITORY is no longer a controller startup requirement: it is
+    // derived per-tenant and injected into the tenant's nexus workspace (#213).
     assert!(env.validate_controller().is_ok());
     assert_eq!(env.tenant.effective_tenant(), "acme");
+    assert_eq!(env.github.repository, None);
 
     // Without OPENFLOWS_TENANT the controller must fail even though a fallback
     // "default" namespace exists for unrelated processes.
