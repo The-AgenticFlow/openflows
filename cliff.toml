@@ -25,7 +25,7 @@ body = """
 
 {% macro commit(commit) -%}
 - *({{ commit.scope | default(value = "uncategorized") | lower }})* {{ commit.message | upper_first | trim }}\
-  {% if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}\
+  {% if commit.author %} by @{{ commit.author.name }}{%- endif -%}\
 {%- if commit.breaking %} [**breaking**]{% endif %}
 {% endmacro -%}
 
