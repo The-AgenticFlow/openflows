@@ -763,6 +763,22 @@ impl CoderBootstrapper {
         let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
         let repo_url = format!("https://github.com/{}.git", github_repo);
 
+        // Re-running `tenant add` for an existing tenant returns the existing
+        // workspace without changing its build parameters (see
+        // create_workspace_for_user 409 handling). Existing workspaces therefore
+        // keep their original `start_controller` value and must be recreated once
+        // to pick up `start_controller=true` (new tenants get it automatically).
+        if let Ok(workspaces) = client.list_workspaces(&tenant_user.id).await {
+            if workspaces.iter().any(|w| w.name == nexus_workspace_name) {
+                println!(
+                    "  ⚠ Tenant workspace '{}' already exists — its build parameters are unchanged. \
+                     Recreate it once to enable the in-workspace controller \
+                     (`start_controller=true`); new tenants get this automatically.",
+                    nexus_workspace_name
+                );
+            }
+        }
+
         let github_pat = self
             .env
             .as_ref()
@@ -806,7 +822,7 @@ impl CoderBootstrapper {
                         "github_pat": github_pat,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
-                        "start_controller": false,
+                        "start_controller": true,
                     }),
                 },
             )

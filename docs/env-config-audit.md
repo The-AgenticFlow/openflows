@@ -55,7 +55,7 @@ the new centralized `crates/config/src/env.rs` layer.
 | `WORKSPACE_ROOT` | agent-nexus, agent-vessel | legacy-alias | `AgentConfig.legacy_workspace_root` (deprecated) |
 | `HOME` / `USERPROFILE` | coder-client, nexus, vessel, binary | in-use (platform) | Use `dirs` semantics / `TenantConfig.openflows_home()` |
 | `GITHUB_TOKEN` | agent-nexus | in-use | `GithubConfig.token` |
-| `GITHUB_REPOSITORY` | coder-client, nexus, binary | required | `GithubConfig.repository` |
+| `GITHUB_REPOSITORY` | coder-client, nexus, binary | in-use · runtime-injected | `GithubConfig.repository`; no longer an operator-set `.env` value — derived per-tenant and injected into the tenant's nexus workspace (#213) |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | coder-client, agent-lore, vessel, config | required | `GithubConfig.personal_access_token`; `effective_token()` |
 | `GITHUB_API_BASE` | github/rest | in-use | `GithubConfig.api_base` (default `https://api.github.com`); `GithubRestClient::new` resolves it via `GithubConfig::init_from_env()` |
 | `USE_AI_GATEWAY` | config/registry | in-use | `AgentConfig.use_ai_gateway` (lenient string; `"true"`/`"1"` enabled via `use_ai_gateway_enabled()`, consistent with `registry::resolve_ai_gateway_enabled`) |

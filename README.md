@@ -10,8 +10,8 @@
 ## Operator Quick Path
 
 1. Copy `.env.example` to `.env`.
-2. Fill only the required operator values: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `CODER_SESSION_TOKEN` after Coder starts, `CODER_CHAT_HOOK_SECRET` (32+ random bytes), and the `CODER_EXTERNAL_AUTH_0_*` GitHub App fields.
-3. Run `docker compose up -d`, then `./scripts/prod.sh bootstrap`, `./scripts/prod.sh tenant <owner/repo> --name <team>`, and `./scripts/prod.sh run`.
+2. Fill only the required operator values: `GITHUB_TOKEN`, `CODER_SESSION_TOKEN` after Coder starts, `CODER_CHAT_HOOK_SECRET` (32+ random bytes), and the `CODER_EXTERNAL_AUTH_0_*` GitHub App fields.
+3. Run `docker compose up -d`, then `./scripts/prod.sh bootstrap` and `./scripts/prod.sh tenant <owner/repo> --name <team>`. Each tenant's nexus workspace runs its own controller scoped to that repo.
 
 Lifecycle hooks are wired by the bundled stack. Do not set `CODER_EXPERIMENTS`, `CODER_CHAT_HOOK_URL`, or hook bind addresses unless you are running a custom deployment; generate `CODER_CHAT_HOOK_SECRET` with a command such as `openssl rand -hex 32`.
 
