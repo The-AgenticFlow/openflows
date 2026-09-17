@@ -119,14 +119,18 @@ To confirm the GitHub App was set up correctly, open **http://localhost:7080/dep
 
 ### Link the GitHub App (required for private repos)
 
-Signing in is **not** enough. You must also **link** the GitHub App so Coder can hand your agents a token to clone/push your repos (including private ones):
+Signing in is **not** enough. Each tenant workspace is owned by its **tenant user** (created by `tenant add`), and Coder refuses to build a workspace until the owning account links the GitHub App. The `CODER_SESSION_TOKEN` account is only the privileged **provisioning** actor — the tenant user is the actual workspace owner.
 
-1. Make sure you are logged into the Coder dashboard **as the account that owns the workspaces** — the one whose session token you put in `CODER_SESSION_TOKEN` (this account provisions the per-tenant nexus workspaces).
+For each tenant, complete the link **as the tenant user** (the team name you passed to `tenant add ... --name <team>`):
+
+1. Sign into the Coder dashboard as the **tenant user** — the account that owns the `openflows-nexus-<tenant>` workspace.
 2. Visit:
    ```
    http://localhost:7080/external-auth/primary-github
    ```
 3. On GitHub, click **Authorize**. You'll be redirected back to Coder once linked.
+
+> Do **not** link the GitHub App only as the `CODER_SESSION_TOKEN` (admin/provisioning) account — that account provisions the workspace but does not own it, so tenant workspace creation would still be blocked by Coder's external-auth `403`.
 
 > Required for private repos: skipping this link makes bootstrap fail with `403 External authentication is required to create a workspace with this template`; see [Troubleshooting](#troubleshooting).
 
@@ -233,16 +237,19 @@ A healthy consumer responds `200`. If you see `InvalidAudience`, see [Troublesho
 
 ### Rotating the secret
 
-`CODER_CHAT_HOOK_SECRET` is an **immutable** Nexus workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only rebuilds the Nexus workspace when the template itself changes). To rotate, you must recreate the workspace so it is rebuilt with the new secret:
+`CODER_CHAT_HOOK_SECRET` is an **immutable** tenant workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only pushes templates; it no longer creates a workspace). To rotate, you must **recreate the tenant workspace** so it is rebuilt with the new secret:
 
-1. Stop the Controller.
+1. Stop the tenant's Controller.
 2. Set a new 32+ byte `CODER_CHAT_HOOK_SECRET` in `.env`.
-3. Delete the existing Nexus workspace so bootstrap rebuilds it. You can do this from the host with the `coder` CLI (logged in as the OpenFlows user):
+3. Delete the tenant's existing Nexus workspace so it can be rebuilt. From the host with the `coder` CLI, logged in as the tenant user:
    ```bash
-   coder delete openflows-nexus
+   coder delete openflows-nexus-<tenant>
    ```
    (If you changed `OPENFLOWS_HOOK_URL` at the same time, do the same — the hook URL is also immutable.)
-4. Re-run bootstrap. It recreates the workspace with the new secret and the controller starts validating against it.
+4. Recreate the workspace through the tenant flow, which rebuilds it with the new secret and restarts its controller:
+   ```bash
+   ./scripts/prod.sh tenant <owner/repo> --name <tenant>
+   ```
 
 Coder and the consumer must always share the same secret, and both Coder and the Controller must be restarted after rotation.
 
@@ -354,12 +361,12 @@ This usually means the hook consumer rejected or couldn't be reached during Code
 
 If the controller logs `Hook consumer: JWT verification failed ... InvalidAudience`, the JWT's `aud` claim (Coder's `CODER_CHAT_HOOK_URL`) does not match the audience the consumer expects. In the bundled stack this should not happen — `OPENFLOWS_HOOK_URL` drives both Coder's URL and the consumer's expected `aud` via bootstrap. It appears when those two get out of sync:
 
-- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **Nexus workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the workspace (see [Rotating the secret](#rotating-the-secret)) so bootstrap rebuilds it against the current URL, or keep the bundled defaults.
+- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **tenant workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the tenant workspace (see [Rotating the secret](#rotating-the-secret)) so it is rebuilt against the current URL, or keep the bundled defaults.
 - Coder and the consumer were started with different `CODER_CHAT_HOOK_SECRET` values or one was restarted out of order. Restart both with the same secret.
 
 ### `403 External authentication is required to create a workspace with this template`
 
-Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
+Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link as the **tenant user** (see [Link the GitHub App](#link-the-github-app-required-for-private-repos)) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, recreate the tenant workspace via `./scripts/prod.sh tenant <owner/repo> --name <tenant>`.
 
 ### Agents can't clone/push the private repo
 
