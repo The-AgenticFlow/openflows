@@ -183,6 +183,8 @@ Bind a GitHub repo to OpenFlows. Each tenant is scoped to one `owner/repo` and g
 
 You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces**.
 
+> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). New tenants get this automatically — nothing extra to do.
+
 ---
 
 ## Step 10 — Let the controller run
