@@ -175,13 +175,15 @@ Confirm the templates were pushed at **http://localhost:7080/templates**.
 
 ## Step 9 — Add a tenant
 
-Bind a GitHub repo to OpenFlows. Each tenant is scoped to one `owner/repo` and gets its own nexus workspace + controller:
+Bind a GitHub repo to OpenFlows. A tenant is scoped to a single `owner/repo` and provisions its own nexus workspace + controller:
 
 ```bash
 ./scripts/prod.sh tenant <owner/repo> --name <my-team>
 ```
 
 You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces**.
+
+> **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
 
 > **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). New tenants get this automatically — nothing extra to do.
 

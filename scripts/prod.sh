@@ -56,8 +56,7 @@ nothing changed). This guarantees the controller never silently runs on a
 stale binary after a code fix.
 
 Examples:
-  # Start controller on host (DEV/DEBUG only — in production the controller
-  # runs inside each tenant's nexus workspace and auto-starts):
+  # Start controller on host (DEV/DEBUG; also resets Redis state first):
   ./scripts/prod.sh run
 
   # First-time setup:
