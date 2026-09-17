@@ -93,7 +93,7 @@ The Controller requires all of these (injected by the Coder template — no fall
 | `REDIS_URL` | SharedStore connection |
 | `OPENFLOWS_TENANT` | Tenant identifier (namespaces every Redis key) |
 
-> `GITHUB_REPOSITORY` is not a controller startup requirement: it is derived per-tenant and injected into the tenant's nexus workspace (`github_repository` coder parameter → template env).
+> `GITHUB_REPOSITORY` is derived per-tenant and injected into the tenant's nexus workspace (`github_repository` coder parameter → template env).
 
 ### 3.3 The Orchestration Engine
 
