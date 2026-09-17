@@ -1,7 +1,7 @@
 # OpenFlows — Autonomous AI Development Team on Coder
 <img src="./assets/home.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
-> Official site: [openflows.dev](https://openflows.dev)
+> Official site: [openflows.dev](https://openflows.dev) · Docker: [ghcr.io/the-agenticflow/openflows](https://ghcr.io/the-agenticflow/openflows)
 
 **OpenFlows is an autonomous AI software team that turns GitHub issues into reviewed, production-ready pull requests inside your self-hosted Coder environment.** For developers, it handles planning, coding, testing, and adversarial review while keeping them in control of architecture and final decisions. For companies, it brings governed, auditable AI delivery into existing engineering workflows without exposing LLM keys or weakening security boundaries. For stakeholders, it creates a faster, more transparent path from product intent to shipped software.
 
