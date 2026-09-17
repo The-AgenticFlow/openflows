@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.5.2] - 2026-09-17
+
+### Bug Fixes
+
+- *(ci,tenant)* Address review — resolver, tenant repo persist, owner-scoped warn by @Christiantyemele
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.1...openflows-1.5.2
+
+
+
 ## [1.5.1] - 2026-09-17
 
 
