@@ -10,19 +10,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace manifests first so `cargo fetch` can resolve and cache the
-# dependency tree before the rest of the build context changes. This keeps the
-# crate-download layer stable — combined with the buildx `type=gha` cache in
-# docker-publish.yml, unchanged dependencies are not re-fetched on re-runs.
+# Copy the workspace source (root manifest/lock + all member sources) before
+# `cargo fetch`. cargo must load every workspace member package to build the
+# dependency graph for `fetch`, and it validates each member's crate targets —
+# which requires the member `src/` trees to be present, not just their
+# manifests (`cargo fetch` otherwise fails with "failed to read
+# .../Cargo.toml" or "no targets specified in the manifest"). The buildx
+# `type=gha` cache in docker-publish.yml still avoids recompiling unchanged
+# dependencies on re-runs.
 COPY Cargo.toml Cargo.lock ./
-
-# Download (and cache in the layer cache) all crates.io dependencies ahead of
-# copying source, so network resolution isn't repeated for every build.
-RUN cargo fetch
-
 COPY crates ./crates
 COPY binary ./binary
 COPY orchestration ./orchestration
+
+# Download (and cache in the layer cache) all crates.io dependencies before
+# building the binaries, so network resolution isn't repeated for every build.
+RUN cargo fetch
 
 # Build all release binaries
 RUN cargo build --release --bin openflows --bin openflows-doctor --bin openflows-harness
