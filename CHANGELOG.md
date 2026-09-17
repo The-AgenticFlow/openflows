@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.5.0] - 2026-09-17
+
+### Features
+
+- *(debug)* Add workspace provider function with fallback for debug output by @Christiantyemele
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.4.0...openflows-1.5.0
+
+
+
 ## [1.4.0] - 2026-09-17
 
 ### Features
