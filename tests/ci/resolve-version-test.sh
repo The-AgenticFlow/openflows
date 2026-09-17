@@ -50,7 +50,6 @@ assert_eq() {
 
 # --- Build fixture repo ---------------------------------------------------------
 FIXTURE="$(mktemp -d)"
-trap 'rm -rf "${FIXTURE}"' EXIT
 cd "${FIXTURE}"
 git init -q
 git config user.email "test@example.com"
@@ -106,7 +105,7 @@ assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W2}" "${E2}" 2>/dev/null)" "oldest ru
 #    after the last tag so all tags are excluded; this is also covered by test 4.
 #    For the "no tags exist" case, use a throwaway empty repo.
 EMPTY_REPO="$(mktemp -d)"
-trap 'rm -rf "${EMPTY_REPO}"' EXIT
+trap 'rm -rf "${FIXTURE}" "${EMPTY_REPO}"' EXIT
 (
   cd "${EMPTY_REPO}"
   git init -q
