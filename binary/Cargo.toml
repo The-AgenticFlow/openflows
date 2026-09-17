@@ -3,6 +3,11 @@ name    = "openflows"
 version = "1.3.3"
 edition = "2021"
 license = "MIT"
+# Register the repo-root README with the package so release-plz tracks edits to it
+# (e.g. `docs(readme): ...` commits) as part of the `openflows` changelog. Without
+# this, release-plz's package-path walk only covers `binary/`, so root README/doc
+# changes are dropped from the generated CHANGELOG and the GitHub release body.
+readme = "../README.md"
 
 [package.metadata.cargo-machete]
 ignored = ["provisioner"]
