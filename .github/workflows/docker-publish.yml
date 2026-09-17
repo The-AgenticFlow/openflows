@@ -20,6 +20,19 @@ on:
   push:
     tags:
       - 'openflows-[0-9]*.[0-9]*.[0-9]*'
+  # The release tag is created by release-plz using GITHUB_TOKEN, and GitHub
+  # deliberately does NOT dispatch tag-push events for commits/tags created by
+  # GITHUB_TOKEN (an anti-recursion safeguard). As a result the `push: tags`
+  # trigger alone never fires for release-plz tags. Reliably react to each new
+  # release by also running when the `Release` workflow completes successfully:
+  # the version is then derived from the newest `openflows-*.*.*` tag.
+  workflow_run:
+    workflows:
+      - 'Release'
+    types:
+      - completed
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
@@ -50,10 +63,28 @@ jobs:
         env:
           MANUAL_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
+          GITHUB_EVENT: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
           if [ -n "${MANUAL_VERSION}" ]; then
+            # Explicit version from a manual dispatch.
             VERSION="${MANUAL_VERSION}"
+          elif [ "${GITHUB_EVENT}" = "workflow_run" ]; then
+            # Triggered by the `Release` workflow completing. Only build when the
+            # triggering run actually succeeded. github.ref_name is the default
+            # branch here, not a version, so derive the newest openflows-X.Y.Z
+            # tag (the release release-plz just created).
+            if [ "${RUN_CONCLUSION}" != "success" ]; then
+              echo "::notice::Skipping: triggering Release run concluded '${RUN_CONCLUSION}', not success"
+              exit 0
+            fi
+            VERSION="$(git tag --list 'openflows-[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 | sed 's/^openflows-//')"
+            if [ -z "${VERSION}" ]; then
+              echo "::error::No openflows-X.Y.Z tag found to derive version from (workflow_run)"
+              exit 1
+            fi
           else
+            # Tag push: derive the version from the ref name.
             VERSION="${REF_NAME#openflows-}"
           fi
           if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
