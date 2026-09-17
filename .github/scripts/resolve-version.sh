@@ -24,10 +24,10 @@ set -euo pipefail
 resolve_version() {
   local start_at="$1"
   local end_at="$2"
-  local run_start_epoch run_end_epoch t tag_epoch version=""
+  local run_start_epoch run_end_epoch t tag_epoch best_epoch="" version=""
   run_start_epoch="$(date -d "${start_at}" +%s)"
   run_end_epoch="$(date -d "${end_at}" +%s)"
-  for t in $(git tag --list 'openflows-*' --sort=-v:refname); do
+  for t in $(git tag --list 'openflows-*'); do
     # Only exact openflows-X.Y.Z tags are candidates; reject any tag with a
     # suffix (e.g. openflows-1.2.3-beta, openflows-1.2.3.4) up front.
     if ! printf '%s' "${t#openflows-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -35,8 +35,14 @@ resolve_version() {
     fi
     tag_epoch="$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/${t}")"
     if [ -n "${tag_epoch}" ] && [ "${tag_epoch}" -ge "${run_start_epoch}" ] && [ "${tag_epoch}" -le "${run_end_epoch}" ]; then
-      version="${t#openflows-}"
-      break
+      # Choose the newest tag CREATED within the window (by its creator date),
+      # not the highest version number. release-plz creates exactly one release
+      # tag per run, so the run's tag is the newest-created in-window tag; an
+      # unrelated higher-version tag pushed concurrently must not be selected.
+      if [ -z "${best_epoch}" ] || [ "${tag_epoch}" -gt "${best_epoch}" ]; then
+        best_epoch="${tag_epoch}"
+        version="${t#openflows-}"
+      fi
     fi
   done
   printf '%s' "${version}"
