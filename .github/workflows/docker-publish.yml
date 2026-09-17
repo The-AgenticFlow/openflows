@@ -20,10 +20,11 @@ name: Docker Publish
 # with `types: [completed]` restricted to `branches: [main]`. The `resolve` job
 # is gated on `github.event.workflow_run.conclusion == "success"` and only
 # resolves a version when the triggering run actually created an
-# `openflows-X.Y.Z` tag (newest tag that is an ancestor of the run's head and
-# created within the run's window); the `build-and-push` job depends on
-# `resolve` and only runs on a resolved version. So an upstream failure or
-# untrusted branch can never drive a build/push. This is the file zizmor flags
+# `openflows-X.Y.Z` tag (newest exact-version tag that is an ancestor of the
+# run's head and created within the run's [created_at, completed_at] window);
+# the `build-and-push` job depends on `resolve` and only runs on a resolved
+# version. So an upstream failure or untrusted branch can never drive a
+# build/push. This is the file zizmor flags
 # as `dangerous-triggers`; the suppression is declared in `.github/zizmor.yml`
 # (zizmor's inline comment form does not suppress this rule).
 on:
@@ -91,6 +92,7 @@ jobs:
           GITHUB_EVENT: ${{ github.event_name }}
           WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          WORKFLOW_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
         run: |
           if [ -n "${MANUAL_VERSION}" ]; then
             # Explicit version from a manual dispatch.
@@ -102,15 +104,22 @@ jobs:
             # head commit itself, so a plain `git tag --points-at` never matches.
             # Resolve the newest openflows-X.Y.Z tag whose commit is an ancestor
             # of the triggering run's head AND whose creator date falls within
-            # this run (created_at): a real release resolves to its exact tag,
-            # while tagless runs (release_always=false, no new tag in the window)
-            # are skipped so we never rebuild/republish the previous release.
+            # this run's window ([created_at, completed_at]): a real release
+            # resolves to its exact tag, while tagless runs (release_always=false,
+            # no new tag in the window) are skipped so we never rebuild/republish
+            # the previous release.
             RUN_START_EPOCH="$(date -d "${WORKFLOW_RUN_CREATED_AT}" +%s)"
+            RUN_END_EPOCH="$(date -d "${WORKFLOW_RUN_COMPLETED_AT}" +%s)"
             VERSION=""
-            for t in $(git tag --list 'openflows-[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname); do
+            for t in $(git tag --list 'openflows-*' --sort=-v:refname); do
+              # Only exact openflows-X.Y.Z tags are candidates; reject any tag with
+              # a suffix (e.g. openflows-1.2.3-beta, openflows-1.2.3.4) up front.
+              if ! printf '%s' "${t#openflows-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                continue
+              fi
               if git merge-base --is-ancestor "${t}^{}" "${WORKFLOW_RUN_HEAD_SHA}" 2>/dev/null; then
                 tag_epoch="$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/${t}")"
-                if [ -n "${tag_epoch}" ] && [ "${tag_epoch}" -ge "${RUN_START_EPOCH}" ]; then
+                if [ -n "${tag_epoch}" ] && [ "${tag_epoch}" -ge "${RUN_START_EPOCH}" ] && [ "${tag_epoch}" -le "${RUN_END_EPOCH}" ]; then
                   VERSION="${t#openflows-}"
                   break
                 fi

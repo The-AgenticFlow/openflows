@@ -10,8 +10,9 @@
 #   - restricted to `types: [completed]` and `branches: [main]`
 #   - the `resolve` job is gated on `github.event.workflow_run.conclusion == "success"`
 #   - a version is resolved only when the triggering run actually created an
-#     `openflows-X.Y.Z` tag (newest tag that is an ancestor of the run's head
-#     and created within the run's window), and the `build-and-push` job only
+#     `openflows-X.Y.Z` tag (newest exact-version tag that is an ancestor of the
+#     run's head and created within the run's [created_at, completed_at] window),
+#     and the `build-and-push` job only
 #     runs on a resolved version — so an upstream failure or untrusted branch
 #     can never drive a build/push
 rules:
