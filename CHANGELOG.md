@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.5.1] - 2026-09-17
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.0...openflows-1.5.1
+
+
+
 ## [1.5.0] - 2026-09-17
 
 ### Features
