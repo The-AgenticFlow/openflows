@@ -100,29 +100,12 @@ jobs:
             # Triggered by the `Release` workflow completing. github.ref_name is
             # the default branch here, not a version. release-plz creates the
             # `openflows-X.Y.Z` tag during the run, so the tag that THIS release
-            # produced is the newest exact-version tag whose creator date falls
-            # within the run's window ([created_at, completed_at]). We deliberately
-            # do NOT gate on the run's head SHA: `workflow_run.head_sha` can be the
-            # `develop` tip (a commit that PREDATES the release commit), so an
-            # ancestor relationship is unreliable. The creator-date window is the
-            # authoritative signal that this run created the tag; a tagless run
-            # (release_always=false, no new tag in the window) is skipped so we
-            # never rebuild/republish the previous release.
-            RUN_START_EPOCH="$(date -d "${WORKFLOW_RUN_CREATED_AT}" +%s)"
-            RUN_END_EPOCH="$(date -d "${WORKFLOW_RUN_COMPLETED_AT}" +%s)"
-            VERSION=""
-            for t in $(git tag --list 'openflows-*' --sort=-v:refname); do
-              # Only exact openflows-X.Y.Z tags are candidates; reject any tag with
-              # a suffix (e.g. openflows-1.2.3-beta, openflows-1.2.3.4) up front.
-              if ! printf '%s' "${t#openflows-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-                continue
-              fi
-              tag_epoch="$(git for-each-ref --format='%(creatordate:unix)' "refs/tags/${t}")"
-              if [ -n "${tag_epoch}" ] && [ "${tag_epoch}" -ge "${RUN_START_EPOCH}" ] && [ "${tag_epoch}" -le "${RUN_END_EPOCH}" ]; then
-                VERSION="${t#openflows-}"
-                break
-              fi
-            done
+            # produced is selected by its creator date falling within the run's
+            # [created_at, completed_at] window (see `.github/scripts/resolve-version.sh`).
+            # A tagless run (release_always=false, no new tag in the window)
+            # resolves to nothing and is skipped so we never rebuild/republish the
+            # previous release.
+            VERSION="$(bash .github/scripts/resolve-version.sh "${WORKFLOW_RUN_CREATED_AT}" "${WORKFLOW_RUN_COMPLETED_AT}")"
             if [ -z "${VERSION}" ]; then
               echo "::notice::Skipping: triggering Release run did not create an openflows-X.Y.Z tag"
               exit 0
