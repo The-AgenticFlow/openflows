@@ -121,7 +121,7 @@ To confirm the GitHub App was set up correctly, open **http://localhost:7080/dep
 
 Signing in is **not** enough. You must also **link** the GitHub App so Coder can hand your agents a token to clone/push your repos (including private ones):
 
-1. Make sure you are logged into the Coder dashboard **as the account that owns the workspaces** — the one whose session token you put in `CODER_SESSION_TOKEN` (bootstrap creates the control-plane workspace under this account).
+1. Make sure you are logged into the Coder dashboard **as the account that owns the workspaces** — the one whose session token you put in `CODER_SESSION_TOKEN` (this account provisions the per-tenant nexus workspaces).
 2. Visit:
    ```
    http://localhost:7080/external-auth/primary-github
@@ -271,7 +271,7 @@ When a team member signs in with GitHub OAuth, Coder creates them as a **regular
 
 | Role | Why |
 |------|-----|
-| `organization-admin` | Create the control-plane workspace + template management. |
+| `organization-admin` | Provision workspaces (e.g. tenant nexus workspaces) + template management. |
 | `organization-template-admin` | Push/update the `openflows-*` templates. |
 | `organization-workspace-access` | Required for org workspaces. Keep it — `edit-roles` replaces the whole role set. |
 

@@ -252,12 +252,6 @@ pub struct TenantConfig {
     #[envconfig(from = "OPENFLOWS_REGISTRY_JSON")]
     pub registry_json: Option<String>,
 
-    #[envconfig(from = "OPENFLOWS_NEXUS_WORKSPACE_ID")]
-    pub nexus_workspace_id: Option<String>,
-
-    #[envconfig(from = "OPENFLOWS_NEXUS_WORKSPACE_NAME")]
-    pub nexus_workspace_name: Option<String>,
-
     #[envconfig(from = "OPENFLOWS_NEXUS_API_TOKEN")]
     pub nexus_api_token: Option<String>,
 
@@ -292,8 +286,6 @@ impl fmt::Debug for TenantConfig {
             .field("home", &self.home)
             .field("registry_path", &self.registry_path)
             .field("registry_json", &self.registry_json)
-            .field("nexus_workspace_id", &self.nexus_workspace_id)
-            .field("nexus_workspace_name", &self.nexus_workspace_name)
             .field("nexus_api_token", &redact(&self.nexus_api_token))
             .field("tar", &self.tar)
             .finish()
@@ -357,15 +349,6 @@ pub struct AgentConfig {
     /// Whether the AI gateway is enabled.
     #[envconfig(from = "USE_AI_GATEWAY")]
     pub use_ai_gateway: Option<String>,
-
-    /// Whether the bootstrapper should create the Nexus control-plane
-    /// workspace.
-    #[envconfig(from = "OPENFLOWS_CREATE_NEXUS_WORKSPACE")]
-    pub create_nexus_workspace: Option<String>,
-
-    /// The role this process runs as (e.g. `nexus`).
-    #[envconfig(from = "ROLE")]
-    pub role: Option<String>,
 }
 
 impl AgentConfig {
@@ -379,12 +362,6 @@ impl AgentConfig {
     /// Whether the AI gateway is enabled.
     pub fn use_ai_gateway_enabled(&self) -> bool {
         matches!(self.use_ai_gateway.as_deref(), Some("true" | "1"))
-    }
-
-    /// Whether the bootstrapper should create the Nexus control-plane
-    /// workspace.
-    pub fn create_nexus_workspace_enabled(&self) -> bool {
-        self.create_nexus_workspace.as_deref() != Some("false")
     }
 }
 
@@ -663,32 +640,6 @@ mod tests {
             cfg.hooks.hook_public_url().as_deref(),
             Some("http://openflows-nexus:4900/experimental/hooks/chat")
         );
-    }
-
-    #[test]
-    fn create_nexus_workspace_is_lenient_and_defaults_enabled() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture(&["OPENFLOWS_CREATE_NEXUS_WORKSPACE"]);
-        std::env::remove_var("OPENFLOWS_CREATE_NEXUS_WORKSPACE");
-        assert!(EnvConfig::from_env()
-            .unwrap()
-            .agent
-            .create_nexus_workspace_enabled());
-
-        for (v, expected) in [
-            ("false", false),
-            ("true", true),
-            ("1", true),
-            ("garbage", true),
-        ] {
-            std::env::set_var("OPENFLOWS_CREATE_NEXUS_WORKSPACE", v);
-            let cfg = EnvConfig::from_env().unwrap();
-            assert_eq!(
-                cfg.agent.create_nexus_workspace_enabled(),
-                expected,
-                "OPENFLOWS_CREATE_NEXUS_WORKSPACE={v}"
-            );
-        }
     }
 
     #[test]
