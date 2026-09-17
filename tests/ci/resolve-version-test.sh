@@ -60,11 +60,15 @@ E10=$((1700000000 + 10))    # openflows-1.4.0
 E20=$((1700000000 + 20))    # openflows-1.5.0
 E25=$((1700000000 + 25))    # openflows-1.2.3-beta (suffix, must be ignored)
 E30=$((1700000000 + 30))    # openflows-1.5.1 (this run's release)
+E35=$((1700000000 + 35))    # openflows-1.6.0 (unrelated higher version, older than run tag)
+E40=$((1700000000 + 40))    # openflows-1.5.2 (newest-created in-window, despite lower version)
 
 make_tag openflows-1.4.0 "${E10}" "release 1.4.0"
 make_tag openflows-1.5.0 "${E20}" "release 1.5.0"
 make_tag openflows-1.2.3-beta "${E25}" "prerelease 1.2.3-beta"
 make_tag openflows-1.5.1 "${E30}" "release 1.5.1"
+make_tag openflows-1.6.0 "${E35}" "release 1.6.0"
+make_tag openflows-1.5.2 "${E40}" "release 1.5.2"
 
 # Resolve uses ISO-8601 windows; build them from the epoch anchors.
 win() { date -d "@$1" -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -88,14 +92,27 @@ E3="$(win $((E10 - 10)))"
 assert_eq "" "$(bash "${RESOLVER}" "${W3}" "${E3}" 2>/dev/null)" "tagless (pre-release) window skips"
 
 # 4. Window after all tags (tagless) -> empty.
-W4="$(win $((E30 + 5)))"
-E4="$(win $((E30 + 6)))"
+W4="$(win $((E40 + 5)))"
+E4="$(win $((E40 + 6)))"
 assert_eq "" "$(bash "${RESOLVER}" "${W4}" "${E4}" 2>/dev/null)" "window after last release skips"
 
 # 5. A window covering a suffix tag only must still skip (suffix never selected).
 W5="$(win $((E25 - 1)))"
 E5="$(win $((E25 + 1)))"
 assert_eq "" "$(bash "${RESOLVER}" "${W5}" "${E5}" 2>/dev/null)" "suffix tag openflows-1.2.3-beta is rejected"
+
+# 6. Two exact tags in the same window: the newer-CREATED (1.5.2) is selected,
+#    NOT the higher-version 1.6.0 (which was created earlier). Guards against
+#    misattributing an unrelated concurrent tag to this run.
+W6="$(win $((E35 - 1)))"
+E6="$(win $((E40 + 1)))"
+assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W6}" "${E6}" 2>/dev/null)" "newest-created in-window tag wins over higher version (1.5.2 over 1.6.0)"
+
+# 7. A window containing only the newer high-version tag (1.6.0) resolves it;
+#    creator-date selection still returns the newest-created in-window tag.
+W7="$(win $((E35 - 1)))"
+E7="$(win $((E35 + 1)))"
+assert_eq "1.6.0" "$(bash "${RESOLVER}" "${W7}" "${E7}" 2>/dev/null)" "creator-date selection resolves newest-created in-window tag (1.6.0)"
 
 echo
 echo "== Result: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC} =="
