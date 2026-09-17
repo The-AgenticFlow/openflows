@@ -16,14 +16,15 @@ name: Docker Publish
 #
 # Manual dispatch requires the `version` input (e.g. 1.3.1).
 #
-# zizmor: ignore[workflow-run] -- used with `types: [completed]` restricted to
-# `branches: [main]`. The `resolve` job is gated on
-# `github.event.workflow_run.conclusion == "success"`, and it only resolves a
-# version when the triggering run points at an `openflows-X.Y.Z` tag, so an
-# upstream failure or untrusted branch can never drive a build/push (the
-# `build-and-push` job depends on `resolve` and only runs on a resolved
-# version). The annotation sits above `on:` because zizmor attributes the
-# trigger finding to the `on:` block.
+# Security note for the `workflow_run` trigger below: it is used deliberately
+# with `types: [completed]` restricted to `branches: [main]`. The `resolve` job
+# is gated on `github.event.workflow_run.conclusion == "success"` and only
+# resolves a version when the triggering run points at an `openflows-X.Y.Z`
+# tag; the `build-and-push` job depends on `resolve` and only runs on a
+# resolved version. So an upstream failure or untrusted branch can never drive
+# a build/push. This is the file zizmor flags as `dangerous-triggers`; the
+# suppression is declared in `.github/zizmor.yml` (zizmor's inline comment
+# form does not suppress this rule).
 on:
   push:
     tags:
@@ -79,6 +80,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Resolve version
         id: version
@@ -129,6 +131,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
+          persist-credentials: false
 
       # Enable QEMU so the buildx builder can produce linux/arm64 images on the
       # amd64 GitHub-hosted runner.
