@@ -27,16 +27,6 @@ pub struct CoderBootstrapper {
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
 
-/// Resolve an already-loaded [`config::EnvConfig`], falling back to parsing the
-/// process environment for callers (e.g. [`CoderBootstrapper::new`]) that were
-/// not constructed from the environment.
-fn load_env(env: Option<&config::EnvConfig>) -> Result<config::EnvConfig> {
-    match env {
-        Some(env) => Ok(env.clone()),
-        None => config::EnvConfig::from_env(),
-    }
-}
-
 /// Check whether a password meets Coder's minimum security requirements.
 ///
 /// Coder requires at least: uppercase, lowercase, digit, special character,
@@ -148,7 +138,7 @@ impl CoderBootstrapper {
                     .with_token(api_key.key.clone())
                     .with_session_token(&existing_token);
                 info!("  ✓ API token generated for '{}'", me.username);
-                return Self::push_templates_and_create_nexus(client, self.env.as_ref()).await;
+                return Self::push_templates(client).await;
             }
         }
 
@@ -207,16 +197,12 @@ impl CoderBootstrapper {
             .with_session_token(&session_token);
         info!("  ✓ API token generated");
 
-        Self::push_templates_and_create_nexus(client, self.env.as_ref()).await
+        Self::push_templates(client).await
     }
 
-    /// Shared post-auth logic: push templates and create the nexus workspace.
-    /// Used by both the "reuse existing token" fast path and the full admin
-    /// bootstrap path.
-    async fn push_templates_and_create_nexus(
-        client: CoderClient,
-        env: Option<&config::EnvConfig>,
-    ) -> Result<CoderClient> {
+    /// Shared post-auth logic: push templates. Used by both the "reuse existing
+    /// token" fast path and the full admin bootstrap path.
+    async fn push_templates(client: CoderClient) -> Result<CoderClient> {
         let resolved_user = client.resolve_current_user().await?;
         info!(
             username = %resolved_user,
@@ -228,13 +214,6 @@ impl CoderBootstrapper {
         // Set as a TF_VAR_* env var — `coder templates push` runs Terraform
         // under the hood and inherits the parent environment.
         Self::set_dev_binary_host_path();
-
-        // Check whether nexus workspace creation is enabled before deleting
-        // any stale workspace. If creation is disabled, we must preserve the
-        // existing one.
-        let env_cfg = load_env(env)?;
-        let create_nexus_workspace = env_cfg.agent.create_nexus_workspace_enabled()
-            && env_cfg.agent.role.as_deref() != Some("nexus");
 
         // Track template push failures — bootstrap must fail if required
         // templates cannot be pushed, so the caller knows provisioning is
@@ -272,7 +251,6 @@ impl CoderBootstrapper {
         if nexus_result.is_none() {
             template_errors.push("openflows-nexus");
         }
-        let nexus_template_updated = nexus_result == Some(true);
 
         let vessel_result = push_template_silently(
             &client,
@@ -306,21 +284,6 @@ impl CoderBootstrapper {
             );
         }
 
-        // Delete stale workspace only if we intend to recreate it. If
-        // OPENFLOWS_CREATE_NEXUS_WORKSPACE=false or ROLE=nexus, preserving
-        // the existing control plane avoids a window with no workspace.
-        if nexus_template_updated && create_nexus_workspace {
-            Self::delete_stale_nexus_workspace(&client, env).await?;
-        }
-
-        // Create or refresh the long-lived Nexus workspace outside Coder.
-        //
-        // This is the bootstrapper's "first mover" responsibility: seed the
-        // persistent control-plane workspace that runs the orchestration loop.
-        if create_nexus_workspace {
-            Self::create_nexus_workspace(&client, env).await?;
-        }
-
         info!("  ✓ Coder bootstrapped");
         Ok(client)
     }
@@ -348,238 +311,6 @@ impl CoderBootstrapper {
         std::env::set_var("TF_VAR_dev_binary_host_path", &canonical);
     }
 
-    /// Delete a stale nexus workspace when its template has been updated.
-    /// Returns Ok if no workspace existed, or after successful deletion.
-    /// Returns Err if deletion failed — callers must fail bootstrap to avoid
-    /// a name conflict when recreating the workspace.
-    async fn delete_stale_nexus_workspace(
-        client: &CoderClient,
-        env: Option<&config::EnvConfig>,
-    ) -> Result<()> {
-        let env_cfg = load_env(env)?;
-        let nexus_workspace_name = env_cfg
-            .tenant
-            .nexus_workspace_name
-            .unwrap_or_else(|| "openflows-nexus".to_string());
-        let me = client.get_me().await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to resolve current user while checking for stale nexus workspace '{}': {}. \
-                 Cannot safely delete the stale workspace — resolve the error or set \
-                 OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
-                nexus_workspace_name,
-                e
-            )
-        })?;
-        let workspaces = client.list_workspaces(&me.id).await.map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to list workspaces while checking for stale nexus workspace '{}': {}. \
-                 Cannot safely delete the stale workspace — resolve the error or set \
-                 OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
-                nexus_workspace_name,
-                e
-            )
-        })?;
-        let Some(existing) = workspaces
-            .iter()
-            .find(|w| w.name == nexus_workspace_name && w.owner_name == me.username)
-        else {
-            return Ok(());
-        };
-        info!(
-            workspace_id = %existing.id,
-            workspace_name = %existing.name,
-            "  → Nexus template updated — deleting stale workspace for recreation"
-        );
-        let _ = client.stop_workspace(&existing.id).await;
-        match client.delete_workspace(&existing.id).await {
-            Ok(()) => {
-                info!("  ✓ Stale nexus workspace deleted — waiting for it to be fully removed");
-                Self::wait_for_workspace_gone(client, &me.username, &nexus_workspace_name).await
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "  ⚠ Could not delete stale nexus workspace '{}': {}. \
-                     Cannot recreate — would cause a name conflict with the existing stale workspace. \
-                     Either delete it manually or set OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
-                    nexus_workspace_name,
-                    e
-                )
-            }
-        }
-    }
-
-    /// Wait until the named workspace no longer appears in the user's listing.
-    ///
-    /// Coder's workspace deletion is asynchronous, so a fixed sleep is racy:
-    /// if deletion outlives the sleep, recreation hits a name conflict and the
-    /// client's conflict handling returns the stale workspace as a success.
-    /// Poll until the name is actually free (or a timeout elapses) before the
-    /// caller recreates it.
-    ///
-    /// The workspace listing is deployment-wide, so the poll is scoped to the
-    /// current user's own workspaces (`owner_name`) to avoid mistaking another
-    /// user's same-named workspace for the one being deleted.
-    async fn wait_for_workspace_gone(
-        client: &CoderClient,
-        owner_name: &str,
-        name: &str,
-    ) -> Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let workspaces = client.list_workspaces(owner_name).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to list workspaces while waiting for stale nexus workspace '{}' to be removed: {}",
-                    name,
-                    e
-                )
-            })?;
-            if !workspaces
-                .iter()
-                .any(|w| w.name == name && w.owner_name == owner_name)
-            {
-                info!("  ✓ Stale nexus workspace '{}' fully removed", name);
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "Timed out waiting for stale nexus workspace '{}' to be removed. \
-                     Recreating now would reuse the stale workspace. \
-                     Delete it manually or set OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
-                    name
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    }
-
-    /// Create the long-lived Nexus workspace.
-    ///
-    /// Returns Err if the workspace could not be created or did not become
-    /// ready. Callers must fail bootstrap on error so a deleted control plane
-    /// is never left without a functional replacement.
-    async fn create_nexus_workspace(
-        client: &CoderClient,
-        env: Option<&config::EnvConfig>,
-    ) -> Result<()> {
-        let env_cfg = load_env(env)?;
-        let tenant_cfg = &env_cfg.tenant;
-        let github_cfg = &env_cfg.github;
-        let nexus_workspace_name = tenant_cfg
-            .nexus_workspace_name
-            .clone()
-            .unwrap_or_else(|| "openflows-nexus".to_string());
-        let nexus_api_token = tenant_cfg
-            .nexus_api_token
-            .clone()
-            .or_else(|| std::env::var("NEXUS_CODER_API_TOKEN").ok())
-            .unwrap_or_else(|| client.token().to_string());
-        let repository = github_cfg.repository.clone().unwrap_or_default();
-        let repo_url = if repository.is_empty() {
-            String::new()
-        } else {
-            format!("https://github.com/{}.git", repository)
-        };
-        let redis_url = "redis://redis:6379".to_string();
-        let tenant = tenant_cfg.effective_tenant().to_string();
-        let registry_json = match tenant_cfg.registry_json.clone() {
-            Some(json) => json,
-            None => {
-                let path = tenant_cfg
-                    .registry_path
-                    .clone()
-                    .unwrap_or_else(|| "orchestration/agent/registry.json".to_string());
-                std::fs::read_to_string(&path).unwrap_or_default()
-            }
-        };
-        let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
-        let github_pat = github_cfg.token.clone().unwrap_or_default();
-        let hook_secret = env_cfg
-            .hooks
-            .chat_hook_secret
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the Nexus workspace")?;
-        let hook_url = env_cfg.hooks.chat_hook_url_effective().unwrap_or_default();
-
-        let workspace = client
-            .create_workspace(&CreateWorkspaceRequest {
-                template_name: "openflows-nexus".to_string(),
-                name: nexus_workspace_name.clone(),
-                parameters: json!({
-                    "repo_url": repo_url,
-                    "redis_url": redis_url,
-                    "coder_url": coder_url_for_workspace,
-                    "coder_session_token": nexus_api_token,
-                    "tenant": tenant,
-                    "github_repository": repository,
-                    "registry_json": registry_json,
-                    "github_pat": github_pat,
-                    "coder_chat_hook_secret": hook_secret,
-                    "coder_chat_hook_url": hook_url,
-                    "start_controller": false,
-                }),
-            })
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create nexus workspace '{}': {}. \
-                     The control plane may be unavailable — resolve the error or set \
-                     OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve an existing workspace.",
-                    nexus_workspace_name,
-                    e
-                )
-            })?;
-
-        client
-            .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Nexus workspace '{}' did not become ready: {}",
-                    workspace.id,
-                    e
-                )
-            })?;
-
-        client
-            .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Nexus workspace '{}' did not become reachable over SSH: {}",
-                    workspace.id,
-                    e
-                )
-            })?;
-        if let Ok(home) = std::env::var("HOME") {
-            let state_dir = format!("{}/.openflows", home);
-            if std::fs::create_dir_all(&state_dir).is_ok() {
-                let state_file = format!("{}/nexus-workspace.json", state_dir);
-                let _ = std::fs::write(
-                    &state_file,
-                    serde_json::to_string_pretty(&json!({
-                        "workspace_id": workspace.id,
-                        "workspace_name": workspace.name,
-                        "template_name": "openflows-nexus",
-                        "coder_url": client.base_url(),
-                    }))
-                    .unwrap_or_else(|_| "{}".to_string()),
-                );
-                info!(state_file = %state_file, "Nexus workspace state persisted");
-            }
-        }
-        std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_ID", &workspace.id);
-        std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_NAME", &workspace.name);
-        info!(
-            workspace_id = %workspace.id,
-            workspace_name = %workspace.name,
-            "  ✓ Nexus workspace resolved"
-        );
-        Ok(())
-    }
-
-    /// Verify that at least one LLM provider/model is configured in Coder.
-    /// Fails with dashboard instructions if none are available.
     pub async fn verify_llm_configured(client: &CoderClient) -> Result<()> {
         match client.list_chat_models().await {
             Ok(models) if !models.is_empty() => {

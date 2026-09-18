@@ -45,8 +45,6 @@ the new centralized `crates/config/src/env.rs` layer.
 | `OPENFLOWS_HOME` | agent-vessel, binary/orchestration | in-use | `TenantConfig.home` (default `~/.openflows`) |
 | `OPENFLOWS_REGISTRY_PATH` | coder-client, nexus, binary | in-use · internal | `TenantConfig.registry_path` |
 | `OPENFLOWS_REGISTRY_JSON` | coder-client, nexus, binary | in-use · internal | `TenantConfig.registry_json` |
-| `OPENFLOWS_NEXUS_WORKSPACE_ID` | coder-client | in-use · internal | `TenantConfig.nexus_workspace_id` |
-| `OPENFLOWS_NEXUS_WORKSPACE_NAME` | coder-client | in-use · internal | `TenantConfig.nexus_workspace_name` |
 | `OPENFLOWS_NEXUS_API_TOKEN` | coder-client | in-use · legacy-alias | `TenantConfig.nexus_api_token`; reconcile with `NEXUS_CODER_API_TOKEN` |
 | `NEXUS_CODER_API_TOKEN` | coder-client | legacy-alias | Merge into `OPENFLOWS_NEXUS_API_TOKEN` |
 | `OPENFLOWS_TAR` | coder-client/build.rs | in-use | `TenantConfig.tar` (default `tar`) |
@@ -59,8 +57,6 @@ the new centralized `crates/config/src/env.rs` layer.
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | coder-client, agent-lore, vessel, config | required | `GithubConfig.personal_access_token`; `effective_token()` |
 | `GITHUB_API_BASE` | github/rest | in-use | `GithubConfig.api_base` (default `https://api.github.com`); `GithubRestClient::new` resolves it via `GithubConfig::init_from_env()` |
 | `USE_AI_GATEWAY` | config/registry | in-use | `AgentConfig.use_ai_gateway` (lenient string; `"true"`/`"1"` enabled via `use_ai_gateway_enabled()`, consistent with `registry::resolve_ai_gateway_enabled`) |
-| `ROLE` | coder-client/bootstrap | in-use | `AgentConfig.role` |
-| `OPENFLOWS_CREATE_NEXUS_WORKSPACE` | coder-client/bootstrap | in-use | `AgentConfig.create_nexus_workspace_enabled()` (lenient string; default enabled, only `"false"` disables) |
 | `DEFAULT_CLI` | config/registry | in-use | keep (registry-specific) |
 | `SLACK_WEBHOOK_URL` | notifier | in-use | **Excluded from centralized layer** (notifier config removed) |
 | `DISCORD_WEBHOOK_URL` | notifier | in-use | **Excluded from centralized layer** (notifier config removed) |
@@ -86,6 +82,11 @@ The following config was intentionally left out of `config::env` in issue #185:
   callers keep their inline fallback).
 - **`CODER_TRANSPORT_VERBOSE`** — excluded (inline read in provisioner only).
 - **`CODER_WORKSPACE_ID`** — excluded (inline read with default only).
+- **Vestigial nexus-workspace vars (removed in #205)** — `OPENFLOWS_NEXUS_WORKSPACE_ID`,
+  `OPENFLOWS_NEXUS_WORKSPACE_NAME`, and `OPENFLOWS_CREATE_NEXUS_WORKSPACE` (plus the
+  `ROLE`-based creation gating and the `~/.openflows/nexus-workspace.json` state file)
+  guarded the removed admin-owned bootstrap `openflows-nexus` workspace and no longer
+  exist. Per-tenant workspaces (`openflows-nexus-<tenant>`) are unaffected.
 
 ## Recommended cleanups (non-blocking, follow-up)
 
