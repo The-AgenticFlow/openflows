@@ -9,12 +9,12 @@
 # These tests lock in the behavior so a later workflow change cannot silently
 # skip publication again.
 #
-# The resolver selects the newest `openflows-X.Y.Z` tag whose creator date is
-# >= start_at. end_at is accepted for interface compatibility but is NOT used as
-# an upper bound: the tag creator timestamp and completed_at are on different
-# clocks and the tag can land after completed_at, which was the original
-# production bug. Dropping the upper bound is safe because the Release and
-# Docker Publish concurrency groups prevent two releases from running in parallel.
+# The resolver selects the newest `openflows-X.Y.Z` tag whose creator date falls
+# within the run's `[start_at, end_at + CLOCK_SKEW_GRACE]` window. The grace
+# absorbs the tag-appears-after-completed_at clock-skew bug, and the upper bound
+# is required because Release and Docker Publish use SEPARATE concurrency groups
+# (a later Release can push a newer tag while an earlier Docker Publish resolve
+# is still running; with an open upper bound that later tag would wrongly win).
 #
 # We exercise the resolver against a throwaway git repository with fixture tags at
 # deterministic creator dates (via GIT_COMMITTER_DATE), so the assertions below
@@ -57,53 +57,66 @@ git config user.name "Test"
 git config commit.gpgsign false
 git commit -q --allow-empty -m "base"
 
-# Epoch anchor values (arbitrary, deterministic).
-E10=$((1700000000 + 10))    # openflows-1.4.0
-E20=$((1700000000 + 20))    # openflows-1.5.0
-E25=$((1700000000 + 25))    # openflows-1.2.3-beta (suffix, must be ignored)
-E30=$((1700000000 + 30))    # openflows-1.5.1 (this run's release)
-E35=$((1700000000 + 35))    # openflows-1.6.0 (unrelated higher version, older than run tag)
-E40=$((1700000000 + 40))    # openflows-1.5.2 (newest-created in-window, despite lower version)
+# Epoch anchor values (arbitrary, deterministic). Spacing reflects real releases:
+# distinct releases are minutes/hundreds of seconds apart, far greater than the
+# resolver's 60-second clock-skew grace.
+BASE=1700000000
+T_A=$((BASE + 10))      # openflows-1.4.0 (old release)
+T_BETA=$((BASE + 50))   # openflows-1.2.3-beta (suffix, must be ignored)
+T_HI_OLD=$((BASE + 150)) # openflows-1.6.0 (higher version, created BEFORE this run -> excluded)
+T_B=$((BASE + 200))     # openflows-1.5.0 (previous release)
+T_RUN=$((BASE + 300))   # openflows-1.5.1 (THIS run's release)
+T_LATER=$((BASE + 600)) # openflows-1.5.2 (a LATER release, beyond the grace -> excluded)
 
-make_tag openflows-1.4.0 "${E10}" "release 1.4.0"
-make_tag openflows-1.5.0 "${E20}" "release 1.5.0"
-make_tag openflows-1.2.3-beta "${E25}" "prerelease 1.2.3-beta"
-make_tag openflows-1.5.1 "${E30}" "release 1.5.1"
-make_tag openflows-1.6.0 "${E35}" "release 1.6.0"
-make_tag openflows-1.5.2 "${E40}" "release 1.5.2"
+make_tag openflows-1.4.0 "${T_A}" "release 1.4.0"
+make_tag openflows-1.2.3-beta "${T_BETA}" "prerelease 1.2.3-beta"
+make_tag openflows-1.6.0 "${T_HI_OLD}" "release 1.6.0"
+make_tag openflows-1.5.0 "${T_B}" "release 1.5.0"
+make_tag openflows-1.5.1 "${T_RUN}" "release 1.5.1"
+make_tag openflows-1.5.2 "${T_LATER}" "release 1.5.2"
 
 # Resolve uses ISO-8601 windows; build them from the epoch anchors.
 win() { date -d "@$1" -u +%Y-%m-%dT%H:%M:%SZ; }
 
 echo "== Resolve version regression tests =="
 
-# 1. The Release run starts at E20+1 (between 1.5.0 and 1.5.1). The release tag
-#    1.5.1 is created at E30. end_at is set to E30-1 (before the tag) to
-#    simulate the original production bug where the tag appeared to land AFTER
-#    completed_at due to clock skew. The resolver must still pick 1.5.1 because
-#    end_at is no longer an upper bound.
-W1="$(win $((E20 + 1)))"
-E1="$(win $((E30 - 1)))"
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W1}" "${E1}" 2>/dev/null)" "tag after completed_at is still resolved (clock-skew scenario)"
+# 1. Clock-skew scenario (the original production bug): the run starts just
+#    before the release tag and "completes" BEFORE the tag is created (the tag
+#    appears to land fractionally after completed_at). The grace extends the
+#    window past completed_at, so 1.5.1 is still selected; the later 1.5.2 tag is
+#    far beyond the grace and must NOT win.
+W1="$(win $((T_RUN - 5)))"
+E1="$(win $((T_RUN - 1)))"
+assert_eq "1.5.1" "$(bash "${RESOLVER}" "${W1}" "${E1}" 2>/dev/null)" "tag created just after completed_at still resolves (clock skew), not the later tag"
 
-# 1b. Narrow window: start_at just before 1.5.1, end_at just after it (classic
-#     in-window case). Without an upper bound all later tags (E35, E40) are also
-#     candidates; the newest-created one (1.5.2 at E40) is returned.
-W1b="$(win $((E30 - 1)))"
-E1b="$(win $((E30 + 1)))"
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W1b}" "${E1b}" 2>/dev/null)" "newest-created tag >= start_at wins (1.5.2)"
+# 2. Later-release exclusion (review finding): even when the earlier Docker
+#    Publish resolve might run late, a tag from a SUBSEQUENT release (1.5.2,
+#    well beyond the grace) is outside the window and must not be selected.
+#    The run's own tag 1.5.1 wins.
+W2="$(win $((T_RUN - 5)))"
+E2="$(win $((T_RUN + 5)))"
+assert_eq "1.5.1" "$(bash "${RESOLVER}" "${W2}" "${E2}" 2>/dev/null)" "a later release's tag beyond the grace is excluded; run's 1.5.1 wins"
 
-# 2. Only tags at E10 and later are candidates when start_at is just before E10
-#    and end_at is just after E10. Without an upper bound all tags >= E10 are
-#    admitted; the newest-created (1.5.2 at E40) is returned.
-W2="$(win $((E10 - 1)))"
-E2="$(win $((E10 + 1)))"
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W2}" "${E2}" 2>/dev/null)" "oldest run: newest-created tag >= start_at is 1.5.2"
+# 3. An older higher-version tag (1.6.0, created before this run started) is
+#    outside the window and must not be chosen just because it is the highest
+#    version. The run's in-window tag 1.5.1 wins.
+W3="$(win $((T_B + 10)))"
+E3="$(win $((T_RUN + 5)))"
+assert_eq "1.5.1" "$(bash "${RESOLVER}" "${W3}" "${E3}" 2>/dev/null)" "older higher-version 1.6.0 is outside the window; newest in-window 1.5.1 wins"
 
-# 3. No tags at all in the repo -> must resolve to nothing (tagless release run).
-#    We verify this in the current fixture repo using a start_at that falls
-#    after the last tag so all tags are excluded; this is also covered by test 4.
-#    For the "no tags exist" case, use a throwaway empty repo.
+# 4. A window covering only the previous release tag resolves it, ignoring the
+#    suffix tag that sits in the same broad window.
+W4="$(win $((T_A - 1)))"
+E4="$(win $((T_A + 1)))"
+assert_eq "1.4.0" "$(bash "${RESOLVER}" "${W4}" "${E4}" 2>/dev/null)" "prior-release window resolves 1.4.0"
+
+# 5. A window covering only the suffix tag must resolve to nothing (suffix never
+#    selected, and no exact tag leaks into the window).
+W5="$(win $((T_BETA - 2)))"
+E5="$(win $((T_BETA + 2)))"
+assert_eq "" "$(bash "${RESOLVER}" "${W5}" "${E5}" 2>/dev/null)" "suffix tag openflows-1.2.3-beta is rejected (no in-window exact tag)"
+
+# 6. Empty repo (no tags at all) -> must resolve to nothing (tagless release run).
 EMPTY_REPO="$(mktemp -d)"
 trap 'rm -rf "${FIXTURE}" "${EMPTY_REPO}"' EXIT
 (
@@ -112,35 +125,13 @@ trap 'rm -rf "${FIXTURE}" "${EMPTY_REPO}"' EXIT
   git config user.email "test@example.com"
   git config user.name "Test"
   git commit -q --allow-empty -m "base"
-  assert_eq "" "$(bash "${RESOLVER}" "$(win $((E10 - 20)))" "$(win $((E10 - 10)))" 2>/dev/null)" "empty repo (no tags) skips"
+  assert_eq "" "$(bash "${RESOLVER}" "$(win $((T_A - 1)))" "$(win $((T_A + 1)))" 2>/dev/null)" "empty repo (no tags) skips"
 )
 
-
-# 4. Window after all tags: all tags are >= any start_at <= E10, so a start_at
-#    after the last tag (E40+5) resolves to nothing.
-W4="$(win $((E40 + 5)))"
-E4="$(win $((E40 + 6)))"
-assert_eq "" "$(bash "${RESOLVER}" "${W4}" "${E4}" 2>/dev/null)" "window after last release skips"
-
-# 5. A window covering only a suffix tag must still skip (suffix never selected).
-W5="$(win $((E25 - 1)))"
-E5="$(win $((E25 + 1)))"
-# start_at is between E20 and E25; without an upper bound all tags >= start_at
-# are admitted, but the suffix tag is filtered. The next exact tags are E30 and
-# above, so the newest (1.5.2) is returned.
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W5}" "${E5}" 2>/dev/null)" "suffix tag openflows-1.2.3-beta is rejected; newest exact tag wins"
-
-# 6. start_at just before E35; all tags from E35 onwards are candidates.
-#    1.5.2 (E40) is newest-created.
-W6="$(win $((E35 - 1)))"
-E6="$(win $((E40 + 1)))"
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W6}" "${E6}" 2>/dev/null)" "newest-created tag wins (1.5.2 over 1.6.0)"
-
-# 7. start_at just before E35, end_at just after E35. Without an upper bound,
-#    1.5.2 (E40) is still >= start_at and newer-created than 1.6.0 (E35).
-W7="$(win $((E35 - 1)))"
-E7="$(win $((E35 + 1)))"
-assert_eq "1.5.2" "$(bash "${RESOLVER}" "${W7}" "${E7}" 2>/dev/null)" "newest-created tag >= start_at (1.5.2) selected even when end_at is before it"
+# 7. Window after all tags -> must resolve to nothing.
+W7="$(win $((T_LATER + 5)))"
+E7="$(win $((T_LATER + 10)))"
+assert_eq "" "$(bash "${RESOLVER}" "${W7}" "${E7}" 2>/dev/null)" "window after last release skips"
 
 echo
 echo "== Result: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC} =="
