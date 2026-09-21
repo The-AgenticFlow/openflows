@@ -249,6 +249,11 @@ resource "docker_container" "workspace" {
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
+    # tenant owner's linked GitHub App token). Export it here: Coder injects the
+    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
+    # env var, so without this the controller's resolve_token() would find nothing.
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
     # reach it over the shared docker network (issue #143). Workspaces address
     # it via the `openflows-nexus` network alias below.

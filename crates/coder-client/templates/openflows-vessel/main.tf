@@ -175,6 +175,10 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_ROLE=${var.role}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Vessel resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the tenant
+    # owner's linked GitHub App token). Export it here — Coder only injects the
+    # provider token into `git` via GIT_ASKPASS, not as a general env var.
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
   ]
 
   # egress allowlist: Coder control plane + github.com + Redis only
