@@ -1227,18 +1227,22 @@ impl CoderClient {
         }
     }
 
-    /// Initiate a device-flow link for a provider. Returns the verification
-    /// URI and codes the user needs to complete linking without a dashboard
-    /// click. `POST /api/v2/external-auth/{externalauth}/device`.
-    pub async fn create_external_auth_device(&self, id: &str) -> Result<crate::ExternalAuthDevice> {
+    /// Retrieve the pending device-flow link details for a provider. Returns
+    /// the verification URI and codes the user needs to complete linking
+    /// without a dashboard click. `GET /api/v2/external-auth/{externalauth}/device`.
+    ///
+    /// The POST variant of this endpoint performs the *exchange* of a device
+    /// code for a token (a 204 with an empty body); the device-details payload
+    /// is only returned by GET, so the device flow is initiated with GET here.
+    pub async fn get_external_auth_device(&self, id: &str) -> Result<crate::ExternalAuthDevice> {
         let resp = self
             .authenticated_request(
-                reqwest::Method::POST,
+                reqwest::Method::GET,
                 &format!("/api/v2/external-auth/{}/device", id),
             )
             .send()
             .await
-            .context("Failed to initiate external-auth device flow")?;
+            .context("Failed to retrieve external-auth device flow")?;
 
         if resp.status().is_success() {
             let device: crate::ExternalAuthDevice = resp.json().await?;
@@ -1247,7 +1251,7 @@ impl CoderClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!(
-                "Failed to initiate external-auth device flow ({}): {}",
+                "Failed to retrieve external-auth device flow ({}): {}",
                 status,
                 body
             )
