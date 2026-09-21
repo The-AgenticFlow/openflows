@@ -620,17 +620,10 @@ fn classify_command(cmd: &str) -> HookDecision {
     // provision, start, stop, delete, recreate, or pick templates for their
     // task — NEXUS owns provisioning and binds the chat to the already
     // provisioned workspace, so self-provisioning here creates duplicate
-    // parallel workspaces that break orchestration.
-    if cmd.contains("coder templates")
-        || cmd.contains("coder template")
-        || cmd.contains("coder delete")
-        || cmd.contains("coder create")
-        || cmd.contains("coder start")
-        || cmd.contains("coder stop")
-        || cmd.contains("coder workspace")
-        || cmd.contains("coder workspaces")
-        || cmd.contains("coder server")
-    {
+    // parallel workspaces that break orchestration. Matching is anchored to an
+    // actual `coder` CLI invocation (not a substring) so benign text that merely
+    // mentions "coder start" (docs, diagnostics) is not denied.
+    if invokes_coder_lifecycle(cmd) {
         return deny(
             "workspace/template lifecycle is controller-managed — NEXUS provisions \
              workspaces; a worker must never self-provision a workspace"
@@ -654,6 +647,59 @@ fn classify_command(cmd: &str) -> HookDecision {
     }
 
     HookDecision::observe()
+}
+
+/// The `coder` lifecycle subcommands a worker must never invoke directly;
+/// provisioning/start/stop/delete are controller-managed by NEXUS.
+const CODER_LIFECYCLE_SUBCOMMANDS: &[&str] = &[
+    "templates",
+    "template",
+    "delete",
+    "create",
+    "start",
+    "stop",
+    "workspace",
+    "workspaces",
+    "server",
+];
+
+/// True when `cmd` actually invokes the `coder` CLI with a controller-managed
+/// lifecycle subcommand. Anchored to a `coder` command token (optionally behind
+/// `sudo` or an absolute/relative path) immediately followed by the dangerous
+/// subcommand, so benign text that merely mentions `coder start` etc. is not
+/// denied.
+fn invokes_coder_lifecycle(cmd: &str) -> bool {
+    let tokens: Vec<&str> = cmd
+        .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if !is_coder_command_token(tok) {
+            continue;
+        }
+        // Skip any global flags between `coder` and the subcommand.
+        let mut j = i + 1;
+        while j < tokens.len() && tokens[j].starts_with('-') {
+            j += 1;
+        }
+        if j < tokens.len() && CODER_LIFECYCLE_SUBCOMMANDS.contains(&tokens[j]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `tok` names the `coder` CLI binary (`coder`, `sudo coder`,
+/// `/usr/local/bin/coder`, `./coder`, …).
+fn is_coder_command_token(tok: &str) -> bool {
+    let trimmed = tok.trim_end_matches('/');
+    if trimmed == "coder" {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix("sudo") {
+        return rest == "coder";
+    }
+    trimmed.ends_with("/coder")
 }
 
 /// True when the given path is absolute and points outside the workspace.

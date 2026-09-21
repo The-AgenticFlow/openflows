@@ -18,11 +18,17 @@ case "$cmd" in
   *"git push"*"--force"*main*|*"git push"*"-f"*main*) deny "force-push to main" ;;
   *"git push"*"--force"*master*|*"git push"*"-f"*master*) deny "force-push to master" ;;
   *"redis-cli"*) deny "direct Redis access — use openflows-harness for all coordination" ;;
-  # Workspace/template lifecycle is controller-managed. Workers must NEVER
-  # provision, start, stop, delete, recreate, or view-manipulate Coder
-  # workspaces or templates for their task — NEXUS owns that and binds the
-  # chat to the already-provisioned workspace. Spawning a fresh workspace
-  # here creates a duplicate/parallel workspace that breaks orchestration.
-  *"coder templates"*|*"coder template"*|*"coder delete"*|*"coder create"*|*"coder start"*|*"coder stop"*|*"coder workspace"*|*"coder workspaces"*) deny "workspace/template lifecycle is controller-managed — NEXUS provisions workspaces, never self-provision from a worker" ;;
 esac
+
+# Workspace/template lifecycle is controller-managed. Workers must NEVER
+# provision, start, stop, delete, recreate, or view-manipulate Coder
+# workspaces or templates for their task — NEXUS owns that and binds the
+# chat to the already-provisioned workspace. Spawning a fresh workspace
+# here creates a duplicate/parallel workspace that breaks orchestration.
+# Matching is anchored to an actual `coder` CLI invocation instead of an
+# unanchored substring, so benign text that merely mentions "coder start"
+# (docs, diagnostics) is not denied.
+if printf '%s\n' "$cmd" | grep -Eq '(^|[;&|()[:space:]])([^[:space:];&|()]*/)?coder([[:space:]]+-[^[:space:]]+)*[[:space:]]+(templates|template|delete|create|start|stop|workspace|workspaces|server)([[:space:]]|$)'; then
+  deny "workspace/template lifecycle is controller-managed — NEXUS provisions workspaces, never self-provision from a worker"
+fi
 exit 0
