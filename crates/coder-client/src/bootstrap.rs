@@ -420,27 +420,45 @@ impl CoderBootstrapper {
             .await;
         info!("  ✓ Tenant user '{}' resolved", tenant_name);
 
-        // 2. Find the tenant user ID via admin API (fallback to admin for testing).
-        //    Resolved before the link poll so we can login as the tenant user
-        //    and check THEIR GitHub grant rather than the admin's.
+        // 2. Find the tenant user ID via admin API. Resolved before the link
+        //    poll so we can login as the tenant user and check THEIR GitHub
+        //    grant rather than the admin's. We deliberately do NOT fall back to
+        //    the administrator identity: provisioning the nexus workspace (and
+        //    minting/sending the external-auth token) under an admin-bound
+        //    GitHub grant would bypass the per-tenant credential boundary.
         let coder_url = client.base_url();
         let tenant_user = match client.list_users().await {
-            Ok(users) => users
-                .into_iter()
-                .find(|u| u.username == tenant_name || u.email == tenant_email),
+            Ok(users) => {
+                let found = users
+                    .into_iter()
+                    .find(|u| u.username == tenant_name || u.email == tenant_email);
+                match found {
+                    Some(u) => {
+                        info!("  ✓ Tenant user ID resolved: {}", u.id);
+                        u
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "Tenant user '{}' ({}) is not present in Coder even though user \
+                             creation returned success. Refusing to fall back to the \
+                             administrator identity: provisioning the nexus workspace under an \
+                             admin-bound GitHub grant would bypass the per-tenant credential \
+                             boundary. Create the tenant user (or fix the error that made user \
+                             creation fail) and rerun `openflows tenant add`.",
+                            tenant_name,
+                            tenant_email
+                        )
+                    }
+                }
+            }
             Err(e) => {
-                warn!("Could not list users: {} — falling back to admin user", e);
-                None
-            }
-        };
-        let tenant_user = match tenant_user {
-            Some(u) => {
-                info!("  ✓ Tenant user ID resolved: {}", u.id);
-                u
-            }
-            None => {
-                warn!("Tenant user not found in list — using admin user as fallback for testing");
-                client.get_me().await?
+                anyhow::bail!(
+                    "Could not list Coder users to resolve tenant '{}': {}. Refusing to fall \
+                     back to the administrator identity — provisioning under an admin-bound \
+                     GitHub grant would bypass the per-tenant credential boundary.",
+                    tenant_name,
+                    e
+                )
             }
         };
 
@@ -498,7 +516,7 @@ impl CoderBootstrapper {
                         // Kick off a device flow for self-serve linking without a
                         // manual dashboard click.
                         match tenant_client
-                            .create_external_auth_device(&external_auth_id)
+                            .get_external_auth_device(&external_auth_id)
                             .await
                         {
                             Ok(device) => {
