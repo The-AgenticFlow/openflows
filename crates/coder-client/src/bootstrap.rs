@@ -351,7 +351,10 @@ impl CoderBootstrapper {
 
         // Use the current session user (admin) as the tenant owner.
         let admin = client.get_me().await?;
-        info!("  ✓ Using session user '{}' as tenant owner", admin.username);
+        info!(
+            "  ✓ Using session user '{}' as tenant owner",
+            admin.username
+        );
 
         // 1. Check the session user's GitHub external-auth grant until linked.
         let coder_url = client.base_url();
@@ -391,10 +394,7 @@ impl CoderBootstrapper {
                             );
                         }
                         // Kick off a device flow for self-serve linking.
-                        match client
-                            .get_external_auth_device(&external_auth_id)
-                            .await
-                        {
+                        match client.get_external_auth_device(&external_auth_id).await {
                             Ok(device) => {
                                 let target = if !device.verification_uri_complete.is_empty() {
                                     device.verification_uri_complete.clone()
