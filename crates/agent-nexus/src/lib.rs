@@ -272,20 +272,13 @@ impl NexusNode {
         registry.resolve_github_token("nexus")
     }
 
-    /// Best-effort GitHub token from the centralized config (`GITHUB_TOKEN`),
-    /// falling back to the `/tmp/github_token` file. Returns `None` when
-    /// neither is available so callers can decide how to degrade.
+    /// Best-effort GitHub token from Coder external auth (the tenant user's
+    /// linked App token). `None` when not configured. PAT flow removed.
     fn resolve_github_token_from_env_or_file(&self) -> Option<String> {
         config::EnvConfig::from_env()
             .ok()
-            .and_then(|e| e.github.token)
+            .and_then(|e| e.github.resolve_token())
             .filter(|t| !t.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string("/tmp/github_token")
-                    .ok()
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            })
     }
 
     fn load_registry(&self) -> Result<Registry> {
@@ -444,7 +437,7 @@ Before significant work, read the relevant skill file to understand the workflow
             Ok(t) => t,
             Err(_) => match self.resolve_github_token_from_env_or_file() {
                 Some(t) => {
-                    info!("Using GITHUB_TOKEN env var / token file for PR sync");
+                    info!("Using GitHub token from env / external auth / token file for PR sync");
                     t
                 }
                 None => {
@@ -904,10 +897,6 @@ Before significant work, read the relevant skill file to understand the workflow
                         .map(|e| e.coder.url)
                         .unwrap_or_default()
                 }),
-                // Prefer a PAT for git in the workspace so clones/pushes work on
-                // any accessible repo regardless of GitHub App install scope.
-                // Falls back inside the template to the Coder GitHub App token.
-                "github_pat": self.resolve_github_token_from_env_or_file(),
             }),
         };
         // Inject the Terraform variable the template reads.
@@ -2796,12 +2785,10 @@ Use `openflows-harness` for all coordination:
         let worker_entry = registry.get(&base_id);
 
         // Resolve the worker's GitHub token. resolve_github_token() falls back
-        // to GITHUB_TOKEN when no dedicated github_token_env is
-        // configured on the registry entry, so agents without a per-agent token
-        // still work as long as the fallback env var is set. We do NOT hard-fail
-        // on a missing github_token_env field — that would block all v2-style
-        // registry entries (which omit the deprecated v1 field) even when the
-        // shared PAT is perfectly valid for assignment.
+        // to the Coder external-auth token when no dedicated github_token_env
+        // is configured on the registry entry. We do NOT hard-fail on a
+        // missing github_token_env field — that would block all v2-style
+        // registry entries (which omit the deprecated v1 field).
         let worker_token_result = identity_manager.resolve_github_token(worker_id);
         if let Err(e) = &worker_token_result {
             warn!(
@@ -2812,7 +2799,7 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("GITHUB_TOKEN");
+                .unwrap_or("CODER_EXTERNAL_AUTH_*_TOKEN");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
                  ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \

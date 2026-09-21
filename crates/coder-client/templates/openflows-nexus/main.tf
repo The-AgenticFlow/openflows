@@ -64,13 +64,6 @@ data "coder_parameter" "github_repository" {
   type        = "string"
 }
 
-data "coder_parameter" "github_pat" {
-  name        = "github_pat"
-  description  = "GitHub Personal Access Token for issue/PR sync"
-  default     = ""
-  type        = "string"
-}
-
 data "coder_parameter" "coder_chat_hook_secret" {
   name        = "coder_chat_hook_secret"
   description = "Required shared OpenFlows/Coder lifecycle hook signing secret (32+ random bytes)"
@@ -130,24 +123,17 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
-    # (github_pat) because a PAT can be scoped to the target repo/org and works
-    # regardless of GitHub App install scope. Fall back to the Coder GitHub App
-    # external-auth token (surfaces the "Login with GitHub" button in the UI).
-    # A persistent store is a deliberate fallback over Coder's automatic
-    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
-    # environment without GIT_ASKPASS, so we pin the token once here.
-    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
-    if [ -z "$GIT_TOKEN" ]; then
-      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
-    fi
+    # Setup git credentials from Coder external auth (the tenant's linked
+    # GitHub App token). PAT flow removed — external auth is the sole source.
+    # The Controller resolves its own GitHub token from CODER_EXTERNAL_AUTH_*.
+    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
     if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
       echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
       chmod 600 /home/coder/.git-credentials
       echo "Configured git credentials for GitHub"
     else
-      echo "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth)"
+      echo "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth)"
     fi
 
     # git pull or clone (creds via Coder external auth)
@@ -198,9 +184,6 @@ resource "coder_agent" "main" {
     if [ -n "${data.coder_parameter.coder_chat_hook_url.value}" ]; then
       export CODER_CHAT_HOOK_URL="${data.coder_parameter.coder_chat_hook_url.value}"
     fi
-    # GitHub PAT for issue sync - export as env var so controller picks it up automatically
-    export GITHUB_TOKEN="${data.coder_parameter.github_pat.value}"
-    echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
 
     cd /home/coder/workspace
 
@@ -262,7 +245,6 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
-    "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",

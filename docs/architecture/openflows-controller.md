@@ -37,7 +37,7 @@ The Controller is fail-fast on required environment (injected by the Coder templ
 | `REDIS_URL` | SharedStore connection |
 | `OPENFLOWS_TENANT` | Tenant identifier (namespaces every Redis key) |
 
-> **Note:** `GITHUB_TOKEN` has been **removed from startup environment**. It is no longer a startup variable. The GitHub repository URL is injected per-tenant by the nexus template (from the `github_repository` coder parameter set during `tenant add`), not supplied by the operator and **not** a startup var.
+> **Note:** No `GITHUB_TOKEN`/PAT is used. The controller's GitHub API auth (issue/PR sync, CI checks, worker token resolution) resolves the token solely from the tenant owner's **Coder external-auth token** (`CODER_EXTERNAL_AUTH_<ID>_TOKEN`/`_ACCESS_TOKEN`/`_TOKEN_FILE`). The GitHub repository URL is injected per-tenant by the nexus template (from the `github_repository` coder parameter set during `tenant add`), not supplied by the operator.
 
 Runtime-supplied (injected per-tenant by the nexus workspace template, not operator-set startup env):
 | Variable | Purpose |
@@ -47,7 +47,7 @@ Runtime-supplied (injected per-tenant by the nexus workspace template, not opera
 | `A2A_RELAY_ADDR` | A2A relay bind address (default `127.0.0.1:3000`) |
 | `OPENFLOWS_REGISTRY_PATH` / `OPENFLOWS_REGISTRY_JSON` | Registry resolution |
 | `ARTIFACTS_DIR` | Artifact output directory |
-| `GITHUB_TOKEN` | GitHub auth (fed in at runtime, not startup) |
+| GitHub auth | Tenant owner's linked external-auth token (`CODER_EXTERNAL_AUTH_*_TOKEN`), injected at runtime |
 | `SLACK_WEBHOOK_URL` | Slack notification webhook |
 | `DISCORD_WEBHOOK_URL` | Discord notification webhook |
 | WhatsApp variables | WhatsApp notification config |

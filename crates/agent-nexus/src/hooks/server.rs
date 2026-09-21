@@ -616,11 +616,26 @@ fn classify_command(cmd: &str) -> HookDecision {
     if cmd.contains("redis-cli") {
         return deny("direct Redis access — use openflows-harness for all coordination".into());
     }
+    // Workspace/template lifecycle is controller-managed. Workers must never
+    // provision, start, stop, delete, recreate, or pick templates for their
+    // task — NEXUS owns provisioning and binds the chat to the already
+    // provisioned workspace, so self-provisioning here creates duplicate
+    // parallel workspaces that break orchestration.
     if cmd.contains("coder templates")
+        || cmd.contains("coder template")
         || cmd.contains("coder delete")
+        || cmd.contains("coder create")
+        || cmd.contains("coder start")
+        || cmd.contains("coder stop")
+        || cmd.contains("coder workspace")
+        || cmd.contains("coder workspaces")
         || cmd.contains("coder server")
     {
-        return deny("control-plane mutation from a worker workspace".into());
+        return deny(
+            "workspace/template lifecycle is controller-managed — NEXUS provisions \
+             workspaces; a worker must never self-provision a workspace"
+                .into(),
+        );
     }
 
     // Override example: wrap risky-but-allowed git pushes to avoid interactive
