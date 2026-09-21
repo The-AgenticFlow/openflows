@@ -7,7 +7,7 @@
 
 use crate::{CoderClient, CreateWorkspaceRequest};
 use anyhow::{Context, Result};
-use config::{CoderConfig, GithubConfig};
+use config::CoderConfig;
 use envconfig::Envconfig;
 use serde_json::json;
 use std::time::Duration;
@@ -339,65 +339,8 @@ impl CoderBootstrapper {
         Ok(())
     }
 
-    /// Create or verify a tenant: a Coder user + GitHub OAuth link + nexus workspace.
-    ///
-    /// Steps:
-    /// 1. Create the tenant-owner Coder user (member role, no admin)
-    /// 2. Print the GitHub OAuth link for the user to complete in the dashboard
-    /// 3. Poll until the GitHub grant exists
-    /// 4. Mint a scoped session token for that user
-    /// 5. Create the openflows-nexus workspace under that user
-    ///
-    /// Returns the workspace ID.
-    fn tenant_password(tenant_name: &str) -> String {
-        let base = format!("T3nant!{}", tenant_name);
-        if password_meets_coder_requirements(&base) {
-            base
-        } else {
-            format!("T3nant!{}#1", tenant_name)
-        }
-    }
-
-    fn tenant_state_file() -> Option<std::path::PathBuf> {
-        std::env::var("HOME").ok().map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".openflows")
-                .join("tenants.json")
-        })
-    }
-
-    fn load_tenant_password(tenant_name: &str) -> Option<String> {
-        let path = Self::tenant_state_file()?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&content).ok()?;
-        map.get(tenant_name)
-            .and_then(|v| v.get("password"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
-    fn save_tenant_password(tenant_name: &str, password: &str) {
-        if let Some(path) = Self::tenant_state_file() {
-            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-            let mut map: serde_json::Map<String, serde_json::Value> =
-                std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "password".to_string(),
-                serde_json::Value::String(password.to_string()),
-            );
-            map.insert(tenant_name.to_string(), serde_json::Value::Object(entry));
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&map).unwrap_or_default(),
-            );
-        }
-    }
-
+    /// Provision a tenant's nexus workspace using the current session user
+    /// (admin) identity. Returns the workspace ID.
     pub async fn ensure_tenant(
         &self,
         client: &CoderClient,
@@ -406,107 +349,113 @@ impl CoderBootstrapper {
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
 
-        // 1. Create tenant-owner user (idempotent — login if exists)
-        let tenant_email = format!("{}@tenant.openflows.dev", tenant_name);
-        let tenant_password = Self::load_tenant_password(tenant_name).unwrap_or_else(|| {
-            let pwd = Self::tenant_password(tenant_name);
-            Self::save_tenant_password(tenant_name, &pwd);
-            pwd
-        });
+        // Use the current session user (admin) as the tenant owner.
+        let admin = client.get_me().await?;
+        info!(
+            "  ✓ Using session user '{}' as tenant owner",
+            admin.username
+        );
 
-        // Try to create the user; if it exists, we just proceed
-        let _ = client
-            .create_first_user(&tenant_email, tenant_name, &tenant_password)
-            .await;
-        info!("  ✓ Tenant user '{}' resolved", tenant_name);
-
-        // 2. Print GitHub OAuth instructions
+        // 1. Check the session user's GitHub external-auth grant until linked.
         let coder_url = client.base_url();
+        let external_auth_id = self
+            .env
+            .as_ref()
+            .and_then(|e| e.coder.external_auth_id.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "primary-github".to_string());
         eprintln!();
-        eprintln!("  ─── GitHub OAuth Setup Required ───");
-        eprintln!("  1. Log in to the Coder dashboard: {}", coder_url);
-        eprintln!(
-            "  2. Configure GitHub OAuth (Deployment → External Authentication → Add GitHub)"
-        );
-        eprintln!(
-            "  3. As tenant user '{}', complete the GitHub OAuth flow in the dashboard",
-            tenant_name
-        );
-        eprintln!("  4. Once linked, press Enter below to continue");
+        eprintln!("  ─── GitHub Link Required ───");
         eprintln!();
-        eprintln!("  Note: For testing, you can skip OAuth and press Enter now");
-        eprintln!("        (workspace will be created with admin token).");
-        eprintln!();
-
-        // 3. Poll until the grant exists (simplified — check every 5s, timeout 5 min)
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(300);
+        let mut link_shown = false;
         loop {
+            match client.get_external_auth(&external_auth_id).await {
+                Ok(auth) if auth.authenticated => {
+                    let linked_user = auth
+                        .user
+                        .as_ref()
+                        .map(|u| u.login.as_str())
+                        .unwrap_or("(unknown account)");
+                    info!(
+                        "  ✓ GitHub link confirmed for account '{}' (provider: {})",
+                        linked_user, external_auth_id
+                    );
+                    break;
+                }
+                Ok(auth) => {
+                    if !link_shown {
+                        eprintln!("  Your GitHub account is not linked yet. To connect it:");
+                        if !auth.app_install_url.is_empty() {
+                            eprintln!(
+                                "    1. Install/grant the OpenFlows GitHub App: {}",
+                                auth.app_install_url
+                            );
+                        }
+                        // Kick off a device flow for self-serve linking.
+                        match client.get_external_auth_device(&external_auth_id).await {
+                            Ok(device) => {
+                                let target = if !device.verification_uri_complete.is_empty() {
+                                    device.verification_uri_complete.clone()
+                                } else {
+                                    device.verification_uri.clone()
+                                };
+                                if !target.is_empty() {
+                                    eprintln!("    2. Authorize at: {}", target);
+                                }
+                                if !device.user_code.is_empty() {
+                                    eprintln!("       and enter code: {}", device.user_code);
+                                }
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "    2. Complete the link in the dashboard: {}/external-auth/{}",
+                                    coder_url.trim_end_matches('/'),
+                                    external_auth_id
+                                );
+                            }
+                        }
+                        eprintln!();
+                        eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
+                        link_shown = true;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Could not query external-auth status for '{}'; retrying",
+                        external_auth_id
+                    );
+                }
+            }
             if start.elapsed() >= timeout {
                 anyhow::bail!(
-                    "Timed out waiting for GitHub OAuth grant. \
-                     The tenant owner must complete the link at {}/external-auth/github",
-                    coder_url.trim_end_matches('/')
+                    "Timed out waiting for the GitHub link (provider '{}'). \
+                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
+                    external_auth_id,
+                    coder_url.trim_end_matches('/'),
+                    external_auth_id
                 );
-            }
-            // In a full implementation, we'd call an API to check if the user has
-            // linked GitHub. For now, we wait for the user to press Enter.
-            // Phase 5/6 will add a proper API check.
-            eprint!("\r  Press Enter once the GitHub link is complete... ");
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                break;
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        info!("  ✓ GitHub OAuth grant confirmed");
 
-        // 4. Find the tenant user ID via admin API (fallback to admin for testing)
-        let tenant_user = match client.list_users().await {
-            Ok(users) => users
-                .into_iter()
-                .find(|u| u.username == tenant_name || u.email == tenant_email),
-            Err(e) => {
-                warn!("Could not list users: {} — falling back to admin user", e);
-                None
-            }
-        };
-        let tenant_user = match tenant_user {
-            Some(u) => {
-                info!("  ✓ Tenant user ID resolved: {}", u.id);
-                u
-            }
-            None => {
-                warn!("Tenant user not found in list — using admin user as fallback for testing");
-                client.get_me().await?
-            }
-        };
-
-        // 5. Mint a scoped API token for the tenant user (admin can do this)
-        let tenant_api_key = client
-            .create_api_token(&tenant_user.id, "openflows-nexus")
-            .await?;
-        let tenant_token = tenant_api_key.key;
-        info!("  ✓ Tenant API token minted");
-
-        // 6. Create the nexus workspace under the tenant user (admin can do this)
+        // 2. Create the nexus workspace under the session user (admin).
         let redis_url = "redis://redis:6379".to_string();
         let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
         let repo_url = format!("https://github.com/{}.git", github_repo);
 
         // Re-running `tenant add` for an existing tenant returns the existing
         // workspace without changing its build parameters (see
-        // create_workspace_for_user 409 handling). Existing workspaces therefore
-        // keep their original `start_controller` value and must be recreated once
+        // create_workspace_for_user 409 handling). Existing workspaces keep
+        // their original `start_controller` value and must be recreated once
         // to pick up `start_controller=true` (new tenants get it automatically).
-        if let Ok(workspaces) = client.list_workspaces(&tenant_user.id).await {
-            // The workspace listing is deployment-wide (list_workspaces ignores
-            // the user id), so match BOTH the owner and the name — as the other
-            // bootstrap lookups do — to avoid a false migration warning from
-            // another owner's same-named workspace.
+        if let Ok(workspaces) = client.list_workspaces(&admin.id).await {
+            // The listing is deployment-wide, so match both owner and name.
             if workspaces
                 .iter()
-                .any(|w| w.name == nexus_workspace_name && w.owner_name == tenant_user.username)
+                .any(|w| w.name == nexus_workspace_name && w.owner_name == admin.username)
             {
                 println!(
                     "  ⚠ Tenant workspace '{}' already exists — its build parameters are unchanged. \
@@ -517,12 +466,6 @@ impl CoderBootstrapper {
             }
         }
 
-        let github_pat = self
-            .env
-            .as_ref()
-            .and_then(|e| e.github.token.clone())
-            .or_else(|| GithubConfig::init_from_env().ok().and_then(|c| c.token))
-            .unwrap_or_default();
         let hook_secret = self
             .env
             .as_ref()
@@ -546,7 +489,7 @@ impl CoderBootstrapper {
             .unwrap_or_default();
         let workspace = client
             .create_workspace_for_user(
-                &tenant_user.id,
+                &admin.id,
                 &CreateWorkspaceRequest {
                     template_name: "openflows-nexus".to_string(),
                     name: nexus_workspace_name.clone(),
@@ -554,10 +497,9 @@ impl CoderBootstrapper {
                         "repo_url": repo_url,
                         "redis_url": redis_url,
                         "coder_url": coder_url,
-                        "coder_session_token": tenant_token,
+                        "coder_session_token": client.session_token(),
                         "tenant": tenant_name,
                         "github_repository": github_repo,
-                        "github_pat": github_pat,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
                         "start_controller": true,

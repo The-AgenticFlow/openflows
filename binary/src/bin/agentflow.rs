@@ -21,12 +21,13 @@ const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the Controller orchestration loop (default inside nexus workspace)
+    /// Run the Controller orchestration loop. The per-tenant nexus workspace
+    /// auto-starts this on workspace boot; it is not a general host command.
     Run {
         /// Clear this tenant's runtime SharedStore state before starting
         #[arg(long)]
@@ -201,7 +202,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run { reset_store: false }) {
+    // No implicit default command: the controller auto-starts inside each
+    // tenant's nexus workspace when the tenant is added, so a bare `openflows`
+    // must not silently start a duplicate host controller. Require an explicit
+    // subcommand (one is already enforced by clap below).
+    match cli.command {
         Commands::Run { reset_store } => run_controller(reset_store).await,
         Commands::Bootstrap => run_bootstrap().await,
         Commands::Tenant { action } => run_tenant(action).await,

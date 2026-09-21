@@ -1183,6 +1183,82 @@ impl CoderClient {
     }
 }
 
+// External-auth (GitHub link) API
+
+impl CoderClient {
+    /// List the external-auth links for the current token's user.
+    /// `GET /api/v2/external-auth`.
+    pub async fn list_external_auth_links(&self) -> Result<Vec<crate::ExternalAuthLink>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/v2/external-auth")
+            .send()
+            .await
+            .context("Failed to list external-auth links")?;
+
+        if resp.status().is_success() {
+            let links: Vec<crate::ExternalAuthLink> = resp.json().await?;
+            Ok(links)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list external-auth links ({}): {}", status, body)
+        }
+    }
+
+    /// Get the link status for a single external-auth provider (e.g.
+    /// `primary-github`). `GET /api/v2/external-auth/{externalauth}`.
+    pub async fn get_external_auth(&self, id: &str) -> Result<crate::ExternalAuth> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/external-auth/{}", id),
+            )
+            .send()
+            .await
+            .context("Failed to get external-auth status")?;
+
+        if resp.status().is_success() {
+            let auth: crate::ExternalAuth = resp.json().await?;
+            Ok(auth)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get external-auth status ({}): {}", status, body)
+        }
+    }
+
+    /// Retrieve the pending device-flow link details for a provider. Returns
+    /// the verification URI and codes the user needs to complete linking
+    /// without a dashboard click. `GET /api/v2/external-auth/{externalauth}/device`.
+    ///
+    /// The POST variant of this endpoint performs the *exchange* of a device
+    /// code for a token (a 204 with an empty body); the device-details payload
+    /// is only returned by GET, so the device flow is initiated with GET here.
+    pub async fn get_external_auth_device(&self, id: &str) -> Result<crate::ExternalAuthDevice> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/external-auth/{}/device", id),
+            )
+            .send()
+            .await
+            .context("Failed to retrieve external-auth device flow")?;
+
+        if resp.status().is_success() {
+            let device: crate::ExternalAuthDevice = resp.json().await?;
+            Ok(device)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to retrieve external-auth device flow ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+}
+
 // Chats API (Phase 3)
 
 impl CoderClient {

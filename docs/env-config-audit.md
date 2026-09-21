@@ -27,7 +27,7 @@ the new centralized `crates/config/src/env.rs` layer.
 | `CODER_ADMIN_USERNAME` | coder-client/bootstrap | in-use | `CoderConfig.admin_username` (default `admin`) |
 | `CODER_ADMIN_EMAIL` | coder-client/bootstrap | in-use | `CoderConfig.admin_email` (default `admin@openflows.dev`) |
 | `CODER_ADMIN_PASSWORD` | coder-client/bootstrap | in-use | `CoderConfig.admin_password` (Option; no baked-in default — bootstrapper applies a secure fallback only when absent/weak) |
-| `CODER_GITHUB_TOKEN` | agent-vessel/types | in-use | `CoderConfig.github_token` |
+| `CODER_GITHUB_TOKEN` | — (removed) | **removed** | `CoderConfig.github_token` deleted with the PAT flow (#205); controller/agents use the tenant's linked external-auth token |
 | `CODER_IMAGE_TAG` | binary/doctor | in-use | `CoderConfig.image_tag` (default `v2.37.1`) |
 | `CODER_TRANSPORT_VERBOSE` | provisioner/transport | confusing | **Excluded from centralized layer** |
 | `CODER_WORKSPACE_ID` | openflows-harness/store | confusing | **Excluded from centralized layer** (read inline with default only) |
@@ -52,9 +52,10 @@ the new centralized `crates/config/src/env.rs` layer.
 | `AGENTFLOW_WORKSPACE_ROOT` | agent-lore, agent-vessel | in-use · legacy-alias | `AgentConfig.workspace_root` (canonical) |
 | `WORKSPACE_ROOT` | agent-nexus, agent-vessel | legacy-alias | `AgentConfig.legacy_workspace_root` (deprecated) |
 | `HOME` / `USERPROFILE` | coder-client, nexus, vessel, binary | in-use (platform) | Use `dirs` semantics / `TenantConfig.openflows_home()` |
-| `GITHUB_TOKEN` | agent-nexus | in-use | `GithubConfig.token` |
+| `GITHUB_TOKEN` | — (removed) | **removed** | `GithubConfig.token` deleted with the PAT flow (#205); resolves solely from `CODER_EXTERNAL_AUTH_*_TOKEN` |
 | `GITHUB_REPOSITORY` | coder-client, nexus, binary | in-use · runtime-injected | `GithubConfig.repository`; no longer an operator-set `.env` value — derived per-tenant and injected into the tenant's nexus workspace (#213) |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | coder-client, agent-lore, vessel, config | required | `GithubConfig.personal_access_token`; `effective_token()` |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | — (removed) | **removed** | `GithubConfig.personal_access_token` deleted with the PAT flow (#205) |
+| `CODER_EXTERNAL_AUTH_<ID>_TOKEN` / `_ACCESS_TOKEN` / `_TOKEN_FILE` | config/env | in-use · injected | Tenant user's linked external-auth token, read by `GithubConfig::external_auth_token()` as the sole source in `resolve_token()`; `<ID>` derived from `CODER_EXTERNAL_AUTH_0_ID` (default `primary-github`) uppercased (`PRIMARY_GITHUB`) |
 | `GITHUB_API_BASE` | github/rest | in-use | `GithubConfig.api_base` (default `https://api.github.com`); `GithubRestClient::new` resolves it via `GithubConfig::init_from_env()` |
 | `USE_AI_GATEWAY` | config/registry | in-use | `AgentConfig.use_ai_gateway` (lenient string; `"true"`/`"1"` enabled via `use_ai_gateway_enabled()`, consistent with `registry::resolve_ai_gateway_enabled`) |
 | `DEFAULT_CLI` | config/registry | in-use | keep (registry-specific) |

@@ -4,6 +4,7 @@
 // NEXUS reloads this on every poll cycle for zero-downtime team changes.
 
 use anyhow::{Context, Result};
+use envconfig::Envconfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -448,10 +449,10 @@ impl Registry {
 
     /// Resolve the workspace provider for a given slot ID.
     ///
-    /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
-    /// Falls back to `GITHUB_TOKEN` when no per-agent token is configured.
-    /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
-    /// Returns an error if the agent exists but is inactive (not in active_agents).
+    /// Resolve the GitHub token for a given agent. Falls back to the Coder
+    /// external-auth token. Handles instance IDs (e.g., "forge-1") by
+    /// stripping suffix to find base agent. Returns an error if the agent exists
+    /// but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
         // Existence check must also consider inactive agents, including the
@@ -469,9 +470,8 @@ impl Registry {
             Some(entry) => match &entry.github_token_env {
                 Some(env_var) => std::env::var(env_var)
                     .with_context(|| format!("{} not set for agent {}", env_var, agent_id))?,
-                None => std::env::var("GITHUB_TOKEN").context(
-                    "GITHUB_TOKEN not set (fallback for agent without github_token_env)",
-                )?,
+                None => Self::resolve_global_github_token()
+                    .context("no GitHub token available for agent without github_token_env")?,
             },
             None => {
                 if entry_exists {
@@ -489,13 +489,23 @@ impl Registry {
                         display_id
                     );
                 } else {
-                    // Agent not found at all — fall back to global PAT for backward compat
-                    std::env::var("GITHUB_TOKEN")
-                        .context(format!("Agent '{}' not found in registry", base_id))?
+                    // Agent not found at all — fall back to the global token for backward compat
+                    Self::resolve_global_github_token()
+                        .with_context(|| format!("Agent '{}' not found in registry", base_id))?
                 }
             }
         };
         Ok(token)
+    }
+
+    /// Resolve the global GitHub token from Coder external auth
+    /// (`CODER_EXTERNAL_AUTH_*`); the PAT flow has been removed.
+    fn resolve_global_github_token() -> Result<String> {
+        crate::GithubConfig::init_from_env()
+            .map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?
+            .resolve_token()
+            .filter(|t| !t.is_empty())
+            .context("no GitHub external-auth token available (set CODER_EXTERNAL_AUTH_*_TOKEN)")
     }
 }
 

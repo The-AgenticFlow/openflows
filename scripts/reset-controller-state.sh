@@ -149,7 +149,7 @@ fi
 echo ""
 echo "=== Clean State Ready ==="
 echo "You can now:"
-echo "  1. Start the controller: cargo run -p openflows --bin openflows"
+echo "  1. Start the controller: cargo run -p openflows --bin openflows -- run"
 echo "  2. Create a test ticket in GitHub"
 echo "  3. Monitor the logs: tail -f /tmp/openflows-controller.log"
 echo ""
