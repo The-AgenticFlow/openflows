@@ -205,7 +205,7 @@ You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces
 
 The controller runs **inside the tenant's nexus workspace** and auto-starts when the workspace is ready. You don't run it on your machine — the workspace was created with `start_controller` enabled, and its `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` are injected from the tenant you added.
 
-> For local development/debugging only, you can still run the controller manually on the host with `./scripts/prod.sh run` (this is not the production path).
+> **Note:** There is no host-side `run` command — the controller runs **inside** the tenant's nexus workspace and auto-starts when the workspace is ready (started by `tenant add`). Running the controller manually on the host has been removed as a duplicate of that in-workspace auto-start.
 
 Create a GitHub issue in the bound repo → OpenFlows automatically assigns it, provisions a workspace, and starts working.
 
