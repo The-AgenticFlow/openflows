@@ -1,49 +1,31 @@
 name: Docker Publish
 
-# Builds and pushes the openflows Docker image to GHCR on every release tag.
+# Builds and pushes the openflows Docker image to GHCR on every release.
 #
-# Triggered by the same `openflows-X.Y.Z` tag push that fires `release-assets.yml`,
-# so the binary tarballs and the container image are always published together.
+# The release tag is created by release-plz using GITHUB_TOKEN, and GitHub
+# deliberately does NOT dispatch tag-push events for tags created by
+# GITHUB_TOKEN (an anti-recursion safeguard). So `push: tags` alone never fires
+# for release-plz tags. Instead, the `Release` workflow directly dispatches this
+# workflow via `gh workflow run` (workflow_dispatch IS exempt from the safeguard)
+# after release-plz creates the tag, passing the exact version.
 #
 # Published image: ghcr.io/the-agenticflow/openflows
-# Tags applied:
+# Tags applied (by the merge job):
 #   - ghcr.io/the-agenticflow/openflows:1.3.1   (exact version)
 #   - ghcr.io/the-agenticflow/openflows:1.3      (minor floating tag)
 #   - ghcr.io/the-agenticflow/openflows:1        (major floating tag)
 #   - ghcr.io/the-agenticflow/openflows:latest
 #
-# Platforms: linux/amd64 and linux/arm64 (published as a multi-platform manifest).
+# Platforms: linux/amd64 and linux/arm64. Each platform is built on a NATIVE
+# runner (no QEMU emulation) and pushed with a per-arch tag, then a merge job
+# assembles the multi-platform manifest with `docker buildx imagetools create`.
+# This avoids QEMU-emulated Rust compilation, which previously took ~1 hour.
 #
 # Manual dispatch requires the `version` input (e.g. 1.3.1).
-#
-# Security note for the `workflow_run` trigger below: it is used deliberately
-# with `types: [completed]` restricted to `branches: [main]`. The `resolve` job
-# is gated on `github.event.workflow_run.conclusion == "success"` and only
-# resolves a version when the triggering run actually created an
-# `openflows-X.Y.Z` tag (newest exact-version tag created within the run's
-# [created_at, completed_at] window);
-# the `build-and-push` job depends on `resolve` and only runs on a resolved
-# version. So an upstream failure or untrusted branch can never drive a
-# build/push. This is the file zizmor flags
-# as `dangerous-triggers`; the suppression is declared in `.github/zizmor.yml`
-# (zizmor's inline comment form does not suppress this rule).
 on:
   push:
     tags:
       - 'openflows-[0-9]*.[0-9]*.[0-9]*'
-  # The release tag is created by release-plz using GITHUB_TOKEN, and GitHub
-  # deliberately does NOT dispatch tag-push events for commits/tags created by
-  # GITHUB_TOKEN (an anti-recursion safeguard). As a result the `push: tags`
-  # trigger alone never fires for release-plz tags. Reliably react to each new
-  # release by also running when the `Release` workflow completes successfully:
-  # the version is then derived from the newest `openflows-*.*.*` tag.
-  workflow_run:
-    workflows:
-      - 'Release'
-    types:
-      - completed
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
@@ -59,24 +41,17 @@ env:
   IMAGE_NAME: the-agenticflow/openflows
 
 jobs:
-  # Resolves the version to build. Kept as its own job so that a
-  # not-applicable trigger (failed/cancelled Release run, or a successful run
-  # that did not actually create a release tag) skips cleanly at the job level
-  # instead of cascading into a broken downstream build.
+  # Resolves the version to build. Kept as its own job so that a not-applicable
+  # trigger (e.g. a manually-pushed tag that doesn't match the openflows-X.Y.Z
+  # pattern) fails at the job level instead of cascading into a broken build.
   resolve:
     name: Resolve release version
     runs-on: ubuntu-latest
-    # Failed/cancelled Release completions are skipped at the job level, so they
-    # do not spawn a noisy docker-publish failure.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      # Resolving a version from git tags requires the repo (and tags) to exist,
-      # so this resolution job checks out first. The build job below then
-      # re-checks out the exact release tag it resolved.
       - name: Checkout repository (history + tags)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -89,27 +64,12 @@ jobs:
         env:
           MANUAL_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
-          GITHUB_EVENT: ${{ github.event_name }}
-          WORKFLOW_RUN_CREATED_AT: ${{ github.event.workflow_run.created_at }}
-          WORKFLOW_RUN_COMPLETED_AT: ${{ github.event.workflow_run.completed_at }}
         run: |
+          set -euo pipefail
           if [ -n "${MANUAL_VERSION}" ]; then
-            # Explicit version from a manual dispatch.
+            # Explicit version from a manual dispatch (or from the Release
+            # workflow's `gh workflow run -f version=…` call).
             VERSION="${MANUAL_VERSION}"
-          elif [ "${GITHUB_EVENT}" = "workflow_run" ]; then
-            # Triggered by the `Release` workflow completing. github.ref_name is
-            # the default branch here, not a version. release-plz creates the
-            # `openflows-X.Y.Z` tag during the run, so the tag that THIS release
-            # produced is selected by its creator date falling within the run's
-            # [created_at, completed_at] window (see `.github/scripts/resolve-version.sh`).
-            # A tagless run (release_always=false, no new tag in the window)
-            # resolves to nothing and is skipped so we never rebuild/republish the
-            # previous release.
-            VERSION="$(bash .github/scripts/resolve-version.sh "${WORKFLOW_RUN_CREATED_AT}" "${WORKFLOW_RUN_COMPLETED_AT}")"
-            if [ -z "${VERSION}" ]; then
-              echo "::notice::Skipping: triggering Release run did not create an openflows-X.Y.Z tag"
-              exit 0
-            fi
           else
             # Tag push: derive the version from the ref name.
             VERSION="${REF_NAME#openflows-}"
@@ -120,29 +80,36 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-  build-and-push:
-    name: Build & push Docker image
+  build:
+    name: Build (${{ matrix.platform }})
     needs: resolve
-    # Only build when a version was actually resolved (otherwise the version was
-    # empty because the run was skipped or created no release tag).
     if: needs.resolve.outputs.version != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      # Required for image attestation (sigstore/cosign provenance).
       id-token: write
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          # Native ARM64 runner — no QEMU emulation. This is what eliminates the
+          # ~1 hour build time (QEMU-emulated Rust compilation was the bottleneck).
+          # Requires the repository to have access to GitHub-hosted ARM runners
+          # (free for public repos; available for private repos on paid plans).
+          # If unavailable, fall back to `ubuntu-latest` with QEMU (add the
+          # `docker/setup-qemu-action` step), but expect ~10x slower arm64 builds.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
           persist-credentials: false
-
-      # Enable QEMU so the buildx builder can produce linux/arm64 images on the
-      # amd64 GitHub-hosted runner.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -154,23 +121,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Generates OCI-standard labels and the full set of version tags.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Per-arch tag (e.g. 1.3.1-amd64). The merge job assembles the final
+          # multi-platform manifest under the canonical tags.
           tags: |
-            # Exact semver tag from the resolved version (not github.ref_name directly,
-            # so manual dispatch works correctly too).
-            type=raw,value=${{ needs.resolve.outputs.version }}
-            # Floating minor tag (e.g. 1.3)
-            type=raw,value=${{ needs.resolve.outputs.version }},enable=true,suffix=,prefix=
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve.outputs.version }}
-            # Floating major tag (e.g. 1)
-            type=semver,pattern={{major}},value=${{ needs.resolve.outputs.version }}
-            # latest
-            type=raw,value=latest
+            type=raw,value=${{ needs.resolve.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.title=openflows
             org.opencontainers.image.description=Openflows — agentic workflow orchestrator
@@ -182,17 +141,53 @@ jobs:
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Layer cache keyed per branch/tag so re-runs are fast.
-          # Use an explicit shared `scope` (type=gha defaults the scope to
-          # github.ref, so tag-push/workflow_run/dispatch each got their own
-          # cold cache and the expensive multi-arch Rust build recompiled from
-          # scratch on every release). A single scope lets every build mode
-          # reuse one accumulated cache.
-          cache-from: type=gha,scope=openflows-docker
-          cache-to: type=gha,mode=max,scope=openflows-docker
+          # Per-arch cache scope so the two platforms don't evict each other's
+          # layers. Both jobs run in parallel on native runners, so the total
+          # wall-clock time is max(amd64, arm64) instead of amd64 + QEMU(arm64).
+          cache-from: type=gha,scope=openflows-docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=openflows-docker-${{ matrix.arch }}
+          provenance: false
           build-args: |
             VERSION=${{ needs.resolve.outputs.version }}
+
+  merge:
+    name: Merge multi-platform manifest
+    needs: [resolve, build]
+    if: needs.resolve.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Create multi-platform manifest
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          MAJOR="$(printf '%s' "${VERSION}" | cut -d. -f1)"
+          MINOR="$(printf '%s' "${VERSION}" | cut -d. -f2)"
+          # Assemble the multi-arch manifest from the two per-arch images,
+          # tagging it with the canonical version, floating, and latest tags.
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:${MAJOR}.${MINOR}" \
+            -t "${IMAGE}:${MAJOR}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          echo "Merged multi-platform manifest for ${VERSION}"
