@@ -12,6 +12,7 @@ members = [
     "crates/provisioner",
     "crates/coder-client",
     "crates/openflows-harness",
+    "crates/openflows-manager",
     "crates/a2a-protocol",
     "binary",
     "crates/notifier",

@@ -1,0 +1,22 @@
+[package]
+name = "openflows-manager"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { version = "0.2.0", path = "../config" }
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
+coder-client = { version = "0.1.0", path = "../coder-client" }
+axum = { version = "0.8", features = ["http1", "json"] }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
