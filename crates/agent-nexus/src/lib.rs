@@ -1170,6 +1170,32 @@ Before significant work, read the relevant skill file to understand the workflow
             .map(|(base, _)| base)
             .unwrap_or(worker_id);
 
+        // Sentinel chats are keyed by role (`ticket:{id}:chat:sentinel`), which is
+        // SHARED across every sentinel slot. Only the 1:1 paired sentinel for the
+        // ticket (the slot with the same index as the ticket's forge) may own it.
+        // Without this guard, any stale extra sentinel slot still bound to the
+        // ticket would delete/recreate the shared chat key against its own
+        // workspace, causing the infinite "rotating chat to bind" churn seen when
+        // multiple sentinel slots are left bound to one ticket.
+        if role == "sentinel" {
+            let forge_worker_id = match &ticket.status {
+                TicketStatus::Assigned { worker_id }
+                | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                _ => String::new(),
+            };
+            let paired = Self::paired_sentinel_slot(&forge_worker_id);
+            let is_paired = paired.as_deref() == Some(worker_id);
+            if !is_paired {
+                debug!(
+                    worker_id,
+                    ticket_id,
+                    paired = ?paired,
+                    "Skipping sentinel chat: slot is not the ticket's paired sentinel"
+                );
+                return;
+            }
+        }
+
         // Build dispatch payload with ticket CONTENT for the harness to read
         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
         let dispatch_payload = json!({
@@ -1893,14 +1919,42 @@ Use `openflows-harness` for all coordination:
                         "Checked for existing sentinel chat; proceeding to idle-slot check"
                     );
 
-                    // Find an idle sentinel worker slot
-                    let sentinel_slot = slots.iter().find(|(id, slot)| {
-                        Self::worker_role(id) == "sentinel"
-                            && matches!(slot.status, WorkerStatus::Idle)
-                    });
+                    // Find the sentinel worker slot to review this ticket's plan.
+                    // Re-read the live slots from the store inside the ticket loop
+                    // (rather than trusting the poll-cycle snapshot captured at the
+                    // top of this method) so multiple tickets in the same cycle each
+                    // claim a distinct slot instead of funneling into the same one.
+                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
+                    // is reviewed by its paired `sentinel-i`, so every active FORGE
+                    // instance has an associated SENTINEL worker. We prefer the paired
+                    // slot when it is Idle, falling back to any idle sentinel slot only
+                    // if the exact pair is momentarily unavailable.
+                    let live_slots: HashMap<String, WorkerSlot> =
+                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    let forge_worker_id = match &ticket.status {
+                        TicketStatus::Assigned { worker_id }
+                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                        _ => String::new(),
+                    };
+                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
+                    let sentinel_slot = paired
+                        .as_deref()
+                        .and_then(|id| {
+                            live_slots.get(id).map(|slot| {
+                                (id.to_string(), slot.clone())
+                            })
+                        })
+                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
+                        .or_else(|| {
+                            live_slots.iter().find(|(id, slot)| {
+                                Self::worker_role(id) == "sentinel"
+                                    && matches!(slot.status, WorkerStatus::Idle)
+                            })
+                            .map(|(id, slot)| (id.clone(), slot.clone()))
+                        });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
-                        Some((id, slot)) => (id.clone(), slot.clone()),
+                        Some((id, slot)) => (id, slot),
                         None => {
                             info!(
                                 ticket_id = %ticket.id,
@@ -2194,14 +2248,42 @@ Use `openflows-harness` for all coordination:
                         continue;
                     }
 
-                    // Find an idle sentinel worker slot
-                    let sentinel_slot = slots.iter().find(|(id, slot)| {
-                        Self::worker_role(id) == "sentinel"
-                            && matches!(slot.status, WorkerStatus::Idle)
-                    });
+                    // Find the sentinel worker slot to review this ticket's work.
+                    // Re-read the live slots from the store inside the ticket loop
+                    // (rather than trusting the poll-cycle snapshot captured at the
+                    // top of this method) so multiple tickets in the same cycle each
+                    // claim a distinct slot instead of funneling into the same one.
+                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
+                    // is reviewed by its paired `sentinel-i`, so every active FORGE
+                    // instance has an associated SENTINEL worker. We prefer the paired
+                    // slot when it is Idle, falling back to any idle sentinel slot only
+                    // if the exact pair is momentarily unavailable.
+                    let live_slots: HashMap<String, WorkerSlot> =
+                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    let forge_worker_id = match &ticket.status {
+                        TicketStatus::Assigned { worker_id }
+                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                        _ => String::new(),
+                    };
+                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
+                    let sentinel_slot = paired
+                        .as_deref()
+                        .and_then(|id| {
+                            live_slots
+                                .get(id)
+                                .map(|slot| (id.to_string(), slot.clone()))
+                        })
+                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
+                        .or_else(|| {
+                            live_slots.iter().find(|(id, slot)| {
+                                Self::worker_role(id) == "sentinel"
+                                    && matches!(slot.status, WorkerStatus::Idle)
+                            })
+                            .map(|(id, slot)| (id.clone(), slot.clone()))
+                        });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
-                        Some((id, slot)) => (id.clone(), slot.clone()),
+                        Some((id, slot)) => (id, slot),
                         None => {
                             info!(
                                 ticket_id = %ticket.id,
@@ -3011,6 +3093,41 @@ Use `openflows-harness` for all coordination:
                 }
                 WorkerStatus::Assigned { ticket_id, .. }
                 | WorkerStatus::Working { ticket_id, .. } => {
+                    // Sentinel pair recycling: a SENTINEL slot that has finished its
+                    // review must be returned to Idle so it can serve a later gate for
+                    // another ticket. Without this, an Assigned sentinel slot sits busy
+                    // for the whole ticket lifecycle and the pool exhausts, leaving
+                    // remaining FORGE builders (each needing its own paired SENTINEL)
+                    // with no reviewer — the "pair never spawned" symptom. A sentinel's
+                    // review is done when the ticket is no longer parked on a review
+                    // phase (planning-gate or review_ready) or a verdict is recorded.
+                    if Self::worker_role(&slot.id) == "sentinel" {
+                        let phase = Self::ticket_phase(store, ticket_id).await;
+                        let gate_key = Self::ticket_gate_key(ticket_id, "planning");
+                        let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
+                        let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
+                        let review_done: Option<Value> = store.get_typed(&review_key).await;
+                        let review_complete = phase.as_deref().is_some_and(|p| {
+                            p != "planning" && p != "review_ready"
+                        }) || gate_approved.is_some()
+                            || review_done.is_some();
+                        if review_complete {
+                            info!(
+                                worker_id = slot.id,
+                                ticket_id,
+                                phase,
+                                "Recycling SENTINEL slot to Idle after review verdict"
+                            );
+                            slot.status = WorkerStatus::Idle;
+                            // Sentinel workspaces are named per-ticket; clear the
+                            // binding so a future pairing provisions a fresh,
+                            // correctly-named workspace instead of reusing a stale
+                            // one bound to a previous ticket.
+                            slot.workspace_id = None;
+                            changed_slots = true;
+                            continue;
+                        }
+                    }
                     let ticket_open = tickets
                         .iter()
                         .any(|t| t.id == *ticket_id && matches!(t.status, TicketStatus::Open));
@@ -3159,6 +3276,22 @@ Use `openflows-harness` for all coordination:
             .rsplit_once('-')
             .map(|(base, _)| base)
             .unwrap_or(worker_id)
+    }
+
+    /// Extract the numeric instance index from a worker slot id (e.g.
+    /// `forge-2` -> Some(2), `sentinel-3` -> Some(3)). Returns `None` for
+    /// non-indexed slots (e.g. `lore`, `vessel`).
+    fn worker_index(worker_id: &str) -> Option<u32> {
+        let (_, suffix) = worker_id.rsplit_once('-')?;
+        suffix.parse::<u32>().ok()
+    }
+
+    /// The paired SENTINEL slot for a FORGE slot: `forge-i` pairs with
+    /// `sentinel-i`, restoring the 1:1 FORGE-SENTINEL pair of the fleet.
+    /// Any worker slot id carrying an index `i` maps to `sentinel-i`.
+    fn paired_sentinel_slot(forge_worker_id: &str) -> Option<String> {
+        Self::worker_index(forge_worker_id)
+            .map(|i| format!("sentinel-{}", i))
     }
 
     /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
@@ -4082,15 +4215,15 @@ impl Node for NexusNode {
             })
             .unwrap_or(false);
 
+        // NOTE: an active sentinel does NOT block new forge assignment. Each FORGE
+        // slot is paired 1:1 with a SENTINEL slot, so new work placed on an idle
+        // forge is reviewed in parallel by that forge's own paired sentinel. A
+        // global "any sentinel active -> route to Sentinel" gate would starve idle
+        // forge slots (e.g. forge-4 stays idle and the 4th pair never spawns) while
+        // one ticket's sentinel happens to be mid-review. The sentinel review is
+        // still driven per-ticket by poll_harness_status_and_spawn_agents.
         if sentinel_active {
-            info!("Nexus: sentinel worker active — routing to Sentinel");
-            return Ok(json!(AgentDecision {
-                action: "sentinel_spawned".to_string(),
-                notes: "Sentinel review is active or pending".to_string(),
-                assign_to: None,
-                ticket_id: None,
-                issue_url: None,
-            }));
+            debug!("Nexus: sentinel(s) active — continuing to allow parallel forge assignment");
         }
 
         // Idle *forge* workers, parsed from the worker_slots map provided by prep.
@@ -4223,6 +4356,14 @@ impl Node for NexusNode {
 
         info!(action = %decision.action, notes = %decision.notes, "Nexus decision reached");
 
+        // Reconcile/recycle worker slots on EVERY pass, not only after a new work
+        // assignment. Sentinel slots can be left stale-bound to a ticket (multiple
+        // slots on one ticket, or an Assigned slot whose review already finished)
+        // while the flow is stuck routing to `sentinel_spawned`; if recycling only
+        // ran on `work_assigned` it would never run in that state and the stale
+        // binding would churn forever, starving idle forge slots of paired sentinels.
+        Self::recover_orphans(store).await?;
+
         if decision.action == ACTION_MERGE_PRS {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
 
@@ -4253,8 +4394,6 @@ impl Node for NexusNode {
 
         if decision.action == "work_assigned" {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
-
-            Self::recover_orphans(store).await?;
 
             if let Some(worker_id) = &decision.assign_to {
                 if let Some(ticket_id) = &decision.ticket_id {
@@ -4449,7 +4588,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nexus_routes_active_sentinel_before_forge_assignment() {
+    async fn test_nexus_assigns_forge_despite_active_sentinel_for_parallel_pairs() {
+        // Parallel 1:1 pairs: an active sentinel on one ticket must NOT block a
+        // new ticket from being assigned to an idle forge slot with its own
+        // paired sentinel. Otherwise idle forge slots starve and fewer than the
+        // fleet's N pairs ever spawn.
         let node = NexusNode::new("nexus.agent.md", "registry.json");
         let context = json!({
             "assignable_tickets": [{
@@ -4480,7 +4623,9 @@ mod tests {
 
         let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
             .expect("nexus exec returns an AgentDecision");
-        assert_eq!(decision.action, "sentinel_spawned");
+        assert_eq!(decision.action, "work_assigned");
+        assert_eq!(decision.assign_to.as_deref(), Some("forge-1"));
+        assert_eq!(decision.ticket_id.as_deref(), Some("T-049"));
     }
 
     #[test]
@@ -4600,6 +4745,21 @@ mod tests {
         assert_eq!(NexusNode::worker_role("forge-1"), "forge");
         assert_eq!(NexusNode::worker_role("forge-42"), "forge");
         assert_eq!(NexusNode::worker_role("sentinel"), "sentinel");
+    }
+
+    #[test]
+    fn paired_sentinel_maps_forge_index_one_to_one() {
+        // Each forge slot pairs with the sentinel slot of the same index.
+        assert_eq!(NexusNode::paired_sentinel_slot("forge-1"), Some("sentinel-1".to_string()));
+        assert_eq!(NexusNode::paired_sentinel_slot("forge-2"), Some("sentinel-2".to_string()));
+        assert_eq!(NexusNode::paired_sentinel_slot("forge-4"), Some("sentinel-4".to_string()));
+        // Non-indexed slots have no pair.
+        assert_eq!(NexusNode::paired_sentinel_slot("lore"), None);
+        assert_eq!(NexusNode::paired_sentinel_slot("vessel"), None);
+        // Index extraction.
+        assert_eq!(NexusNode::worker_index("forge-3"), Some(3));
+        assert_eq!(NexusNode::worker_index("sentinel-2"), Some(2));
+        assert_eq!(NexusNode::worker_index("lore"), None);
     }
 
     #[test]
