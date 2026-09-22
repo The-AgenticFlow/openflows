@@ -19,7 +19,11 @@ name: Release
 # the resulting `release-plz-*` version-bump PR merges back into `main` and
 # triggers `release`. The `release-branch.yml` guard enforces this source model.
 #
-# Publications to npm / Homebrew / Docker (GHCR) / crates.io are removed.
+# After the tag + GitHub Release are created, this workflow directly dispatches
+# `docker-publish.yml` (via `gh workflow run`, which IS exempt from the
+# GITHUB_TOKEN anti-recursion safeguard that suppresses `push: tags` and
+# `release` events). This replaces the unreliable `workflow_run` trigger that
+# docker-publish previously relied on.
 
 on:
   push:
@@ -221,3 +225,39 @@ jobs:
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trigger-docker-publish:
+    name: Trigger Docker publish
+    runs-on: ubuntu-latest
+    needs: [gate, release-plz-release]
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout repository (history + tags)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Dispatch docker-publish for the new release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # release-plz creates exactly one `openflows-X.Y.Z` tag per release
+          # run. Select the newest-created tag reachable from HEAD.
+          TAG="$(git tag --list 'openflows-*' --sort=-creatordate \
+            --format='%(refname:short)' | head -1)"
+          if [ -z "${TAG}" ]; then
+            echo "::notice::No openflows-* tag found — this push did not create a release. Skipping docker-publish dispatch."
+            exit 0
+          fi
+          VERSION="${TAG#openflows-}"
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::Newest tag '${TAG}' is not an exact openflows-X.Y.Z release tag — skipping."
+            exit 0
+          fi
+          echo "Dispatching docker-publish.yml for version ${VERSION}"
+          gh workflow run docker-publish.yml --ref main -f version="${VERSION}"
