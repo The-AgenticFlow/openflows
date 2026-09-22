@@ -32,15 +32,27 @@ body = """
 {% macro mention(commit) -%}
 {%- if commit.author -%}
 {%- set acct = commit.author -%}
-{%- if acct.email is ending_with("users.noreply.github.com") -%}
+{%- set email_ok = acct.email is string -%}
+{# `acct.email` can be a non-string (Null) for some commits under release-plz's#}
+{# embedded git-cliff-core (e.g. commits without a resolvable author). Calling #}
+{# `ending_with` on a non-string makes Tera throw "Tester ending_with was      #}
+{# called on a variable that isn't a string", which aborts the whole release-  #}
+{# pr changelog generation. Guard on `email_ok` so the test only runs on a     #}
+{# real string and the templating never crashes.                              #}
+{%- if email_ok and acct.email is ending_with("users.noreply.github.com") -%}
 {# GitHub noreply emails are `NNNNNNN+<login>@users.noreply.github.com`, so the#}
 {# `<login>` is an exact GitHub username that makes a valid mention.          #}
-  by @{{ acct.email | split(pat="+") | last | split(pat="@") | first }}{%- endif -%}
-{%- if not acct.email is ending_with("users.noreply.github.com") -%}
+  by @{{ acct.email | split(pat="+") | last | split(pat="@") | first }}
+{%- elif email_ok and not acct.email is ending_with("users.noreply.github.com") -%}
 {# Non-noreply (e.g. personal) emails have no reliable login: fall back to the#}
 {# commit author's display name, which equals the GitHub login for releases   #}
 {# by name=login authors (NkwaTambe, Ngha-Boris, ...).                         #}
-  by @{{ acct.name }}{%- endif -%}
+  by @{{ acct.name }}
+{%- elif acct.name -%}
+{# No usable email (non-string/Null from git-cliff-core): still credit the    #}
+{# author by display name rather than silently dropping the attribution.      #}
+  by @{{ acct.name }}
+{%- endif -%}
 {%- endif -%}
 {% endmacro -%}
 
