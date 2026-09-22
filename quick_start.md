@@ -70,7 +70,7 @@ Fill in the required values:
 | `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
 
-> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team> --fleet <N>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
+> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
 
 Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
 
@@ -124,7 +124,7 @@ Signing in is **not** enough. Each tenant workspace is owned by its **tenant use
 
 Since `tenant add` performs a **real API-driven grant check** (it polls `GET /api/v2/external-auth/primary-github` until the tenant user's GitHub link is confirmed), you no longer need to pre-link the app manually. When you run `tenant add`, it prints the link URL and (when a device flow is available) a one-time code you can authorize in a browser — complete that and onboarding continues automatically:
 
-1. Run `./scripts/prod.sh tenant <owner/repo> --name <my-team> --fleet <N>`.
+1. Run `./scripts/prod.sh tenant <owner/repo> --name <my-team>`.
 2. Onboarding prints a "GitHub Link Required" prompt with either:
    - a **device-flow URL + one-time code** (fastest — open it, enter the code, click **Authorize**), or
    - the Coder dashboard link `http://localhost:7080/external-auth/primary-github` to authorize as the tenant user.
@@ -182,10 +182,8 @@ Confirm the templates were pushed at **http://localhost:7080/templates**.
 Bind a GitHub repo to OpenFlows. A tenant is scoped to a single `owner/repo` and provisions its own nexus workspace + controller:
 
 ```bash
-./scripts/prod.sh tenant <owner/repo> --name <my-team> --fleet 3
+./scripts/prod.sh tenant <owner/repo> --name <my-team>
 ```
-
-`--fleet N` sets the number of **FORGE-SENTINEL pairs** for the tenant: `N` forge worker slots **and** `N` sentinel worker slots (a fleet of `3` → `forge-1..forge-3` and `sentinel-1..sentinel-3`). It is **mandatory** and must be >= 1. The fleet value is written into the tenant's `registry.json` (also persisted to the tenant store), which the in-workspace controller reads and applies automatically.
 
 `tenant add` now onboards **self-serve**:
 
@@ -199,7 +197,7 @@ You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces
 
 > **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
 
-> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). The same applies to **`--fleet`**: `tenant add` on an existing nexus workspace leaves its build parameters (including the fleet) unchanged, so the fleet value only applies to newly added tenants, or after you recreate the tenant's workspace. New tenants get these automatically — nothing extra to do.
+> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). New tenants get this automatically — nothing extra to do.
 
 ---
 

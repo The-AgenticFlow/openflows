@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./scripts/prod.sh bootstrap                    # Setup Coder + push templates
-#   ./scripts/prod.sh tenant owner/repo --name team --fleet 3 # Add a tenant (3 FORGE-SENTINEL pairs)
+#   ./scripts/prod.sh tenant owner/repo --name team # Add a tenant
 #   ./scripts/prod.sh doctor                       # Health check
 #   ./scripts/prod.sh --help                       # Show help
 #
@@ -44,7 +44,7 @@ OpenFlows Production Commands
 
 Usage:
   ./scripts/prod.sh bootstrap                          Setup Coder + push templates
-  ./scripts/prod.sh tenant owner/repo --name team-name --fleet N  Add a tenant (each tenant runs its own in-workspace controller; N = number of FORGE-SENTINEL pairs)
+  ./scripts/prod.sh tenant owner/repo --name team-name  Add a tenant (each tenant runs its own in-workspace controller)
   ./scripts/prod.sh doctor                             Health check
 
 Options:
@@ -66,9 +66,8 @@ Examples:
   # First-time setup:
   ./scripts/prod.sh bootstrap
 
-  # Add a team (provisions the tenant's nexus workspace + auto-started controller).
-  # --fleet N sets N FORGE-SENTINEL pairs (N forge + N sentinel max slots):
-  ./scripts/prod.sh tenant my-org/my-repo --name my-team --fleet 3
+  # Add a team (provisions the tenant's nexus workspace + auto-started controller):
+  ./scripts/prod.sh tenant my-org/my-repo --name my-team
 
   # Health check:
   ./scripts/prod.sh doctor
@@ -197,29 +196,22 @@ case "$CMD" in
         if [ -z "${1:-}" ]; then
             echo "❌ Missing owner/repo argument"
             echo ""
-            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
+            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name"
             echo ""
-            echo "Example: ./scripts/prod.sh tenant my-org/my-repo --name my-team --fleet 3"
+            echo "Example: ./scripts/prod.sh tenant my-org/my-repo --name my-team"
             exit 1
         fi
         OWNER_REPO="$1"
         shift
 
         NAME=""
-        FLEET=""
-        REST=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --name)
                     NAME="$2"
                     shift 2
                     ;;
-                --fleet)
-                    FLEET="$2"
-                    shift 2
-                    ;;
                 *)
-                    REST+=("$1")
                     shift
                     ;;
             esac
@@ -228,18 +220,7 @@ case "$CMD" in
         if [ -z "$NAME" ]; then
             echo "❌ Missing --name argument"
             echo ""
-            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
-            exit 1
-        fi
-
-        if [ -z "$FLEET" ]; then
-            echo "❌ Missing --fleet argument (fleet N = number of FORGE-SENTINEL pairs; must be >= 1)"
-            echo ""
-            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
-            exit 1
-        fi
-        if ! [[ "$FLEET" =~ ^[0-9]+$ ]] || [ "$FLEET" -lt 1 ]; then
-            echo "❌ --fleet must be a whole number >= 1 (got: $FLEET)"
+            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name"
             exit 1
         fi
 
@@ -249,9 +230,8 @@ case "$CMD" in
         echo ""
         echo "  Owner/Repo: $OWNER_REPO"
         echo "  Tenant Name: $NAME"
-        echo "  Fleet: $FLEET (FORGE-SENTINEL pair(s))"
         echo ""
-        run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET" "${REST[@]}"
+        run_openflows tenant add "$OWNER_REPO" --name "$NAME" "$@"
         ;;
 
     doctor)

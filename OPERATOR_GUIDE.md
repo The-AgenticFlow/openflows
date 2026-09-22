@@ -53,14 +53,8 @@ auth. Confirm templates under the Coder dashboard → Templates.
 ## 4. Onboard a tenant (self-serve)
 
 ```bash
-./scripts/prod.sh tenant <owner/repo> --name <trial-team> --fleet 3
+./scripts/prod.sh tenant <owner/repo> --name <trial-team>
 ```
-
-`--fleet N` is **mandatory** and sets the number of **FORGE-SENTINEL pairs** for the
-tenant: `N` forge worker slots **and** `N` sentinel worker slots (`--fleet 3` →
-`forge-1..forge-3` + `sentinel-1..sentinel-3`). The fleet value is baked into the
-tenant's `registry.json` (injected into the nexus workspace as `registry_json` and
-persisted to the tenant store), so the pair capacity is applied automatically.
 
 `tenant add` now onboards self-serve:
 
@@ -70,11 +64,6 @@ persisted to the tenant store), so the pair capacity is applied automatically.
    install URL.
 3. Once GitHub is linked, mints a tenant token and provisions the
    `openflows-nexus-<tenant>` workspace, which auto-starts its controller.
-
-> **Fleet on existing tenants:** re-running `tenant add` on a tenant whose nexus
-> workspace already exists leaves its build parameters (including the fleet) unchanged
-> (Coder 409 path). A fleet change applies to **new** tenants only, or after you
-> recreate the tenant's workspace once.
 
 The controller then reads issues and opens PRs on the trial's private repo using the
 tenant's linked external-auth token.
