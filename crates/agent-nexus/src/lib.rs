@@ -1964,12 +1964,11 @@ Use `openflows-harness` for all coordination:
                     // (rather than trusting the poll-cycle snapshot captured at the
                     // top of this method) so multiple tickets in the same cycle each
                     // claim a distinct slot instead of funneling into the same one.
-                    // Forge owns the 1:1 fleet pair: a ticket worked by `forge-i` is
-                    // reviewed only by its paired `sentinel-i`. There is no fallback
-                    // to an idle sentinel of a different index — that would let one
-                    // sentinel review another pair's forge and break the 1:1
-                    // invariant. If the exact pair is not Idle, the ticket simply
-                    // waits until it is (each pair reviews in parallel).
+                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
+                    // is reviewed by its paired `sentinel-i`, so every active FORGE
+                    // instance has an associated SENTINEL worker. We prefer the paired
+                    // slot when it is Idle, falling back to any idle sentinel slot only
+                    // if the exact pair is momentarily unavailable.
                     let live_slots: HashMap<String, WorkerSlot> =
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
@@ -1977,9 +1976,24 @@ Use `openflows-harness` for all coordination:
                         | TicketStatus::InProgress { worker_id } => worker_id.clone(),
                         _ => String::new(),
                     };
-                    let sentinel_slot = Self::strict_paired_sentinel(&forge_worker_id, &live_slots)
-                        .and_then(|id| live_slots.get(&id).map(|slot| (id, slot.clone())))
-                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle));
+                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
+                    let sentinel_slot = paired
+                        .as_deref()
+                        .and_then(|id| {
+                            live_slots
+                                .get(id)
+                                .map(|slot| (id.to_string(), slot.clone()))
+                        })
+                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
+                        .or_else(|| {
+                            live_slots
+                                .iter()
+                                .find(|(id, slot)| {
+                                    Self::worker_role(id) == "sentinel"
+                                        && matches!(slot.status, WorkerStatus::Idle)
+                                })
+                                .map(|(id, slot)| (id.clone(), slot.clone()))
+                        });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
                         Some((id, slot)) => (id, slot),
@@ -2281,12 +2295,11 @@ Use `openflows-harness` for all coordination:
                     // (rather than trusting the poll-cycle snapshot captured at the
                     // top of this method) so multiple tickets in the same cycle each
                     // claim a distinct slot instead of funneling into the same one.
-                    // Forge owns the 1:1 fleet pair: a ticket worked by `forge-i` is
-                    // reviewed only by its paired `sentinel-i`. There is no fallback
-                    // to an idle sentinel of a different index — that would let one
-                    // sentinel review another pair's forge and break the 1:1
-                    // invariant. If the exact pair is not Idle, the ticket simply
-                    // waits until it is (each pair reviews in parallel).
+                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
+                    // is reviewed by its paired `sentinel-i`, so every active FORGE
+                    // instance has an associated SENTINEL worker. We prefer the paired
+                    // slot when it is Idle, falling back to any idle sentinel slot only
+                    // if the exact pair is momentarily unavailable.
                     let live_slots: HashMap<String, WorkerSlot> =
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
@@ -2294,9 +2307,24 @@ Use `openflows-harness` for all coordination:
                         | TicketStatus::InProgress { worker_id } => worker_id.clone(),
                         _ => String::new(),
                     };
-                    let sentinel_slot = Self::strict_paired_sentinel(&forge_worker_id, &live_slots)
-                        .and_then(|id| live_slots.get(&id).map(|slot| (id, slot.clone())))
-                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle));
+                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
+                    let sentinel_slot = paired
+                        .as_deref()
+                        .and_then(|id| {
+                            live_slots
+                                .get(id)
+                                .map(|slot| (id.to_string(), slot.clone()))
+                        })
+                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
+                        .or_else(|| {
+                            live_slots
+                                .iter()
+                                .find(|(id, slot)| {
+                                    Self::worker_role(id) == "sentinel"
+                                        && matches!(slot.status, WorkerStatus::Idle)
+                                })
+                                .map(|(id, slot)| (id.clone(), slot.clone()))
+                        });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
                         Some((id, slot)) => (id, slot),
@@ -3308,35 +3336,6 @@ Use `openflows-harness` for all coordination:
     /// Any worker slot id carrying an index `i` maps to `sentinel-i`.
     fn paired_sentinel_slot(forge_worker_id: &str) -> Option<String> {
         Self::worker_index(forge_worker_id).map(|i| format!("sentinel-{}", i))
-    }
-
-    /// Resolve the strict 1:1 SENTINEL reviewer for a FORGE worker, verified
-    /// against the live worker slots.
-    ///
-    /// A ticket worked by `forge-i` may only be reviewed by its exact pair
-    /// `sentinel-i` — never by an idle sentinel of a different index. Without
-    /// this, a busy `sentinel-i` on one ticket could cause a ticket worked by
-    /// `forge-j` (j != i) to be picked up by `sentinel-i`, breaking the 1:1
-    /// fleet invariant the controller guarantees.
-    ///
-    /// The only non-indexed allowance is the fleet-of-one layout, where a
-    /// single FORGE (`forge-1`) pairs with the bare `sentinel` slot (the
-    /// registry names a sole sentinel instance `sentinel`, not `sentinel-1`).
-    /// That is still a strict 1:1 pair; it never lets one sentinel serve a
-    /// forge of a different index.
-    fn strict_paired_sentinel(
-        forge_worker_id: &str,
-        live_slots: &HashMap<String, WorkerSlot>,
-    ) -> Option<String> {
-        if let Some(id) = Self::paired_sentinel_slot(forge_worker_id) {
-            if live_slots.contains_key(&id) {
-                return Some(id);
-            }
-        }
-        if forge_worker_id == "forge-1" && live_slots.contains_key("sentinel") {
-            return Some("sentinel".to_string());
-        }
-        None
     }
 
     /// Whether a sentinel slot may operate on the shared
@@ -4854,110 +4853,6 @@ mod tests {
         assert_eq!(NexusNode::worker_index("forge-3"), Some(3));
         assert_eq!(NexusNode::worker_index("sentinel-2"), Some(2));
         assert_eq!(NexusNode::worker_index("lore"), None);
-    }
-
-    #[test]
-    fn strict_paired_sentinel_only_reviews_its_own_forge() {
-        // A balanced fleet: forge-1..3 with sentinel-1..3. Each forge-i resolves
-        // to exactly sentinel-i and never to a sentinel of another index.
-        let slots = HashMap::from_iter([
-            (
-                "forge-1".to_string(),
-                WorkerSlot {
-                    id: "forge-1".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "forge-2".to_string(),
-                WorkerSlot {
-                    id: "forge-2".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "forge-3".to_string(),
-                WorkerSlot {
-                    id: "forge-3".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "sentinel-1".to_string(),
-                WorkerSlot {
-                    id: "sentinel-1".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "sentinel-2".to_string(),
-                WorkerSlot {
-                    id: "sentinel-2".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "sentinel-3".to_string(),
-                WorkerSlot {
-                    id: "sentinel-3".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-        ]);
-        assert_eq!(
-            NexusNode::strict_paired_sentinel("forge-1", &slots).as_deref(),
-            Some("sentinel-1")
-        );
-        assert_eq!(
-            NexusNode::strict_paired_sentinel("forge-2", &slots).as_deref(),
-            Some("sentinel-2")
-        );
-        assert_eq!(
-            NexusNode::strict_paired_sentinel("forge-3", &slots).as_deref(),
-            Some("sentinel-3")
-        );
-
-        // Even when a different-index sentinel exists, forge-2 does NOT fall back
-        // to it: forging the pair back is the exact behavior we must prevent.
-        assert_eq!(
-            NexusNode::strict_paired_sentinel("forge-2", &slots).as_deref(),
-            Some("sentinel-2")
-        );
-
-        // A forge whose paired sentinel slot does not exist resolves to None — no
-        // cross-pair fallback (forge-4 has no sentinel-4 in a fleet of 3).
-        assert_eq!(NexusNode::strict_paired_sentinel("forge-4", &slots), None);
-
-        // Fleet of one: forge-1 pairs with the bare `sentinel` slot (the registry
-        // names a sole sentinel instance `sentinel`, not `sentinel-1`).
-        let fleet1 = HashMap::from_iter([
-            (
-                "forge-1".to_string(),
-                WorkerSlot {
-                    id: "forge-1".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-            (
-                "sentinel".to_string(),
-                WorkerSlot {
-                    id: "sentinel".into(),
-                    status: WorkerStatus::Idle,
-                    workspace_id: None,
-                },
-            ),
-        ]);
-        assert_eq!(
-            NexusNode::strict_paired_sentinel("forge-1", &fleet1).as_deref(),
-            Some("sentinel")
-        );
     }
 
     #[test]
