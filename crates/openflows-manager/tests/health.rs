@@ -5,12 +5,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::Value;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::oneshot};
 use tower::ServiceExt;
 
 #[derive(Clone)]
 struct UnreadyProbe;
+
+#[derive(Clone)]
+struct HangingProbe;
 
 impl openflows_manager::server::ReadinessCheck for UnreadyProbe {
     fn check(
@@ -22,6 +25,15 @@ impl openflows_manager::server::ReadinessCheck for UnreadyProbe {
                 anyhow::anyhow!("store unavailable"),
             ))
         })
+    }
+}
+
+impl openflows_manager::server::ReadinessCheck for HangingProbe {
+    fn check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), openflows_manager::error::ManagerError>> + Send + '_>>
+    {
+        Box::pin(async { std::future::pending().await })
     }
 }
 
@@ -105,6 +117,36 @@ async fn readiness_returns_unavailable_when_dependency_check_fails() {
     let serialized = value.to_string();
     assert!(!serialized.contains("redis://"));
     assert!(!serialized.contains("store unavailable"));
+}
+
+#[tokio::test]
+async fn readiness_returns_unavailable_when_dependency_check_hangs() {
+    let app = openflows_manager::server::create_router(
+        openflows_manager::server::AppState::with_readiness_check(
+            pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
+            Arc::new(HangingProbe),
+        ),
+    );
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(1500),
+        app.oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("readiness should time out stalled dependency checks")
+    .unwrap();
+
+    assert_eq!(StatusCode::SERVICE_UNAVAILABLE, response.status());
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "unavailable");
+    assert_eq!(value["service"], "openflows-manager");
 }
 
 #[tokio::test]

@@ -4,7 +4,12 @@ use crate::error::ManagerError;
 use axum::Router;
 use pocketflow_core::SharedStore;
 use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    time::{timeout, Duration},
+};
+
+const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub trait ReadinessCheck: Send + Sync {
     fn check(&self) -> Pin<Box<dyn Future<Output = Result<(), ManagerError>> + Send + '_>>;
@@ -61,7 +66,13 @@ impl AppState {
     }
 
     pub async fn check_readiness(&self) -> Result<(), ManagerError> {
-        self.readiness.check().await
+        match timeout(READINESS_CHECK_TIMEOUT, self.readiness.check()).await {
+            Ok(result) => result,
+            Err(_) => Err(ManagerError::Service(anyhow::anyhow!(
+                "readiness check timed out after {:?}",
+                READINESS_CHECK_TIMEOUT
+            ))),
+        }
     }
 }
 
