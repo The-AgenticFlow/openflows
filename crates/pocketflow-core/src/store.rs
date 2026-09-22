@@ -86,6 +86,12 @@ impl RedisBackend {
         }
         keys
     }
+
+    async fn ping(&self) -> Result<()> {
+        use fred::prelude::*;
+        let _: String = self.client.ping(None).await?;
+        Ok(())
+    }
 }
 
 // ── Backend enum ──────────────────────────────────────────────────────────
@@ -139,6 +145,13 @@ impl Backend {
         match self {
             Backend::InMemory(b) => b.keys(pattern).await,
             Backend::Redis(b) => b.keys(pattern).await,
+        }
+    }
+
+    async fn ping(&self) -> Result<()> {
+        match self {
+            Backend::InMemory(_) => Ok(()),
+            Backend::Redis(b) => b.ping().await,
         }
     }
 }
@@ -238,6 +251,11 @@ impl SharedStore {
     /// already fully-qualified and must not be re-prefixed.
     pub async fn raw_del(&self, key: &str) {
         self.backend.del(key).await;
+    }
+
+    /// Check whether the underlying store backend is reachable.
+    pub async fn ping(&self) -> Result<()> {
+        self.backend.ping().await
     }
 
     /// Typed get — deserialises JSON into T. Returns None on missing key or type mismatch.
