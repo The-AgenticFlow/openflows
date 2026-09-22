@@ -272,13 +272,20 @@ impl NexusNode {
         registry.resolve_github_token("nexus")
     }
 
-    /// Best-effort GitHub token from Coder external auth (the tenant user's
-    /// linked App token). `None` when not configured. PAT flow removed.
+    /// Best-effort GitHub token from the centralized config (`GITHUB_TOKEN`),
+    /// falling back to the `/tmp/github_token` file. Returns `None` when
+    /// neither is available so callers can decide how to degrade.
     fn resolve_github_token_from_env_or_file(&self) -> Option<String> {
         config::EnvConfig::from_env()
             .ok()
-            .and_then(|e| e.github.resolve_token())
+            .and_then(|e| e.github.token)
             .filter(|t| !t.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/tmp/github_token")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            })
     }
 
     fn load_registry(&self) -> Result<Registry> {
@@ -437,7 +444,7 @@ Before significant work, read the relevant skill file to understand the workflow
             Ok(t) => t,
             Err(_) => match self.resolve_github_token_from_env_or_file() {
                 Some(t) => {
-                    info!("Using GitHub token from env / external auth / token file for PR sync");
+                    info!("Using GITHUB_TOKEN env var / token file for PR sync");
                     t
                 }
                 None => {
@@ -897,6 +904,10 @@ Before significant work, read the relevant skill file to understand the workflow
                         .map(|e| e.coder.url)
                         .unwrap_or_default()
                 }),
+                // Prefer a PAT for git in the workspace so clones/pushes work on
+                // any accessible repo regardless of GitHub App install scope.
+                // Falls back inside the template to the Coder GitHub App token.
+                "github_pat": self.resolve_github_token_from_env_or_file(),
             }),
         };
         // Inject the Terraform variable the template reads.
@@ -1169,72 +1180,6 @@ Before significant work, read the relevant skill file to understand the workflow
             .rsplit_once('-')
             .map(|(base, _)| base)
             .unwrap_or(worker_id);
-
-        // Sentinel chats are keyed by role (`ticket:{id}:chat:sentinel`), which is
-        // SHARED across every sentinel slot. Only the 1:1 paired sentinel for the
-        // ticket (the slot with the same index as the ticket's forge) may own it.
-        // Without this guard, any stale extra sentinel slot still bound to the
-        // ticket would delete/recreate the shared chat key against its own
-        // workspace, causing the infinite "rotating chat to bind" churn seen when
-        // multiple sentinel slots are left bound to one ticket.
-        if role == "sentinel" {
-            let forge_worker_id = match &ticket.status {
-                TicketStatus::Assigned { worker_id } | TicketStatus::InProgress { worker_id } => {
-                    worker_id.clone()
-                }
-                _ => String::new(),
-            };
-            let paired = Self::paired_sentinel_slot(&forge_worker_id);
-            let is_paired = paired.as_deref() == Some(worker_id);
-            let is_ticket_sentinel = matches!(
-                &slot.status,
-                WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. }
-                    if *ticket_id == ticket.id
-            );
-            // Only one sentinel may own the shared `ticket:{id}:chat:sentinel`
-            // key. The paired `sentinel-i` is the primary owner. When the
-            // paired slot is momentarily busy a fallback sentinel is assigned to
-            // the ticket; that single fallback is the legitimate owner and must
-            // be able to (re)create the shared chat during recovery after its
-            // workspace is re-provisioned. To avoid the chat-rotation churn this
-            // guard exists to prevent, a duplicate sentinel bound to the same
-            // ticket but a different workspace must NOT be allowed to operate on
-            // the shared chat. Ownership of an existing chat is decided by
-            // workspace match; when the chat is confirmed missing (not yet
-            // created, or its workspace was destroyed during recovery) an assigned
-            // sentinel is allowed to (re)create it. A transient lookup failure is
-            // NOT treated as "missing" — granting ownership on a transient error
-            // would let the fallback rotate a live shared chat once the next
-            // lookup succeeds and finds it attached to another workspace.
-            let shared_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
-            let (chat_exists, chat_healthy, chat_workspace_matches, lookup_errored) =
-                match store.get_typed::<String>(&shared_chat_key).await {
-                    Some(stored_chat_id) => match client.get_chat_opt(&stored_chat_id).await {
-                        Ok(Some(chat)) => (true, true, chat.workspace_id == *workspace_id, false),
-                        Ok(None) => (false, false, false, false),
-                        Err(_) => (false, false, false, true),
-                    },
-                    None => (false, false, false, false),
-                };
-            let owns_shared_chat = Self::sentinel_may_own_shared_chat(
-                is_paired,
-                is_ticket_sentinel,
-                chat_exists,
-                chat_healthy,
-                chat_workspace_matches,
-                lookup_errored,
-            );
-            if !owns_shared_chat {
-                debug!(
-                    worker_id,
-                    ticket_id,
-                    paired = ?paired,
-                    "Skipping sentinel chat: slot is not the paired sentinel nor the shared-chat owner"
-                );
-                return;
-            }
-        }
 
         // Build dispatch payload with ticket CONTENT for the harness to read
         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
@@ -1959,30 +1904,14 @@ Use `openflows-harness` for all coordination:
                         "Checked for existing sentinel chat; proceeding to idle-slot check"
                     );
 
-                    // Find the sentinel worker slot to review this ticket's plan.
-                    // Re-read the live slots from the store inside the ticket loop
-                    // (rather than trusting the poll-cycle snapshot captured at the
-                    // top of this method) so multiple tickets in the same cycle each
-                    // claim a distinct slot instead of funneling into the same one.
-                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
-                    // is reviewed by its paired `sentinel-i`, so every active FORGE
-                    // instance has an associated SENTINEL worker. We preserve a
-                    // sentinel already bound to this ticket as the sole owner (so a
-                    // fallback reviewer is not displaced by the pair becoming idle),
-                    // prefer the paired slot when Idle, and fall back to any idle
-                    // sentinel only if the exact pair is momentarily unavailable.
-                    let live_slots: HashMap<String, WorkerSlot> =
-                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                    let forge_worker_id = match &ticket.status {
-                        TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
-                    };
-                    let sentinel_slot =
-                        Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
+                    // Find an idle sentinel worker slot
+                    let sentinel_slot = slots.iter().find(|(id, slot)| {
+                        Self::worker_role(id) == "sentinel"
+                            && matches!(slot.status, WorkerStatus::Idle)
+                    });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
-                        Some((id, slot)) => (id, slot),
+                        Some((id, slot)) => (id.clone(), slot.clone()),
                         None => {
                             info!(
                                 ticket_id = %ticket.id,
@@ -2276,30 +2205,14 @@ Use `openflows-harness` for all coordination:
                         continue;
                     }
 
-                    // Find the sentinel worker slot to review this ticket's work.
-                    // Re-read the live slots from the store inside the ticket loop
-                    // (rather than trusting the poll-cycle snapshot captured at the
-                    // top of this method) so multiple tickets in the same cycle each
-                    // claim a distinct slot instead of funneling into the same one.
-                    // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
-                    // is reviewed by its paired `sentinel-i`, so every active FORGE
-                    // instance has an associated SENTINEL worker. We preserve a
-                    // sentinel already bound to this ticket as the sole owner (so a
-                    // fallback reviewer is not displaced by the pair becoming idle),
-                    // prefer the paired slot when Idle, and fall back to any idle
-                    // sentinel only if the exact pair is momentarily unavailable.
-                    let live_slots: HashMap<String, WorkerSlot> =
-                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                    let forge_worker_id = match &ticket.status {
-                        TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
-                    };
-                    let sentinel_slot =
-                        Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
+                    // Find an idle sentinel worker slot
+                    let sentinel_slot = slots.iter().find(|(id, slot)| {
+                        Self::worker_role(id) == "sentinel"
+                            && matches!(slot.status, WorkerStatus::Idle)
+                    });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
-                        Some((id, slot)) => (id, slot),
+                        Some((id, slot)) => (id.clone(), slot.clone()),
                         None => {
                             info!(
                                 ticket_id = %ticket.id,
@@ -2883,10 +2796,12 @@ Use `openflows-harness` for all coordination:
         let worker_entry = registry.get(&base_id);
 
         // Resolve the worker's GitHub token. resolve_github_token() falls back
-        // to the Coder external-auth token when no dedicated github_token_env
-        // is configured on the registry entry. We do NOT hard-fail on a
-        // missing github_token_env field — that would block all v2-style
-        // registry entries (which omit the deprecated v1 field).
+        // to GITHUB_TOKEN when no dedicated github_token_env is
+        // configured on the registry entry, so agents without a per-agent token
+        // still work as long as the fallback env var is set. We do NOT hard-fail
+        // on a missing github_token_env field — that would block all v2-style
+        // registry entries (which omit the deprecated v1 field) even when the
+        // shared PAT is perfectly valid for assignment.
         let worker_token_result = identity_manager.resolve_github_token(worker_id);
         if let Err(e) = &worker_token_result {
             warn!(
@@ -2897,7 +2812,7 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("CODER_EXTERNAL_AUTH_*_TOKEN");
+                .unwrap_or("GITHUB_TOKEN");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
                  ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \
@@ -3109,42 +3024,6 @@ Use `openflows-harness` for all coordination:
                 }
                 WorkerStatus::Assigned { ticket_id, .. }
                 | WorkerStatus::Working { ticket_id, .. } => {
-                    // Sentinel pair recycling: a SENTINEL slot that has finished its
-                    // review must be returned to Idle so it can serve a later gate for
-                    // another ticket. Without this, an Assigned sentinel slot sits busy
-                    // for the whole ticket lifecycle and the pool exhausts, leaving
-                    // remaining FORGE builders (each needing its own paired SENTINEL)
-                    // with no reviewer — the "pair never spawned" symptom. A sentinel's
-                    // review is done when the ticket is no longer parked on a review
-                    // phase (planning-gate or review_ready) or a verdict is recorded.
-                    if Self::worker_role(&slot.id) == "sentinel" {
-                        let phase = Self::ticket_phase(store, ticket_id).await;
-                        let gate_key = Self::ticket_gate_key(ticket_id, "planning");
-                        let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
-                        let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
-                        let review_done: Option<Value> = store.get_typed(&review_key).await;
-                        let review_complete = phase
-                            .as_deref()
-                            .is_some_and(|p| p != "planning" && p != "review_ready")
-                            || gate_approved.is_some()
-                            || review_done.is_some();
-                        if review_complete {
-                            info!(
-                                worker_id = slot.id,
-                                ticket_id,
-                                phase,
-                                "Recycling SENTINEL slot to Idle after review verdict"
-                            );
-                            slot.status = WorkerStatus::Idle;
-                            // Sentinel workspaces are named per-ticket; clear the
-                            // binding so a future pairing provisions a fresh,
-                            // correctly-named workspace instead of reusing a stale
-                            // one bound to a previous ticket.
-                            slot.workspace_id = None;
-                            changed_slots = true;
-                            continue;
-                        }
-                    }
                     let ticket_open = tickets
                         .iter()
                         .any(|t| t.id == *ticket_id && matches!(t.status, TicketStatus::Open));
@@ -3293,107 +3172,6 @@ Use `openflows-harness` for all coordination:
             .rsplit_once('-')
             .map(|(base, _)| base)
             .unwrap_or(worker_id)
-    }
-
-    /// Extract the numeric instance index from a worker slot id (e.g.
-    /// `forge-2` -> Some(2), `sentinel-3` -> Some(3)). Returns `None` for
-    /// non-indexed slots (e.g. `lore`, `vessel`).
-    fn worker_index(worker_id: &str) -> Option<u32> {
-        let (_, suffix) = worker_id.rsplit_once('-')?;
-        suffix.parse::<u32>().ok()
-    }
-
-    /// The paired SENTINEL slot for a FORGE slot: `forge-i` pairs with
-    /// `sentinel-i`, restoring the 1:1 FORGE-SENTINEL pair of the fleet.
-    /// Any worker slot id carrying an index `i` maps to `sentinel-i`.
-    fn paired_sentinel_slot(forge_worker_id: &str) -> Option<String> {
-        Self::worker_index(forge_worker_id).map(|i| format!("sentinel-{}", i))
-    }
-
-    /// Resolve the single sentinel slot that should review `ticket_id`, given the
-    /// live worker slots. Ownership priority:
-    ///
-    /// 1. **A sentinel already `Assigned`/`Working` on this ticket** — preserved as
-    ///    the sole reviewer. Once a fallback sentinel binds to a ticket (because the
-    ///    paired slot was momentarily busy), it stays the owner until the review
-    ///    finishes; a later poll must NOT re-select the now-idle paired slot and
-    ///    rotate the shared chat out from under the fallback (the "fallback reviewer
-    ///    gets displaced" churn). Only a sentinel genuinely bound to this ticket is
-    ///    preserved — a duplicate assigned to a different ticket is excluded.
-    /// 2. **The paired `sentinel-i`** for the ticket's forge when idle — the 1:1
-    ///    fleet default.
-    /// 3. **Any idle sentinel** — fallback that also covers legacy fleet layouts
-    ///    (e.g. `forge-2` with no `sentinel-2`) where strict pairing would otherwise
-    ///    stall the review at the gate.
-    fn review_sentinel_for_ticket(
-        ticket_id: &str,
-        forge_worker_id: &str,
-        live_slots: &HashMap<String, WorkerSlot>,
-    ) -> Option<(String, WorkerSlot)> {
-        if let Some((id, slot)) = live_slots.iter().find(|(id, slot)| {
-            Self::worker_role(id) == "sentinel"
-                && matches!(
-                    &slot.status,
-                    WorkerStatus::Assigned { ticket_id: tid, .. }
-                        | WorkerStatus::Working { ticket_id: tid, .. }
-                        if tid == ticket_id
-                )
-        }) {
-            return Some((id.clone(), slot.clone()));
-        }
-        if let Some(id) = Self::paired_sentinel_slot(forge_worker_id) {
-            if let Some(slot) = live_slots.get(&id) {
-                if matches!(slot.status, WorkerStatus::Idle) {
-                    return Some((id, slot.clone()));
-                }
-            }
-        }
-        live_slots
-            .iter()
-            .find(|(id, slot)| {
-                Self::worker_role(id) == "sentinel" && matches!(slot.status, WorkerStatus::Idle)
-            })
-            .map(|(id, slot)| (id.clone(), slot.clone()))
-    }
-
-    /// Whether a sentinel slot may operate on the shared
-    /// `ticket:{id}:chat:sentinel` key. Only ONE sentinel may own it at a time.
-    ///
-    /// - The paired `sentinel-i` always owns it (`is_paired`).
-    /// - A fallback sentinel owns it only when it is bound to the ticket
-    ///   (`is_ticket_sentinel`). An existing, healthy chat is owned only by the
-    ///   sentinel whose workspace matches the chat's bound workspace
-    ///   (`chat_workspace_matches`); a duplicate sentinel assigned to the same
-    ///   ticket but bound to a different workspace is not the owner and must not
-    ///   rotate the shared chat. When the chat is confirmed missing (not yet
-    ///   created, or its workspace was destroyed during recovery), the assigned
-    ///   sentinel is allowed to create/recreate it.
-    /// - A transient lookup failure (`lookup_errored`) is kept distinct from a
-    ///   confirmed missing chat: it never grants ownership, so a fallback cannot
-    ///   rotate a live shared chat on a temporary Coder API error. The sentinel
-    ///   simply skips this pass and retries on a later poll.
-    fn sentinel_may_own_shared_chat(
-        is_paired: bool,
-        is_ticket_sentinel: bool,
-        chat_exists: bool,
-        chat_healthy: bool,
-        chat_workspace_matches: bool,
-        lookup_errored: bool,
-    ) -> bool {
-        if is_paired {
-            return true;
-        }
-        if !is_ticket_sentinel {
-            return false;
-        }
-        if lookup_errored {
-            return false;
-        }
-        if chat_exists && chat_healthy {
-            chat_workspace_matches
-        } else {
-            true
-        }
     }
 
     /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
@@ -4317,15 +4095,15 @@ impl Node for NexusNode {
             })
             .unwrap_or(false);
 
-        // NOTE: an active sentinel does NOT block new forge assignment. Each FORGE
-        // slot is paired 1:1 with a SENTINEL slot, so new work placed on an idle
-        // forge is reviewed in parallel by that forge's own paired sentinel. A
-        // global "any sentinel active -> route to Sentinel" gate would starve idle
-        // forge slots (e.g. forge-4 stays idle and the 4th pair never spawns) while
-        // one ticket's sentinel happens to be mid-review. The sentinel review is
-        // still driven per-ticket by poll_harness_status_and_spawn_agents.
         if sentinel_active {
-            debug!("Nexus: sentinel(s) active — continuing to allow parallel forge assignment");
+            info!("Nexus: sentinel worker active — routing to Sentinel");
+            return Ok(json!(AgentDecision {
+                action: "sentinel_spawned".to_string(),
+                notes: "Sentinel review is active or pending".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
         }
 
         // Idle *forge* workers, parsed from the worker_slots map provided by prep.
@@ -4458,14 +4236,6 @@ impl Node for NexusNode {
 
         info!(action = %decision.action, notes = %decision.notes, "Nexus decision reached");
 
-        // Reconcile/recycle worker slots on EVERY pass, not only after a new work
-        // assignment. Sentinel slots can be left stale-bound to a ticket (multiple
-        // slots on one ticket, or an Assigned slot whose review already finished)
-        // while the flow is stuck routing to `sentinel_spawned`; if recycling only
-        // ran on `work_assigned` it would never run in that state and the stale
-        // binding would churn forever, starving idle forge slots of paired sentinels.
-        Self::recover_orphans(store).await?;
-
         if decision.action == ACTION_MERGE_PRS {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
 
@@ -4496,6 +4266,8 @@ impl Node for NexusNode {
 
         if decision.action == "work_assigned" {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
+
+            Self::recover_orphans(store).await?;
 
             if let Some(worker_id) = &decision.assign_to {
                 if let Some(ticket_id) = &decision.ticket_id {
@@ -4690,11 +4462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nexus_assigns_forge_despite_active_sentinel_for_parallel_pairs() {
-        // Parallel 1:1 pairs: an active sentinel on one ticket must NOT block a
-        // new ticket from being assigned to an idle forge slot with its own
-        // paired sentinel. Otherwise idle forge slots starve and fewer than the
-        // fleet's N pairs ever spawn.
+    async fn test_nexus_routes_active_sentinel_before_forge_assignment() {
         let node = NexusNode::new("nexus.agent.md", "registry.json");
         let context = json!({
             "assignable_tickets": [{
@@ -4725,9 +4493,7 @@ mod tests {
 
         let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
             .expect("nexus exec returns an AgentDecision");
-        assert_eq!(decision.action, "work_assigned");
-        assert_eq!(decision.assign_to.as_deref(), Some("forge-1"));
-        assert_eq!(decision.ticket_id.as_deref(), Some("T-049"));
+        assert_eq!(decision.action, "sentinel_spawned");
     }
 
     #[test]
@@ -4847,142 +4613,6 @@ mod tests {
         assert_eq!(NexusNode::worker_role("forge-1"), "forge");
         assert_eq!(NexusNode::worker_role("forge-42"), "forge");
         assert_eq!(NexusNode::worker_role("sentinel"), "sentinel");
-    }
-
-    #[test]
-    fn paired_sentinel_maps_forge_index_one_to_one() {
-        // Each forge slot pairs with the sentinel slot of the same index.
-        assert_eq!(
-            NexusNode::paired_sentinel_slot("forge-1"),
-            Some("sentinel-1".to_string())
-        );
-        assert_eq!(
-            NexusNode::paired_sentinel_slot("forge-2"),
-            Some("sentinel-2".to_string())
-        );
-        assert_eq!(
-            NexusNode::paired_sentinel_slot("forge-4"),
-            Some("sentinel-4".to_string())
-        );
-        // Non-indexed slots have no pair.
-        assert_eq!(NexusNode::paired_sentinel_slot("lore"), None);
-        assert_eq!(NexusNode::paired_sentinel_slot("vessel"), None);
-        // Index extraction.
-        assert_eq!(NexusNode::worker_index("forge-3"), Some(3));
-        assert_eq!(NexusNode::worker_index("sentinel-2"), Some(2));
-        assert_eq!(NexusNode::worker_index("lore"), None);
-    }
-
-    fn slot(id: &str, status: WorkerStatus) -> WorkerSlot {
-        WorkerSlot {
-            id: id.to_string(),
-            status,
-            workspace_id: None,
-        }
-    }
-
-    #[test]
-    fn review_sentinel_preserves_assigned_fallback_owner() {
-        // Regression (PR review "Fallback Reviewer Gets Displaced"): when a
-        // fallback sentinel is already assigned to a ticket (because the paired
-        // slot was momentarily busy) it must stay the reviewer even after the
-        // paired slot becomes Idle — a later poll must not re-select the pair and
-        // rotate the shared chat out from under the fallback.
-        let slots = HashMap::from([
-            ("forge-1".to_string(), slot("forge-1", WorkerStatus::Idle)),
-            (
-                "sentinel-1".to_string(),
-                slot("sentinel-1", WorkerStatus::Idle),
-            ),
-            (
-                "sentinel-2".to_string(),
-                slot(
-                    "sentinel-2",
-                    WorkerStatus::Assigned {
-                        ticket_id: "T-1".to_string(),
-                        issue_url: None,
-                    },
-                ),
-            ),
-        ]);
-        let (id, _) = NexusNode::review_sentinel_for_ticket("T-1", "forge-1", &slots).unwrap();
-        // The bound fallback is preserved even though the paired sentinel-1 is idle.
-        assert_eq!(id, "sentinel-2");
-    }
-
-    #[test]
-    fn review_sentinel_prefers_paired_when_idle() {
-        // No sentinel is bound to the ticket yet → the 1:1 pair is preferred.
-        let slots = HashMap::from([
-            ("forge-1".to_string(), slot("forge-1", WorkerStatus::Idle)),
-            (
-                "sentinel-1".to_string(),
-                slot("sentinel-1", WorkerStatus::Idle),
-            ),
-            (
-                "sentinel-2".to_string(),
-                slot("sentinel-2", WorkerStatus::Idle),
-            ),
-        ]);
-        let (id, _) = NexusNode::review_sentinel_for_ticket("T-9", "forge-1", &slots).unwrap();
-        assert_eq!(id, "sentinel-1");
-    }
-
-    #[test]
-    fn review_sentinel_falls_back_for_legacy_fleet() {
-        // Regression (PR review "Legacy Fleets Stall Reviews"): a legacy tenant may
-        // keep `forge-2` with no `sentinel-2`. Strict pairing would stall the review
-        // at the gate; the helper must fall back to any idle sentinel.
-        let slots = HashMap::from([
-            ("forge-2".to_string(), slot("forge-2", WorkerStatus::Idle)),
-            (
-                "sentinel-1".to_string(),
-                slot("sentinel-1", WorkerStatus::Idle),
-            ),
-        ]);
-        let (id, _) = NexusNode::review_sentinel_for_ticket("T-10", "forge-2", &slots).unwrap();
-        assert_eq!(id, "sentinel-1");
-    }
-
-    #[test]
-    fn sentinel_shared_chat_ownership_uses_one_owner() {
-        // The paired sentinel always owns the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            true, false, true, true, false, false
-        ));
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            true, true, true, true, true, false
-        ));
-        // A sentinel that is neither paired nor assigned to the ticket is blocked.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, true, true, false, false
-        ));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, false, false, false, false
-        ));
-        // The assigned fallback owns an existing, healthy chat only when its
-        // workspace matches the chat's bound workspace — a duplicate sentinel
-        // bound to a different workspace must not rotate the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            false, true, true, true, true, false
-        ));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, true, true, true, false, false
-        ));
-        // When the chat is confirmed missing (recovery / first creation), the
-        // assigned sentinel is allowed to (re)create it.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            false, true, false, false, false, false
-        ));
-        // A transient lookup failure is NOT treated as missing, so it never
-        // grants ownership — the fallback must not rotate on a temporary error.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, true, false, false, false, true
-        ));
-        // A non-assigned sentinel cannot create the chat in either case.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, false, false, false, true
-        ));
     }
 
     #[test]

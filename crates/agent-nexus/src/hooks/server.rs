@@ -616,19 +616,11 @@ fn classify_command(cmd: &str) -> HookDecision {
     if cmd.contains("redis-cli") {
         return deny("direct Redis access — use openflows-harness for all coordination".into());
     }
-    // Workspace/template lifecycle is controller-managed. Workers must never
-    // provision, start, stop, delete, recreate, or pick templates for their
-    // task — NEXUS owns provisioning and binds the chat to the already
-    // provisioned workspace, so self-provisioning here creates duplicate
-    // parallel workspaces that break orchestration. Matching is anchored to an
-    // actual `coder` CLI invocation (not a substring) so benign text that merely
-    // mentions "coder start" (docs, diagnostics) is not denied.
-    if invokes_coder_lifecycle(cmd) {
-        return deny(
-            "workspace/template lifecycle is controller-managed — NEXUS provisions \
-             workspaces; a worker must never self-provision a workspace"
-                .into(),
-        );
+    if cmd.contains("coder templates")
+        || cmd.contains("coder delete")
+        || cmd.contains("coder server")
+    {
+        return deny("control-plane mutation from a worker workspace".into());
     }
 
     // Override example: wrap risky-but-allowed git pushes to avoid interactive
@@ -647,104 +639,6 @@ fn classify_command(cmd: &str) -> HookDecision {
     }
 
     HookDecision::observe()
-}
-
-/// The `coder` lifecycle subcommands a worker must never invoke directly;
-/// provisioning/start/stop/delete are controller-managed by NEXUS.
-const CODER_LIFECYCLE_SUBCOMMANDS: &[&str] = &[
-    "templates",
-    "template",
-    "delete",
-    "create",
-    "start",
-    "stop",
-    "workspace",
-    "workspaces",
-    "server",
-];
-
-/// True when `cmd` actually invokes the `coder` CLI with a controller-managed
-/// lifecycle subcommand. Anchored to a `coder` command token at a command
-/// boundary (start of string, after `;`/`&&`/`||`/`|`/`(`/`&`, or after a
-/// `sudo`/shell-wrapper `-c`), optionally behind an absolute/relative path,
-/// immediately followed by the dangerous subcommand. Quoted tokens (e.g.
-/// `bash -c 'coder start …'`) are unwrapped, so real invocations are caught
-/// while benign text that merely mentions `coder start` (docs, diagnostics) is
-/// not denied.
-fn invokes_coder_lifecycle(cmd: &str) -> bool {
-    let tokens = tokenize_shell(cmd);
-
-    for i in 0..tokens.len() {
-        let (tok, at_start) = &tokens[i];
-        if !is_coder_command_token(tok) || !token_at_command_boundary(&tokens, i, *at_start) {
-            continue;
-        }
-        // Skip any global flags between `coder` and the subcommand.
-        let mut j = i + 1;
-        while j < tokens.len() && tokens[j].0.starts_with('-') {
-            j += 1;
-        }
-        if j < tokens.len() && CODER_LIFECYCLE_SUBCOMMANDS.contains(&tokens[j].0.as_str()) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Split a shell command into tokens, stripping shell quotes and tracking
-/// whether each token starts a fresh command. Handles quotes and separators
-/// that fall inside a quoted argument (e.g. `sh -c 'coder start ws'`).
-fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
-    let mut tokens: Vec<(String, bool)> = Vec::new();
-    let mut at_start = true;
-    for part in cmd.split(char::is_whitespace) {
-        if part.is_empty() {
-            continue;
-        }
-        let lead = part.trim_start_matches(&[';', '&', '|', '(', ')', '{', '}', '`'][..]);
-        let sep_before = lead.len() != part.len();
-        let body = lead.trim_end_matches(&[';', '&', '|', '(', ')', '{', '}', '`'][..]);
-        if body.is_empty() {
-            at_start = true;
-            continue;
-        }
-        let tok = body.trim_matches(&['\'', '"', '`'][..]);
-        if tok.is_empty() {
-            at_start = true;
-            continue;
-        }
-        tokens.push((tok.to_string(), at_start || sep_before));
-        at_start = false;
-    }
-    tokens
-}
-
-/// True when `tokens[i]` begins a command: it is the first token, it followed
-/// a separator, or it followed a `sudo` prefix or a shell-wrapper `-c`.
-fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool) -> bool {
-    if at_start {
-        return true;
-    }
-    if i > 0 {
-        let prev = tokens[i - 1].0.as_str();
-        if prev == "-c" || prev == "sudo" || prev == "su" {
-            return true;
-        }
-    }
-    false
-}
-
-/// True when `tok` names the `coder` CLI binary (`coder`, `sudo coder`,
-/// `/usr/local/bin/coder`, `./coder`, …).
-fn is_coder_command_token(tok: &str) -> bool {
-    let trimmed = tok.trim_end_matches('/');
-    if trimmed == "coder" {
-        return true;
-    }
-    if let Some(rest) = trimmed.strip_prefix("sudo") {
-        return rest == "coder";
-    }
-    trimmed.ends_with("/coder")
 }
 
 /// True when the given path is absolute and points outside the workspace.
@@ -983,46 +877,5 @@ mod tests {
     fn observe_serializes_empty() {
         let v = decision_to_response(&HookDecision::observe());
         assert!(v.as_object().map(|o| o.is_empty()).unwrap_or(false));
-    }
-
-    #[test]
-    fn lifecycle_blocks_real_coder_invocations() {
-        for cmd in [
-            "coder start other-workspace",
-            "coder stop my-ws",
-            "coder delete my-ws",
-            "coder create bogus -t prod",
-            "coder templates list",
-            "coder server",
-            "sudo coder delete x",
-            "/usr/local/bin/coder stop x",
-            "sh -c 'coder start other-workspace'",
-            "bash -c 'coder stop my-ws'",
-            "sh -c \"coder delete ws\"",
-            "nohup openflows run & coder start x",
-            "cd /tmp && coder workspace y",
-        ] {
-            assert!(
-                invokes_coder_lifecycle(cmd),
-                "expected lifecycle invocation to be blocked: {cmd:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn lifecycle_allows_benign_mentions() {
-        for cmd in [
-            "echo 'coder start does nothing here'",
-            "grep 'coder stop' docs/runbook.md",
-            "echo \"coder workspace\"",
-            "cat guide.txt # how to coder start",
-            "openflows-harness coder start", // a different binary, not the CLI
-            "echo \"see coder templates for the API\"",
-        ] {
-            assert!(
-                !invokes_coder_lifecycle(cmd),
-                "expected benign text NOT to be blocked: {cmd:?}"
-            );
-        }
     }
 }
