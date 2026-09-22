@@ -264,12 +264,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # release-plz creates exactly one `openflows-X.Y.Z` tag per release
-          # run. Select the newest-created tag reachable from HEAD.
-          TAG="$(git tag --list 'openflows-*' --sort=-creatordate \
+          # Only dispatch when THIS push actually created a release tag.
+          # release-plz tags the pushed commit `openflows-X.Y.Z` on a real
+          # release; on an ordinary main push (no release) HEAD carries no
+          # openflows-* tag, so `--points-at HEAD` resolves to nothing and we
+          # skip instead of republishing the previous release's Docker tags.
+          TAG="$(git tag --points-at HEAD 'openflows-*' --sort=-creatordate \
             --format='%(refname:short)' | head -1)"
           if [ -z "${TAG}" ]; then
-            echo "::notice::No openflows-* tag found — this push did not create a release. Skipping docker-publish dispatch."
+            echo "::notice::No openflows-* tag on HEAD — this push did not create a release. Skipping docker-publish dispatch."
             exit 0
           fi
           VERSION="${TAG#openflows-}"
