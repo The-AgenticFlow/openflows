@@ -1185,7 +1185,20 @@ Before significant work, read the relevant skill file to understand the workflow
             };
             let paired = Self::paired_sentinel_slot(&forge_worker_id);
             let is_paired = paired.as_deref() == Some(worker_id);
-            if !is_paired {
+            // A fallback (non-paired) sentinel may be the one actually bound to
+            // this ticket when the paired sentinel slot was momentarily busy.
+            // That sentinel must still be able to own/recreate the shared chat
+            // during recovery (e.g. after its workspace crashed), otherwise the
+            // ticket stays assigned but the chat is never rebuilt and it stalls
+            // at the review gate. Only a sentinel that is neither the ticket's
+            // pair nor currently assigned to this ticket is stale and blocked.
+            let is_ticket_sentinel = matches!(
+                &slot.status,
+                WorkerStatus::Assigned { ticket_id, .. }
+                    | WorkerStatus::Working { ticket_id, .. }
+                    if *ticket_id == ticket.id
+            );
+            if !is_paired && !is_ticket_sentinel {
                 debug!(
                     worker_id,
                     ticket_id,
