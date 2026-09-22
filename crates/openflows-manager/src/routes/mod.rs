@@ -1,3 +1,5 @@
+//! Versioned HTTP route composition for the OpenFlows Manager API.
+
 use crate::server::AppState;
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
@@ -7,7 +9,7 @@ pub mod health;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health))
-        .route("/ready", get(health::health))
+        .route("/ready", get(health::ready))
         .nest("/api/v1", api_v1_router())
 }
 

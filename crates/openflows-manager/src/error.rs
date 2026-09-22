@@ -1,3 +1,5 @@
+//! Error types shared by the OpenFlows Manager binary and HTTP server.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

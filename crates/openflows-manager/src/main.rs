@@ -1,3 +1,5 @@
+//! Binary entry point for running the OpenFlows Manager service.
+
 use openflows_manager::{error::ManagerError, server};
 use std::net::SocketAddr;
 
@@ -17,7 +19,34 @@ async fn main() -> Result<(), ManagerError> {
 }
 
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install Ctrl-C shutdown handler");
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to install Ctrl-C shutdown handler");
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let terminate = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to install SIGTERM shutdown handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
     }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }

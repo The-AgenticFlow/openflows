@@ -1,3 +1,4 @@
+# Cargo manifest for the OpenFlows Manager service crate.
 [package]
 name = "openflows-manager"
 version = "0.1.0"
@@ -14,7 +15,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 config = { version = "0.2.0", path = "../config" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
-coder-client = { version = "0.1.0", path = "../coder-client" }
 axum = { version = "0.8", features = ["http1", "json"] }
 
 [dev-dependencies]
