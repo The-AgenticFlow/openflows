@@ -1966,9 +1966,11 @@ Use `openflows-harness` for all coordination:
                     // claim a distinct slot instead of funneling into the same one.
                     // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
                     // is reviewed by its paired `sentinel-i`, so every active FORGE
-                    // instance has an associated SENTINEL worker. We prefer the paired
-                    // slot when it is Idle, falling back to any idle sentinel slot only
-                    // if the exact pair is momentarily unavailable.
+                    // instance has an associated SENTINEL worker. We preserve a
+                    // sentinel already bound to this ticket as the sole owner (so a
+                    // fallback reviewer is not displaced by the pair becoming idle),
+                    // prefer the paired slot when Idle, and fall back to any idle
+                    // sentinel only if the exact pair is momentarily unavailable.
                     let live_slots: HashMap<String, WorkerSlot> =
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
@@ -1976,24 +1978,8 @@ Use `openflows-harness` for all coordination:
                         | TicketStatus::InProgress { worker_id } => worker_id.clone(),
                         _ => String::new(),
                     };
-                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
-                    let sentinel_slot = paired
-                        .as_deref()
-                        .and_then(|id| {
-                            live_slots
-                                .get(id)
-                                .map(|slot| (id.to_string(), slot.clone()))
-                        })
-                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
-                        .or_else(|| {
-                            live_slots
-                                .iter()
-                                .find(|(id, slot)| {
-                                    Self::worker_role(id) == "sentinel"
-                                        && matches!(slot.status, WorkerStatus::Idle)
-                                })
-                                .map(|(id, slot)| (id.clone(), slot.clone()))
-                        });
+                    let sentinel_slot =
+                        Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
                         Some((id, slot)) => (id, slot),
@@ -2297,9 +2283,11 @@ Use `openflows-harness` for all coordination:
                     // claim a distinct slot instead of funneling into the same one.
                     // Forge torches the 1:1 fleet pair: a ticket worked by `forge-i`
                     // is reviewed by its paired `sentinel-i`, so every active FORGE
-                    // instance has an associated SENTINEL worker. We prefer the paired
-                    // slot when it is Idle, falling back to any idle sentinel slot only
-                    // if the exact pair is momentarily unavailable.
+                    // instance has an associated SENTINEL worker. We preserve a
+                    // sentinel already bound to this ticket as the sole owner (so a
+                    // fallback reviewer is not displaced by the pair becoming idle),
+                    // prefer the paired slot when Idle, and fall back to any idle
+                    // sentinel only if the exact pair is momentarily unavailable.
                     let live_slots: HashMap<String, WorkerSlot> =
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
@@ -2307,24 +2295,8 @@ Use `openflows-harness` for all coordination:
                         | TicketStatus::InProgress { worker_id } => worker_id.clone(),
                         _ => String::new(),
                     };
-                    let paired = Self::paired_sentinel_slot(&forge_worker_id);
-                    let sentinel_slot = paired
-                        .as_deref()
-                        .and_then(|id| {
-                            live_slots
-                                .get(id)
-                                .map(|slot| (id.to_string(), slot.clone()))
-                        })
-                        .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
-                        .or_else(|| {
-                            live_slots
-                                .iter()
-                                .find(|(id, slot)| {
-                                    Self::worker_role(id) == "sentinel"
-                                        && matches!(slot.status, WorkerStatus::Idle)
-                                })
-                                .map(|(id, slot)| (id.clone(), slot.clone()))
-                        });
+                    let sentinel_slot =
+                        Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
                         Some((id, slot)) => (id, slot),
@@ -3336,6 +3308,52 @@ Use `openflows-harness` for all coordination:
     /// Any worker slot id carrying an index `i` maps to `sentinel-i`.
     fn paired_sentinel_slot(forge_worker_id: &str) -> Option<String> {
         Self::worker_index(forge_worker_id).map(|i| format!("sentinel-{}", i))
+    }
+
+    /// Resolve the single sentinel slot that should review `ticket_id`, given the
+    /// live worker slots. Ownership priority:
+    ///
+    /// 1. **A sentinel already `Assigned`/`Working` on this ticket** — preserved as
+    ///    the sole reviewer. Once a fallback sentinel binds to a ticket (because the
+    ///    paired slot was momentarily busy), it stays the owner until the review
+    ///    finishes; a later poll must NOT re-select the now-idle paired slot and
+    ///    rotate the shared chat out from under the fallback (the "fallback reviewer
+    ///    gets displaced" churn). Only a sentinel genuinely bound to this ticket is
+    ///    preserved — a duplicate assigned to a different ticket is excluded.
+    /// 2. **The paired `sentinel-i`** for the ticket's forge when idle — the 1:1
+    ///    fleet default.
+    /// 3. **Any idle sentinel** — fallback that also covers legacy fleet layouts
+    ///    (e.g. `forge-2` with no `sentinel-2`) where strict pairing would otherwise
+    ///    stall the review at the gate.
+    fn review_sentinel_for_ticket(
+        ticket_id: &str,
+        forge_worker_id: &str,
+        live_slots: &HashMap<String, WorkerSlot>,
+    ) -> Option<(String, WorkerSlot)> {
+        if let Some((id, slot)) = live_slots.iter().find(|(id, slot)| {
+            Self::worker_role(id) == "sentinel"
+                && matches!(
+                    &slot.status,
+                    WorkerStatus::Assigned { ticket_id: tid, .. }
+                        | WorkerStatus::Working { ticket_id: tid, .. }
+                        if tid == ticket_id
+                )
+        }) {
+            return Some((id.clone(), slot.clone()));
+        }
+        if let Some(id) = Self::paired_sentinel_slot(forge_worker_id) {
+            if let Some(slot) = live_slots.get(&id) {
+                if matches!(slot.status, WorkerStatus::Idle) {
+                    return Some((id, slot.clone()));
+                }
+            }
+        }
+        live_slots
+            .iter()
+            .find(|(id, slot)| {
+                Self::worker_role(id) == "sentinel" && matches!(slot.status, WorkerStatus::Idle)
+            })
+            .map(|(id, slot)| (id.clone(), slot.clone()))
     }
 
     /// Whether a sentinel slot may operate on the shared
@@ -4853,6 +4871,77 @@ mod tests {
         assert_eq!(NexusNode::worker_index("forge-3"), Some(3));
         assert_eq!(NexusNode::worker_index("sentinel-2"), Some(2));
         assert_eq!(NexusNode::worker_index("lore"), None);
+    }
+
+    fn slot(id: &str, status: WorkerStatus) -> WorkerSlot {
+        WorkerSlot {
+            id: id.to_string(),
+            status,
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn review_sentinel_preserves_assigned_fallback_owner() {
+        // Regression (PR review "Fallback Reviewer Gets Displaced"): when a
+        // fallback sentinel is already assigned to a ticket (because the paired
+        // slot was momentarily busy) it must stay the reviewer even after the
+        // paired slot becomes Idle — a later poll must not re-select the pair and
+        // rotate the shared chat out from under the fallback.
+        let slots = HashMap::from([
+            ("forge-1".to_string(), slot("forge-1", WorkerStatus::Idle)),
+            (
+                "sentinel-1".to_string(),
+                slot("sentinel-1", WorkerStatus::Idle),
+            ),
+            (
+                "sentinel-2".to_string(),
+                slot(
+                    "sentinel-2",
+                    WorkerStatus::Assigned {
+                        ticket_id: "T-1".to_string(),
+                        issue_url: None,
+                    },
+                ),
+            ),
+        ]);
+        let (id, _) = NexusNode::review_sentinel_for_ticket("T-1", "forge-1", &slots).unwrap();
+        // The bound fallback is preserved even though the paired sentinel-1 is idle.
+        assert_eq!(id, "sentinel-2");
+    }
+
+    #[test]
+    fn review_sentinel_prefers_paired_when_idle() {
+        // No sentinel is bound to the ticket yet → the 1:1 pair is preferred.
+        let slots = HashMap::from([
+            ("forge-1".to_string(), slot("forge-1", WorkerStatus::Idle)),
+            (
+                "sentinel-1".to_string(),
+                slot("sentinel-1", WorkerStatus::Idle),
+            ),
+            (
+                "sentinel-2".to_string(),
+                slot("sentinel-2", WorkerStatus::Idle),
+            ),
+        ]);
+        let (id, _) = NexusNode::review_sentinel_for_ticket("T-9", "forge-1", &slots).unwrap();
+        assert_eq!(id, "sentinel-1");
+    }
+
+    #[test]
+    fn review_sentinel_falls_back_for_legacy_fleet() {
+        // Regression (PR review "Legacy Fleets Stall Reviews"): a legacy tenant may
+        // keep `forge-2` with no `sentinel-2`. Strict pairing would stall the review
+        // at the gate; the helper must fall back to any idle sentinel.
+        let slots = HashMap::from([
+            ("forge-2".to_string(), slot("forge-2", WorkerStatus::Idle)),
+            (
+                "sentinel-1".to_string(),
+                slot("sentinel-1", WorkerStatus::Idle),
+            ),
+        ]);
+        let (id, _) = NexusNode::review_sentinel_for_ticket("T-10", "forge-2", &slots).unwrap();
+        assert_eq!(id, "sentinel-1");
     }
 
     #[test]
