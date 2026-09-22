@@ -37,6 +37,24 @@ echo "  Ticket: ${CYAN}$OPENFLOWS_TICKET${NC}"
 echo "  Role: ${CYAN}${OPENFLOWS_ROLE}${NC}"
 echo ""
 
+# ── Workspace identity & lifecycle ─────────────────────────────────────
+# The Controller (NEXUS) has ALREADY provisioned and started this Coder
+# workspace and bound the chat to it. The agent runs INSIDE that workspace;
+# it must never provision, start, stop, delete, or recreate workspaces or
+# pick templates — that is controller-managed and doing it here creates
+# duplicate/parallel workspaces that break the ticket's orchestration.
+if [ -n "$CODER_WORKSPACE_ID" ]; then
+    echo -e "${BOLD}Your provisioned workspace:${NC} ${GREEN}$CODER_WORKSPACE_ID${NC}"
+    echo -e "  You are ALREADY running inside this workspace. Do NOT create, start,"
+    echo -e "  stop, delete, or re-provision any Coder workspace or template — NEXUS"
+    echo -e "  owns the workspace lifecycle and has bound this chat to this workspace."
+else
+    echo -e "${YELLOW}⚠ No CODER_WORKSPACE_ID set — the controller may still be"
+    echo -e "  provisioning this workspace. Do NOT create a new workspace or pick"
+    echo -e "  a template; wait for the controller instead.${NC}"
+fi
+echo ""
+
 # Harness verification
 if ! command -v openflows-harness >/dev/null 2>&1; then
     echo -e "${YELLOW}⚠ openflows-harness not found in PATH${NC}"

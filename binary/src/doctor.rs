@@ -241,7 +241,6 @@ mod tests {
             admin_password: None,
             admin_username: "admin".to_string(),
             image_tag: "v2.37.0".to_string(),
-            github_token: None,
             external_auth_id: id.map(str::to_string),
             external_auth_client_id: client_id.map(str::to_string),
             external_auth_client_secret: secret.map(str::to_string),
