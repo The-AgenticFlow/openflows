@@ -243,6 +243,8 @@ Returns a JSON decision-set: `tickets`, `assignable_tickets`, `worker_slots`, `o
 
 **Key methods:** `sync_issues`, `sync_open_prs`, `provision_coder_workspace`, `destroy_coder_workspace`, `create_chat_for_assignment`/`create_chat_for_ticket_id`, `resume_chat`, `poll_harness_status_and_spawn_agents`, `spawn_lore_for_merged_tickets`, `check_ci_readiness`, `sync_assignment_to_github`/`post_comment_once`, `recover_orphans`, `reconcile`, `inspect_coder_recovery`/`repair_coder_recovery`, `mark_ticket_awaiting_human`/`notify_awaiting_human`, `release_worker_slot`, gate/phase helpers, and the **A2A relay module** (see §8).
 
+**Team-fleet pair invariant:** `tenant add --fleet N` (see §5.x tenant onboarding) derives a tenant registry via `Registry::with_team_fleet(N)`, which sets both `forge.max_instances` **and** `sentinel.max_instances` to `N`. Because `sync_registry` derives `worker_slots` from `effective_instances()`, the fleet value directly controls paired capacity: `N` forge **and** `N` sentinel slots (`forge-1..forge-N`, `sentinel-1..sentinel-N`), restoring the 1:1 FORGE-SENTINEL pair the independent bundled defaults (2 forge / 1 sentinel) used to break. Fork/sentinel slots are still picked independently at runtime from idle slots; equalizing `max_instances` is what guarantees the *capacity* stays paired.
+
 **Recovery structures** (all in `FlowRecovery`): `unmerged_prs`, `orphaned_tickets`, `stale_workers`, `completed_without_pr`, `crashed_workspaces`, `crashed_chats`, each with `has_*` flags and `needs_recovery`.
 
 ### 6.2 ForgePairNode — the builder (`crates/agent-forge/src/lib.rs`)
@@ -449,6 +451,7 @@ The system-facing decisions documented in `openflows-system-architecture.md` (dy
 
 ### 11.1 Dynamic agent registry (no file)
 - **Today:** the Controller loads the registry in `agentflow.rs` (from path/env) and writes `registry_json` into the store (see §4.3). `sync_registry` reconciles `worker_slots` from it every pass.
+- **Team fleet:** when a tenant is onboarded with `--fleet N`, `tenant add` derives a tenant registry (`Registry::with_team_fleet(N)`) and injects it as the `registry_json` Coder parameter (→ `OPENFLOWS_REGISTRY_JSON`). On controller boot, `run_controller` validates and **overwrites** the on-disk `registry.json` with that env content (see §6.1 team-fleet invariant), so the per-tenant fleet registry precedes the bundled default in `load_registry`'s file-first resolution. The same JSON is persisted to the store's `registry_json` key for `sync_registry`.
 - **Decision:** the registry becomes **entirely control-plane defined** — the `registry_json` store key is the sole source of truth; the bundled `registry.json` is eliminated. The control path is `openflows control set-registry <json>` / a web-UI endpoint. Because `sync_registry` re-reads the store each pass, a change applies **on the next poll without a restart** and `worker_slots` rescales automatically.
 - **Guardrail:** overrides must preserve `effective_instances()` semantics (v1 `instances` vs v2 `max_instances`) so a partial override can never zero-out a role.
 

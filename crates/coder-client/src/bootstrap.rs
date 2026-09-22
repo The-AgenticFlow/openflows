@@ -346,6 +346,7 @@ impl CoderBootstrapper {
         client: &CoderClient,
         tenant_name: &str,
         github_repo: &str,
+        registry_json: &str,
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
 
@@ -458,9 +459,9 @@ impl CoderBootstrapper {
                 .any(|w| w.name == nexus_workspace_name && w.owner_name == admin.username)
             {
                 println!(
-                    "  ⚠ Tenant workspace '{}' already exists — its build parameters are unchanged. \
-                     Recreate it once to enable the in-workspace controller \
-                     (`start_controller=true`); new tenants get this automatically.",
+                    "  ⚠ Tenant workspace '{}' already exists — its build parameters (including fleet) are unchanged. \
+                     Recreate it once to apply `--fleet` / enable the in-workspace controller \
+                     (`start_controller=true`); new tenants get these automatically.",
                     nexus_workspace_name
                 );
             }
@@ -502,6 +503,7 @@ impl CoderBootstrapper {
                         "github_repository": github_repo,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
+                        "registry_json": registry_json,
                         "start_controller": true,
                     }),
                 },
