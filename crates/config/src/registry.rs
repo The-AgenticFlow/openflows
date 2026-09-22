@@ -4,7 +4,6 @@
 // NEXUS reloads this on every poll cycle for zero-downtime team changes.
 
 use anyhow::{Context, Result};
-use envconfig::Envconfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -447,25 +446,12 @@ impl Registry {
         slots
     }
 
-    /// Set forge/sentinel max_instances (and v1 instances) to `pairs` each,
-    /// preserving all other entries, enforcing the FORGE-SENTINEL pair invariant.
-    pub fn with_team_fleet(&self, pairs: u32) -> Registry {
-        let mut clone = self.clone();
-        for entry in clone.team.iter_mut() {
-            if entry.id == "forge" || entry.id == "sentinel" {
-                entry.max_instances = pairs;
-                entry.instances = pairs;
-            }
-        }
-        clone
-    }
-
     /// Resolve the workspace provider for a given slot ID.
     ///
-    /// Resolve the GitHub token for a given agent. Falls back to the Coder
-    /// external-auth token. Handles instance IDs (e.g., "forge-1") by
-    /// stripping suffix to find base agent. Returns an error if the agent exists
-    /// but is inactive (not in active_agents).
+    /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
+    /// Falls back to `GITHUB_TOKEN` when no per-agent token is configured.
+    /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
+    /// Returns an error if the agent exists but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
         // Existence check must also consider inactive agents, including the
@@ -483,8 +469,9 @@ impl Registry {
             Some(entry) => match &entry.github_token_env {
                 Some(env_var) => std::env::var(env_var)
                     .with_context(|| format!("{} not set for agent {}", env_var, agent_id))?,
-                None => Self::resolve_global_github_token()
-                    .context("no GitHub token available for agent without github_token_env")?,
+                None => std::env::var("GITHUB_TOKEN").context(
+                    "GITHUB_TOKEN not set (fallback for agent without github_token_env)",
+                )?,
             },
             None => {
                 if entry_exists {
@@ -502,23 +489,13 @@ impl Registry {
                         display_id
                     );
                 } else {
-                    // Agent not found at all — fall back to the global token for backward compat
-                    Self::resolve_global_github_token()
-                        .with_context(|| format!("Agent '{}' not found in registry", base_id))?
+                    // Agent not found at all — fall back to global PAT for backward compat
+                    std::env::var("GITHUB_TOKEN")
+                        .context(format!("Agent '{}' not found in registry", base_id))?
                 }
             }
         };
         Ok(token)
-    }
-
-    /// Resolve the global GitHub token from Coder external auth
-    /// (`CODER_EXTERNAL_AUTH_*`); the PAT flow has been removed.
-    fn resolve_global_github_token() -> Result<String> {
-        crate::GithubConfig::init_from_env()
-            .map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?
-            .resolve_token()
-            .filter(|t| !t.is_empty())
-            .context("no GitHub external-auth token available (set CODER_EXTERNAL_AUTH_*_TOKEN)")
     }
 }
 
@@ -773,66 +750,5 @@ mod tests {
         // forge has cli: "codex" in registry
         assert_eq!(reg.resolve_cli_backend("forge-1"), CliBackend::Codex);
         assert_eq!(reg.resolve_cli_backend("forge-2"), CliBackend::Codex);
-    }
-
-    fn fleet_sample() -> Registry {
-        // Mirrors the live v2 registry shape: max_instances only (instances=0).
-        let json = r#"{
-          "default_cli": "claude",
-          "team": [
-            { "id": "nexus",    "active": true, "max_instances": 1 },
-            { "id": "forge",    "active": true, "max_instances": 2, "skills": ["x"] },
-            { "id": "sentinel", "active": true, "max_instances": 1, "model": "m" },
-            { "id": "vessel",   "active": true, "max_instances": 1 }
-          ]
-        }"#;
-        serde_json::from_str(json).unwrap()
-    }
-
-    #[test]
-    fn test_with_team_fleet_sets_both_roles() {
-        let reg = fleet_sample();
-        let fleet = reg.with_team_fleet(3);
-
-        assert_eq!(fleet.get("forge").unwrap().effective_instances(), 3);
-        assert_eq!(fleet.get("sentinel").unwrap().effective_instances(), 3);
-        // Non-pair roles unchanged.
-        assert_eq!(fleet.get("nexus").unwrap().effective_instances(), 1);
-        assert_eq!(fleet.get("vessel").unwrap().effective_instances(), 1);
-        // Unrelated fields preserved verbatim.
-        assert_eq!(fleet.get("forge").unwrap().skills, vec!["x"]);
-        assert_eq!(fleet.get("sentinel").unwrap().model.as_deref(), Some("m"));
-        // Original is untouched (immutable copy).
-        assert_eq!(reg.get("forge").unwrap().effective_instances(), 2);
-    }
-
-    #[test]
-    fn test_with_team_fleet_fleet3_slots() {
-        let fleet = fleet_sample().with_team_fleet(3);
-        assert_eq!(fleet.forge_slots(), vec!["forge-1", "forge-2", "forge-3"]);
-        let sentinel_slots: Vec<_> = fleet
-            .all_worker_slots()
-            .into_iter()
-            .filter(|s| s.starts_with("sentinel"))
-            .collect();
-        assert_eq!(
-            sentinel_slots,
-            vec!["sentinel-1", "sentinel-2", "sentinel-3"]
-        );
-    }
-
-    #[test]
-    fn test_with_team_fleet_fleet1() {
-        let fleet = fleet_sample().with_team_fleet(1);
-        assert_eq!(fleet.forge_slots(), vec!["forge-1"]);
-        // sentinel with count 1 yields the bare "sentinel" slot
-        let sentinel_slots: Vec<_> = fleet
-            .all_worker_slots()
-            .into_iter()
-            .filter(|s| s.starts_with("sentinel"))
-            .collect();
-        assert_eq!(sentinel_slots, vec!["sentinel"]);
-        assert_eq!(fleet.get("forge").unwrap().max_instances, 1);
-        assert_eq!(fleet.get("sentinel").unwrap().max_instances, 1);
     }
 }

@@ -100,15 +100,15 @@ impl LoreConfig {
                     Err(e) => {
                         tracing::warn!(error = %e, registry = %path.display(), "LORE failed to resolve token from registry, falling back");
                         env.as_ref()
-                            .and_then(|e| e.github.resolve_token())
+                            .and_then(|e| e.github.token.clone())
                             .unwrap_or_default()
                     }
                 }
             }
             _ => {
-                tracing::warn!("LORE: registry.json not found, falling back to external auth");
+                tracing::warn!("LORE: registry.json not found, falling back to GITHUB_TOKEN");
                 env.as_ref()
-                    .and_then(|e| e.github.resolve_token())
+                    .and_then(|e| e.github.token.clone())
                     .unwrap_or_default()
             }
         };

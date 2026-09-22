@@ -69,6 +69,13 @@ data "coder_parameter" "coder_url" {
   type        = "string"
 }
 
+data "coder_parameter" "github_pat" {
+  name        = "github_pat"
+  description  = "GitHub Personal Access Token for git clone/push in the workspace"
+  default     = ""
+  type        = "string"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -184,21 +191,25 @@ resource "coder_agent" "main" {
     print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
     PYEOF
 
-    # Setup git credentials from Coder external auth (the tenant's linked
-    # GitHub App token). PAT flow removed — external auth is the sole source.
-    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
+    # (github_pat, e.g. from CODER_GITHUB_TOKEN) because a PAT can be scoped to
+    # the target repo/org and works regardless of GitHub App install scope.
+    # Fall back to the Coder GitHub App external-auth token (surfaces the
+    # "Login with GitHub" button in the workspace UI). A persistent store is a
+    # deliberate fallback over Coder's automatic GIT_ASKPASS auth: agent-executed
+    # git (push) can run in a subprocess environment without GIT_ASKPASS, so we
+    # pin the token once here.
+    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
+    if [ -z "$GIT_TOKEN" ]; then
+      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    fi
     if [ -n "$GIT_TOKEN" ]; then
-      # System-level helper so git works for BOTH the agent user (pushes) and
-      # the sudo'd root clone below (their $HOME differ).
-      sudo git config --system credential.helper store
+      git config --global credential.helper store
       echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
       chmod 600 /home/coder/.git-credentials
-      sudo mkdir -p /root
-      sudo cp /home/coder/.git-credentials /root/.git-credentials
-      sudo chmod 600 /root/.git-credentials
       log "Configured git credentials for GitHub push auth"
     else
-      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
+      log "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi
 
     # Acquire the repository. Prefer the golden offline seed from the shared

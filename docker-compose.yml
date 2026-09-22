@@ -36,10 +36,6 @@ services:
       CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
-      # Shared Terraform provider cache so workspace builds reuse downloaded
-      # providers instead of re-fetching them from GitHub on every build (which
-      # intermittently 504s). Persisted on the tf_plugin_cache volume.
-      TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
       DOCKER_HOST: unix:///var/run/docker.sock
       REDIS_URL: ${REDIS_URL:-redis://localhost:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
@@ -77,8 +73,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)
       - ./.dev-binaries:/opt/openflows-dev:ro
-      # Persist the Terraform provider cache across restarts.
-      - tf_plugin_cache:/root/.terraform.d/plugin-cache
     depends_on:
       coder-db:
         condition: service_healthy
@@ -92,4 +86,3 @@ services:
 volumes:
   redis_data:
   coder_db_data:
-  tf_plugin_cache:
