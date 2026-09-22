@@ -1185,25 +1185,47 @@ Before significant work, read the relevant skill file to understand the workflow
             };
             let paired = Self::paired_sentinel_slot(&forge_worker_id);
             let is_paired = paired.as_deref() == Some(worker_id);
-            // A fallback (non-paired) sentinel may be the one actually bound to
-            // this ticket when the paired sentinel slot was momentarily busy.
-            // That sentinel must still be able to own/recreate the shared chat
-            // during recovery (e.g. after its workspace crashed), otherwise the
-            // ticket stays assigned but the chat is never rebuilt and it stalls
-            // at the review gate. Only a sentinel that is neither the ticket's
-            // pair nor currently assigned to this ticket is stale and blocked.
             let is_ticket_sentinel = matches!(
                 &slot.status,
                 WorkerStatus::Assigned { ticket_id, .. }
                     | WorkerStatus::Working { ticket_id, .. }
                     if *ticket_id == ticket.id
             );
-            if !is_paired && !is_ticket_sentinel {
+            // Only one sentinel may own the shared `ticket:{id}:chat:sentinel`
+            // key. The paired `sentinel-i` is the primary owner. When the
+            // paired slot is momentarily busy a fallback sentinel is assigned to
+            // the ticket; that single fallback is the legitimate owner and must
+            // be able to (re)create the shared chat during recovery after its
+            // workspace is re-provisioned. To avoid the chat-rotation churn this
+            // guard exists to prevent, a duplicate sentinel bound to the same
+            // ticket but a different workspace must NOT be allowed to operate on
+            // the shared chat. Ownership of an existing chat is decided by
+            // workspace match; when the chat is missing (not yet created, or its
+            // workspace was destroyed during recovery) an assigned sentinel is
+            // allowed to (re)create it.
+            let shared_chat_key =
+                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+            let (chat_exists, chat_healthy, chat_workspace_matches) =
+                match store.get_typed::<String>(&shared_chat_key).await {
+                    Some(stored_chat_id) => match client.get_chat_opt(&stored_chat_id).await {
+                        Ok(Some(chat)) => (true, true, chat.workspace_id == *workspace_id),
+                        Ok(None) | Err(_) => (false, false, false),
+                    },
+                    None => (false, false, false),
+                };
+            let owns_shared_chat = Self::sentinel_may_own_shared_chat(
+                is_paired,
+                is_ticket_sentinel,
+                chat_exists,
+                chat_healthy,
+                chat_workspace_matches,
+            );
+            if !owns_shared_chat {
                 debug!(
                     worker_id,
                     ticket_id,
                     paired = ?paired,
-                    "Skipping sentinel chat: slot is not the ticket's paired sentinel"
+                    "Skipping sentinel chat: slot is not the paired sentinel nor the shared-chat owner"
                 );
                 return;
             }
@@ -3307,6 +3329,38 @@ Use `openflows-harness` for all coordination:
             .map(|i| format!("sentinel-{}", i))
     }
 
+    /// Whether a sentinel slot may operate on the shared
+    /// `ticket:{id}:chat:sentinel` key. Only ONE sentinel may own it at a time.
+    ///
+    /// - The paired `sentinel-i` always owns it (`is_paired`).
+    /// - A fallback sentinel owns it only when it is bound to the ticket
+    ///   (`is_ticket_sentinel`). An existing, healthy chat is owned only by the
+    ///   sentinel whose workspace matches the chat's bound workspace
+    ///   (`chat_workspace_matches`); a duplicate sentinel assigned to the same
+    ///   ticket but bound to a different workspace is not the owner and must not
+    ///   rotate the shared chat. When the chat is missing or unreadable (not yet
+    ///   created, or its workspace was destroyed during recovery), the assigned
+    ///   sentinel is allowed to create/recreate it.
+    fn sentinel_may_own_shared_chat(
+        is_paired: bool,
+        is_ticket_sentinel: bool,
+        chat_exists: bool,
+        chat_healthy: bool,
+        chat_workspace_matches: bool,
+    ) -> bool {
+        if is_paired {
+            return true;
+        }
+        if !is_ticket_sentinel {
+            return false;
+        }
+        if chat_exists && chat_healthy {
+            chat_workspace_matches
+        } else {
+            true
+        }
+    }
+
     /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
     /// for re-spawn. Only when no review verdict has been recorded AND the ticket is
     /// still in `review_ready`. A decided (approved/rejected) ticket — in particular
@@ -4773,6 +4827,27 @@ mod tests {
         assert_eq!(NexusNode::worker_index("forge-3"), Some(3));
         assert_eq!(NexusNode::worker_index("sentinel-2"), Some(2));
         assert_eq!(NexusNode::worker_index("lore"), None);
+    }
+
+    #[test]
+    fn sentinel_shared_chat_ownership_uses_one_owner() {
+        // The paired sentinel always owns the shared chat.
+        assert!(NexusNode::sentinel_may_own_shared_chat(true, false, true, true, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(true, true, true, true, true));
+        // A sentinel that is neither paired nor assigned to the ticket is blocked.
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, true, true, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false));
+        // The assigned fallback owns an existing, healthy chat only when its
+        // workspace matches the chat's bound workspace — a duplicate sentinel
+        // bound to a different workspace must not rotate the shared chat.
+        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, true, true));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, true, true, false));
+        // When the chat is missing or unreadable (recovery / first creation), the
+        // assigned sentinel is allowed to (re)create it.
+        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, false, false));
+        // A non-assigned sentinel cannot create the chat in either case.
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false));
     }
 
     #[test]
