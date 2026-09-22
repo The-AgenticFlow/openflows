@@ -1,21 +1,11 @@
 # zizmor configuration.
 #
-# `docker-publish.yml` intentionally uses a `workflow_run` trigger to react to
-# the `Release` workflow completing (the release tag is created by release-plz
-# using GITHUB_TOKEN, which GitHub does not emit a tag-push event for). zizmor
-# flags ANY `workflow_run` under `dangerous-triggers` regardless of guardrails,
-# and its inline-comment suppression does not cover this rule. The trigger is
-# safe here:
-#
-#   - restricted to `types: [completed]` and `branches: [main]`
-#   - the `resolve` job is gated on `github.event.workflow_run.conclusion == "success"`
-#   - a version is resolved only when the triggering run actually created an
-#     `openflows-X.Y.Z` tag (newest exact-version tag created within the run's
-#     [created_at, completed_at] window),
-#     and the `build-and-push` job only
-#     runs on a resolved version — so an upstream failure or untrusted branch
-#     can never drive a build/push
+# `docker-publish.yml` previously used a `workflow_run` trigger (flagged by
+# zizmor as `dangerous-triggers`) to react to the Release workflow completing.
+# That trigger has been replaced with a direct `workflow_dispatch` call from
+# `release.yml` (via `gh workflow run`), which is reliable and exempt from the
+# GITHUB_TOKEN anti-recursion safeguard. The suppression below is no longer
+# needed but is kept as a no-op in case the trigger is reintroduced.
 rules:
   dangerous-triggers:
-    ignore:
-      - "docker-publish.yml"
+    ignore: []
