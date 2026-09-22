@@ -1,12 +1,24 @@
 # Token Acquisition Guide
 
-OpenFlows needs GitHub access for the **controller** (issue/PR sync, CI checks) and **workspace git** (clone/push). This is provided entirely by the **GitHub App external auth** — it is **required**, and it is the *sole* source of the GitHub token. Coder and the workspace templates need it to start and provision. No PAT is required.
+OpenFlows requires **two tokens** to operate. Both are personal to you and grant OpenFlows the permissions you have.
 
-## 1. GitHub access: GitHub App external auth (required)
+## 1. GITHUB_TOKEN
 
-The GitHub App external auth (`CODER_EXTERNAL_AUTH_0_*` in `.env`) must be configured — Coder won't start without it. See [quick_start.md](quick_start.md) Step 1 for how to create and install the App.
+**What it's used for:** OpenFlows reads issues from GitHub and opens/manages PRs
 
-Each workspace owner links their GitHub account (during `tenant add`), and the controller/agents use **that linked token** for GitHub API and git ops. That is the only token acquisition step.
+**How to get it:**
+1. Go to https://github.com/settings/tokens
+2. Click **"Generate new token"** → **"Generate new token (classic)"**
+3. Under **"Select scopes"**, check ✓ **`repo`** (all options)
+   - This grants access to public and private repositories
+4. Click **"Generate token"** at the bottom
+5. **Copy the token immediately** (you won't see it again)
+   - Format: `ghp_xxxxxxxxxxxxxxxxxxxx`
+6. Paste in `.env`: `GITHUB_TOKEN=ghp_...`
+
+**Security:** This token is personal to your account. Keep it private. It's in `.gitignore` so it won't be committed to git.
+
+---
 
 ## 2. CODER_SESSION_TOKEN
 
@@ -60,18 +72,17 @@ Each workspace owner links their GitHub account (during `tenant add`), and the c
 
 ## Quick Check
 
-**Before running the script**, verify you have the Coder token and that GitHub external auth is linked:
+**Before running the script**, verify you have both tokens:
 
 ```bash
+echo $GITHUB_TOKEN       # Should print ghp_...
 echo $CODER_SESSION_TOKEN # Should print cdr_...
 ```
 
 Or check `.env`:
 ```bash
-grep "CODER_SESSION_TOKEN\|CODER_EXTERNAL_AUTH_0_" .env | grep -v "^#"
+grep "GITHUB_TOKEN\|CODER_SESSION_TOKEN" .env | grep -v "^#"
 ```
-
-With external auth configured and each tenant user linked during `tenant add`, no GitHub PAT is required — the controller uses the tenant's linked token.
 
 ---
 
@@ -82,19 +93,24 @@ With external auth configured and each tenant user linked during `tenant add`, n
 - Check you're clicking your username (top-right), not the menu button
 - Create a new token (old ones may have expired)
 
+**"GITHUB_TOKEN not working"**
+- Token needs `repo` scope
+- If you changed scopes, regenerate a new token
+- Make sure you copied the full token (it's long)
+
 **"Permission denied" errors in logs**
-- GitHub: Check the workspace owner has linked the GitHub App and the App is installed on the repo (see quick_start.md Step 4).
-- Coder: Check you're a member of the workspace/organization
+- GitHub token: Check you have access to the repository
+- Coder token: Check you're a member of the workspace/organization
 
 ---
 
 ## File Structure
 
-Once you have the tokens (Coder session token; GitHub via linked external auth):
+Once you have both tokens:
 
 ```
 .env.example  ← Template (safe to commit)
-.env          ← Your secrets (keep private, .gitignore'd)
+.env          ← Your tokens (keep private, .gitignore'd)
 ```
 
 **Never commit `.env`** — it contains your personal tokens.
@@ -103,7 +119,7 @@ Once you have the tokens (Coder session token; GitHub via linked external auth):
 
 ## Next Steps
 
-Once you have `CODER_SESSION_TOKEN` in `.env` and GitHub linked:
+Once you have both tokens in `.env`:
 
 ```bash
 ./scripts/start.sh --reset

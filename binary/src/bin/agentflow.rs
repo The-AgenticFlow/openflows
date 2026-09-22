@@ -21,13 +21,12 @@ const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the Controller orchestration loop. The per-tenant nexus workspace
-    /// auto-starts this on workspace boot; it is not a general host command.
+    /// Run the Controller orchestration loop (default inside nexus workspace)
     Run {
         /// Clear this tenant's runtime SharedStore state before starting
         #[arg(long)]
@@ -79,9 +78,6 @@ enum TenantCommands {
         /// Tenant name (defaults to repo owner)
         #[arg(long)]
         name: Option<String>,
-        /// Number of FORGE-SENTINEL pairs (fleet size) for this tenant
-        #[arg(long)]
-        fleet: u32,
     },
     /// List all tenants (from Redis namespaces)
     List,
@@ -205,11 +201,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // No implicit default command: the controller auto-starts inside each
-    // tenant's nexus workspace when the tenant is added, so a bare `openflows`
-    // must not silently start a duplicate host controller. Require an explicit
-    // subcommand (one is already enforced by clap below).
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Run { reset_store: false }) {
         Commands::Run { reset_store } => run_controller(reset_store).await,
         Commands::Bootstrap => run_bootstrap().await,
         Commands::Tenant { action } => run_tenant(action).await,
@@ -293,45 +285,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     resolver.validate()?;
 
     let registry_path = resolver.registry_path();
-    // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
-    if let Ok(env_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
-        if !env_json.trim().is_empty() {
-            match serde_json::from_str::<config::Registry>(&env_json) {
-                Ok(validated) => match serde_json::to_string_pretty(&validated) {
-                    Ok(pretty) => {
-                        if let Err(e) = std::fs::write(&registry_path, pretty) {
-                            tracing::warn!(
-                                error = %e,
-                                path = %registry_path.display(),
-                                "OPENFLOWS_REGISTRY_JSON was set but the on-disk registry could \
-                                 not be overwritten; continuing with the bundled registry"
-                            );
-                        } else {
-                            tracing::info!(
-                                path = %registry_path.display(),
-                                "Overwrote on-disk registry from OPENFLOWS_REGISTRY_JSON (tenant fleet)"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "OPENFLOWS_REGISTRY_JSON parsed but could not be serialized; \
-                             keeping on-disk registry"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "OPENFLOWS_REGISTRY_JSON is set but invalid; ignoring it and keeping \
-                         the on-disk registry"
-                    );
-                }
-            }
-        }
-    }
-
     let registry = config::Registry::load(&registry_path)?;
     let registry_json = serde_json::to_string_pretty(&registry)?;
     std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
@@ -707,37 +660,26 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
         .context("Bootstrap required before tenant operations")?;
 
     match action {
-        TenantCommands::Add { repo, name, fleet } => {
-            if fleet < 1 {
-                anyhow::bail!(
-                    "--fleet must be >= 1 (a fleet of N means N FORGE-SENTINEL pairs); got {}",
-                    fleet
-                );
-            }
+        TenantCommands::Add { repo, name } => {
             let tenant_name =
                 name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
             validate_tenant_name(&tenant_name)?;
 
-            // Derive the tenant fleet registry with pairs applied to forge/sentinel.
-            let resolver = openflows::orchestration::OrchestrationResolver::new()
-                .context("Failed to resolve orchestration registry")?;
-            let registry_path = resolver.registry_path();
-            let base_registry = config::Registry::load(&registry_path).with_context(|| {
-                format!("cannot load base registry at {}", registry_path.display())
-            })?;
-            let tenant_registry = base_registry.with_team_fleet(fleet);
-            let registry_json = serde_json::to_string_pretty(&tenant_registry)?;
-
             println!(
-                "Adding tenant '{}' for repository '{}' with fleet {} ({} forge + {} sentinel pairs)...",
-                tenant_name, repo, fleet, fleet, fleet
+                "Adding tenant '{}' for repository '{}'...",
+                tenant_name, repo
             );
             let workspace_id = bootstrapper
-                .ensure_tenant(&client, &tenant_name, &repo, &registry_json)
+                .ensure_tenant(&client, &tenant_name, &repo)
                 .await
                 .context("Tenant setup failed")?;
 
-            // Persist repo + fleet registry into the tenant store.
+            // Persist the tenant's repository into its Redis namespace so a host /
+            // dev controller run without GITHUB_REPOSITORY can resolve the repo
+            // from the tenant store (the same `repository` key the Nexus node
+            // writes once its flow starts running). Without this, a controller
+            // started right after `tenant add` aborts telling the operator to add
+            // a tenant even though one was just added.
             let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
             match pocketflow_core::SharedStore::new_redis_with_tenant(
                 &redis_url,
@@ -747,24 +689,20 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             {
                 Ok(store) => {
                     store.set("repository", serde_json::json!(&repo)).await;
-                    store
-                        .set("registry_json", serde_json::json!(&registry_json))
-                        .await;
                     println!(
-                        "  ✓ Repository '{}' and fleet registry persisted for tenant '{}'",
+                        "  ✓ Repository '{}' persisted for tenant '{}'",
                         repo, tenant_name
                     );
                 }
                 Err(e) => {
                     eprintln!(
-                        "  ⚠ Could not persist repository/registry to Redis for tenant '{}': {}",
-                        tenant_name, e
+                        "  ⚠ Could not persist repository '{}' to Redis for tenant '{}': {}",
+                        repo, tenant_name, e
                     );
                 }
             }
 
             println!("\n  ✓ Tenant '{}' added", tenant_name);
-            println!("  ✓ Fleet: {} FORGE-SENTINEL pair(s)", fleet);
             println!("  ✓ Nexus workspace: {}", workspace_id);
             println!("  → Complete the GitHub OAuth link in the Coder dashboard for this tenant");
         }

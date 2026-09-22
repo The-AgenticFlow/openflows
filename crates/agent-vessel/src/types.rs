@@ -35,7 +35,12 @@ impl VesselConfig {
     pub fn from_env() -> Self {
         let github_token = config::GithubConfig::init_from_env()
             .ok()
-            .and_then(|g| g.resolve_token())
+            .and_then(|g| g.token)
+            .or_else(|| {
+                config::CoderConfig::init_from_env()
+                    .ok()
+                    .and_then(|c| c.github_token)
+            })
             .unwrap_or_default();
 
         Self {
