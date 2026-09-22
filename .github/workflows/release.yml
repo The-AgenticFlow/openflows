@@ -77,11 +77,15 @@ jobs:
       - name: Regenerate changelog with git-cliff
         if: success()
         run: |
-          # Find the release-plz PR branch (if one was created).
+          # Find the release-plz PR branch (if one was created). Only PRs
+          # targeting `main` (base) and opening from a `release-plz-*` head are
+          # considered, and the newest is chosen — this keeps the step tied to
+          # the PR release-plz just created/updated in THIS run instead of
+          # picking an unrelated open release-plz PR.
           PR_BRANCH=$(gh pr list --repo "${{ github.repository }}" --state open \
-            --json headRefName --jq \
-            '.[] | select(.headRefName | startswith("release-plz-")) | .headRefName' \
-            | head -1)
+            --base main --json headRefName,createdAt --jq \
+            '[.[] | select(.headRefName | startswith("release-plz-"))]
+             | sort_by(.createdAt) | reverse | .[0].headRefName // empty')
           if [ -z "$PR_BRANCH" ]; then
             echo "No release-plz PR found — nothing to regenerate."
             exit 0
@@ -94,8 +98,9 @@ jobs:
           # Read the bumped version from binary/Cargo.toml.
           VERSION=$(grep '^version' binary/Cargo.toml | head -1 | sed 's/.*= *//' | tr -d '"')
 
-          # Install git-cliff.
-          cargo install git-cliff --locked --quiet
+          # Install git-cliff (pinned so changelog rendering is reproducible
+          # across runs and upstream releases can't silently change output).
+          cargo install git-cliff@2.14.2 --locked --quiet
 
           # Regenerate the full changelog with ALL commits since each tag,
           # not just those touching binary/.
@@ -105,10 +110,13 @@ jobs:
           # collecting all unique `by @username` mentions from that block and
           # listing them in a deduplicated, alphabetically sorted section.
           # Bots (github-actions[bot], AgentFlow, etc.) are excluded.
-          python3 - <<'PYEOF'
+          # VERSION is passed via env because this is a quoted heredoc (the
+          # shell would otherwise treat `${VERSION}` as literal text).
+          RELEASE_PLZ_VERSION="${VERSION}" python3 - <<'PYEOF'
+          import os
           import re
 
-          VERSION = "${VERSION}"
+          VERSION = os.environ["RELEASE_PLZ_VERSION"]
           BOTS = {"github-actions[bot]", "AgentFlow", "dependabot[bot]", "dependabot-preview[bot]"}
 
           with open("CHANGELOG.md") as f:
@@ -126,25 +134,28 @@ jobs:
               m for m in re.findall(r"by @([\w-]+)", block)
               if m not in BOTS
           })
-          if not contributors:
-              raise SystemExit("No contributors found in the version block")
 
-          # Build the Contributors section.
-          contrib_lines = "\n".join(f"- @{c}" for c in contributors)
-          contrib_section = f"\n### Contributors\n\n{contrib_lines}\n\n"
+          # Contributor attribution is optional: a release with no non-bot
+          # `by @username` mentions simply omits the Contributors subsection.
+          if contributors:
+              # Build the Contributors section.
+              contrib_lines = "\n".join(f"- @{c}" for c in contributors)
+              contrib_section = f"\n### Contributors\n\n{contrib_lines}\n\n"
 
-          # Insert it right before the **Full Changelog** line (or at the end
-          # of the block if there is no compare link).
-          insert_pattern = r"(\*\*Full Changelog\*\*)"
-          if re.search(insert_pattern, block):
-              new_block = re.sub(insert_pattern, contrib_section + r"\1", block, count=1)
+              # Insert it right before the **Full Changelog** line (or at the
+              # end of the block if there is no compare link).
+              insert_pattern = r"(\*\*Full Changelog\*\*)"
+              if re.search(insert_pattern, block):
+                  new_block = re.sub(insert_pattern, contrib_section + r"\1", block, count=1)
+              else:
+                  new_block = block.rstrip() + "\n" + contrib_section
+
+              content = content[:match.start(1)] + new_block + content[match.end(1):]
+              with open("CHANGELOG.md", "w") as f:
+                  f.write(content)
+              print(f"Inserted {len(contributors)} contributor(s): {', '.join(contributors)}")
           else:
-              new_block = block.rstrip() + "\n" + contrib_section
-
-          content = content[:match.start(1)] + new_block + content[match.end(1):]
-          with open("CHANGELOG.md", "w") as f:
-              f.write(content)
-          print(f"Inserted {len(contributors)} contributor(s): {', '.join(contributors)}")
+              print("No non-bot contributors found — skipping Contributors section.")
           PYEOF
 
           # Commit and push the corrected changelog to the PR branch.
@@ -185,9 +196,16 @@ jobs:
       - name: Update release body from CHANGELOG
         if: success()
         run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          # The checkout happened before release-plz created the new tag and
+          # GitHub Release, so fetch the freshly-pushed tags before selecting
+          # one. Pick the newest `openflows-*` tag (by creation date) rather
+          # than `git describe`, which would resolve the previous release's
+          # local tag and risk editing the wrong/empty release.
+          git fetch --tags --force origin 2>/dev/null || git fetch --tags origin
+          TAG=$(git tag --list 'openflows-*' --sort=-creatordate \
+            --format='%(refname:short)' | head -1)
           if [ -z "$TAG" ]; then
-            echo "No tag found — skipping."
+            echo "No openflows-* tag found — this push did not create a release. Skipping."
             exit 0
           fi
 
