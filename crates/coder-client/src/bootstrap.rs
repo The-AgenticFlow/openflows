@@ -20,7 +20,6 @@ pub struct CoderBootstrapper {
     admin_password: String,
     admin_username: String,
     /// Configuration loaded once at startup, reused across the bootstrap flow
-    /// instead of re-parsing `std::env::var(...)` per step.
     env: Option<config::EnvConfig>,
 }
 

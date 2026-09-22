@@ -61,7 +61,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: release-plz/action@5b353e755cfc29e2efff7365a831d69fef0aaea9 # v0.5.99
+      - id: release-plz
+        uses: release-plz/action@5b353e755cfc29e2efff7365a831d69fef0aaea9 # v0.5.99
         with:
           command: release-pr
           version: "0.3.167"
@@ -77,17 +78,19 @@ jobs:
       - name: Regenerate changelog with git-cliff
         if: success()
         run: |
-          # Find the release-plz PR branch (if one was created). Only PRs
-          # targeting `main` (base) and opening from a `release-plz-*` head are
-          # considered, and the newest is chosen — this keeps the step tied to
-          # the PR release-plz just created/updated in THIS run instead of
-          # picking an unrelated open release-plz PR.
-          PR_BRANCH=$(gh pr list --repo "${{ github.repository }}" --state open \
-            --base main --json headRefName,createdAt --jq \
-            '[.[] | select(.headRefName | startswith("release-plz-"))]
-             | sort_by(.createdAt) | reverse | .[0].headRefName // empty')
+          # Use the release-plz action output to get the exact PR it opened
+          # or updated in THIS run — not a repository-wide `gh pr list` query,
+          # which could select an unrelated open `release-plz-*` PR when more
+          # than one exists. `prs_created` is "true" whenever release-plz
+          # opened or updated a release PR; `pr` is that PR's JSON object
+          # (with a `head_branch` field naming the branch to push to).
+          if [[ "${RELEASE_PLZ_PRS_CREATED}" != "true" ]]; then
+            echo "release-plz did not create or update a release PR — nothing to regenerate."
+            exit 0
+          fi
+          PR_BRANCH=$(printf '%s' "${RELEASE_PLZ_PR}" | jq -r '.head_branch // empty')
           if [ -z "$PR_BRANCH" ]; then
-            echo "No release-plz PR found — nothing to regenerate."
+            echo "No release-plz PR branch found in action output — nothing to regenerate."
             exit 0
           fi
 
@@ -169,6 +172,8 @@ jobs:
           git push origin "${PR_BRANCH}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PLZ_PRS_CREATED: ${{ steps.release-plz.outputs.prs_created }}
+          RELEASE_PLZ_PR: ${{ steps.release-plz.outputs.pr }}
 
   release-plz-release:
     name: release-plz (release)
