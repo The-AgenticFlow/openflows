@@ -2,11 +2,15 @@
 # OpenFlows Production Commands
 #
 # Usage:
-#   ./scripts/prod.sh run                          # Clean slate + start controller
 #   ./scripts/prod.sh bootstrap                    # Setup Coder + push templates
-#   ./scripts/prod.sh tenant owner/repo --name team # Add a tenant
+#   ./scripts/prod.sh tenant owner/repo --name team --fleet 3 # Add a tenant (3 FORGE-SENTINEL pairs)
 #   ./scripts/prod.sh doctor                       # Health check
 #   ./scripts/prod.sh --help                       # Show help
+#
+# Note: there is no `run` command. The controller is started automatically,
+# in-workspace, for each tenant when a tenant is added (its nexus workspace
+# auto-starts the controller). Running the controller manually on the host has
+# been removed as a duplicate of that in-workspace auto-start.
 
 set -euo pipefail
 
@@ -39,9 +43,14 @@ usage() {
 OpenFlows Production Commands
 
 Usage:
+<<<<<<< Updated upstream
   ./scripts/prod.sh run                                Start controller on host (DEV/DEBUG only; production runs in-workspace)
   ./scripts/prod.sh bootstrap                          Setup Coder + push templates
   ./scripts/prod.sh tenant owner/repo --name team-name  Add a tenant (each tenant runs its own in-workspace controller)
+=======
+  ./scripts/prod.sh bootstrap                          Setup Coder + push templates
+  ./scripts/prod.sh tenant owner/repo --name team-name --fleet N  Add a tenant (each tenant runs its own in-workspace controller; N = number of FORGE-SENTINEL pairs)
+>>>>>>> Stashed changes
   ./scripts/prod.sh doctor                             Health check
 
 Options:
@@ -52,10 +61,15 @@ Options:
 
 Note: by default, every invocation rebuilds ./target/release/openflows from
 current source first (cargo build is incremental, so this is fast when
-nothing changed). This guarantees the controller never silently runs on a
-stale binary after a code fix.
+nothing changed). This guarantees the binary never silently runs on a stale
+build after a code fix.
+
+The controller itself is not run here — it auto-starts in each tenant's nexus
+workspace when the tenant is added. `prod.sh` only boots Coder, adds tenants,
+and runs health checks.
 
 Examples:
+<<<<<<< Updated upstream
   # Start controller on host (DEV/DEBUG; also resets Redis state first):
   ./scripts/prod.sh run
 
@@ -64,6 +78,14 @@ Examples:
 
   # Add a team (provisions the tenant's nexus workspace + controller):
   ./scripts/prod.sh tenant my-org/my-repo --name my-team
+=======
+  # First-time setup:
+  ./scripts/prod.sh bootstrap
+
+  # Add a team (provisions the tenant's nexus workspace + auto-started controller).
+  # --fleet N sets N FORGE-SENTINEL pairs (N forge + N sentinel max slots):
+  ./scripts/prod.sh tenant my-org/my-repo --name my-team --fleet 3
+>>>>>>> Stashed changes
 
   # Health check:
   ./scripts/prod.sh doctor
@@ -87,35 +109,6 @@ ensure_fresh_binary() {
         exit 1
     fi
     BUILD_DONE=true
-}
-
-# Warn (and optionally stop) any other running controller processes that may
-# be bound to a now-stale binary from a previous session. Running two
-# controllers against the same Redis/Coder backend causes duplicate ticket
-# assignment races, and a leftover process from before a rebuild will keep
-# exhibiting bugs that were already fixed in the freshly built binary.
-check_stale_processes() {
-    local mypid=$$
-    local stale_pids
-    stale_pids=$(pgrep -f "openflows run" 2>/dev/null | grep -v "^${mypid}\$" || true)
-    if [ -n "$stale_pids" ]; then
-        echo ""
-        echo "⚠  Found other running 'openflows run' process(es): $stale_pids"
-        echo "   These may be running stale, previously-built code. Stop them before"
-        echo "   continuing so the fresh binary from this run is the only one active:"
-        echo "     kill $stale_pids"
-        echo ""
-        echo -n "Stop them now? [y/N] "
-        read -r stop_response
-        if [[ "$stop_response" =~ ^[Yy]$ ]]; then
-            # shellcheck disable=SC2086
-            kill $stale_pids 2>/dev/null || echo "   (some processes could not be stopped — you may need to stop them manually)"
-            sleep 1
-        else
-            echo "   Continuing anyway — you may see stale behavior from the other process(es)."
-        fi
-        echo ""
-    fi
 }
 
 # Find openflows binary
@@ -195,58 +188,6 @@ CMD="${1:-}"
 shift || true
 
 case "$CMD" in
-    run)
-        echo "═══════════════════════════════════════"
-        echo "  OpenFlows: Starting Controller"
-        echo "═══════════════════════════════════════"
-        echo ""
-        echo "Step 0: Ensuring binary is up to date with source..."
-        if [ "$OPENFLOWS_BIN_EXPLICIT" = "1" ]; then
-            echo "  → Using explicitly pinned binary: $OPENFLOWS_BIN (skipping auto-rebuild)"
-        elif [ "$SKIP_BUILD" = "true" ]; then
-            echo "  → Skipping auto-rebuild (--skip-build)"
-        else
-            ensure_fresh_binary
-            OPENFLOWS_BIN="${PROJECT_ROOT}/target/release/openflows"
-            export OPENFLOWS_BIN
-        fi
-        echo ""
-        echo "Step 1: Resetting Redis state (clean slate)..."
-        if [ -f "${SCRIPT_DIR}/reset-controller-state.sh" ]; then
-            "${SCRIPT_DIR}/reset-controller-state.sh" --confirm
-        else
-            echo "⚠ reset-controller-state.sh not found, skipping..."
-        fi
-        echo ""
-        echo "Step 2: Confirming controller start..."
-        echo ""
-        if [ -n "${GITHUB_REPOSITORY:-}" ]; then
-            echo "Open issues in ${GITHUB_REPOSITORY}:"
-            ISSUE_COUNT=$(curl -s "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
-                -H "Authorization: token ${GITHUB_TOKEN:-}" \
-                -H "Accept: application/vnd.github.v3+json" | jq 'if type == "array" then ([.[] | select(.pull_request == null)] | length) else 0 end' 2>/dev/null || echo "0")
-            echo "  • $ISSUE_COUNT open issues will be synced as tickets"
-            echo "  • Each ticket will provision a forge workspace agent when started"
-            echo ""
-        fi
-        echo "This will start the OpenFlows controller which will:"
-        echo "  • Sync open GitHub issues as tickets"
-        echo "  • Assign tickets to available forge workers"
-        echo "  • Provision workspace agents to work on tickets"
-        echo ""
-        echo -n "Start the controller? [y/N] "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            echo "Cancelled."
-            exit 0
-        fi
-        echo ""
-        check_stale_processes
-        echo "Step 3: Starting OpenFlows controller..."
-        echo ""
-        run_openflows run "$@"
-        ;;
-
     bootstrap)
         echo "═══════════════════════════════════════"
         echo "  OpenFlows Bootstrap"
@@ -273,22 +214,29 @@ case "$CMD" in
         if [ -z "${1:-}" ]; then
             echo "❌ Missing owner/repo argument"
             echo ""
-            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name"
+            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
             echo ""
-            echo "Example: ./scripts/prod.sh tenant my-org/my-repo --name my-team"
+            echo "Example: ./scripts/prod.sh tenant my-org/my-repo --name my-team --fleet 3"
             exit 1
         fi
         OWNER_REPO="$1"
         shift
 
         NAME=""
+        FLEET=""
+        REST=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --name)
                     NAME="$2"
                     shift 2
                     ;;
+                --fleet)
+                    FLEET="$2"
+                    shift 2
+                    ;;
                 *)
+                    REST+=("$1")
                     shift
                     ;;
             esac
@@ -297,7 +245,18 @@ case "$CMD" in
         if [ -z "$NAME" ]; then
             echo "❌ Missing --name argument"
             echo ""
-            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name"
+            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
+            exit 1
+        fi
+
+        if [ -z "$FLEET" ]; then
+            echo "❌ Missing --fleet argument (fleet N = number of FORGE-SENTINEL pairs; must be >= 1)"
+            echo ""
+            echo "Usage: ./scripts/prod.sh tenant owner/repo --name team-name --fleet N"
+            exit 1
+        fi
+        if ! [[ "$FLEET" =~ ^[0-9]+$ ]] || [ "$FLEET" -lt 1 ]; then
+            echo "❌ --fleet must be a whole number >= 1 (got: $FLEET)"
             exit 1
         fi
 
@@ -307,8 +266,9 @@ case "$CMD" in
         echo ""
         echo "  Owner/Repo: $OWNER_REPO"
         echo "  Tenant Name: $NAME"
+        echo "  Fleet: $FLEET (FORGE-SENTINEL pair(s))"
         echo ""
-        run_openflows tenant add "$OWNER_REPO" --name "$NAME" "$@"
+        run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET" "${REST[@]}"
         ;;
 
     doctor)

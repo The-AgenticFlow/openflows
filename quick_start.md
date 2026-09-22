@@ -1,4 +1,4 @@
-# OpenFlows — Quick Start
+# OpenFlows — Quick Start (Local Development)
 
 Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and how it works, see the [README](README.md).
 
@@ -41,6 +41,8 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 
 OpenFlows agents authenticate to your GitHub repos (including private ones) through a GitHub App. Create a new one at **https://github.com/settings/apps/new**:
 
+> **Important:** If your repository belongs to an organization, you must create the GitHub App directly within that organization's settings (`https://github.com/organizations/<your-org>/settings/apps`), not your personal account.
+
 1. Set the **Redirect URI** (under *Identifying and authorizing users*) to exactly:
    ```
    http://localhost:7080/external-auth/primary-github/callback
@@ -65,11 +67,18 @@ Fill in the required values:
 
 | Variable | What to put |
 |----------|-------------|
+<<<<<<< Updated upstream
 | `GITHUB_TOKEN` | GitHub PAT with `repo` scope. |
 | `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
 
 > **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
+=======
+| `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
+| `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
+
+> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team> --fleet <N>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
+>>>>>>> Stashed changes
 
 Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
 
@@ -119,16 +128,19 @@ To confirm the GitHub App was set up correctly, open **http://localhost:7080/dep
 
 ### Link the GitHub App (required for private repos)
 
-Signing in is **not** enough. You must also **link** the GitHub App so Coder can hand your agents a token to clone/push your repos (including private ones):
+Signing in is **not** enough. Each tenant workspace is owned by its **tenant user** (created by `tenant add`), and Coder refuses to build a workspace until the owning account links the GitHub App. The `CODER_SESSION_TOKEN` account is only the privileged **provisioning** actor — the tenant user is the actual workspace owner.
 
-1. Make sure you are logged into the Coder dashboard **as the account that owns the workspaces** — the one whose session token you put in `CODER_SESSION_TOKEN` (bootstrap creates the control-plane workspace under this account).
-2. Visit:
-   ```
-   http://localhost:7080/external-auth/primary-github
-   ```
-3. On GitHub, click **Authorize**. You'll be redirected back to Coder once linked.
+Since `tenant add` performs a **real API-driven grant check** (it polls `GET /api/v2/external-auth/primary-github` until the tenant user's GitHub link is confirmed), you no longer need to pre-link the app manually. When you run `tenant add`, it prints the link URL and (when a device flow is available) a one-time code you can authorize in a browser — complete that and onboarding continues automatically:
 
-> Required for private repos: skipping this link makes bootstrap fail with `403 External authentication is required to create a workspace with this template`; see [Troubleshooting](#troubleshooting).
+1. Run `./scripts/prod.sh tenant <owner/repo> --name <my-team> --fleet <N>`.
+2. Onboarding prints a "GitHub Link Required" prompt with either:
+   - a **device-flow URL + one-time code** (fastest — open it, enter the code, click **Authorize**), or
+   - the Coder dashboard link `http://localhost:7080/external-auth/primary-github` to authorize as the tenant user.
+3. Once you authorize, `tenant add` confirms the linked GitHub account (`user.login`) and proceeds to create the tenant workspace automatically — no need to press Enter.
+
+> Do **not** link the GitHub App only as the `CODER_SESSION_TOKEN` (admin/provisioning) account — that account provisions the workspace but does not own it, so tenant workspace creation would still be blocked by Coder's external-auth `403`.
+
+> Required for private repos: skipping this link makes bootstrap/`tenant add` time out (or fail with `403 External authentication is required to create a workspace with this template`); see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -178,14 +190,32 @@ Confirm the templates were pushed at **http://localhost:7080/templates**.
 Bind a GitHub repo to OpenFlows. A tenant is scoped to a single `owner/repo` and provisions its own nexus workspace + controller:
 
 ```bash
-./scripts/prod.sh tenant <owner/repo> --name <my-team>
+./scripts/prod.sh tenant <owner/repo> --name <my-team> --fleet 3
 ```
 
+<<<<<<< Updated upstream
 You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces**.
 
 > **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
 
 > **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). New tenants get this automatically — nothing extra to do.
+=======
+`--fleet N` sets the number of **FORGE-SENTINEL pairs** for the tenant: `N` forge worker slots **and** `N` sentinel worker slots (a fleet of `3` → `forge-1..forge-3` and `sentinel-1..sentinel-3`). It is **mandatory** and must be >= 1. The fleet value is written into the tenant's `registry.json` (also persisted to the tenant store), which the in-workspace controller reads and applies automatically.
+
+`tenant add` now onboards **self-serve**:
+
+1. Creates the tenant-owner Coder user.
+2. Checks (via the Coder API, as that user) whether GitHub is linked, and — if not — prints a device-flow **one-time code** and link URL to authorize.
+3. Once GitHub is linked, mints a tenant token and provisions the `openflows-nexus-<tenant>` workspace, which auto-starts its controller.
+
+You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces**.
+
+> **GitHub auth:** the GitHub App (Step 1) is the sole source of the GitHub token — each tenant links their GitHub account during `tenant add`, and the controller/agents use that linked token. No PAT is required.
+
+> **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
+
+> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). The same applies to **`--fleet`**: `tenant add` on an existing nexus workspace leaves its build parameters (including the fleet) unchanged, so the fleet value only applies to newly added tenants, or after you recreate the tenant's workspace. New tenants get these automatically — nothing extra to do.
+>>>>>>> Stashed changes
 
 ---
 
@@ -193,7 +223,11 @@ You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces
 
 The controller runs **inside the tenant's nexus workspace** and auto-starts when the workspace is ready. You don't run it on your machine — the workspace was created with `start_controller` enabled, and its `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` are injected from the tenant you added.
 
+<<<<<<< Updated upstream
 > For local development/debugging only, you can still run the controller manually on the host with `./scripts/prod.sh run` (this is not the production path).
+=======
+> **Note:** There is no host-side `run` command — the controller runs **inside** the tenant's nexus workspace and auto-starts when the workspace is ready (started by `tenant add`). Running the controller manually on the host has been removed as a duplicate of that in-workspace auto-start.
+>>>>>>> Stashed changes
 
 Create a GitHub issue in the bound repo → OpenFlows automatically assigns it, provisions a workspace, and starts working.
 
@@ -233,16 +267,19 @@ A healthy consumer responds `200`. If you see `InvalidAudience`, see [Troublesho
 
 ### Rotating the secret
 
-`CODER_CHAT_HOOK_SECRET` is an **immutable** Nexus workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only rebuilds the Nexus workspace when the template itself changes). To rotate, you must recreate the workspace so it is rebuilt with the new secret:
+`CODER_CHAT_HOOK_SECRET` is an **immutable** tenant workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only pushes templates; it no longer creates a workspace). To rotate, you must **recreate the tenant workspace** so it is rebuilt with the new secret:
 
-1. Stop the Controller.
+1. Stop the tenant's Controller.
 2. Set a new 32+ byte `CODER_CHAT_HOOK_SECRET` in `.env`.
-3. Delete the existing Nexus workspace so bootstrap rebuilds it. You can do this from the host with the `coder` CLI (logged in as the OpenFlows user):
+3. Delete the tenant's existing Nexus workspace so it can be rebuilt. From the host with the `coder` CLI, logged in as the tenant user:
    ```bash
-   coder delete openflows-nexus
+   coder delete openflows-nexus-<tenant>
    ```
    (If you changed `OPENFLOWS_HOOK_URL` at the same time, do the same — the hook URL is also immutable.)
-4. Re-run bootstrap. It recreates the workspace with the new secret and the controller starts validating against it.
+4. Recreate the workspace through the tenant flow, which rebuilds it with the new secret and restarts its controller:
+   ```bash
+   ./scripts/prod.sh tenant <owner/repo> --name <tenant>
+   ```
 
 Coder and the consumer must always share the same secret, and both Coder and the Controller must be restarted after rotation.
 
@@ -271,7 +308,7 @@ When a team member signs in with GitHub OAuth, Coder creates them as a **regular
 
 | Role | Why |
 |------|-----|
-| `organization-admin` | Create the control-plane workspace + template management. |
+| `organization-admin` | Provision workspaces (e.g. tenant nexus workspaces) + template management. |
 | `organization-template-admin` | Push/update the `openflows-*` templates. |
 | `organization-workspace-access` | Required for org workspaces. Keep it — `edit-roles` replaces the whole role set. |
 
@@ -354,12 +391,13 @@ This usually means the hook consumer rejected or couldn't be reached during Code
 
 If the controller logs `Hook consumer: JWT verification failed ... InvalidAudience`, the JWT's `aud` claim (Coder's `CODER_CHAT_HOOK_URL`) does not match the audience the consumer expects. In the bundled stack this should not happen — `OPENFLOWS_HOOK_URL` drives both Coder's URL and the consumer's expected `aud` via bootstrap. It appears when those two get out of sync:
 
-- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **Nexus workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the workspace (see [Rotating the secret](#rotating-the-secret)) so bootstrap rebuilds it against the current URL, or keep the bundled defaults.
+- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **tenant workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the tenant workspace (see [Rotating the secret](#rotating-the-secret)) so it is rebuilt against the current URL, or keep the bundled defaults.
+- You manually set `CODER_CHAT_HOOK_URL` or `OPENFLOWS_HOOK_ADDR` in your `.env` while using the default Docker setup. These variables are for custom host deployments only; the standard Docker setup automatically configures the internal networking. Remove them from `.env` and recreate the workspace.
 - Coder and the consumer were started with different `CODER_CHAT_HOOK_SECRET` values or one was restarted out of order. Restart both with the same secret.
 
 ### `403 External authentication is required to create a workspace with this template`
 
-Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
+Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link as the **tenant user** (see [Link the GitHub App](#link-the-github-app-required-for-private-repos)) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, recreate the tenant workspace via `./scripts/prod.sh tenant <owner/repo> --name <tenant>`.
 
 ### Agents can't clone/push the private repo
 

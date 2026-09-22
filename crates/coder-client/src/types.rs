@@ -496,3 +496,131 @@ pub fn build_chat_labels(
     );
     map
 }
+
+// ── External-auth (GitHub link) types ────────────────────────────────────
+
+/// One entry of `GET /api/v2/external-auth`: whether the current token's user
+/// has linked the given provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAuthLink {
+    #[serde(default)]
+    pub authenticated: bool,
+    #[serde(default, rename = "provider_id")]
+    pub provider_id: String,
+}
+
+/// Link status for one provider from `GET /api/v2/external-auth/{externalauth}`.
+/// `authenticated` is the grant check; `app_install_url`/`user` guide linking.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAuth {
+    #[serde(default)]
+    pub authenticated: bool,
+    #[serde(default, rename = "has_refresh_token")]
+    pub has_refresh_token: bool,
+    #[serde(default, rename = "app_install_url")]
+    pub app_install_url: String,
+    #[serde(default)]
+    pub user: Option<ExternalAuthUser>,
+}
+
+/// The GitHub user linked to a provider (nested in [`ExternalAuth`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAuthUser {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// Device-flow initiation result from `POST /api/v2/external-auth/{externalauth}/device`.
+///
+/// The user completes the link by visiting `verification_uri` and entering
+/// `user_code` (or opening `verification_uri_complete` directly); the caller
+/// polls `GET /api/v2/external-auth/{externalauth}` until `authenticated`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAuthDevice {
+    #[serde(default, rename = "verification_uri")]
+    pub verification_uri: String,
+    #[serde(default, rename = "verification_uri_complete")]
+    pub verification_uri_complete: String,
+    #[serde(default, rename = "user_code")]
+    pub user_code: String,
+    #[serde(default, rename = "device_code")]
+    pub device_code: String,
+    #[serde(default, rename = "expires_in")]
+    pub expires_in: i64,
+    #[serde(default)]
+    pub interval: i64,
+}
+
+#[cfg(test)]
+mod external_auth_tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_external_auth_link_list() {
+        let json = r#"[
+            {"authenticated": true, "provider_id": "primary-github"},
+            {"authenticated": false, "provider_id": "gitlab"}
+        ]"#;
+        let links: Vec<ExternalAuthLink> = serde_json::from_str(json).unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links[0].authenticated);
+        assert_eq!(links[0].provider_id, "primary-github");
+        assert!(!links[1].authenticated);
+        assert_eq!(links[1].provider_id, "gitlab");
+    }
+
+    #[test]
+    fn deserialize_external_auth_link_list_missing_fields() {
+        // Coder may omit provider_id/authenticated for unlinked providers.
+        let json = r#"[{"provider_id": "primary-github"}]"#;
+        let links: Vec<ExternalAuthLink> = serde_json::from_str(json).unwrap();
+        assert_eq!(links.len(), 1);
+        assert!(!links[0].authenticated);
+        assert_eq!(links[0].provider_id, "primary-github");
+    }
+
+    #[test]
+    fn deserialize_external_auth_authenticated() {
+        let json = r#"{
+            "authenticated": true,
+            "has_refresh_token": true,
+            "app_install_url": "https://github.com/apps/openflows/installations/new/abc123",
+            "user": {"login": "octocat"}
+        }"#;
+        let auth: ExternalAuth = serde_json::from_str(json).unwrap();
+        assert!(auth.authenticated);
+        assert!(auth.has_refresh_token);
+        assert!(auth.app_install_url.contains("installations/new"));
+        assert_eq!(auth.user.as_ref().unwrap().login, "octocat");
+    }
+
+    #[test]
+    fn deserialize_external_auth_unauthenticated_defaults() {
+        // Unlinked provider: no user, not authenticated.
+        let json = r#"{"authenticated": false}"#;
+        let auth: ExternalAuth = serde_json::from_str(json).unwrap();
+        assert!(!auth.authenticated);
+        assert!(!auth.has_refresh_token);
+        assert!(auth.app_install_url.is_empty());
+        assert!(auth.user.is_none());
+    }
+
+    #[test]
+    fn deserialize_external_auth_device_flow() {
+        let json = r#"{
+            "verification_uri": "https://github.com/login/device",
+            "verification_uri_complete": "https://github.com/login/device?user_code=ABCD-EFGH",
+            "user_code": "ABCD-EFGH",
+            "device_code": "device-code-123",
+            "expires_in": 900,
+            "interval": 5
+        }"#;
+        let device: ExternalAuthDevice = serde_json::from_str(json).unwrap();
+        assert_eq!(device.verification_uri, "https://github.com/login/device");
+        assert!(device.verification_uri_complete.contains("ABCD-EFGH"));
+        assert_eq!(device.user_code, "ABCD-EFGH");
+        assert_eq!(device.device_code, "device-code-123");
+        assert_eq!(device.expires_in, 900);
+        assert_eq!(device.interval, 5);
+    }
+}

@@ -1,6 +1,10 @@
 [package]
 name    = "openflows"
+<<<<<<< Updated upstream
 version = "1.5.4"
+=======
+version = "1.3.4"
+>>>>>>> Stashed changes
 edition = "2021"
 license = "MIT"
 # Register the repo-root README with the package so release-plz tracks edits to it

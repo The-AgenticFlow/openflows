@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+<<<<<<< Updated upstream
 ## [1.5.4] - 2026-09-18
 
 
@@ -65,6 +66,13 @@ https://github.com/The-AgenticFlow/openflows/commit/fc121604ed30e2dce29739e2f845
 
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.3.3...openflows-1.4.0
+=======
+## [1.3.4] - 2026-09-22
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.3.3...openflows-1.3.4
+>>>>>>> Stashed changes
 
 
 

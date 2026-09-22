@@ -12,6 +12,11 @@ use envconfig::Envconfig;
 use std::fmt;
 use std::path::PathBuf;
 
+/// Serializes env mutation across config tests so test modules that touch
+/// `GITHUB_*`/`CODER_EXTERNAL_AUTH_*` env vars never race.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Coder-related configuration.
 ///
 /// `Debug` is implemented manually to redact credentials.
@@ -37,9 +42,6 @@ pub struct CoderConfig {
 
     #[envconfig(from = "CODER_IMAGE_TAG", default = "v2.37.1")]
     pub image_tag: String,
-
-    #[envconfig(from = "CODER_GITHUB_TOKEN")]
-    pub github_token: Option<String>,
 
     #[envconfig(from = "CODER_EXTERNAL_AUTH_0_ID")]
     pub external_auth_id: Option<String>,
@@ -193,7 +195,6 @@ impl fmt::Debug for CoderConfig {
             .field("admin_password", &"<redacted>")
             .field("admin_username", &self.admin_username)
             .field("image_tag", &self.image_tag)
-            .field("github_token", &redact(&self.github_token))
             .field("external_auth_id", &self.external_auth_id)
             .field("external_auth_client_id", &self.external_auth_client_id)
             .field(
@@ -252,12 +253,6 @@ pub struct TenantConfig {
     #[envconfig(from = "OPENFLOWS_REGISTRY_JSON")]
     pub registry_json: Option<String>,
 
-    #[envconfig(from = "OPENFLOWS_NEXUS_WORKSPACE_ID")]
-    pub nexus_workspace_id: Option<String>,
-
-    #[envconfig(from = "OPENFLOWS_NEXUS_WORKSPACE_NAME")]
-    pub nexus_workspace_name: Option<String>,
-
     #[envconfig(from = "OPENFLOWS_NEXUS_API_TOKEN")]
     pub nexus_api_token: Option<String>,
 
@@ -292,8 +287,6 @@ impl fmt::Debug for TenantConfig {
             .field("home", &self.home)
             .field("registry_path", &self.registry_path)
             .field("registry_json", &self.registry_json)
-            .field("nexus_workspace_id", &self.nexus_workspace_id)
-            .field("nexus_workspace_name", &self.nexus_workspace_name)
             .field("nexus_api_token", &redact(&self.nexus_api_token))
             .field("tar", &self.tar)
             .finish()
@@ -308,23 +301,53 @@ pub struct GithubConfig {
     #[envconfig(from = "GITHUB_REPOSITORY")]
     pub repository: Option<String>,
 
-    #[envconfig(from = "GITHUB_TOKEN")]
-    pub token: Option<String>,
-
-    #[envconfig(from = "GITHUB_PERSONAL_ACCESS_TOKEN")]
-    pub personal_access_token: Option<String>,
-
     #[envconfig(from = "GITHUB_API_BASE", default = "https://api.github.com")]
     pub api_base: String,
 }
 
 impl GithubConfig {
-    /// Effective GitHub token, preferring the personal access token and falling
-    /// back to the generic `GITHUB_TOKEN`.
-    pub fn effective_token(&self) -> Option<String> {
-        self.personal_access_token
-            .clone()
-            .or_else(|| self.token.clone())
+    /// Normalize a Coder external-auth provider id to the injected env suffix:
+    /// uppercase, `-`/`.`→`_` (e.g. `primary-github` → `PRIMARY_GITHUB`).
+    pub fn normalize_external_auth_id(id: &str) -> String {
+        id.to_uppercase().replace(['-', '.'], "_")
+    }
+
+    /// Read the tenant user's external-auth token injected by Coder
+    /// (`_ACCESS_TOKEN`, then `_TOKEN`, then `_TOKEN_FILE`).
+    pub fn external_auth_token(&self) -> Option<String> {
+        let id = CoderConfig::init_from_env()
+            .ok()
+            .and_then(|c| c.external_auth_id.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "primary-github".to_string());
+        let base = format!(
+            "CODER_EXTERNAL_AUTH_{}",
+            Self::normalize_external_auth_id(&id)
+        );
+        for var in [format!("{}_ACCESS_TOKEN", base), format!("{}_TOKEN", base)] {
+            if let Ok(v) = std::env::var(&var) {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        if let Ok(path) = std::env::var(format!("{}_TOKEN_FILE", base)) {
+            if let Ok(v) = std::fs::read_to_string(path) {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the GitHub token for the controller/agents. External auth
+    /// (the tenant user's linked GitHub App token) is the sole source — the
+    /// PAT flow has been removed. Returns `None` when not configured.
+    pub fn resolve_token(&self) -> Option<String> {
+        self.external_auth_token()
     }
 }
 
@@ -332,11 +355,7 @@ impl fmt::Debug for GithubConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GithubConfig")
             .field("repository", &self.repository)
-            .field("token", &redact(&self.token))
-            .field(
-                "personal_access_token",
-                &redact(&self.personal_access_token),
-            )
+            .field("api_base", &self.api_base)
             .finish()
     }
 }
@@ -357,15 +376,6 @@ pub struct AgentConfig {
     /// Whether the AI gateway is enabled.
     #[envconfig(from = "USE_AI_GATEWAY")]
     pub use_ai_gateway: Option<String>,
-
-    /// Whether the bootstrapper should create the Nexus control-plane
-    /// workspace.
-    #[envconfig(from = "OPENFLOWS_CREATE_NEXUS_WORKSPACE")]
-    pub create_nexus_workspace: Option<String>,
-
-    /// The role this process runs as (e.g. `nexus`).
-    #[envconfig(from = "ROLE")]
-    pub role: Option<String>,
 }
 
 impl AgentConfig {
@@ -379,12 +389,6 @@ impl AgentConfig {
     /// Whether the AI gateway is enabled.
     pub fn use_ai_gateway_enabled(&self) -> bool {
         matches!(self.use_ai_gateway.as_deref(), Some("true" | "1"))
-    }
-
-    /// Whether the bootstrapper should create the Nexus control-plane
-    /// workspace.
-    pub fn create_nexus_workspace_enabled(&self) -> bool {
-        self.create_nexus_workspace.as_deref() != Some("false")
     }
 }
 
@@ -463,9 +467,6 @@ impl EnvConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Snapshot the given variables and restore them on drop so test-runner
     /// environment changes never leak to other tests.
@@ -666,32 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn create_nexus_workspace_is_lenient_and_defaults_enabled() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::capture(&["OPENFLOWS_CREATE_NEXUS_WORKSPACE"]);
-        std::env::remove_var("OPENFLOWS_CREATE_NEXUS_WORKSPACE");
-        assert!(EnvConfig::from_env()
-            .unwrap()
-            .agent
-            .create_nexus_workspace_enabled());
-
-        for (v, expected) in [
-            ("false", false),
-            ("true", true),
-            ("1", true),
-            ("garbage", true),
-        ] {
-            std::env::set_var("OPENFLOWS_CREATE_NEXUS_WORKSPACE", v);
-            let cfg = EnvConfig::from_env().unwrap();
-            assert_eq!(
-                cfg.agent.create_nexus_workspace_enabled(),
-                expected,
-                "OPENFLOWS_CREATE_NEXUS_WORKSPACE={v}"
-            );
-        }
-    }
-
-    #[test]
     fn debug_redacts_secrets() {
         let _g = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::capture(&["CODER_SESSION_TOKEN", "CODER_ADMIN_PASSWORD"]);
@@ -702,6 +677,104 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("s3cr3t-token"));
         assert!(!dbg.contains("hunter2"));
+    }
+
+    #[test]
+    fn github_resolve_token_uses_external_auth() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_EXTERNAL_AUTH_0_ID",
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN",
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN",
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE",
+        ]);
+        guard.unset_all();
+
+        // No external-auth token → None (no PAT fallback exists anymore).
+        assert_eq!(EnvConfig::from_env().unwrap().github.resolve_token(), None);
+
+        // `_TOKEN` is used.
+        std::env::set_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN", "ea-token");
+        assert_eq!(
+            EnvConfig::from_env()
+                .unwrap()
+                .github
+                .resolve_token()
+                .as_deref(),
+            Some("ea-token")
+        );
+
+        // `_ACCESS_TOKEN` is preferred over `_TOKEN`.
+        std::env::remove_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN");
+        std::env::set_var(
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN",
+            "ea-access-token",
+        );
+        assert_eq!(
+            EnvConfig::from_env()
+                .unwrap()
+                .github
+                .resolve_token()
+                .as_deref(),
+            Some("ea-access-token")
+        );
+
+        // `_TOKEN_FILE` (a path to a file) is read as the final tier.
+        std::env::remove_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN");
+        let dir = std::env::temp_dir();
+        let file = dir.join("kilo-ea-token-file-test");
+        std::fs::write(&file, "file-token\n").ok();
+        std::env::set_var(
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE",
+            file.to_str().unwrap(),
+        );
+        assert_eq!(
+            EnvConfig::from_env()
+                .unwrap()
+                .github
+                .resolve_token()
+                .as_deref(),
+            Some("file-token")
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn github_normalize_external_auth_id() {
+        assert_eq!(
+            GithubConfig::normalize_external_auth_id("primary-github"),
+            "PRIMARY_GITHUB"
+        );
+        assert_eq!(
+            GithubConfig::normalize_external_auth_id("github.com"),
+            "GITHUB_COM"
+        );
+        assert_eq!(
+            GithubConfig::normalize_external_auth_id("primary_github"),
+            "PRIMARY_GITHUB"
+        );
+    }
+
+    #[test]
+    fn github_resolve_token_honors_custom_external_auth_id() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_EXTERNAL_AUTH_0_ID",
+            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN",
+            "CODER_EXTERNAL_AUTH_CUSTOM_GITHUB_TOKEN",
+        ]);
+        guard.unset_all();
+
+        std::env::set_var("CODER_EXTERNAL_AUTH_0_ID", "custom-github");
+        std::env::set_var("CODER_EXTERNAL_AUTH_CUSTOM_GITHUB_TOKEN", "custom-ea-token");
+        // The default-named var is ignored when a custom id is configured.
+        std::env::set_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN", "wrong");
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.github.resolve_token().as_deref(),
+            Some("custom-ea-token"),
+            "custom CODER_EXTERNAL_AUTH_0_ID must drive the env var name"
+        );
     }
 
     #[test]

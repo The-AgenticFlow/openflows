@@ -15,6 +15,7 @@
 // - Supports both base roles (forge) and instance slots (forge-1, forge-2)
 
 use anyhow::{Context, Result};
+use envconfig::Envconfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -315,8 +316,14 @@ impl IdentityManager {
         let token = match &entry.github_token_env {
             Some(env_var) => std::env::var(env_var)
                 .with_context(|| format!("{} not set for agent {}", env_var, entry.id))?,
-            None => std::env::var("GITHUB_TOKEN")
-                .context("GITHUB_TOKEN not set (fallback for agent without github_token_env)")?,
+            None => crate::GithubConfig::init_from_env()
+                .map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?
+                .resolve_token()
+                .filter(|t| !t.is_empty())
+                .context(
+                    "no GitHub external-auth token for agent without github_token_env \
+                     (set CODER_EXTERNAL_AUTH_*_TOKEN)",
+                )?,
         };
 
         {
@@ -459,8 +466,32 @@ mod tests {
         f
     }
 
-    fn setup_test_token() {
-        std::env::set_var("GITHUB_TOKEN", "test-token");
+    /// Sets the external-auth token for the test and restores it on drop.
+    /// Holds the crate-wide `ENV_LOCK` so it never races other test modules.
+    struct GithubTokenGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<String>,
+    }
+
+    impl Drop for GithubTokenGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(CONFIG_TEST_EA_TOKEN, v),
+                None => std::env::remove_var(CONFIG_TEST_EA_TOKEN),
+            }
+        }
+    }
+
+    const CONFIG_TEST_EA_TOKEN: &str = "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN";
+    const CONFIG_TEST_EA_ID: &str = "CODER_EXTERNAL_AUTH_0_ID";
+
+    fn setup_test_token() -> GithubTokenGuard {
+        let _lock = crate::env::ENV_LOCK.lock().unwrap();
+        let prior = std::env::var(CONFIG_TEST_EA_TOKEN).ok();
+        // No custom id so resolution targets the default `primary-github`.
+        std::env::remove_var(CONFIG_TEST_EA_ID);
+        std::env::set_var(CONFIG_TEST_EA_TOKEN, "test-token");
+        GithubTokenGuard { _lock, prior }
     }
 
     #[test]
@@ -478,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_load_identity_manager() {
-        setup_test_token();
+        let _token_guard = setup_test_token();
         let f = write_temp(sample_registry_json());
         let manager = IdentityManager::load(f.path()).unwrap();
         let identities = manager.all_identities().unwrap();
@@ -487,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_get_identity_forge_instance() {
-        setup_test_token();
+        let _token_guard = setup_test_token();
         let f = write_temp(sample_registry_json());
         let manager = IdentityManager::load(f.path()).unwrap();
 
@@ -502,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_get_identity_nexus() {
-        setup_test_token();
+        let _token_guard = setup_test_token();
         let f = write_temp(sample_registry_json());
         let manager = IdentityManager::load(f.path()).unwrap();
 
@@ -517,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_get_identities_for_role_forge() {
-        setup_test_token();
+        let _token_guard = setup_test_token();
         let f = write_temp(sample_registry_json());
         let manager = IdentityManager::load(f.path()).unwrap();
 
@@ -529,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_get_identities_for_role_nexus() {
-        setup_test_token();
+        let _token_guard = setup_test_token();
         let f = write_temp(sample_registry_json());
         let manager = IdentityManager::load(f.path()).unwrap();
 
