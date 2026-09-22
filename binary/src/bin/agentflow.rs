@@ -297,32 +297,30 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     if let Ok(env_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
         if !env_json.trim().is_empty() {
             match serde_json::from_str::<config::Registry>(&env_json) {
-                Ok(validated) => {
-                    match serde_json::to_string_pretty(&validated) {
-                        Ok(pretty) => {
-                            if let Err(e) = std::fs::write(&registry_path, pretty) {
-                                tracing::warn!(
-                                    error = %e,
-                                    path = %registry_path.display(),
-                                    "OPENFLOWS_REGISTRY_JSON was set but the on-disk registry could \
-                                     not be overwritten; continuing with the bundled registry"
-                                );
-                            } else {
-                                tracing::info!(
-                                    path = %registry_path.display(),
-                                    "Overwrote on-disk registry from OPENFLOWS_REGISTRY_JSON (tenant fleet)"
-                                );
-                            }
-                        }
-                        Err(e) => {
+                Ok(validated) => match serde_json::to_string_pretty(&validated) {
+                    Ok(pretty) => {
+                        if let Err(e) = std::fs::write(&registry_path, pretty) {
                             tracing::warn!(
                                 error = %e,
-                                "OPENFLOWS_REGISTRY_JSON parsed but could not be serialized; \
-                                 keeping on-disk registry"
+                                path = %registry_path.display(),
+                                "OPENFLOWS_REGISTRY_JSON was set but the on-disk registry could \
+                                 not be overwritten; continuing with the bundled registry"
+                            );
+                        } else {
+                            tracing::info!(
+                                path = %registry_path.display(),
+                                "Overwrote on-disk registry from OPENFLOWS_REGISTRY_JSON (tenant fleet)"
                             );
                         }
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "OPENFLOWS_REGISTRY_JSON parsed but could not be serialized; \
+                             keeping on-disk registry"
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -724,8 +722,9 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             let resolver = openflows::orchestration::OrchestrationResolver::new()
                 .context("Failed to resolve orchestration registry")?;
             let registry_path = resolver.registry_path();
-            let base_registry = config::Registry::load(&registry_path)
-                .with_context(|| format!("cannot load base registry at {}", registry_path.display()))?;
+            let base_registry = config::Registry::load(&registry_path).with_context(|| {
+                format!("cannot load base registry at {}", registry_path.display())
+            })?;
             let tenant_registry = base_registry.with_team_fleet(fleet);
             let registry_json = serde_json::to_string_pretty(&tenant_registry)?;
 

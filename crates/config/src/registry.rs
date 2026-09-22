@@ -815,7 +815,10 @@ mod tests {
             .into_iter()
             .filter(|s| s.starts_with("sentinel"))
             .collect();
-        assert_eq!(sentinel_slots, vec!["sentinel-1", "sentinel-2", "sentinel-3"]);
+        assert_eq!(
+            sentinel_slots,
+            vec!["sentinel-1", "sentinel-2", "sentinel-3"]
+        );
     }
 
     #[test]

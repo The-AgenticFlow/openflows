@@ -1179,8 +1179,9 @@ Before significant work, read the relevant skill file to understand the workflow
         // multiple sentinel slots are left bound to one ticket.
         if role == "sentinel" {
             let forge_worker_id = match &ticket.status {
-                TicketStatus::Assigned { worker_id }
-                | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                TicketStatus::Assigned { worker_id } | TicketStatus::InProgress { worker_id } => {
+                    worker_id.clone()
+                }
                 _ => String::new(),
             };
             let paired = Self::paired_sentinel_slot(&forge_worker_id);
@@ -1206,14 +1207,11 @@ Before significant work, read the relevant skill file to understand the workflow
             // NOT treated as "missing" — granting ownership on a transient error
             // would let the fallback rotate a live shared chat once the next
             // lookup succeeds and finds it attached to another workspace.
-            let shared_chat_key =
-                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+            let shared_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
             let (chat_exists, chat_healthy, chat_workspace_matches, lookup_errored) =
                 match store.get_typed::<String>(&shared_chat_key).await {
                     Some(stored_chat_id) => match client.get_chat_opt(&stored_chat_id).await {
-                        Ok(Some(chat)) => {
-                            (true, true, chat.workspace_id == *workspace_id, false)
-                        }
+                        Ok(Some(chat)) => (true, true, chat.workspace_id == *workspace_id, false),
                         Ok(None) => (false, false, false, false),
                         Err(_) => (false, false, false, true),
                     },
@@ -1982,17 +1980,19 @@ Use `openflows-harness` for all coordination:
                     let sentinel_slot = paired
                         .as_deref()
                         .and_then(|id| {
-                            live_slots.get(id).map(|slot| {
-                                (id.to_string(), slot.clone())
-                            })
+                            live_slots
+                                .get(id)
+                                .map(|slot| (id.to_string(), slot.clone()))
                         })
                         .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
                         .or_else(|| {
-                            live_slots.iter().find(|(id, slot)| {
-                                Self::worker_role(id) == "sentinel"
-                                    && matches!(slot.status, WorkerStatus::Idle)
-                            })
-                            .map(|(id, slot)| (id.clone(), slot.clone()))
+                            live_slots
+                                .iter()
+                                .find(|(id, slot)| {
+                                    Self::worker_role(id) == "sentinel"
+                                        && matches!(slot.status, WorkerStatus::Idle)
+                                })
+                                .map(|(id, slot)| (id.clone(), slot.clone()))
                         });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
@@ -2317,11 +2317,13 @@ Use `openflows-harness` for all coordination:
                         })
                         .filter(|(_, slot)| matches!(slot.status, WorkerStatus::Idle))
                         .or_else(|| {
-                            live_slots.iter().find(|(id, slot)| {
-                                Self::worker_role(id) == "sentinel"
-                                    && matches!(slot.status, WorkerStatus::Idle)
-                            })
-                            .map(|(id, slot)| (id.clone(), slot.clone()))
+                            live_slots
+                                .iter()
+                                .find(|(id, slot)| {
+                                    Self::worker_role(id) == "sentinel"
+                                        && matches!(slot.status, WorkerStatus::Idle)
+                                })
+                                .map(|(id, slot)| (id.clone(), slot.clone()))
                         });
 
                     let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
@@ -3149,9 +3151,10 @@ Use `openflows-harness` for all coordination:
                         let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
                         let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
                         let review_done: Option<Value> = store.get_typed(&review_key).await;
-                        let review_complete = phase.as_deref().is_some_and(|p| {
-                            p != "planning" && p != "review_ready"
-                        }) || gate_approved.is_some()
+                        let review_complete = phase
+                            .as_deref()
+                            .is_some_and(|p| p != "planning" && p != "review_ready")
+                            || gate_approved.is_some()
                             || review_done.is_some();
                         if review_complete {
                             info!(
@@ -3332,8 +3335,7 @@ Use `openflows-harness` for all coordination:
     /// `sentinel-i`, restoring the 1:1 FORGE-SENTINEL pair of the fleet.
     /// Any worker slot id carrying an index `i` maps to `sentinel-i`.
     fn paired_sentinel_slot(forge_worker_id: &str) -> Option<String> {
-        Self::worker_index(forge_worker_id)
-            .map(|i| format!("sentinel-{}", i))
+        Self::worker_index(forge_worker_id).map(|i| format!("sentinel-{}", i))
     }
 
     /// Whether a sentinel slot may operate on the shared
@@ -4832,9 +4834,18 @@ mod tests {
     #[test]
     fn paired_sentinel_maps_forge_index_one_to_one() {
         // Each forge slot pairs with the sentinel slot of the same index.
-        assert_eq!(NexusNode::paired_sentinel_slot("forge-1"), Some("sentinel-1".to_string()));
-        assert_eq!(NexusNode::paired_sentinel_slot("forge-2"), Some("sentinel-2".to_string()));
-        assert_eq!(NexusNode::paired_sentinel_slot("forge-4"), Some("sentinel-4".to_string()));
+        assert_eq!(
+            NexusNode::paired_sentinel_slot("forge-1"),
+            Some("sentinel-1".to_string())
+        );
+        assert_eq!(
+            NexusNode::paired_sentinel_slot("forge-2"),
+            Some("sentinel-2".to_string())
+        );
+        assert_eq!(
+            NexusNode::paired_sentinel_slot("forge-4"),
+            Some("sentinel-4".to_string())
+        );
         // Non-indexed slots have no pair.
         assert_eq!(NexusNode::paired_sentinel_slot("lore"), None);
         assert_eq!(NexusNode::paired_sentinel_slot("vessel"), None);
@@ -4847,24 +4858,42 @@ mod tests {
     #[test]
     fn sentinel_shared_chat_ownership_uses_one_owner() {
         // The paired sentinel always owns the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(true, false, true, true, false, false));
-        assert!(NexusNode::sentinel_may_own_shared_chat(true, true, true, true, true, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(
+            true, false, true, true, false, false
+        ));
+        assert!(NexusNode::sentinel_may_own_shared_chat(
+            true, true, true, true, true, false
+        ));
         // A sentinel that is neither paired nor assigned to the ticket is blocked.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, true, true, false, false));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(
+            false, false, true, true, false, false
+        ));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(
+            false, false, false, false, false, false
+        ));
         // The assigned fallback owns an existing, healthy chat only when its
         // workspace matches the chat's bound workspace — a duplicate sentinel
         // bound to a different workspace must not rotate the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, true, true, false));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, true, true, false, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(
+            false, true, true, true, true, false
+        ));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(
+            false, true, true, true, false, false
+        ));
         // When the chat is confirmed missing (recovery / first creation), the
         // assigned sentinel is allowed to (re)create it.
-        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(
+            false, true, false, false, false, false
+        ));
         // A transient lookup failure is NOT treated as missing, so it never
         // grants ownership — the fallback must not rotate on a temporary error.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false, true));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(
+            false, true, false, false, false, true
+        ));
         // A non-assigned sentinel cannot create the chat in either case.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false, true));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(
+            false, false, false, false, false, true
+        ));
     }
 
     #[test]
