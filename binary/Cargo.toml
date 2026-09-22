@@ -1,6 +1,6 @@
 [package]
 name    = "openflows"
-version = "1.5.6"
+version = "1.5.7"
 edition = "2021"
 license = "MIT"
 # Register the repo-root README with the package so release-plz tracks edits to it
