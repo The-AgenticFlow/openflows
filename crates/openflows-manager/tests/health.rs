@@ -20,6 +20,8 @@ impl openflows_manager::server::ReadinessCheck for UnreadyProbe {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), openflows_manager::error::ManagerError>> + Send + '_>>
     {
+        // Simulates a dependency that responds with a concrete failure. The
+        // readiness handler should translate this into a sanitized 503 body.
         Box::pin(async {
             Err(openflows_manager::error::ManagerError::Service(
                 anyhow::anyhow!("store unavailable"),
@@ -33,12 +35,17 @@ impl openflows_manager::server::ReadinessCheck for HangingProbe {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<(), openflows_manager::error::ManagerError>> + Send + '_>>
     {
+        // Simulates a dependency future that never resolves, exercising the
+        // readiness timeout path rather than an immediate error path.
         Box::pin(async { std::future::pending().await })
     }
 }
 
 #[tokio::test]
 async fn health_endpoint_returns_ready_without_secrets() {
+    // The liveness endpoint must be safe for unauthenticated infrastructure
+    // probes, so the response is checked for both expected metadata and absent
+    // secret-like implementation details.
     let app =
         openflows_manager::server::create_router(openflows_manager::server::AppState::for_tests());
 
@@ -68,6 +75,9 @@ async fn health_endpoint_returns_ready_without_secrets() {
 
 #[tokio::test]
 async fn health_remains_live_when_readiness_dependency_fails() {
+    // Liveness should continue to return 200 even when readiness fails. This is
+    // important for distinguishing a running-but-unready process from a crashed
+    // one in orchestration systems.
     let app = openflows_manager::server::create_router(
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
@@ -90,6 +100,8 @@ async fn health_remains_live_when_readiness_dependency_fails() {
 
 #[tokio::test]
 async fn readiness_returns_unavailable_when_dependency_check_fails() {
+    // A failing dependency should make the process unready without leaking the
+    // dependency error message to the HTTP client.
     let app = openflows_manager::server::create_router(
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
@@ -121,6 +133,8 @@ async fn readiness_returns_unavailable_when_dependency_check_fails() {
 
 #[tokio::test]
 async fn readiness_returns_unavailable_when_dependency_check_hangs() {
+    // Readiness must fail closed when a dependency stalls. The outer timeout
+    // keeps the test from hanging if the endpoint-level timeout regresses.
     let app = openflows_manager::server::create_router(
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
@@ -151,6 +165,8 @@ async fn readiness_returns_unavailable_when_dependency_check_hangs() {
 
 #[tokio::test]
 async fn api_v1_router_is_mounted_for_future_routes() {
+    // This protects the public shape of the versioned API mount while the first
+    // substantive manager endpoints are still being introduced.
     let app =
         openflows_manager::server::create_router(openflows_manager::server::AppState::for_tests());
 
@@ -174,6 +190,8 @@ async fn api_v1_router_is_mounted_for_future_routes() {
 
 #[tokio::test]
 async fn server_starts_serves_readiness_and_shuts_down() {
+    // Bind to an ephemeral local port so the test validates the real TCP server
+    // path without depending on a fixed port being free on the host.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -192,6 +210,8 @@ async fn server_starts_serves_readiness_and_shuts_down() {
     let value: Value = response.json().await.unwrap();
     assert_eq!(value["status"], "ready");
 
+    // Drive graceful shutdown through the same future contract used by the
+    // binary entry point, then await the server task so shutdown errors surface.
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
