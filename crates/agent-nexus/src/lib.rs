@@ -1200,18 +1200,24 @@ Before significant work, read the relevant skill file to understand the workflow
             // guard exists to prevent, a duplicate sentinel bound to the same
             // ticket but a different workspace must NOT be allowed to operate on
             // the shared chat. Ownership of an existing chat is decided by
-            // workspace match; when the chat is missing (not yet created, or its
-            // workspace was destroyed during recovery) an assigned sentinel is
-            // allowed to (re)create it.
+            // workspace match; when the chat is confirmed missing (not yet
+            // created, or its workspace was destroyed during recovery) an assigned
+            // sentinel is allowed to (re)create it. A transient lookup failure is
+            // NOT treated as "missing" — granting ownership on a transient error
+            // would let the fallback rotate a live shared chat once the next
+            // lookup succeeds and finds it attached to another workspace.
             let shared_chat_key =
                 full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
-            let (chat_exists, chat_healthy, chat_workspace_matches) =
+            let (chat_exists, chat_healthy, chat_workspace_matches, lookup_errored) =
                 match store.get_typed::<String>(&shared_chat_key).await {
                     Some(stored_chat_id) => match client.get_chat_opt(&stored_chat_id).await {
-                        Ok(Some(chat)) => (true, true, chat.workspace_id == *workspace_id),
-                        Ok(None) | Err(_) => (false, false, false),
+                        Ok(Some(chat)) => {
+                            (true, true, chat.workspace_id == *workspace_id, false)
+                        }
+                        Ok(None) => (false, false, false, false),
+                        Err(_) => (false, false, false, true),
                     },
-                    None => (false, false, false),
+                    None => (false, false, false, false),
                 };
             let owns_shared_chat = Self::sentinel_may_own_shared_chat(
                 is_paired,
@@ -1219,6 +1225,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 chat_exists,
                 chat_healthy,
                 chat_workspace_matches,
+                lookup_errored,
             );
             if !owns_shared_chat {
                 debug!(
@@ -3338,20 +3345,28 @@ Use `openflows-harness` for all coordination:
     ///   sentinel whose workspace matches the chat's bound workspace
     ///   (`chat_workspace_matches`); a duplicate sentinel assigned to the same
     ///   ticket but bound to a different workspace is not the owner and must not
-    ///   rotate the shared chat. When the chat is missing or unreadable (not yet
+    ///   rotate the shared chat. When the chat is confirmed missing (not yet
     ///   created, or its workspace was destroyed during recovery), the assigned
     ///   sentinel is allowed to create/recreate it.
+    /// - A transient lookup failure (`lookup_errored`) is kept distinct from a
+    ///   confirmed missing chat: it never grants ownership, so a fallback cannot
+    ///   rotate a live shared chat on a temporary Coder API error. The sentinel
+    ///   simply skips this pass and retries on a later poll.
     fn sentinel_may_own_shared_chat(
         is_paired: bool,
         is_ticket_sentinel: bool,
         chat_exists: bool,
         chat_healthy: bool,
         chat_workspace_matches: bool,
+        lookup_errored: bool,
     ) -> bool {
         if is_paired {
             return true;
         }
         if !is_ticket_sentinel {
+            return false;
+        }
+        if lookup_errored {
             return false;
         }
         if chat_exists && chat_healthy {
@@ -4832,22 +4847,24 @@ mod tests {
     #[test]
     fn sentinel_shared_chat_ownership_uses_one_owner() {
         // The paired sentinel always owns the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(true, false, true, true, false));
-        assert!(NexusNode::sentinel_may_own_shared_chat(true, true, true, true, true));
+        assert!(NexusNode::sentinel_may_own_shared_chat(true, false, true, true, false, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(true, true, true, true, true, false));
         // A sentinel that is neither paired nor assigned to the ticket is blocked.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, true, true, false));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, true, true, false, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false, false));
         // The assigned fallback owns an existing, healthy chat only when its
         // workspace matches the chat's bound workspace — a duplicate sentinel
         // bound to a different workspace must not rotate the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, true, true));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, true, true, false));
-        // When the chat is missing or unreadable (recovery / first creation), the
+        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, true, true, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, true, true, false, false));
+        // When the chat is confirmed missing (recovery / first creation), the
         // assigned sentinel is allowed to (re)create it.
-        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false));
-        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, true, false, false));
+        assert!(NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false, false));
+        // A transient lookup failure is NOT treated as missing, so it never
+        // grants ownership — the fallback must not rotate on a temporary error.
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, true, false, false, false, true));
         // A non-assigned sentinel cannot create the chat in either case.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false));
+        assert!(!NexusNode::sentinel_may_own_shared_chat(false, false, false, false, false, true));
     }
 
     #[test]
