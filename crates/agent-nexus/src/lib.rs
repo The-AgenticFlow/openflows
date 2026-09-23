@@ -7,10 +7,10 @@ use coder_client::{
 };
 use config::{
     state::{
-        full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord, KEY_COMMAND_GATE,
-        KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
-        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REVIEW, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE,
-        KEY_WORKER_SLOTS,
+        address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
+        HeartbeatRecord, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
+        KEY_TICKET_REVIEW, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -479,6 +479,33 @@ Before significant work, read the relevant skill file to understand the workflow
                             ticket_id = %tid,
                             "Duplicate PR for ticket already in pending_prs — skipping (only one PR per ticket tracked)"
                         );
+                        continue;
+                    }
+
+                    // If FORGE is (or was) addressing a VESSEL-dispatched
+                    // `/address_review` for this PR, always re-add it. This
+                    // overrides the ticket-state skip rules below (Failed /
+                    // InProgress / awaiting human) so VESSEL can resume polling
+                    // once FORGE re-arms — otherwise a rework ticket in those
+                    // states would never re-enter pending_prs and the PR would
+                    // strand forever.
+                    let dispatch_key = address_review_dispatched_key(pr.number);
+                    if store.get(&dispatch_key).await.is_some() {
+                        info!(
+                            pr_number = pr.number,
+                            ticket_id = %tid,
+                            "PR has an active /address_review dispatch — re-adding to pending_prs regardless of ticket state"
+                        );
+                        pending_prs.push(json!({
+                            "number": pr.number,
+                            "ticket_id": pr.ticket_id,
+                            "head_sha": pr.head_sha,
+                            "head_branch": pr.head_branch,
+                            "base_branch": pr.base_branch,
+                            "title": pr.title,
+                            "mergeable": pr.mergeable,
+                            "has_conflicts": pr.has_conflicts(),
+                        }));
                         continue;
                     }
 

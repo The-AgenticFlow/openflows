@@ -10,8 +10,10 @@ ignored = ["tokio"]
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 config          = { version = "0.2.0", path = "../config" }
 coder-client    = { version = "0.1.0", path = "../coder-client", features = ["chats-api"] }
+github          = { version = "0.1.0", path = "../github" }
   anyhow      = { workspace = true }
   async-trait = { workspace = true }
+  regex       = "1"
   serde       = { workspace = true }
   serde_json  = { workspace = true }
   tokio       = { workspace = true }

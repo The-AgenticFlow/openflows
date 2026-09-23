@@ -107,6 +107,7 @@ pub const ACTION_DEPLOY_FAILED: &str = "deploy_failed";
 pub const ACTION_MERGE_BLOCKED: &str = "merge_blocked";
 pub const ACTION_MERGE_PRS: &str = "merge_prs";
 pub const ACTION_CONFLICTS_DETECTED: &str = "conflicts_detected";
+pub const ACTION_ADDRESS_REVIEW_DISPATCHED: &str = "address_review_dispatched";
 pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
 pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
 pub const ACTION_DOCS_PENDING: &str = "docs_pending";
@@ -180,4 +181,24 @@ pub fn full_ticket_key(ticket_id: &str, subkey: &str, role: &str) -> String {
 /// e.g. `ticket:T-42:status`
 pub fn full_ticket_key_flat(ticket_id: &str, subkey: &str) -> String {
     format!("ticket:{}:{}", ticket_id, subkey)
+}
+
+// ── `/address_review` rework-loop keys (shared VESSEL/FORGE/NEXUS) ───────
+
+/// Flat key for the PR head SHA VESSEL last dispatched `/address_review` for.
+/// A live value means FORGE is (or was) addressing the review on that head and
+/// the PR must not be re-dispatched for the same SHA. NEXUS treats a live value
+/// as a reason to keep re-adding the PR so VESSEL can resume polling.
+/// Full key: `_address_review_dispatched_{pr_number}`
+pub fn address_review_dispatched_key(pr_number: u64) -> String {
+    format!("_address_review_dispatched_{}", pr_number)
+}
+
+/// Flat key FORGE writes after it has addressed a VESSEL-dispatched
+/// `/address_review` and re-armed the PR with `status set review_ready`. VESSEL
+/// watches for these markers so it re-polls the PR without depending on NEXUS
+/// re-discovery, then clears the marker once it re-adds the PR.
+/// Full key: `_address_review_rearmed_{pr_number}`
+pub fn address_review_rearmed_key(pr_number: u64) -> String {
+    format!("_address_review_rearmed_{}", pr_number)
 }

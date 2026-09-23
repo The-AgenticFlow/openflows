@@ -149,6 +149,90 @@ impl SentinelNode {
             );
         }
     }
+
+    /// Construct a GitHub REST client for SENTINEL's review submission from the
+    /// environment (external-auth token, same source VESSEL uses).
+    fn github_client_from_env() -> Option<github::GithubRestClient> {
+        let token = config::GithubConfig::init_from_env()
+            .ok()
+            .and_then(|g| g.resolve_token())
+            .filter(|t| !t.is_empty())?;
+        Some(github::GithubRestClient::new(token))
+    }
+
+    /// Parse the store's `"repository"` value (`owner/repo`) into its parts.
+    fn parse_repository(repository: Option<&str>) -> (String, String) {
+        match repository.and_then(|r| r.split_once('/')) {
+            Some((owner, repo)) => (owner.to_string(), repo.to_string()),
+            None => (String::new(), String::new()),
+        }
+    }
+
+    /// Derive inline review comments from a SENTINEL report body. Lines matching
+    /// a `path:line — message` (or `path:line message`) shape become GitHub
+    /// inline review comments so a REQUEST_CHANGES review carries actionable
+    /// file:line guidance for FORGE to address.
+    fn parse_report_comments(report: &str) -> Vec<github::ReviewCommentInput> {
+        let re = regex::Regex::new(r"(?m)^\s*([^\s:]+):(\d+)[\s:\-–—]*\s*(.*)$").unwrap();
+        let mut comments = Vec::new();
+        for caps in re.captures_iter(report) {
+            let Some(path) = caps.get(1) else { continue };
+            let Some(line) = caps.get(2) else { continue };
+            let msg = caps.get(3).map(|m| m.as_str().trim()).unwrap_or("").trim();
+            let Ok(line_num) = line.as_str().parse::<u64>() else {
+                continue;
+            };
+            if !path.as_str().is_empty() && !msg.is_empty() {
+                comments.push(github::ReviewCommentInput {
+                    path: path.as_str().to_string(),
+                    line: line_num,
+                    body: msg.to_string(),
+                });
+            }
+        }
+        comments
+    }
+
+    /// Submit SENTINEL's verdict as a GitHub PR review. Non-fatal: any failure
+    /// (e.g. missing token, insufficient scope, network) is logged and the
+    /// sharedstore verdict flow is never blocked by it.
+    async fn submit_github_review(
+        store: &SharedStore,
+        pr_number: u64,
+        event: &str,
+        body: &str,
+        comments: Vec<github::ReviewCommentInput>,
+    ) {
+        let repository: Option<String> = store.get_typed("repository").await;
+        let (owner, repo) = Self::parse_repository(repository.as_deref());
+        if owner.is_empty() || repo.is_empty() {
+            warn!(
+                pr_number,
+                event, "Repository info missing — cannot submit GitHub PR review"
+            );
+            return;
+        }
+        let Some(client) = Self::github_client_from_env() else {
+            warn!(
+                pr_number,
+                event, "No GitHub token — cannot submit GitHub PR review"
+            );
+            return;
+        };
+        if let Err(e) = client
+            .submit_pull_request_review(&owner, &repo, pr_number, event, body, comments)
+            .await
+        {
+            warn!(
+                pr_number,
+                event,
+                error = %e,
+                "Failed to submit GitHub PR review (non-fatal)"
+            );
+        } else {
+            info!(pr_number, event, "Submitted GitHub PR review");
+        }
+    }
 }
 
 #[async_trait]
@@ -373,9 +457,31 @@ impl Node for SentinelNode {
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
 
+                    // Read the review payload (pr_number, report) before consuming
+                    // it so we can mirror the approve verdict on GitHub.
+                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                    let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
+                    if let Some(pr_number) = review_payload.as_ref().and_then(|r| r.pr_number) {
+                        let report = review_payload
+                            .as_ref()
+                            .map(|r| r.report.clone())
+                            .unwrap_or_default();
+                        Self::submit_github_review(
+                            store,
+                            pr_number,
+                            "APPROVE",
+                            if report.trim().is_empty() {
+                                "Review approved by SENTINEL."
+                            } else {
+                                &report
+                            },
+                            Vec::new(),
+                        )
+                        .await;
+                    }
+
                     // Consume the review verdict so it is not replayed on the
                     // next poll cycle.
-                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
                     store.del(&review_key).await;
 
                     // Release the SENTINEL reviewer slot, not the Forge owner
@@ -397,6 +503,25 @@ impl Node for SentinelNode {
                         .map(|r| r.report.clone())
                         .unwrap_or_default();
                     let pr_number = review_payload.as_ref().and_then(|r| r.pr_number);
+
+                    // Mirror the reject verdict on GitHub: submit a
+                    // REQUEST_CHANGES review carrying inline comments derived
+                    // from the report's file:line guidance. Non-fatal.
+                    if let Some(pr_number) = pr_number {
+                        let comments = Self::parse_report_comments(&report);
+                        Self::submit_github_review(
+                            store,
+                            pr_number,
+                            "REQUEST_CHANGES",
+                            if report.trim().is_empty() {
+                                "Changes requested by SENTINEL."
+                            } else {
+                                &report
+                            },
+                            comments,
+                        )
+                        .await;
+                    }
 
                     // Look up the FORGE chat via its role name (e.g. `forge`), not
                     // the literal worker id (`forge-1`). The chat bindings are stored
@@ -806,5 +931,47 @@ mod tests {
     fn action_constants_match_expected_action_names() {
         assert_eq!(ACTION_REVIEW_APPROVE, "review_approve");
         assert_eq!(ACTION_REVIEW_REJECT, "review_reject");
+    }
+
+    #[test]
+    fn parse_report_comments_extracts_file_line_guidance() {
+        let report = "The PR needs work:\n\n\
+                      src/api.rs:78 — missing pagination; required per spec\n\
+                      src/api.rs:78  also add a cursor param\n\
+                      tests/integration.rs:12 — flaky assertion\n\
+                      not-a-location line\n\
+                      src/models.rs:5 —\n";
+        let comments = SentinelNode::parse_report_comments(report);
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].path, "src/api.rs");
+        assert_eq!(comments[0].line, 78);
+        assert!(comments[0].body.contains("missing pagination"));
+        assert_eq!(comments[1].path, "src/api.rs");
+        assert_eq!(comments[1].line, 78);
+        assert!(comments[1].body.contains("cursor param"));
+        assert_eq!(comments[2].path, "tests/integration.rs");
+        assert_eq!(comments[2].line, 12);
+    }
+
+    #[test]
+    fn parse_report_comments_empty_for_no_matches() {
+        assert!(SentinelNode::parse_report_comments("no guidance here").is_empty());
+        assert!(SentinelNode::parse_report_comments("").is_empty());
+    }
+
+    #[test]
+    fn parse_repository_splits_owner_repo() {
+        assert_eq!(
+            SentinelNode::parse_repository(Some("owner/repo")),
+            ("owner".to_string(), "repo".to_string())
+        );
+        assert_eq!(
+            SentinelNode::parse_repository(Some("single")),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            SentinelNode::parse_repository(None),
+            (String::new(), String::new())
+        );
     }
 }

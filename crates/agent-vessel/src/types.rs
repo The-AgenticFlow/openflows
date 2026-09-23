@@ -13,11 +13,26 @@ pub enum CiReadiness {
     SetupInProgress,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct VesselConfig {
     pub ci_poll: CiPollConfig,
     pub merge_method: MergeMethod,
     pub github_token: String,
+    /// Whether VESSEL dispatches `/address_review` directives to FORGE's chat
+    /// when a PR is in a non-merge-ready review state. When disabled, VESSEL
+    /// falls back to the existing file-based rework markers.
+    pub address_review_enabled: bool,
+}
+
+impl Default for VesselConfig {
+    fn default() -> Self {
+        Self {
+            ci_poll: CiPollConfig::default(),
+            merge_method: MergeMethod::default(),
+            github_token: String::new(),
+            address_review_enabled: true,
+        }
+    }
 }
 
 impl VesselConfig {
@@ -29,6 +44,7 @@ impl VesselConfig {
             ci_poll: CiPollConfig::default(),
             merge_method: MergeMethod::default(),
             github_token,
+            address_review_enabled: true,
         })
     }
 
@@ -42,6 +58,7 @@ impl VesselConfig {
             ci_poll: CiPollConfig::default(),
             merge_method: MergeMethod::default(),
             github_token,
+            address_review_enabled: true,
         }
     }
 }
@@ -80,6 +97,15 @@ pub enum VesselOutcome {
         pr_number: u64,
         conflicted_files: Vec<String>,
     },
+    /// VESSEL dispatched a `/address_review` directive to FORGE because the PR
+    /// is in a non-merge-ready review state (conflicts / changes_requested /
+    /// comments). The PR is removed from pending_prs and FORGE re-signals
+    /// `review_ready` after rework.
+    Reviews {
+        ticket_id: Option<String>,
+        pr_number: u64,
+        state: String,
+    },
     DocsPrClosed {
         pr_number: u64,
         reason: String,
@@ -95,6 +121,7 @@ impl VesselOutcome {
             VesselOutcome::CiTimeout { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::CiMissing { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::Conflicts { ticket_id, .. } => ticket_id.as_deref(),
+            VesselOutcome::Reviews { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::DocsPrClosed { .. } => None,
         }
     }
@@ -107,6 +134,7 @@ impl VesselOutcome {
             VesselOutcome::CiTimeout { pr_number, .. } => *pr_number,
             VesselOutcome::CiMissing { pr_number, .. } => *pr_number,
             VesselOutcome::Conflicts { pr_number, .. } => *pr_number,
+            VesselOutcome::Reviews { pr_number, .. } => *pr_number,
             VesselOutcome::DocsPrClosed { pr_number, .. } => *pr_number,
         }
     }

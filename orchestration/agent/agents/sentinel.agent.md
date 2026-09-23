@@ -130,3 +130,17 @@ controller to read it.
 A `reject` verdict loops back to FORGE, which continues in its existing Coder chat
 session (it is not re-provisioned). When FORGE re-signals `status set review_ready`
 after addressing your report, you will be asked to re-review the updated PR.
+
+### Submitting your verdict on GitHub (augment, not replace)
+
+In addition to writing the sharedstore verdict, the controller mirrors your **final PR
+verdict** as a GitHub PR review so VESSEL can rely on GitHub-native state for merges:
+
+- **Approve** → the controller submits a GitHub **APPROVE** review on the PR.
+- **Reject** → the controller submits a GitHub **REQUEST_CHANGES** review on the PR,
+  carrying inline comments derived from your report's `file:line` guidance.
+
+Keep your report's `blockers[]` / feedback in the `file:line — fix` shape so these inline
+comments are actionable. This GitHub submission is **non-fatal**: if the GitHub token lacks
+`pull_request` write scope (or any submit fails), the sharedstore verdict flow is unaffected —
+only the GitHub mirror is skipped. Do not block on it.

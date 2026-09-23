@@ -1002,6 +1002,92 @@ impl GithubRestClient {
         Ok(conflicted)
     }
 
+    // ── PR Review & Comment API ──────────────────────────────────────────
+
+    /// List the reviews submitted on a pull request.
+    ///
+    /// GitHub returns *all* reviews for a PR, including superseded ones (a
+    /// reviewer may Approve and later request changes). Use
+    /// [`effective_review_state`] to compute the current state from this list.
+    pub async fn list_pr_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<PrReview>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
+            self.api_base, owner, repo, pr_number
+        );
+        self.get_json(&url).await
+    }
+
+    /// List the inline review comments on a pull request.
+    ///
+    /// Uses the `/pulls/{n}/comments` endpoint (diff/line comments), which is
+    /// distinct from the issue-comments endpoint.
+    pub async fn list_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<ReviewComment>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/comments?per_page=100",
+            self.api_base, owner, repo, pr_number
+        );
+        self.get_json(&url).await
+    }
+
+    /// Submit a review on a pull request (approve, request changes, or comment).
+    ///
+    /// `event` must be one of `APPROVE`, `REQUEST_CHANGES`, or `COMMENT`.
+    /// Errors are surfaced to the caller, which is expected to handle them
+    /// non-fatally (e.g. a token without `pull_request` write scope yields a 403).
+    pub async fn submit_pull_request_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        event: &str,
+        body: &str,
+        comments: Vec<ReviewCommentInput>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews",
+            self.api_base, owner, repo, pr_number
+        );
+        let payload = serde_json::json!({
+            "event": event,
+            "body": body,
+            "comments": comments,
+        });
+        let body_bytes = serde_json::to_vec(&payload)?;
+
+        let resp = self
+            .send_with_retry(|| self.build_post(&url, &body_bytes))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to submit pull request review on PR #{} (status {}): {}",
+                pr_number,
+                status,
+                text
+            );
+        }
+
+        info!(
+            owner,
+            repo,
+            pr = pr_number,
+            event,
+            "Submitted pull request review"
+        );
+        Ok(())
+    }
+
     // ── Actions Job Log Fetching ──────────────────────────────────────────
 
     /// Fetch job logs for failed workflow runs associated with a commit.
@@ -1339,4 +1425,230 @@ struct WorkflowJob {
     name: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
+}
+
+// ── PR Review & Comment Types ──────────────────────────────────────────────
+
+/// A review submitted on a pull request.
+///
+/// GitHub returns every review ever submitted, including superseded ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrReview {
+    /// `APPROVED`, `CHANGES_REQUESTED`, or `COMMENTED`.
+    pub state: String,
+    /// Reviewer's GitHub login (from the nested `user` object).
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+impl PrReview {
+    pub fn state_enum(&self) -> PrReviewState {
+        PrReviewState::from_api_state(&self.state)
+    }
+}
+
+/// The computed, current review state of a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    None,
+}
+
+impl PrReviewState {
+    /// Parse a raw GitHub review `state` string into the typed state.
+    pub fn from_api_state(state: &str) -> Self {
+        match state {
+            "APPROVED" => PrReviewState::Approved,
+            "CHANGES_REQUESTED" => PrReviewState::ChangesRequested,
+            "COMMENTED" => PrReviewState::Commented,
+            _ => PrReviewState::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrReviewState::Approved => "approved",
+            PrReviewState::ChangesRequested => "changes_requested",
+            PrReviewState::Commented => "commented",
+            PrReviewState::None => "none",
+        }
+    }
+}
+
+/// An inline review comment on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// Input for an inline comment attached to a submitted review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCommentInput {
+    /// The path of the file to comment on.
+    pub path: String,
+    /// The line of the blob in the pull request diff to comment on.
+    pub line: u64,
+    /// The text of the comment.
+    pub body: String,
+}
+
+/// Compute the effective review state of a PR from the (possibly superseded)
+/// list of reviews returned by `GET /pulls/{n}/reviews`.
+///
+/// Rules:
+/// - Consider only the latest review per reviewer.
+/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
+///   approve then re-request changes).
+/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
+/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
+pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
+    // Latest review per reviewer (later `submitted_at` wins).
+    let mut latest: Vec<&PrReview> = Vec::new();
+    for review in reviews {
+        if review.user.as_deref().is_none() || review.user.as_deref() == Some("") {
+            continue;
+        }
+        let user = review.user.as_deref().unwrap_or("");
+        let idx = latest.iter().position(|r| r.user.as_deref() == Some(user));
+        let replace = match idx {
+            Some(i) => {
+                // Prefer the later review; fall back to insertion order when
+                // timestamps are absent.
+                match (&latest[i].submitted_at, &review.submitted_at) {
+                    (Some(a), Some(b)) => b > a,
+                    (None, Some(_)) => true,
+                    (Some(_), None) => false,
+                    (None, None) => true,
+                }
+            }
+            None => false,
+        };
+        match idx {
+            Some(i) if replace => {
+                latest[i] = review;
+            }
+            None => {
+                latest.push(review);
+            }
+            _ => {}
+        }
+    }
+
+    let mut any_approved = false;
+    for review in latest {
+        match review.state_enum() {
+            PrReviewState::ChangesRequested => return PrReviewState::ChangesRequested,
+            PrReviewState::Approved => any_approved = true,
+            _ => {}
+        }
+    }
+
+    if any_approved {
+        PrReviewState::Approved
+    } else {
+        PrReviewState::None
+    }
+}
+
+#[cfg(test)]
+mod pr_review_tests {
+    use super::*;
+
+    fn review(state: &str, user: &str, ts: &str) -> PrReview {
+        PrReview {
+            state: state.to_string(),
+            user: Some(user.to_string()),
+            submitted_at: Some(ts.to_string()),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_state_none() {
+        assert_eq!(effective_review_state(&[]), PrReviewState::None);
+    }
+
+    #[test]
+    fn test_effective_state_approved() {
+        let reviews = vec![
+            review("COMMENTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "bob", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_changes_requested_beats_approve() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("CHANGES_REQUESTED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_effective_state_latest_approve_wins() {
+        let reviews = vec![
+            review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_multi_reviewer_any_changes_wins() {
+        let reviews = vec![
+            review("APPROVED", "bob", "2026-01-02T00:00:00Z"),
+            review("CHANGES_REQUESTED", "carol", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_effective_state_ignores_superseded_approve() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("CHANGES_REQUESTED", "alice", "2026-01-02T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_state_enum_parsing() {
+        assert_eq!(
+            PrReviewState::from_api_state("APPROVED"),
+            PrReviewState::Approved
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("CHANGES_REQUESTED"),
+            PrReviewState::ChangesRequested
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("COMMENTED"),
+            PrReviewState::Commented
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("DISMISSED"),
+            PrReviewState::None
+        );
+    }
 }

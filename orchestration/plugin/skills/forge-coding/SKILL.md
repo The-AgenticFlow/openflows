@@ -59,6 +59,24 @@ If SENTINEL returns `CHANGES_REQUESTED`:
 - Re-run tests and linter
 - Re-submit with `/segment-done`
 
+## Handling `/address_review` from VESSEL
+
+VESSEL may dispatch a structured `/address_review` directive into your chat when your PR is
+not merge-ready because of GitHub-native review state: `conflicts`, `changes_requested`, or
+unaddressed inline comments. It includes `state`, `pr`, `reason`, inline `comments`
+(`path:line`), and conflicted files when relevant.
+
+1. Read every comment (`path:line` + message) and any conflicted files.
+2. For `conflicts`: fetch the latest base, resolve every conflict marker (integrate both
+   sides — never just pick one), stage, and commit.
+3. Address **all** inline comments, not just the first.
+4. Verify, then push. **Never force-push or bypass branch protection.**
+5. Re-arm the PR for review: `openflows-harness status set review_ready`.
+6. Stay in the same chat session. If you cannot resolve it, `status set blocked` with an
+   exact question.
+
+See `orchestration/plugin/commands/address_review.md` for the full contract.
+
 ## File locking
 
 Before writing to any file, the `pre_write_check.sh` hook validates ownership.
