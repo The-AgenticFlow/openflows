@@ -852,8 +852,33 @@ impl Node for VesselNode {
                                 .unwrap_or_else(|| format!("unknown/{}", pr_number))
                         });
 
-                    let ci_fix_md_written = self
-                        .write_ci_fix_md(
+                    // Prefer chat-based `/ci_fix` dispatch into the existing FORGE
+                    // chat/workspace so the existing forge is reused (it checks out
+                    // the already-existing branch) instead of spawning a fresh
+                    // workspace and starting from scratch. If no forge chat / Coder
+                    // client is available, fall back to the file-based `CI_FIX.md`
+                    // marker + worker reassignment below (which lets NEXUS
+                    // provision/reuse a forge for the issue).
+                    let ci_chat_dispatched = self
+                        .dispatch_ci_fix_for_pr(
+                            store,
+                            *pr_number,
+                            &tid,
+                            &head_branch,
+                            reason,
+                            failure_detail.as_ref(),
+                        )
+                        .await;
+
+                    let ci_fix_md_written = if ci_chat_dispatched {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "Dispatched /ci_fix to existing forge chat — reusing forge workspace"
+                        );
+                        false
+                    } else {
+                        self.write_ci_fix_md(
                             &CiFixPrInfo {
                                 pr_number: *pr_number,
                                 head_branch: head_branch.clone(),
@@ -862,7 +887,8 @@ impl Node for VesselNode {
                             reason,
                             failure_detail.as_ref(),
                         )
-                        .await;
+                        .await
+                    };
 
                     if ci_fix_md_written {
                         info!(
@@ -870,7 +896,7 @@ impl Node for VesselNode {
                             ticket_id = %tid,
                             "Wrote CI_FIX.md — routing to forge_pair for CI fix"
                         );
-                    } else {
+                    } else if !ci_chat_dispatched {
                         warn!(
                             pr_number,
                             ticket_id = %tid,
@@ -1027,8 +1053,26 @@ impl Node for VesselNode {
                                 .unwrap_or_else(|| format!("unknown/{}", pr_number))
                         });
 
-                    let ci_fix_md_written = self
-                        .write_ci_fix_md(
+                    let ci_chat_dispatched = self
+                        .dispatch_ci_fix_for_pr(
+                            store,
+                            *pr_number,
+                            &tid,
+                            &head_branch,
+                            "CI timed out — possible stuck or flaky CI run",
+                            None,
+                        )
+                        .await;
+
+                    let ci_fix_md_written = if ci_chat_dispatched {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "Dispatched /ci_fix to existing forge chat — reusing forge workspace (timeout)"
+                        );
+                        false
+                    } else {
+                        self.write_ci_fix_md(
                             &CiFixPrInfo {
                                 pr_number: *pr_number,
                                 head_branch: head_branch.clone(),
@@ -1037,7 +1081,8 @@ impl Node for VesselNode {
                             "CI timed out — possible stuck or flaky CI run",
                             None,
                         )
-                        .await;
+                        .await
+                    };
 
                     if ci_fix_md_written {
                         info!(
@@ -2591,6 +2636,70 @@ impl VesselNode {
         }
     }
 
+    /// Dispatch a `/ci_fix` directive into the responsible FORGE's **existing**
+    /// Coder chat, keyed by role name (`ticket:{id}:chat:forge`).
+    ///
+    /// The goal is to reuse the existing FORGE workspace/chat for the issue so it
+    /// checks out the already-existing branch and addresses the failing checks —
+    /// not spawn a fresh workspace and start from scratch. Returns `true` when the
+    /// directive was sent. When no forge chat or Coder client is resolvable,
+    /// returns `false` so the caller falls back to the file-based `CI_FIX.md` +
+    /// worker reassignment path (which lets NEXUS provision/reuse a forge).
+    async fn dispatch_ci_fix_for_pr(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        ticket_id: &str,
+        head_branch: &str,
+        reason: &str,
+        failure_detail: Option<&github::CiFailureDetail>,
+    ) -> bool {
+        let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+        let chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
+        let Some(client) = Self::coder_client_from_store(store).await else {
+            warn!(
+                ticket_id,
+                pr_number, "No Coder client — cannot dispatch /ci_fix"
+            );
+            return false;
+        };
+        let Some(chat_id) = chat_id else {
+            warn!(
+                ticket_id,
+                pr_number, "No forge chat binding — cannot dispatch /ci_fix"
+            );
+            return false;
+        };
+
+        let directive = build_ci_fix_directive(pr_number, ticket_id, head_branch, reason, failure_detail);
+
+        match client
+            .send_chat_message(
+                &chat_id,
+                vec![coder_client::types::ChatInputPart::text(directive)],
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    ticket_id,
+                    pr_number,
+                    chat_id,
+                    "Dispatched /ci_fix to existing forge chat"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    ticket_id,
+                    pr_number,
+                    error = %e, "Failed to dispatch /ci_fix to forge chat"
+                );
+                false
+            }
+        }
+    }
+
     /// Re-arm review PRs that FORGE signalled it addressed via `review_ready`.
     ///
     /// FORGE writes `_address_review_rearmed_{pr}` once it has re-armed the PR after
@@ -2851,6 +2960,58 @@ fn is_merge_conflict_message(msg: &str) -> bool {
     lower.contains("merge conflict")
         || lower.contains("merge_conflict")
         || (lower.contains("405") && lower.contains("method not allowed"))
+}
+
+/// Build the lightweight `/ci_fix` chat directive for FORGE.
+///
+/// This is a **pointer**, not a dump of the whole CI output: it names the PR, the
+/// ticket, the branch, the failure reason, and the failed check names + `path:line`
+/// annotations so FORGE can reproduce and fix in its existing workspace. FORGE is
+/// instructed to reuse its existing workspace/branch (via the `/ci_fix` command and
+/// `forge-ci-fix` skill) rather than start from scratch.
+fn build_ci_fix_directive(
+    pr_number: u64,
+    ticket_id: &str,
+    head_branch: &str,
+    reason: &str,
+    failure_detail: Option<&github::CiFailureDetail>,
+) -> String {
+    let mut out = String::from("/ci_fix\n");
+    out.push_str("state: ci_failed\n");
+    out.push_str(&format!("pr: {}\n", pr_number));
+    out.push_str(&format!("ticket: {}\n", ticket_id));
+    if !head_branch.is_empty() {
+        out.push_str(&format!("branch: {}\n", head_branch));
+    }
+    if !reason.trim().is_empty() {
+        out.push_str(&format!("reason: {}\n", reason.trim()));
+    }
+
+    if let Some(detail) = failure_detail {
+        let check_names = detail.failed_check_names();
+        if !check_names.is_empty() {
+            out.push_str("checks:\n");
+            for name in check_names {
+                out.push_str(&format!("- {}\n", name));
+            }
+        }
+        if !detail.annotations.is_empty() {
+            out.push_str("annotations:\n");
+            for a in &detail.annotations {
+                out.push_str(&format!(
+                    "- **{}** `{}:{}` {}\n",
+                    a.check_name, a.path, a.start_line, a.message
+                ));
+            }
+        }
+    }
+
+    out.push_str(
+        "\nReuse your existing workspace and branch (you already have this PR checked \
+         out). Match the failed checks to .github/workflows/, reproduce and fix ALL \
+         errors locally, push, then re-run: openflows-harness status set review_ready",
+    );
+    out
 }
 
 fn parse_repository(repository: Option<&str>) -> (&str, &str) {
@@ -3199,5 +3360,57 @@ mod tests {
         // Marker still cleared.
         let marker_keys = store.keys("_address_review_rearmed_*").await;
         assert!(marker_keys.is_empty());
+    }
+
+    #[test]
+    fn build_ci_fix_directive_is_minimal_pointer() {
+        let detail = github::CiFailureDetail {
+            failed_checks: vec![github::FailedCheck {
+                name: "check-lint".to_string(),
+                conclusion: "failure".to_string(),
+            }],
+            still_running: vec![],
+            job_logs: vec![(
+                "check-lint".to_string(),
+                "##[error]lint failed\n".to_string(),
+            )],
+            annotations: vec![github::CheckAnnotationDetail {
+                check_name: "check-lint".to_string(),
+                path: "src/api.rs".to_string(),
+                start_line: 78,
+                message: "missing pagination".to_string(),
+            }],
+        };
+        let d = build_ci_fix_directive(
+            42,
+            "T-034",
+            "forge-1/T-034",
+            "CI status: Failure",
+            Some(&detail),
+        );
+        assert!(d.contains("/ci_fix"));
+        assert!(d.contains("state: ci_failed"));
+        assert!(d.contains("pr: 42"));
+        assert!(d.contains("ticket: T-034"));
+        assert!(d.contains("branch: forge-1/T-034"));
+        assert!(d.contains("reason: CI status: Failure"));
+        // Pointer, not a dump: full job-log text must NOT be embedded.
+        assert!(!d.contains("##[error]lint failed"));
+        assert!(d.contains("check-lint"));
+        assert!(d.contains("src/api.rs"));
+        // FORGE is told to reuse its existing workspace and re-arm the PR.
+        assert!(d.contains("Reuse your existing workspace"));
+        assert!(d.contains("openflows-harness status set review_ready"));
+    }
+
+    #[test]
+    fn build_ci_fix_directive_omits_missing_parts() {
+        let d = build_ci_fix_directive(7, "T-007", "", "CI status: Failure", None);
+        assert!(d.contains("/ci_fix"));
+        assert!(d.contains("pr: 7"));
+        // No branch and no reason lines when absent.
+        assert!(!d.contains("branch:"));
+        assert!(!d.contains("checks:"));
+        assert!(!d.contains("annotations:"));
     }
 }

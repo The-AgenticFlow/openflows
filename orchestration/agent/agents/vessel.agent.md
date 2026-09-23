@@ -63,6 +63,19 @@ merge while the PR is in a rework state.
   (`awaiting_human`) instead of looping.
 - After FORGE addresses the review and re-signals `status set review_ready`, you re-poll.
 
+## `/ci_fix` dispatch
+
+When a pending PR has a **failing CI check** (`CiFailed` / `CiTimeout`), dispatch a structured
+`/ci_fix` directive into the responsible FORGE's **existing chat session** (keyed by role name,
+`ticket:{id}:chat:forge`) so it **reuses its existing workspace and branch** to fix the failing
+checks — not spawn a fresh workspace. The directive carries the PR number, ticket id, branch,
+failure reason, and the failed check names + `path:line` annotations.
+
+- If no forge chat / Coder client is resolvable, fall back to the file-based `CI_FIX.md` marker
+  and worker reassignment so NEXUS provisions/reuses a forge for the issue.
+- After FORGE fixes CI and re-signals `status set review_ready`, you re-poll.
+- See `orchestration/plugin/commands/ci_fix.md` for the full command contract.
+
 ## Merge gate
 
 You only merge once a PR is **ready_for_merge**: approved (GitHub-native) + no conflicts +

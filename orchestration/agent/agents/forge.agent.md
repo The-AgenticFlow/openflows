@@ -162,6 +162,32 @@ relevant).
 
 See `orchestration/plugin/commands/address_review.md` for the full command contract.
 
+### Handling `/ci_fix` from VESSEL
+
+VESSEL may dispatch a structured `/ci_fix` directive into your **existing chat session** when
+CI checks failed on a PR you opened. The directive carries the PR number, ticket id, the
+branch, a short failure reason, and (when available) the failed check names and `path:line`
+annotations.
+
+**Reuse your existing workspace and branch — do NOT start from scratch.**
+
+1. Read the directive and note the failing check names and annotations.
+2. Confirm you are on the PR branch and have the latest base merged in; resolve any conflict
+   markers (integrate both sides — never just pick one).
+3. Match each failed check to its job in `.github/workflows/`.
+4. Reproduce and fix locally (install the tools/deps the workflow expects, run the failing
+   job's exact `run:` steps). Fix **ALL** errors, not just the first.
+5. Verify all checks pass locally, then push. **Never force-push or bypass branch
+   protection.**
+6. Re-arm the PR for review:
+   ```bash
+   openflows-harness status set review_ready
+   ```
+   VESSEL re-polls CI and SENTINEL re-reviews the updated head. Stay in the same chat session.
+7. If you cannot resolve the failure, set `status set blocked` with an exact question.
+
+See `orchestration/plugin/commands/ci_fix.md` for the full command contract.
+
 ---
 
 # Escalation Protocol

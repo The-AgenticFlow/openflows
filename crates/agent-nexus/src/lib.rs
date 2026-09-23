@@ -904,6 +904,18 @@ Before significant work, read the relevant skill file to understand the workflow
 
         let coder_url: Option<String> = store.get_typed("coder_url").await;
 
+        // Resolve the git branch the workspace should check out. For rework of an
+        // existing PR (CI fix / review rework), this is the PR's `head_branch` from
+        // `pending_prs` so the freshly provisioned forge resumes the branch where the
+        // work was already done instead of starting afresh on the default branch.
+        // When no PR exists yet, fall back to the conventional `{worker}/{ticket}`
+        // branch the forge creates on first work.
+        let pending_prs: Vec<Value> = store
+            .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
+            .await
+            .unwrap_or_default();
+        let branch = Self::resolve_workspace_branch(&pending_prs, worker_id, ticket_id);
+
         // Note: The openflows-forge template expects the dev binaries via the
         // Terraform variable `TF_VAR_dev_binary_host_path` (not workspace parameters). Providing it this
         // variable allows the template's SessionStart script to mount and copy the correct CLI
@@ -915,6 +927,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 "repo_url": repo_url,
                 "role": worker_id,
                 "ticket_id": ticket_id,
+                "branch": branch,
                 "redis_url": "redis://redis:6379",
                 "tenant": config::EnvConfig::from_env()
                     .map(|e| e.tenant.effective_tenant().to_string())
@@ -1143,6 +1156,24 @@ Before significant work, read the relevant skill file to understand the workflow
             role.to_ascii_uppercase().replace('-', "_")
         );
         std::env::var(&env_key).unwrap_or_else(|_| format!("openflows-{}", role))
+    }
+
+    /// Resolve the git branch a freshly provisioned forge workspace should check out.
+    ///
+    /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
+    /// rework workspace resumes the branch where the work was already done), falling
+    /// back to the conventional `{worker}/{ticket}` branch for first-time work.
+    fn resolve_workspace_branch(
+        pending_prs: &[Value],
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> String {
+        pending_prs
+            .iter()
+            .find(|p| p.get("ticket_id").and_then(|v| v.as_str()) == Some(ticket_id))
+            .and_then(|p| p.get("head_branch").and_then(|v| v.as_str()).map(String::from))
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| format!("{}/{}", worker_id, ticket_id))
     }
 
     /// Create a Coder Chat for a ticket assignment and store the chat ID in SharedStore.
@@ -4874,6 +4905,42 @@ mod tests {
         assert_eq!(NexusNode::worker_role("forge-1"), "forge");
         assert_eq!(NexusNode::worker_role("forge-42"), "forge");
         assert_eq!(NexusNode::worker_role("sentinel"), "sentinel");
+    }
+
+    #[test]
+    fn resolve_workspace_branch_prefers_pending_pr_head_branch() {
+        let pending_prs = json!([
+            {"number": 42, "ticket_id": "T-034", "head_branch": "forge-1/T-034"},
+            {"number": 43, "ticket_id": "T-035", "head_branch": "forge-2/T-035"},
+        ]);
+        let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
+        // Rework of an existing PR reuses its real PR branch.
+        assert_eq!(
+            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-034"),
+            "forge-1/T-034"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_branch_falls_back_for_new_ticket() {
+        let pending_prs: Vec<Value> = Vec::new();
+        // No PR yet — fall back to the conventional worker/ticket branch.
+        assert_eq!(
+            NexusNode::resolve_workspace_branch(&pending_prs, "forge-3", "T-099"),
+            "forge-3/T-099"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_branch_ignores_empty_head_branch() {
+        let pending_prs = json!([
+            {"number": 7, "ticket_id": "T-007", "head_branch": ""}
+        ]);
+        let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
+        assert_eq!(
+            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-007"),
+            "forge-1/T-007"
+        );
     }
 
     #[test]

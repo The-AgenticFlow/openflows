@@ -55,6 +55,13 @@ data "coder_parameter" "repo_url" {
   type        = "string"
 }
 
+data "coder_parameter" "branch" {
+  name        = "branch"
+  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = default branch."
+  default     = ""
+  type        = "string"
+}
+
 data "coder_parameter" "tenant" {
   name        = "tenant"
   description  = "OpenFlows tenant identifier"
@@ -208,10 +215,15 @@ resource "coder_agent" "main" {
     # workspace, because an agent with no repo cannot do useful work and the
     # old silent `2>/dev/null` clone was the root cause of empty workspaces.
     GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    # The target branch: when the controller passes a PR `branch` (rework of an
+    # existing PR), check that out so already-done work is NOT redone. When
+    # empty, fall back to the default branch (fresh work).
+    TARGET_BRANCH="${data.coder_parameter.branch.value}"
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
+      git fetch --all --prune 2>/dev/null || true
     elif [ -d "$GOLDEN_REPO/.git" ]; then
       sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
       sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
@@ -219,18 +231,36 @@ resource "coder_agent" "main" {
       # Refresh to latest before checkout (design: copy -> refresh -> checkout).
       cd /home/coder/workspace
       git fetch --all --prune 2>/dev/null || true
-      # Checkout the default branch head so work never begins on a stale tree.
-      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
       if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
+        cd /home/coder/workspace
+        git fetch --all --prune 2>/dev/null || true
       else
         log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
     else
       log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
+    fi
+
+    # Checkout the target branch. For rework of an existing PR, this resumes the
+    # branch where the work was already done (never redo completed work). Fall
+    # back to the default branch head when no branch was requested.
+    if [ -d /home/coder/workspace/.git ]; then
+      cd /home/coder/workspace
+      if [ -n "$TARGET_BRANCH" ]; then
+        if git checkout "origin/$TARGET_BRANCH" 2>/dev/null || git checkout "$TARGET_BRANCH" 2>/dev/null; then
+          log "Checked out target branch: $TARGET_BRANCH"
+        else
+          log "WARNING: could not check out branch '$TARGET_BRANCH' — falling back to default branch"
+          git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+        fi
+      else
+        # Checkout the default branch head so work never begins on a stale tree.
+        git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+      fi
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).

@@ -320,7 +320,22 @@ impl GithubRestClient {
             self.get_check_suites_status(owner, repo, ref_sha)
         );
 
-        let combined = combined_result?;
+        // The legacy combined-status (`/commits/{ref}/status`) API is not granted to
+        // every GitHub App installation (it needs the "Statuses" permission). When it
+        // is forbidden we must NOT abort the CI gate — fall back to the modern Checks
+        // API, which is the permission-appropriate source. Otherwise VESSEL crashes
+        // before it can classify review state and route to rework.
+        let combined = match combined_result {
+            Ok(c) => c,
+            Err(e) if is_status_api_forbidden(&e) => {
+                warn!(
+                    error = %e,
+                    "Combined status (legacy Statuses) API not accessible — relying on Checks API only"
+                );
+                return checks_result;
+            }
+            Err(e) => return Err(e),
+        };
         if combined.is_terminal() {
             return Ok(combined);
         }
@@ -1170,6 +1185,18 @@ fn map_status_state(state: &str) -> CiStatus {
     }
 }
 
+/// Whether a GitHub API error indicates the legacy combined-status (Statuses)
+/// endpoint is not accessible to the authenticated integration (GitHub App).
+///
+/// The error is surfaced as a plain string of the form
+/// `GitHub API error 403 Forbidden: {"message":"Resource not accessible by integration",...}`.
+/// We detect a 403 that is scoped to a permission/access denial so the CI gate can
+/// fall back to the modern Checks API instead of aborting.
+fn is_status_api_forbidden(err: &anyhow::Error) -> bool {
+    let msg = format!("{err}");
+    msg.contains("GitHub API error 403") && (msg.contains("not accessible") || msg.contains("forbidden"))
+}
+
 fn extract_ticket_id(title: &str, body: &Option<String>, branch: &str) -> Option<String> {
     let patterns = [
         regex::Regex::new(r"T-(\d+)").ok(),
@@ -1650,5 +1677,31 @@ mod pr_review_tests {
             PrReviewState::from_api_state("DISMISSED"),
             PrReviewState::None
         );
+    }
+}
+
+#[cfg(test)]
+mod status_api_tests {
+    use super::*;
+
+    #[test]
+    fn detects_status_api_forbidden() {
+        let body = r#"GitHub API error 403 Forbidden: {"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/commits/statuses#get-the-combined-status-for-a-specific-reference","status":"403"}"#;
+        let err = anyhow::anyhow!("{}", body);
+        assert!(is_status_api_forbidden(&err));
+    }
+
+    #[test]
+    fn rejects_other_errors() {
+        // 404 missing / different non-403 errors must NOT be treated as forbidden.
+        let not_found = anyhow::anyhow!("{}", r#"GitHub API error 404: {"message":"Not Found"}"#);
+        assert!(!is_status_api_forbidden(&not_found));
+
+        let network =
+            anyhow::anyhow!("GitHub API request failed after 3 retries: connection refused");
+        assert!(!is_status_api_forbidden(&network));
+
+        let empty = anyhow::anyhow!("something else");
+        assert!(!is_status_api_forbidden(&empty));
     }
 }
