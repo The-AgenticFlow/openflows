@@ -22,10 +22,6 @@ use tokio::sync::RwLock;
 
 const GLOBAL_MODEL_POLICY_KEY: &str = "system:ai:model_policy";
 
-fn tenant_model_policy_key(tenant: &str) -> String {
-    format!("ns:{}:ai:model_policy", tenant)
-}
-
 /// Abstract backend interface for AI Provider and Model operations.
 #[async_trait::async_trait]
 pub trait AiBackend: Send + Sync {
@@ -115,11 +111,18 @@ impl AiBackend for CoderAiBackend {
     }
 
     async fn get_provider(&self, id_or_name: &str) -> Result<CoderAiProvider, ManagerError> {
-        self.get_client()
-            .await?
-            .get_ai_provider(id_or_name)
-            .await
-            .map_err(|e| ManagerError::ProviderNotFound(e.to_string()))
+        let client = self.get_client().await?;
+        match client.get_ai_provider(id_or_name).await {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
+                    Err(ManagerError::ProviderNotFound(id_or_name.to_string()))
+                } else {
+                    Err(ManagerError::Service(e))
+                }
+            }
+        }
     }
 
     async fn create_provider(
@@ -557,6 +560,10 @@ impl AiService {
 
     /// Get global model assignment policy.
     pub async fn get_global_model_policy(&self) -> Result<ModelPolicy, ManagerError> {
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Store unavailable: {e}")))?;
         let policy: Option<ModelPolicy> = self.store.get_typed(GLOBAL_MODEL_POLICY_KEY).await;
         Ok(policy.unwrap_or_default())
     }
@@ -573,8 +580,12 @@ impl AiService {
     /// Get tenant-scoped model assignment policy.
     pub async fn get_tenant_model_policy(&self, tenant: &str) -> Result<ModelPolicy, ManagerError> {
         validate_tenant_name(tenant)?;
-        let key = tenant_model_policy_key(tenant);
-        let policy: Option<ModelPolicy> = self.store.get_typed(&key).await;
+        let t_store = self.store.for_tenant(tenant);
+        t_store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Store unavailable: {e}")))?;
+        let policy: Option<ModelPolicy> = t_store.get_typed("ai:model_policy").await;
         Ok(policy.unwrap_or_default())
     }
 
@@ -585,9 +596,9 @@ impl AiService {
         policy: ModelPolicy,
     ) -> Result<(), ManagerError> {
         validate_tenant_name(tenant)?;
-        let key = tenant_model_policy_key(tenant);
-        self.store
-            .set_typed(&key, &policy)
+        let t_store = self.store.for_tenant(tenant);
+        t_store
+            .set_typed("ai:model_policy", &policy)
             .await
             .map_err(|e| ManagerError::Store(e.to_string()))?;
         Ok(())
@@ -607,31 +618,8 @@ impl AiService {
     ) -> Result<ResolvedModel, ManagerError> {
         // 1 & 2: Tenant policy
         if let Some(t) = tenant {
-            if let Ok(t_policy) = self.get_tenant_model_policy(t).await {
-                if let Some(m) = t_policy.roles.get(role) {
-                    if !m.trim().is_empty() {
-                        return Ok(ResolvedModel {
-                            role: role.to_string(),
-                            model: m.clone(),
-                            source: ModelResolutionSource::RolePolicy,
-                        });
-                    }
-                }
-                if let Some(ref d) = t_policy.default_model {
-                    if !d.trim().is_empty() {
-                        return Ok(ResolvedModel {
-                            role: role.to_string(),
-                            model: d.clone(),
-                            source: ModelResolutionSource::DefaultPolicy,
-                        });
-                    }
-                }
-            }
-        }
-
-        // 3 & 4: Global policy
-        if let Ok(g_policy) = self.get_global_model_policy().await {
-            if let Some(m) = g_policy.roles.get(role) {
+            let t_policy = self.get_tenant_model_policy(t).await?;
+            if let Some(m) = t_policy.roles.get(role) {
                 if !m.trim().is_empty() {
                     return Ok(ResolvedModel {
                         role: role.to_string(),
@@ -640,7 +628,7 @@ impl AiService {
                     });
                 }
             }
-            if let Some(ref d) = g_policy.default_model {
+            if let Some(ref d) = t_policy.default_model {
                 if !d.trim().is_empty() {
                     return Ok(ResolvedModel {
                         role: role.to_string(),
@@ -648,6 +636,27 @@ impl AiService {
                         source: ModelResolutionSource::DefaultPolicy,
                     });
                 }
+            }
+        }
+
+        // 3 & 4: Global policy
+        let g_policy = self.get_global_model_policy().await?;
+        if let Some(m) = g_policy.roles.get(role) {
+            if !m.trim().is_empty() {
+                return Ok(ResolvedModel {
+                    role: role.to_string(),
+                    model: m.clone(),
+                    source: ModelResolutionSource::RolePolicy,
+                });
+            }
+        }
+        if let Some(ref d) = g_policy.default_model {
+            if !d.trim().is_empty() {
+                return Ok(ResolvedModel {
+                    role: role.to_string(),
+                    model: d.clone(),
+                    source: ModelResolutionSource::DefaultPolicy,
+                });
             }
         }
 

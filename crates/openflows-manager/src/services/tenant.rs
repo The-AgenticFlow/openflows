@@ -205,33 +205,72 @@ impl TenantService {
             )));
         }
 
-        // Check if tenant already has persisted state
+        // Verify Redis backend is reachable
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Redis connection failed: {e}")))?;
+
+        // Check if tenant already has persisted state or active reservation
         let existing_keys = self.store.raw_keys(&format!("ns:{}:*", tenant_name)).await;
         if !existing_keys.is_empty() {
             return Err(ManagerError::TenantAlreadyExists(tenant_name));
         }
 
-        // Load base registry and apply fleet size
-        let base_registry = self.load_base_registry()?;
-        let tenant_registry = base_registry.with_team_fleet(req.fleet);
-        let registry_json = serde_json::to_string_pretty(&tenant_registry).map_err(|e| {
-            ManagerError::Service(anyhow::anyhow!("Failed to serialize registry: {e}"))
-        })?;
-
-        // Provision workspace via provisioner
-        let workspace_id = self
-            .provisioner
-            .provision_tenant(&tenant_name, &req.repo, &registry_json)
-            .await?;
-
-        // Persist repository and registry into the tenant store
+        // Reserve tenant name in Redis before provisioning
         let t_store = self.store.for_tenant(&tenant_name);
         t_store
             .set("repository", serde_json::json!(&req.repo))
             .await;
+        if t_store.get("repository").await.is_none() {
+            return Err(ManagerError::Store(
+                "Failed to reserve tenant: write to repository key failed".to_string(),
+            ));
+        }
+
+        // Load base registry and apply fleet size
+        let base_registry = match self.load_base_registry() {
+            Ok(reg) => reg,
+            Err(e) => {
+                t_store.del("repository").await;
+                return Err(e);
+            }
+        };
+        let tenant_registry = base_registry.with_team_fleet(req.fleet);
+        let registry_json = match serde_json::to_string_pretty(&tenant_registry) {
+            Ok(j) => j,
+            Err(e) => {
+                t_store.del("repository").await;
+                return Err(ManagerError::Service(anyhow::anyhow!(
+                    "Failed to serialize registry: {e}"
+                )));
+            }
+        };
+
+        // Provision workspace via provisioner
+        let workspace_id = match self
+            .provisioner
+            .provision_tenant(&tenant_name, &req.repo, &registry_json)
+            .await
+        {
+            Ok(wid) => wid,
+            Err(e) => {
+                // Roll back reservation on provisioning failure
+                t_store.del("repository").await;
+                return Err(e);
+            }
+        };
+
+        // Persist registry into the tenant store
         t_store
             .set("registry_json", serde_json::json!(&registry_json))
             .await;
+        if t_store.get("registry_json").await.is_none() {
+            t_store.del("repository").await;
+            return Err(ManagerError::Store(
+                "Failed to persist tenant registry: write failed".to_string(),
+            ));
+        }
 
         info!(
             tenant = %tenant_name,
@@ -257,6 +296,11 @@ impl TenantService {
         reset_all: bool,
     ) -> Result<TenantCleanResponse, ManagerError> {
         validate_tenant_name(tenant)?;
+
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Redis connection failed: {e}")))?;
 
         let pattern = format!("ns:{}:*", tenant);
         let keys = self.store.raw_keys(&pattern).await;
@@ -290,6 +334,9 @@ impl TenantService {
                 });
                 if let Some(obj) = ticket.as_object_mut() {
                     obj.insert("attempts".to_string(), serde_json::json!(0));
+                }
+                if let Some(tid) = ticket.get("id").and_then(|v| v.as_str()) {
+                    t_store.del(&format!("ticket:{}:status", tid)).await;
                 }
                 reset_count += 1;
             }
@@ -331,6 +378,11 @@ impl TenantService {
     ) -> Result<TenantRemoveResponse, ManagerError> {
         validate_tenant_name(tenant)?;
 
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Redis connection failed: {e}")))?;
+
         let pattern = format!("ns:{}:*", tenant);
         let keys = self.store.raw_keys(&pattern).await;
         if keys.is_empty() {
@@ -343,6 +395,14 @@ impl TenantService {
                 self.store.raw_del(key).await;
                 purged_count += 1;
             }
+        } else {
+            // Non-purging deregistration: remove identity bindings so the tenant
+            // is deregistered from tenant queries while preserving historical data.
+            let t_store = self.store.for_tenant(tenant);
+            t_store.del("repository").await;
+            t_store.del("registry_json").await;
+            t_store.del("workspace_id").await;
+            purged_count = 3;
         }
 
         Ok(TenantRemoveResponse {
@@ -354,17 +414,54 @@ impl TenantService {
 
     fn load_base_registry(&self) -> Result<config::Registry, ManagerError> {
         if let Ok(reg_path) = std::env::var("OPENFLOWS_REGISTRY_PATH") {
-            if let Ok(reg) = config::Registry::load(&reg_path) {
-                return Ok(reg);
+            let path = std::path::PathBuf::from(reg_path);
+            if path.exists() {
+                return config::Registry::load(&path).map_err(|e| {
+                    ManagerError::Config(format!(
+                        "Failed to load registry from OPENFLOWS_REGISTRY_PATH ({}): {e}",
+                        path.display()
+                    ))
+                });
             }
         }
 
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(home) = std::env::var("OPENFLOWS_HOME") {
-            let path = std::path::PathBuf::from(home).join("orchestration/agent/registry.json");
-            if path.exists() {
-                if let Ok(reg) = config::Registry::load(&path) {
-                    return Ok(reg);
+            candidates.push(std::path::PathBuf::from(home));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if !dir.as_os_str().is_empty() {
+                    candidates.push(dir.to_path_buf());
                 }
+                if let Some(parent) = dir.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        candidates.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd);
+        }
+
+        for dir in candidates {
+            let dir_str = dir.to_string_lossy();
+            if dir_str.ends_with("/orchestration/agent")
+                || dir_str.ends_with("/orchestration")
+                || dir_str.ends_with("/orchestration/agent/")
+                || dir_str.ends_with("/orchestration/")
+            {
+                continue;
+            }
+            let reg_file = dir.join("orchestration/agent/registry.json");
+            if reg_file.exists() {
+                return config::Registry::load(&reg_file).map_err(|e| {
+                    ManagerError::Config(format!(
+                        "Failed to load on-disk registry at {}: {e}",
+                        reg_file.display()
+                    ))
+                });
             }
         }
 

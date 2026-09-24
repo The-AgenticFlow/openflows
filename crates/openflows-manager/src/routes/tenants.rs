@@ -2,6 +2,7 @@
 
 use crate::{
     error::ApiErrorEnvelope,
+    extractors::{AppJson, AppQuery},
     middleware::RequestId,
     models::tenant::{
         TenantCleanRequest, TenantCleanResponse, TenantCreateRequest, TenantCreateResponse,
@@ -10,7 +11,7 @@ use crate::{
     server::AppState,
 };
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     Json,
 };
@@ -33,7 +34,7 @@ pub async fn list_tenants(
 pub async fn create_tenant(
     State(state): State<AppState>,
     request_id: Option<Extension<RequestId>>,
-    Json(payload): Json<TenantCreateRequest>,
+    AppJson(payload): AppJson<TenantCreateRequest>,
 ) -> Result<(StatusCode, Json<TenantCreateResponse>), (StatusCode, Json<ApiErrorEnvelope>)> {
     let req_id = request_id.as_ref().map(|Extension(r)| r);
     state
@@ -64,10 +65,10 @@ pub async fn clean_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
     request_id: Option<Extension<RequestId>>,
-    payload: Option<Json<TenantCleanRequest>>,
+    payload: Option<AppJson<TenantCleanRequest>>,
 ) -> Result<Json<TenantCleanResponse>, (StatusCode, Json<ApiErrorEnvelope>)> {
     let req_id = request_id.as_ref().map(|Extension(r)| r);
-    let reset_all = payload.map(|Json(p)| p.reset_all).unwrap_or(false);
+    let reset_all = payload.map(|AppJson(p)| p.reset_all).unwrap_or(false);
     state
         .tenant_service()
         .clean_tenant(&tenant, reset_all)
@@ -80,7 +81,7 @@ pub async fn clean_tenant(
 pub async fn remove_tenant(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
-    Query(query): Query<TenantRemoveQuery>,
+    AppQuery(query): AppQuery<TenantRemoveQuery>,
     request_id: Option<Extension<RequestId>>,
 ) -> Result<Json<TenantRemoveResponse>, (StatusCode, Json<ApiErrorEnvelope>)> {
     let req_id = request_id.as_ref().map(|Extension(r)| r);

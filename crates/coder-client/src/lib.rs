@@ -1719,7 +1719,22 @@ impl CoderClient {
 
         if resp.status().is_success() {
             let data: crate::types::CoderChatModelsResponse = resp.json().await?;
-            Ok(data.models)
+            let mut models = data.models;
+            if models.is_empty() {
+                for prov in data.providers {
+                    if let Some(prov_models) = prov.get("models").and_then(|v| v.as_array()) {
+                        for m in prov_models {
+                            if let Ok(model_cfg) = serde_json::from_value::<
+                                crate::types::CoderChatModelConfig,
+                            >(m.clone())
+                            {
+                                models.push(model_cfg);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(models)
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

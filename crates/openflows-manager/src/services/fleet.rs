@@ -25,6 +25,10 @@ impl FleetService {
 
     /// Retrieve fleet status and agent state across all tenants.
     pub async fn get_fleet_summary(&self) -> Result<FleetSummaryResponse, ManagerError> {
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Store unavailable: {e}")))?;
         let keys = self.store.raw_keys("ns:*").await;
         let mut tenant_names = HashSet::new();
         for key in keys {
@@ -47,25 +51,24 @@ impl FleetService {
         let mut total_escalations = 0;
 
         for name in sorted_names {
-            if let Ok(tenant_fleet) = self.get_tenant_fleet(&name).await {
-                total_tickets += tenant_fleet.ticket_counts.total;
-                total_active_workers += tenant_fleet
-                    .worker_slots
-                    .values()
-                    .filter(|slot| {
-                        matches!(
-                            slot.status,
-                            config::state::WorkerStatus::Assigned { .. }
-                                | config::state::WorkerStatus::Working { .. }
-                        )
-                    })
-                    .count();
-                total_pending_prs += tenant_fleet.pending_prs.len();
-                total_escalations += tenant_fleet.escalations.awaiting_human_count
-                    + tenant_fleet.escalations.failed_count;
+            let tenant_fleet = self.get_tenant_fleet(&name).await?;
+            total_tickets += tenant_fleet.ticket_counts.total;
+            total_active_workers += tenant_fleet
+                .worker_slots
+                .values()
+                .filter(|slot| {
+                    matches!(
+                        slot.status,
+                        config::state::WorkerStatus::Assigned { .. }
+                            | config::state::WorkerStatus::Working { .. }
+                    )
+                })
+                .count();
+            total_pending_prs += tenant_fleet.pending_prs.len();
+            total_escalations += tenant_fleet.escalations.awaiting_human_count
+                + tenant_fleet.escalations.failed_count;
 
-                tenants.push(tenant_fleet);
-            }
+            tenants.push(tenant_fleet);
         }
 
         Ok(FleetSummaryResponse {
@@ -86,6 +89,11 @@ impl FleetService {
         tenant: &str,
     ) -> Result<TenantFleetResponse, ManagerError> {
         validate_tenant_name(tenant)?;
+
+        self.store
+            .ping()
+            .await
+            .map_err(|e| ManagerError::Store(format!("Store unavailable: {e}")))?;
 
         let pattern = format!("ns:{}:*", tenant);
         let keys = self.store.raw_keys(&pattern).await;

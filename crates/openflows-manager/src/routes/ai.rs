@@ -2,6 +2,7 @@
 
 use crate::{
     error::ManagerError,
+    extractors::{AppJson, AppQuery},
     models::{
         AiModelCreateRequest, AiModelSummary, AiModelUpdateRequest, AiProviderCreateRequest,
         AiProviderSummary, AiProviderUpdateRequest, ModelPolicy, ResolvedModel,
@@ -9,7 +10,7 @@ use crate::{
     server::AppState,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch},
@@ -62,7 +63,7 @@ async fn get_provider(
 
 async fn create_provider(
     State(state): State<AppState>,
-    Json(payload): Json<AiProviderCreateRequest>,
+    AppJson(payload): AppJson<AiProviderCreateRequest>,
 ) -> Result<impl IntoResponse, ManagerError> {
     let summary = state.ai_service().create_provider(payload).await?;
     Ok((StatusCode::CREATED, Json(summary)))
@@ -71,7 +72,7 @@ async fn create_provider(
 async fn update_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<AiProviderUpdateRequest>,
+    AppJson(payload): AppJson<AiProviderUpdateRequest>,
 ) -> Result<Json<AiProviderSummary>, ManagerError> {
     let summary = state.ai_service().update_provider(&id, payload).await?;
     Ok(Json(summary))
@@ -99,7 +100,7 @@ async fn list_models(
 
 async fn create_model(
     State(state): State<AppState>,
-    Json(payload): Json<AiModelCreateRequest>,
+    AppJson(payload): AppJson<AiModelCreateRequest>,
 ) -> Result<impl IntoResponse, ManagerError> {
     let summary = state.ai_service().create_model(payload).await?;
     Ok((StatusCode::CREATED, Json(summary)))
@@ -108,7 +109,7 @@ async fn create_model(
 async fn update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<AiModelUpdateRequest>,
+    AppJson(payload): AppJson<AiModelUpdateRequest>,
 ) -> Result<Json<AiModelSummary>, ManagerError> {
     let summary = state.ai_service().update_model(&id, payload).await?;
     Ok(Json(summary))
@@ -136,7 +137,7 @@ async fn get_global_policy(
 
 async fn set_global_policy(
     State(state): State<AppState>,
-    Json(policy): Json<ModelPolicy>,
+    AppJson(policy): AppJson<ModelPolicy>,
 ) -> Result<Json<ModelPolicy>, ManagerError> {
     state
         .ai_service()
@@ -156,7 +157,7 @@ async fn get_tenant_policy(
 async fn set_tenant_policy(
     State(state): State<AppState>,
     Path(tenant): Path<String>,
-    Json(policy): Json<ModelPolicy>,
+    AppJson(policy): AppJson<ModelPolicy>,
 ) -> Result<Json<ModelPolicy>, ManagerError> {
     state
         .ai_service()
@@ -174,7 +175,7 @@ pub struct ResolveQuery {
 
 async fn resolve_model(
     State(state): State<AppState>,
-    Query(query): Query<ResolveQuery>,
+    AppQuery(query): AppQuery<ResolveQuery>,
 ) -> Result<Json<ResolvedModel>, ManagerError> {
     let resolved = state
         .ai_service()
