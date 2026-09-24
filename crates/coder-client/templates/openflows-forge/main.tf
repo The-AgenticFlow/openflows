@@ -62,6 +62,15 @@ data "coder_parameter" "branch" {
   type        = "string"
 }
 
+# The requested branch is interpolated directly into the startup bash script.
+# A branch name containing shell metacharacters (e.g. `$(...)`) would otherwise
+# be evaluated by bash as command substitution, so validate it against a strict
+# git-ref-safe charset and fall back to the default branch when it does not match.
+locals {
+  requested_branch = data.coder_parameter.branch.value
+  safe_branch      = can(regex("^[A-Za-z0-9._/-]+$", local.requested_branch)) ? local.requested_branch : ""
+}
+
 data "coder_parameter" "tenant" {
   name        = "tenant"
   description  = "OpenFlows tenant identifier"
@@ -218,7 +227,7 @@ resource "coder_agent" "main" {
     # The target branch: when the controller passes a PR `branch` (rework of an
     # existing PR), check that out so already-done work is NOT redone. When
     # empty, fall back to the default branch (fresh work).
-    TARGET_BRANCH="${data.coder_parameter.branch.value}"
+    TARGET_BRANCH="${local.safe_branch}"
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
@@ -251,8 +260,14 @@ resource "coder_agent" "main" {
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace
       if [ -n "$TARGET_BRANCH" ]; then
-        if git checkout "origin/$TARGET_BRANCH" 2>/dev/null || git checkout "$TARGET_BRANCH" 2>/dev/null; then
+        # Create/reset a LOCAL tracking branch instead of checking out
+        # `origin/$TARGET_BRANCH` directly. A direct remote-tracking checkout
+        # leaves HEAD detached, and the CI-fix / /address_review flow pushes
+        # with plain `git push`, which cannot publish from a detached HEAD.
+        if git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH" 2>/dev/null; then
           log "Checked out target branch: $TARGET_BRANCH"
+        elif git checkout -B "$TARGET_BRANCH" "origin/HEAD" 2>/dev/null; then
+          log "WARNING: no origin branch '$TARGET_BRANCH' — created local branch from default"
         else
           log "WARNING: could not check out branch '$TARGET_BRANCH' — falling back to default branch"
           git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
