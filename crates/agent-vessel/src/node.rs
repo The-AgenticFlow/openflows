@@ -16,7 +16,7 @@ use config::{
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
+use pocketflow_core::{node::PAUSE_SIGNAL, Action, CiStatus, Node, PrInfo, SharedStore};
 use provisioner::transport::{CoderTransport, WorkspaceTransport};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -714,6 +714,7 @@ impl Node for VesselNode {
         let mut any_ci_fix = false;
         let mut any_awaiting_human = false;
         let mut any_address_review = false;
+        let mut any_needs_review = false;
         let mut failed_ticket_ids: Vec<String> = Vec::new();
 
         for outcome in outcomes {
@@ -1336,8 +1337,25 @@ impl Node for VesselNode {
                     let monitor_state = match state.as_str() {
                         "changes_requested" => PrMonitorState::ChangesRequested,
                         "comments" => PrMonitorState::Comments,
+                        "needs_review" => PrMonitorState::NeedsReview,
                         _ => PrMonitorState::Comments,
                     };
+
+                    // ── NeedsReview: SENTINEL has not yet submitted an approve
+                    // review on GitHub. This is a gating wait, NOT a rework
+                    // request to FORGE. We must not dispatch `/address_review`,
+                    // must not mark the ticket failed, and must not drop the PR
+                    // from pending_prs — it stays queued so the next poll
+                    // re-classifies once SENTINEL's approve review lands.
+                    if monitor_state == PrMonitorState::NeedsReview {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "PR not yet approved by SENTINEL — keeping pending until the final review is submitted"
+                        );
+                        any_needs_review = true;
+                        continue;
+                    }
 
                     // Dedup guard: if we already dispatched `/address_review` for
                     // this exact PR head SHA, FORGE is still addressing it and has
@@ -1435,6 +1453,10 @@ impl Node for VesselNode {
             Ok(Action::new(ACTION_CONFLICTS_DETECTED))
         } else if any_address_review {
             Ok(Action::new(ACTION_ADDRESS_REVIEW_DISPATCHED))
+        } else if any_needs_review {
+            // Waiting on SENTINEL's GitHub approve review. Keep the PR pending
+            // and let the controller poll again — do not treat as success/failure.
+            Ok(Action::new(PAUSE_SIGNAL))
         } else if any_success {
             Ok(Action::DEPLOYED.into())
         } else if any_ci_fix {
@@ -1541,6 +1563,22 @@ impl VesselNode {
                     classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
                         .await
                         .unwrap_or(PrMonitorState::ReadyForMerge);
+
+                // SENTINEL has not yet approved the PR on GitHub. Do not merge
+                // and do not ask FORGE to rework — keep the PR pending so the
+                // cycle waits for the final review to land.
+                if monitor_state == PrMonitorState::NeedsReview {
+                    debug!(
+                        pr_number,
+                        "PR not yet approved by SENTINEL — keeping pending for final review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: PrMonitorState::NeedsReview.as_str().to_string(),
+                    });
+                }
+
                 if matches!(
                     monitor_state,
                     PrMonitorState::ChangesRequested | PrMonitorState::Comments
@@ -1639,7 +1677,7 @@ impl VesselNode {
                 );
                 self.handle_conflicts(owner, repo, pr_info).await
             }
-            CiPollResult::Timeout => {
+             CiPollResult::Timeout => {
                 warn!(
                     pr_number,
                     "CI timed out — checking for conflicts as likely cause"
@@ -1654,6 +1692,26 @@ impl VesselNode {
                         return self.handle_conflicts(owner, repo, fresh_pr.unwrap()).await;
                     }
                 }
+
+                // Even when CI times out, never merge a PR that has not received
+                // SENTINEL's GitHub approve review. This mirrors the
+                // CI-Success path so a timeout cannot bypass the review gate.
+                let monitor_state =
+                    classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
+                        .await
+                        .unwrap_or(PrMonitorState::ReadyForMerge);
+                if monitor_state == PrMonitorState::NeedsReview {
+                    debug!(
+                        pr_number,
+                        "CI timed out and PR not yet approved by SENTINEL — keeping pending for final review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: PrMonitorState::NeedsReview.as_str().to_string(),
+                    });
+                }
+
                 match self.merger.merge(owner, repo, &pr_info).await {
                     Ok(result) if result.merged => Ok(VesselOutcome::CiMissing {
                         ticket_id,

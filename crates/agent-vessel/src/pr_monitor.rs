@@ -22,6 +22,10 @@ pub enum PrMonitorState {
     ChangesRequested,
     /// Inline review comments are present (not yet approved).
     Comments,
+    /// SENTINEL has not yet submitted an approve review on GitHub — the PR must
+    /// not be merged until it does. This is the gating state that stops VESSEL
+    /// from merging a PR that never received a final review.
+    NeedsReview,
     /// A reviewer has approved but the PR is not yet merge-ready (e.g. CI pending).
     Approved,
     /// Approved + no conflicts + CI success — safe to merge.
@@ -36,6 +40,7 @@ impl PrMonitorState {
             PrMonitorState::CiRunning => "ci_running",
             PrMonitorState::ChangesRequested => "changes_requested",
             PrMonitorState::Comments => "comments",
+            PrMonitorState::NeedsReview => "needs_review",
             PrMonitorState::Approved => "approved",
             PrMonitorState::ReadyForMerge => "ready_for_merge",
         }
@@ -99,8 +104,12 @@ pub fn classify_from_parts(
         return PrMonitorState::Comments;
     }
     match review_state {
+        // Only an explicit GitHub APPROVE review makes the PR merge-ready. A PR
+        // with no approve review (SENTINEL has not yet submitted its final
+        // review) must NOT fall through to merge — it is gated on NeedsReview
+        // until the approve review lands.
         PrReviewState::Approved => PrMonitorState::ReadyForMerge,
-        _ => PrMonitorState::Approved,
+        _ => PrMonitorState::NeedsReview,
     }
 }
 
@@ -294,6 +303,42 @@ mod tests {
             ),
             PrMonitorState::ReadyForMerge
         );
+    }
+
+    #[test]
+    fn classify_no_review_is_needs_review_not_merge_ready() {
+        // No SENTINEL approve review on GitHub must NOT merge. It is gated on
+        // NeedsReview so the cycle waits for the final review to be submitted.
+        assert_eq!(
+            classify_from_parts(Some(true), CiStatus::Success, PrReviewState::None, false),
+            PrMonitorState::NeedsReview
+        );
+        // Commented-only review (no approve) with no inline comments is also
+        // not merge-ready.
+        assert_eq!(
+            classify_from_parts(
+                Some(true),
+                CiStatus::Success,
+                PrReviewState::Commented,
+                false
+            ),
+            PrMonitorState::NeedsReview
+        );
+    }
+
+    #[test]
+    fn classify_no_review_with_comments_is_comments() {
+        // Inline comments on an unapproved PR still route to rework.
+        assert_eq!(
+            classify_from_parts(Some(true), CiStatus::Success, PrReviewState::None, true),
+            PrMonitorState::Comments
+        );
+    }
+
+    #[test]
+    fn needs_review_is_not_rework() {
+        assert!(!PrMonitorState::NeedsReview.needs_rework());
+        assert_eq!(PrMonitorState::NeedsReview.as_str(), "needs_review");
     }
 
     #[test]

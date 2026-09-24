@@ -169,6 +169,26 @@ impl SentinelNode {
         }
     }
 
+    /// Resolve the PR number for a review verdict.
+    ///
+    /// The SENTINEL chat's `review submit` command may omit `--pr`, which leaves
+    /// `ReviewPayload.pr_number == None`. When that happens we fall back to the
+    /// PR number Forge recorded when it opened the PR
+    /// (`ticket:{id}:pr` -> `{pr_number, branch, title}`). This guarantees the
+    /// GitHub review submission (approve / request-changes) always targets the
+    /// right PR instead of being silently skipped.
+    async fn resolve_pr_number(store: &SharedStore, ticket_id: &str, pr_number: Option<u64>) -> Option<u64> {
+        if pr_number.is_some() {
+            return pr_number;
+        }
+        let pr_key = full_ticket_key_flat(ticket_id, "pr");
+        #[derive(serde::Deserialize)]
+        struct StoredPr {
+            pr_number: u64,
+        }
+        store.get_typed::<StoredPr>(&pr_key).await.map(|p| p.pr_number)
+    }
+
     /// Derive inline review comments from a SENTINEL report body. Lines matching
     /// a `path:line — message` (or `path:line message`) shape become GitHub
     /// inline review comments so a REQUEST_CHANGES review carries actionable
@@ -470,10 +490,14 @@ impl Node for SentinelNode {
                     store.set(&action_key, json!("completed")).await;
 
                     // Read the review payload (pr_number, report) before consuming
-                    // it so we can mirror the approve verdict on GitHub.
+                    // it so we can mirror the approve verdict on GitHub. Backfill
+                    // the PR number from the ticket's stored PR info when the
+                    // verdict omitted it, so the APPROVE review always lands.
                     let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
                     let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
-                    if let Some(pr_number) = review_payload.as_ref().and_then(|r| r.pr_number) {
+                    let pr_number =
+                        Self::resolve_pr_number(store, ticket_id, review_payload.as_ref().and_then(|r| r.pr_number)).await;
+                    if let Some(pr_number) = pr_number {
                         let report = review_payload
                             .as_ref()
                             .map(|r| r.report.clone())
@@ -514,7 +538,12 @@ impl Node for SentinelNode {
                         .as_ref()
                         .map(|r| r.report.clone())
                         .unwrap_or_default();
-                    let pr_number = review_payload.as_ref().and_then(|r| r.pr_number);
+                    let pr_number = Self::resolve_pr_number(
+                        store,
+                        ticket_id,
+                        review_payload.as_ref().and_then(|r| r.pr_number),
+                    )
+                    .await;
 
                     // Mirror the reject verdict on GitHub: submit a
                     // REQUEST_CHANGES review carrying inline comments derived
@@ -999,5 +1028,35 @@ mod tests {
             SentinelNode::parse_repository(None),
             (String::new(), String::new())
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_pr_number_uses_verdict_when_present() {
+        let store = SharedStore::new_in_memory();
+        let pr = SentinelNode::resolve_pr_number(&store, "T-1", Some(58)).await;
+        assert_eq!(pr, Some(58));
+    }
+
+    #[tokio::test]
+    async fn resolve_pr_number_backfills_from_ticket_pr_info() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-2";
+        // Simulate the verdict omitting --pr (pr_number None) while Forge
+        // recorded the opened PR at ticket:{id}:pr.
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, "pr"),
+                json!({ "pr_number": 58, "branch": "feature/T-2", "title": "T-2 work" }),
+            )
+            .await;
+        let pr = SentinelNode::resolve_pr_number(&store, ticket_id, None).await;
+        assert_eq!(pr, Some(58));
+    }
+
+    #[tokio::test]
+    async fn resolve_pr_number_none_when_no_verdict_and_no_pr_info() {
+        let store = SharedStore::new_in_memory();
+        let pr = SentinelNode::resolve_pr_number(&store, "T-3", None).await;
+        assert_eq!(pr, None);
     }
 }
