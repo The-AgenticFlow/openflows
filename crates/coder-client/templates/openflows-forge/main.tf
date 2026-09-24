@@ -258,6 +258,28 @@ resource "coder_agent" "main" {
       log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
     fi
 
+    # When we cannot get onto the intended PR branch, record it so the rework
+    # flow does not treat the current branch as the PR branch and push the fix
+    # to the wrong remote branch. The agent stays available, but the mismatch is
+    # made visible via a workspace-root marker plus a prominent startup log.
+    warn_branch_mismatch() {
+      local intended="$1"
+      local current
+      current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+      log "WARNING: workspace is on branch '$current', NOT the intended PR branch '$intended' — rework must NOT push to the current branch"
+      {
+        echo "# REWORK BRANCH MISMATCH"
+        echo ""
+        echo "The startup script could not switch to the intended PR branch \`$intended\`."
+        echo "The workspace is currently on branch \`$current\`, which is NOT the PR branch."
+        echo ""
+        echo "**Do NOT run \`git push\` on the current branch** — it is not the PR branch and"
+        echo "pushing here would update the wrong branch, not the PR."
+        echo "Resolve the local conflict or uncommitted changes and switch to \`$intended\`"
+        echo "before performing any push."
+      } > /home/coder/workspace/REWORK_BRANCH_MISMATCH.md
+    }
+
     # Checkout the target branch. For rework of an existing PR, this resumes the
     # branch where the work was already done (never redo completed work). Fall
     # back to the default branch head when no branch was requested.
@@ -276,18 +298,18 @@ resource "coder_agent" "main" {
         if git rev-parse --verify --quiet "refs/heads/$TARGET_BRANCH" >/dev/null; then
           # The local branch exists but the switch can still fail (uncommitted
           # work or an unresolved merge blocks it). That must NOT abort startup
-          # via `set -e` — log a warning and continue so the heartbeat and agent
-          # still come up instead of leaving FORGE unable to perform the rework.
+          # via `set -e` — keep the agent available, but flag the mismatch so the
+          # rework flow does not push to the wrong branch.
           if git checkout "$TARGET_BRANCH" 2>/dev/null; then
             log "Checked out existing local branch: $TARGET_BRANCH"
           else
-            log "WARNING: could not switch to local branch '$TARGET_BRANCH' (uncommitted work or unresolved merge) — continuing on current branch"
+            warn_branch_mismatch "$TARGET_BRANCH"
           fi
         elif git checkout -B "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" 2>/dev/null; then
           log "Checked out target branch: $TARGET_BRANCH"
         else
-          log "WARNING: branch '$TARGET_BRANCH' not found locally or on origin — falling back to default branch"
           git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+          warn_branch_mismatch "$TARGET_BRANCH"
         fi
       else
         # Checkout the default branch head so work never begins on a stale tree.
