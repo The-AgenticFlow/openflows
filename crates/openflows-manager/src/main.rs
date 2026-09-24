@@ -5,6 +5,9 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), ManagerError> {
+    // Load local .env before configuration and logging bootstrap.
+    let _ = dotenvy::dotenv();
+
     // Initialize the default tracing subscriber before any fallible setup so
     // configuration and bind failures are visible to operators.
     tracing_subscriber::fmt::init();
