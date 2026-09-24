@@ -446,14 +446,27 @@ impl HarnessStore {
     }
 
     /// Submit a review verdict (sentinel).
+    ///
+    /// Only SENTINEL may write the PR-review verdict. This mirrors
+    /// [`authorize_gate_approver`]: FORGE/other roles must not be able to submit
+    /// an `approve` for their own ticket, which would otherwise be treated as
+    /// SENTINEL's verdict and let the builder bypass the independent reviewer.
     pub async fn review_submit(
         &self,
         ticket: &str,
-        _role: &str,
+        role: &str,
         verdict: &str,
         report_path: &Path,
         pr: Option<u64>,
     ) -> Result<()> {
+        if !role.eq_ignore_ascii_case("sentinel") {
+            bail!(
+                "Review submit rejected: role '{}' is not SENTINEL. \
+                 Only SENTINEL may record a PR review verdict; FORGE/other roles \
+                 cannot submit an approval for their own ticket.",
+                role
+            );
+        }
         if !VALID_VERDICTS.contains(&verdict) {
             bail!(
                 "Invalid verdict '{}'. Valid verdicts: {}",

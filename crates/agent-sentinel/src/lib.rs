@@ -177,23 +177,39 @@ impl SentinelNode {
     /// (`ticket:{id}:pr` -> `{pr_number, branch, title}`). This guarantees the
     /// GitHub review submission (approve / request-changes) always targets the
     /// right PR instead of being silently skipped.
+    ///
+    /// A supplied `--pr` that disagrees with the ticket's recorded PR is treated
+    /// as a reviewer mistake: we log a warning and use the ticket's recorded PR
+    /// so a wrong `--pr` can never post APPROVE/REQUEST_CHANGES to another PR.
     async fn resolve_pr_number(
         store: &SharedStore,
         ticket_id: &str,
         pr_number: Option<u64>,
     ) -> Option<u64> {
-        if pr_number.is_some() {
-            return pr_number;
-        }
         let pr_key = full_ticket_key_flat(ticket_id, "pr");
         #[derive(serde::Deserialize)]
         struct StoredPr {
             pr_number: u64,
         }
-        store
+        let stored = store
             .get_typed::<StoredPr>(&pr_key)
             .await
-            .map(|p| p.pr_number)
+            .map(|p| p.pr_number);
+
+        match (pr_number, stored) {
+            (Some(supplied), Some(recorded)) if supplied == recorded => Some(supplied),
+            (Some(supplied), Some(recorded)) => {
+                warn!(
+                    supplied_pr = supplied,
+                    recorded_pr = recorded,
+                    ticket_id,
+                    "Verdict --pr does not match the ticket's recorded PR — using the recorded PR"
+                );
+                Some(recorded)
+            }
+            (Some(supplied), None) => Some(supplied),
+            (None, stored) => stored,
+        }
     }
 
     /// Derive inline review comments from a SENTINEL report body. Lines matching
