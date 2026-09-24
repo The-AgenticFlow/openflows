@@ -1313,6 +1313,32 @@ impl Node for VesselNode {
                     let current_attempts =
                         self.get_address_review_attempts(store, *pr_number).await;
 
+                    let monitor_state = match state.as_str() {
+                        "changes_requested" => PrMonitorState::ChangesRequested,
+                        "comments" => PrMonitorState::Comments,
+                        "needs_review" => PrMonitorState::NeedsReview,
+                        _ => PrMonitorState::Comments,
+                    };
+
+                    // ── NeedsReview: SENTINEL has not yet submitted an approve
+                    // review on GitHub. This is a gating wait, NOT a rework
+                    // request to FORGE. Check it BEFORE the attempt cap so a PR
+                    // that is simply awaiting SENTINEL's approve review stays
+                    // pending instead of being escalated to human after the
+                    // rework-attempt cap is exhausted. We must not dispatch
+                    // `/address_review`, must not mark the ticket failed, and
+                    // must not drop the PR from pending_prs — it stays queued so
+                    // the next poll re-classifies once SENTINEL's review lands.
+                    if monitor_state == PrMonitorState::NeedsReview {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "PR not yet approved by SENTINEL — keeping pending until the final review is submitted"
+                        );
+                        any_needs_review = true;
+                        continue;
+                    }
+
                     if current_attempts >= MAX_ADDRESS_REVIEW_ATTEMPTS {
                         warn!(
                             pr_number,
@@ -1331,29 +1357,6 @@ impl Node for VesselNode {
                         .await;
                         self.remove_from_pending_prs(store, *pr_number).await;
                         any_awaiting_human = true;
-                        continue;
-                    }
-
-                    let monitor_state = match state.as_str() {
-                        "changes_requested" => PrMonitorState::ChangesRequested,
-                        "comments" => PrMonitorState::Comments,
-                        "needs_review" => PrMonitorState::NeedsReview,
-                        _ => PrMonitorState::Comments,
-                    };
-
-                    // ── NeedsReview: SENTINEL has not yet submitted an approve
-                    // review on GitHub. This is a gating wait, NOT a rework
-                    // request to FORGE. We must not dispatch `/address_review`,
-                    // must not mark the ticket failed, and must not drop the PR
-                    // from pending_prs — it stays queued so the next poll
-                    // re-classifies once SENTINEL's approve review lands.
-                    if monitor_state == PrMonitorState::NeedsReview {
-                        info!(
-                            pr_number,
-                            ticket_id = %tid,
-                            "PR not yet approved by SENTINEL — keeping pending until the final review is submitted"
-                        );
-                        any_needs_review = true;
                         continue;
                     }
 
@@ -1404,30 +1407,23 @@ impl Node for VesselNode {
                         warn!(
                             pr_number,
                             ticket_id = %tid,
-                            "Could not dispatch /address_review (no forge chat or client) — falling back to file rework"
+                            "Could not dispatch /address_review (no forge chat or client) — persisting directive for NEXUS"
                         );
-                        // Fall back to the existing file-based rework routing.
+                        // No live FORGE chat to dispatch to. Persist the targeted
+                        // `/address_review` directive (with the actual review
+                        // feedback) so NEXUS provisions the FORGE chat with it as
+                        // its initial prompt. Do NOT fall through to the conflict
+                        // handler here: that would tell FORGE to resolve conflict
+                        // markers and drop the review feedback entirely.
                         let repository: Option<String> = store.get_typed("repository").await;
                         let (owner, repo) = parse_repository(repository.as_deref());
-                        let pr_info = self
-                            .client
-                            .get_pull_request(owner, repo, *pr_number)
+                        let reason = collect_rework(&self.client, owner, repo, *pr_number)
                             .await
-                            .ok();
-                        if let Some(pr_info) = pr_info {
-                            if let Ok(VesselOutcome::Conflicts {
-                                conflicted_files, ..
-                            }) = self.handle_conflicts(owner, repo, pr_info).await
-                            {
-                                VesselNotifier::emit_conflicts_detected(
-                                    store,
-                                    ticket_id.as_deref(),
-                                    *pr_number,
-                                    &conflicted_files,
-                                )
-                                .await;
-                            }
-                        }
+                            .reason;
+                        let directive =
+                            build_directive(monitor_state, *pr_number, reason.as_deref());
+                        self.persist_rework_directive(store, &tid, "forge", &directive)
+                            .await;
                         self.increment_address_review_attempts(store, *pr_number)
                             .await;
                         any_address_review = true;
@@ -1709,6 +1705,26 @@ impl VesselNode {
                         ticket_id,
                         pr_number,
                         state: PrMonitorState::NeedsReview.as_str().to_string(),
+                    });
+                }
+
+                // A timeout must not bypass outstanding review feedback. If the
+                // PR is in a review-rework state (changes requested or open
+                // comments), route it back to FORGE via /address_review instead
+                // of merging — mirroring the CI-Success path.
+                if matches!(
+                    monitor_state,
+                    PrMonitorState::ChangesRequested | PrMonitorState::Comments
+                ) {
+                    warn!(
+                        pr_number,
+                        state = monitor_state.as_str(),
+                        "CI timed out with outstanding review feedback — routing to /address_review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: monitor_state.as_str().to_string(),
                     });
                 }
 
