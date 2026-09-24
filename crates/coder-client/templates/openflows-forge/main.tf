@@ -274,8 +274,15 @@ resource "coder_agent" "main" {
         # would start rework without the PR's commits and could reset existing
         # local work.
         if git rev-parse --verify --quiet "refs/heads/$TARGET_BRANCH" >/dev/null; then
-          git checkout "$TARGET_BRANCH" 2>/dev/null
-          log "Checked out existing local branch: $TARGET_BRANCH"
+          # The local branch exists but the switch can still fail (uncommitted
+          # work or an unresolved merge blocks it). That must NOT abort startup
+          # via `set -e` — log a warning and continue so the heartbeat and agent
+          # still come up instead of leaving FORGE unable to perform the rework.
+          if git checkout "$TARGET_BRANCH" 2>/dev/null; then
+            log "Checked out existing local branch: $TARGET_BRANCH"
+          else
+            log "WARNING: could not switch to local branch '$TARGET_BRANCH' (uncommitted work or unresolved merge) — continuing on current branch"
+          fi
         elif git checkout -B "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" 2>/dev/null; then
           log "Checked out target branch: $TARGET_BRANCH"
         else
