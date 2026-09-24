@@ -2,7 +2,10 @@
 
 use crate::{
     error::ManagerError,
-    services::{FleetService, KanbanService, TenantProvisioner, TenantService},
+    services::{
+        AiBackend, AiService, CoderAiBackend, FleetService, KanbanService, MockAiBackend,
+        TenantProvisioner, TenantService,
+    },
 };
 use axum::Router;
 use pocketflow_core::SharedStore;
@@ -40,6 +43,7 @@ pub struct AppState {
     tenant_service: TenantService,
     fleet_service: FleetService,
     kanban_service: KanbanService,
+    ai_service: AiService,
 }
 
 impl AppState {
@@ -61,6 +65,7 @@ impl AppState {
         let tenant_service = TenantService::for_tests(store.clone());
         let fleet_service = FleetService::new(store.clone());
         let kanban_service = KanbanService::new(store.clone());
+        let ai_service = AiService::for_tests(store.clone());
 
         Self {
             store,
@@ -68,6 +73,7 @@ impl AppState {
             tenant_service,
             fleet_service,
             kanban_service,
+            ai_service,
         }
     }
 
@@ -78,6 +84,10 @@ impl AppState {
         let tenant_service = TenantService::with_coder_provisioner(store.clone());
         let fleet_service = FleetService::new(store.clone());
         let kanban_service = KanbanService::new(store.clone());
+        let ai_backend: Arc<dyn AiBackend> = CoderAiBackend::from_env()
+            .map(|b| Arc::new(b) as Arc<dyn AiBackend>)
+            .unwrap_or_else(|_| Arc::new(MockAiBackend::new()));
+        let ai_service = AiService::new(store.clone(), ai_backend);
 
         Self {
             store,
@@ -85,6 +95,7 @@ impl AppState {
             tenant_service,
             fleet_service,
             kanban_service,
+            ai_service,
         }
     }
 
@@ -98,6 +109,10 @@ impl AppState {
         let tenant_service = TenantService::new(store.clone(), provisioner);
         let fleet_service = FleetService::new(store.clone());
         let kanban_service = KanbanService::new(store.clone());
+        let ai_backend: Arc<dyn AiBackend> = CoderAiBackend::from_env()
+            .map(|b| Arc::new(b) as Arc<dyn AiBackend>)
+            .unwrap_or_else(|_| Arc::new(MockAiBackend::new()));
+        let ai_service = AiService::new(store.clone(), ai_backend);
 
         Self {
             store,
@@ -105,6 +120,7 @@ impl AppState {
             tenant_service,
             fleet_service,
             kanban_service,
+            ai_service,
         }
     }
 
@@ -112,6 +128,10 @@ impl AppState {
         let tenant_service = TenantService::with_coder_provisioner(store.clone());
         let fleet_service = FleetService::new(store.clone());
         let kanban_service = KanbanService::new(store.clone());
+        let ai_backend: Arc<dyn AiBackend> = CoderAiBackend::from_env()
+            .map(|b| Arc::new(b) as Arc<dyn AiBackend>)
+            .unwrap_or_else(|_| Arc::new(MockAiBackend::new()));
+        let ai_service = AiService::new(store.clone(), ai_backend);
 
         Self {
             store,
@@ -119,7 +139,13 @@ impl AppState {
             tenant_service,
             fleet_service,
             kanban_service,
+            ai_service,
         }
+    }
+
+    pub fn with_ai_backend(mut self, backend: Arc<dyn AiBackend>) -> Self {
+        self.ai_service = AiService::new(self.store.clone(), backend);
+        self
     }
 
     pub fn store(&self) -> &SharedStore {
@@ -136,6 +162,10 @@ impl AppState {
 
     pub fn kanban_service(&self) -> &KanbanService {
         &self.kanban_service
+    }
+
+    pub fn ai_service(&self) -> &AiService {
+        &self.ai_service
     }
 
     pub async fn check_readiness(&self) -> Result<(), ManagerError> {

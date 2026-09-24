@@ -1596,6 +1596,223 @@ impl CoderClient {
         *cached = None;
     }
 
+    // ── AI Provider & Chat Model APIs (Issue #290) ─────────────────────────
+
+    /// List all AI Providers (`GET /api/v2/ai/providers`).
+    pub async fn list_ai_providers(&self) -> Result<Vec<crate::types::CoderAiProvider>> {
+        let resp = self
+            .authenticated_request(reqwest::Method::GET, "/api/v2/ai/providers")
+            .send()
+            .await
+            .context("Failed to list AI providers")?;
+
+        if resp.status().is_success() {
+            let providers: Vec<crate::types::CoderAiProvider> = resp.json().await?;
+            Ok(providers)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list AI providers ({}): {}", status, body)
+        }
+    }
+
+    /// Get a specific AI Provider by ID or Name (`GET /api/v2/ai/providers/{idOrName}`).
+    pub async fn get_ai_provider(&self, id_or_name: &str) -> Result<crate::types::CoderAiProvider> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/ai/providers/{}", id_or_name),
+            )
+            .send()
+            .await
+            .context("Failed to get AI provider")?;
+
+        if resp.status().is_success() {
+            let provider: crate::types::CoderAiProvider = resp.json().await?;
+            Ok(provider)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get AI provider ({}): {}", status, body)
+        }
+    }
+
+    /// Create an AI Provider (`POST /api/v2/ai/providers`).
+    pub async fn create_ai_provider(
+        &self,
+        req: &crate::types::CreateAiProviderRequest,
+    ) -> Result<crate::types::CoderAiProvider> {
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/ai/providers")
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create AI provider")?;
+
+        if resp.status().is_success() {
+            let provider: crate::types::CoderAiProvider = resp.json().await?;
+            Ok(provider)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create AI provider ({}): {}", status, body)
+        }
+    }
+
+    /// Update an AI Provider (`PATCH /api/v2/ai/providers/{idOrName}`).
+    pub async fn update_ai_provider(
+        &self,
+        id_or_name: &str,
+        req: &crate::types::UpdateAiProviderRequest,
+    ) -> Result<crate::types::CoderAiProvider> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::PATCH,
+                &format!("/api/v2/ai/providers/{}", id_or_name),
+            )
+            .json(req)
+            .send()
+            .await
+            .context("Failed to update AI provider")?;
+
+        if resp.status().is_success() {
+            let provider: crate::types::CoderAiProvider = resp.json().await?;
+            Ok(provider)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to update AI provider ({}): {}", status, body)
+        }
+    }
+
+    /// Delete an AI Provider (`DELETE /api/v2/ai/providers/{idOrName}`).
+    pub async fn delete_ai_provider(&self, id_or_name: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::DELETE,
+                &format!("/api/v2/ai/providers/{}", id_or_name),
+            )
+            .send()
+            .await
+            .context("Failed to delete AI provider")?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete AI provider ({}): {}", status, body)
+        }
+    }
+
+    /// List all Chat Model configurations for default organization (`GET /api/v2/organizations/{org}/chats/models`).
+    pub async fn list_chat_model_configs(&self) -> Result<Vec<crate::types::CoderChatModelConfig>> {
+        let organization_id = self.get_default_organization_id().await?;
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/chats/models", organization_id),
+            )
+            .send()
+            .await
+            .context("Failed to list chat model configs")?;
+
+        if resp.status().is_success() {
+            let data: crate::types::CoderChatModelsResponse = resp.json().await?;
+            Ok(data.models)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list chat model configs ({}): {}", status, body)
+        }
+    }
+
+    /// Create a Chat Model configuration (`POST /api/v2/organizations/{org}/chats/models`).
+    pub async fn create_chat_model(
+        &self,
+        req: &crate::types::CreateChatModelRequest,
+    ) -> Result<crate::types::CoderChatModelConfig> {
+        let organization_id = self.get_default_organization_id().await?;
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/organizations/{}/chats/models", organization_id),
+            )
+            .json(req)
+            .send()
+            .await
+            .context("Failed to create chat model")?;
+
+        if resp.status().is_success() {
+            let model: crate::types::CoderChatModelConfig = resp.json().await?;
+            #[cfg(feature = "chats-api")]
+            self.invalidate_model_cache().await;
+            Ok(model)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create chat model ({}): {}", status, body)
+        }
+    }
+
+    /// Update a Chat Model configuration (`PATCH /api/v2/organizations/{org}/chats/models/{id}`).
+    pub async fn update_chat_model(
+        &self,
+        model_id: &str,
+        req: &crate::types::UpdateChatModelRequest,
+    ) -> Result<crate::types::CoderChatModelConfig> {
+        let organization_id = self.get_default_organization_id().await?;
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::PATCH,
+                &format!(
+                    "/api/v2/organizations/{}/chats/models/{}",
+                    organization_id, model_id
+                ),
+            )
+            .json(req)
+            .send()
+            .await
+            .context("Failed to update chat model")?;
+
+        if resp.status().is_success() {
+            let model: crate::types::CoderChatModelConfig = resp.json().await?;
+            #[cfg(feature = "chats-api")]
+            self.invalidate_model_cache().await;
+            Ok(model)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to update chat model ({}): {}", status, body)
+        }
+    }
+
+    /// Delete a Chat Model configuration (`DELETE /api/v2/organizations/{org}/chats/models/{id}`).
+    pub async fn delete_chat_model(&self, model_id: &str) -> Result<()> {
+        let organization_id = self.get_default_organization_id().await?;
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::DELETE,
+                &format!(
+                    "/api/v2/organizations/{}/chats/models/{}",
+                    organization_id, model_id
+                ),
+            )
+            .send()
+            .await
+            .context("Failed to delete chat model")?;
+
+        if resp.status().is_success() {
+            #[cfg(feature = "chats-api")]
+            self.invalidate_model_cache().await;
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete chat model ({}): {}", status, body)
+        }
+    }
+
     // ── Convenience methods (Phase 3, Tasks 3.3 + 3.4) ─────────────────────
 
     /// Create a workspace and chat in one step, with standard OpenFlows labels.

@@ -551,6 +551,128 @@ pub struct ExternalAuthDevice {
     pub interval: i64,
 }
 
+/// A Coder AI Provider (`/api/v2/ai/providers`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderAiProvider {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// Request to create an AI Provider in Coder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAiProviderRequest {
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
+}
+
+/// Request to update an AI Provider in Coder.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateAiProviderRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// A Coder Chat Model configuration (`/api/v2/organizations/{org}/chats/models`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoderChatModelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub organization_id: String,
+    pub ai_provider_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub context_limit: u64,
+    #[serde(default)]
+    pub compression_threshold: Option<u64>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// Response returned by GET `/api/v2/organizations/{org}/chats/models`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoderChatModelsResponse {
+    #[serde(default)]
+    pub models: Vec<CoderChatModelConfig>,
+    #[serde(default)]
+    pub providers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub unsupported_providers: Vec<serde_json::Value>,
+}
+
+/// Request to create a Chat Model in Coder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateChatModelRequest {
+    pub ai_provider_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub context_limit: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_threshold: Option<u64>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Request to update a Chat Model in Coder.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateChatModelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_threshold: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
 #[cfg(test)]
 mod external_auth_tests {
     use super::*;

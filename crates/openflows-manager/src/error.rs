@@ -63,6 +63,12 @@ pub enum ManagerError {
     #[error("ticket '{ticket}' not found in tenant '{tenant}'")]
     TicketNotFound { tenant: String, ticket: String },
 
+    #[error("AI provider '{0}' not found")]
+    ProviderNotFound(String),
+
+    #[error("AI model '{0}' not found")]
+    ModelNotFound(String),
+
     #[error("store error: {0}")]
     Store(String),
 
@@ -83,6 +89,8 @@ impl ManagerError {
             Self::InvalidRepository(_) => "invalid_repository",
             Self::InvalidRequest(_) => "invalid_request",
             Self::TicketNotFound { .. } => "ticket_not_found",
+            Self::ProviderNotFound(_) => "provider_not_found",
+            Self::ModelNotFound(_) => "model_not_found",
             Self::Store(_) => "store_error",
             Self::Io(_) => "io_error",
             Self::Service(_) => "internal_error",
@@ -91,7 +99,10 @@ impl ManagerError {
 
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::TenantNotFound(_) | Self::TicketNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::TenantNotFound(_)
+            | Self::TicketNotFound { .. }
+            | Self::ProviderNotFound(_)
+            | Self::ModelNotFound(_) => StatusCode::NOT_FOUND,
             Self::TenantAlreadyExists(_) => StatusCode::CONFLICT,
             Self::InvalidTenantName(_) | Self::InvalidRepository(_) | Self::InvalidRequest(_) => {
                 StatusCode::BAD_REQUEST

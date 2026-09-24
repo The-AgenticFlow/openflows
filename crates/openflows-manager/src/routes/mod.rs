@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 
+pub mod ai;
 pub mod fleet;
 pub mod health;
 pub mod tenants;
@@ -45,6 +46,8 @@ fn api_v1_router() -> Router<AppState> {
             "/tenants/{tenant}/tickets/{ticket}",
             get(tickets::get_ticket),
         )
+        // AI Provider, Model, and Model Assignment Policy routes
+        .merge(ai::router())
 }
 
 #[derive(Serialize)]
