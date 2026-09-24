@@ -7,15 +7,19 @@ license = "MIT"
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true }
+async-trait = { workspace = true }
+coder-client = { version = "0.1.0", path = "../coder-client" }
+config = { version = "0.2.0", path = "../config" }
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-config = { version = "0.2.0", path = "../config" }
-pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
-axum = { version = "0.8", features = ["http1", "json"] }
+axum = { version = "0.8", features = ["http1", "json", "query"] }
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 reqwest = { workspace = true }

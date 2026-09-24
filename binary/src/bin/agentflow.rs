@@ -597,13 +597,7 @@ async fn run_bootstrap() -> Result<()> {
 }
 
 fn validate_tenant_name(name: &str) -> Result<()> {
-    anyhow::ensure!(!name.is_empty(), "tenant name must not be empty");
-    anyhow::ensure!(
-        name.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
-        "tenant name '{name}' contains characters that are not allowed in Redis namespace operations; use only ASCII letters, numbers, '.', '_' and '-'"
-    );
-    Ok(())
+    openflows_manager::services::tenant::validate_tenant_name(name).map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
@@ -613,188 +607,97 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     validate_tenant_name(name)?;
 
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
-    // Scope the store to the tenant we are cleaning: SharedStore namespaces
-    // every key as `ns:{tenant}:{key}`, so we pass it the tenant and use plain
-    // keys below. (We must NOT also hand-format `ns:{name}:` prefixes here,
-    // which would double the namespace to `ns:{name}:ns:{name}:...` and fail
-    // to touch the real ticket keys.)
-    let store =
-        match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(name.clone()))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  ✗ Redis error: {}", e);
-                return Ok(());
+    let store = match pocketflow_core::SharedStore::new_redis(&redis_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  ✗ Redis error: {}", e);
+            return Ok(());
+        }
+    };
+
+    let tenant_svc = openflows_manager::services::TenantService::with_coder_provisioner(store);
+    match tenant_svc.clean_tenant(name, *reset_all).await {
+        Ok(res) => {
+            if res.reset_tickets_count > 0 {
+                println!("  ✓ Reset {} ticket(s) to Open", res.reset_tickets_count);
+            } else {
+                println!("  (no stale tickets found)");
             }
-        };
-
-    let mut tickets: Vec<serde_json::Value> = store.get_typed("tickets").await.unwrap_or_default();
-
-    let mut reset_count = 0;
-
-    for ticket in tickets.iter_mut() {
-        let status = ticket.get("status");
-        let is_stale = status
-            .map(|s| {
-                let stype = match s {
-                    serde_json::Value::Object(obj) => {
-                        obj.get("type").and_then(|v| v.as_str()).unwrap_or("")
-                    }
-                    serde_json::Value::String(s) => s.as_str(),
-                    _ => "",
-                };
-                stype == "awaiting_human" || stype == "failed"
-            })
-            .unwrap_or(false);
-
-        let should_reset = is_stale || *reset_all;
-
-        if should_reset {
-            // Reset the status object to Open format
-            ticket["status"] = serde_json::json!({
-                "type": "open"
-            });
-            if let Some(obj) = ticket.as_object_mut() {
-                obj.insert("attempts".to_string(), serde_json::json!(0));
+            if res.cleared_recovery_counters > 0 {
+                println!(
+                    "  ✓ Cleared {} recovery counters",
+                    res.cleared_recovery_counters
+                );
             }
-            reset_count += 1;
+            println!("  ✓ Cleared worker slots (stale workspace references)");
+            println!("  ✓ Tenant '{}' cleaned", name);
+            println!("  (Restart the controller to pick up changes)");
+        }
+        Err(e) => {
+            eprintln!("  ✗ Clean error: {}", e);
         }
     }
-
-    if reset_count > 0 {
-        store.set("tickets", serde_json::to_value(&tickets)?).await;
-        println!("  ✓ Reset {} ticket(s) to Open", reset_count);
-    } else {
-        println!("  (no stale tickets found)");
-    }
-
-    // Also clear recovery attempt counters.
-    // keys()/raw_keys() return full Redis keys (ns:{tenant}:...), so delete
-    // them with raw_del to avoid re-applying the tenant namespace.
-    let recovery_pattern = format!("ns:{}:ticket:*:recovery_attempts", name);
-    let recovery_keys: Vec<String> = store.raw_keys(&recovery_pattern).await;
-    let recovery_count = recovery_keys.len();
-    for key in &recovery_keys {
-        store.raw_del(key).await;
-    }
-    if recovery_count > 0 {
-        println!("  ✓ Cleared {} recovery counters", recovery_count);
-    }
-
-    // Clear worker_slots to prevent stale workspace IDs triggering premature provisioning
-    store.set("worker_slots", serde_json::json!({})).await;
-    println!("  ✓ Cleared worker slots (stale workspace references)");
-
-    println!("  ✓ Tenant '{}' cleaned", name);
-    println!("  (Restart the controller to pick up changes)");
 
     Ok(())
 }
 
 async fn run_tenant(action: TenantCommands) -> Result<()> {
-    // Clean command doesn't need bootstrap - handle it completely separately
     if matches!(action, TenantCommands::Clean { .. }) {
         return run_tenant_clean(&action).await;
     }
 
-    let bootstrapper = coder_client::bootstrap::CoderBootstrapper::from_env()
-        .context("Failed to create bootstrapper from environment")?;
-
-    let client = bootstrapper
-        .bootstrap()
-        .await
-        .context("Bootstrap required before tenant operations")?;
+    let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
+    let store = match pocketflow_core::SharedStore::new_redis(&redis_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  ✗ Redis error: {}", e);
+            return Ok(());
+        }
+    };
+    let tenant_svc = openflows_manager::services::TenantService::with_coder_provisioner(store);
 
     match action {
         TenantCommands::Add { repo, name, fleet } => {
-            if fleet < 1 {
-                anyhow::bail!(
-                    "--fleet must be >= 1 (a fleet of N means N FORGE-SENTINEL pairs); got {}",
-                    fleet
-                );
-            }
-            let tenant_name =
-                name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
-            validate_tenant_name(&tenant_name)?;
-
-            // Derive the tenant fleet registry with pairs applied to forge/sentinel.
-            let resolver = openflows::orchestration::OrchestrationResolver::new()
-                .context("Failed to resolve orchestration registry")?;
-            let registry_path = resolver.registry_path();
-            let base_registry = config::Registry::load(&registry_path).with_context(|| {
-                format!("cannot load base registry at {}", registry_path.display())
-            })?;
-            let tenant_registry = base_registry.with_team_fleet(fleet);
-            let registry_json = serde_json::to_string_pretty(&tenant_registry)?;
-
+            let tenant_name = name
+                .clone()
+                .unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
             println!(
                 "Adding tenant '{}' for repository '{}' with fleet {} ({} forge + {} sentinel pairs)...",
                 tenant_name, repo, fleet, fleet, fleet
             );
-            let workspace_id = bootstrapper
-                .ensure_tenant(&client, &tenant_name, &repo, &registry_json)
+
+            let res = tenant_svc
+                .create_tenant(openflows_manager::models::tenant::TenantCreateRequest {
+                    repo: repo.clone(),
+                    name,
+                    fleet,
+                })
                 .await
                 .context("Tenant setup failed")?;
 
-            // Persist repo + fleet registry into the tenant store.
-            let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
-            match pocketflow_core::SharedStore::new_redis_with_tenant(
-                &redis_url,
-                Some(tenant_name.clone()),
-            )
-            .await
-            {
-                Ok(store) => {
-                    store.set("repository", serde_json::json!(&repo)).await;
-                    store
-                        .set("registry_json", serde_json::json!(&registry_json))
-                        .await;
-                    println!(
-                        "  ✓ Repository '{}' and fleet registry persisted for tenant '{}'",
-                        repo, tenant_name
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  ⚠ Could not persist repository/registry to Redis for tenant '{}': {}",
-                        tenant_name, e
-                    );
-                }
-            }
-
-            println!("\n  ✓ Tenant '{}' added", tenant_name);
-            println!("  ✓ Fleet: {} FORGE-SENTINEL pair(s)", fleet);
-            println!("  ✓ Nexus workspace: {}", workspace_id);
+            println!(
+                "  ✓ Repository '{}' and fleet registry persisted for tenant '{}'",
+                res.repository, res.tenant
+            );
+            println!("\n  ✓ Tenant '{}' added", res.tenant);
+            println!("  ✓ Fleet: {} FORGE-SENTINEL pair(s)", res.fleet);
+            println!("  ✓ Nexus workspace: {}", res.workspace_id);
             println!("  → Complete the GitHub OAuth link in the Coder dashboard for this tenant");
         }
         TenantCommands::List => {
             println!("Tenants (from Redis namespaces):");
-            // Read all ns:* keys from Redis and list unique tenants
-            let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
-            match pocketflow_core::SharedStore::new_redis(&redis_url).await {
-                Ok(store) => {
-                    // raw_keys scans full Redis keys (`ns:*`) without re-applying
-                    // the tenant namespace, so we can enumerate all tenants.
-                    let keys: Vec<String> = store.raw_keys("ns:*").await;
-                    let mut tenants = std::collections::HashSet::new();
-                    for key in keys {
-                        if let Some(ns) = key.strip_prefix("ns:") {
-                            if let Some(tenant) = ns.split(':').next() {
-                                tenants.insert(tenant.to_string());
-                            }
-                        }
-                    }
+            match tenant_svc.list_tenants().await {
+                Ok(tenants) => {
                     if tenants.is_empty() {
                         println!("  (no tenants found)");
                     } else {
                         for t in tenants {
-                            println!("  - {}", t);
+                            println!("  - {}", t.name);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("  ✗ Redis error: {}", e);
+                    eprintln!("  ✗ Tenant list error: {}", e);
                 }
             }
         }
@@ -802,33 +705,20 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             validate_tenant_name(&name)?;
             println!("Removing tenant '{}'...", name);
 
-            if purge {
-                let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
-                match pocketflow_core::SharedStore::new_redis(&redis_url).await {
-                    Ok(store) => {
-                        // raw_keys + raw_del operate on full keys, so we purge the
-                        // real `ns:{name}:*` namespace instead of re-prefixing it.
-                        let pattern = format!("ns:{}:*", name);
-                        let keys: Vec<String> = store.raw_keys(&pattern).await;
-                        if !keys.is_empty() {
-                            for key in &keys {
-                                store.raw_del(key).await;
-                            }
-                            println!("  ✓ Purged {} keys from Redis", keys.len());
-                        }
+            match tenant_svc.remove_tenant(&name, purge).await {
+                Ok(res) => {
+                    if purge && res.purged_keys_count > 0 {
+                        println!("  ✓ Purged {} keys from Redis", res.purged_keys_count);
                     }
-                    Err(e) => {
-                        eprintln!("  ⚠ Could not purge Redis: {}", e);
-                    }
+                    println!("  ✓ Tenant '{}' removed", name);
+                    println!("  (Workspaces and chats must be cleaned up manually in the Coder dashboard)");
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ Could not remove tenant: {}", e);
                 }
             }
-
-            println!("  ✓ Tenant '{}' removed", name);
-            println!("  (Workspaces and chats must be cleaned up manually in the Coder dashboard)");
         }
-        TenantCommands::Clean { .. } => {
-            // Already handled above, this arm exists only to satisfy exhaustive match
-        }
+        TenantCommands::Clean { .. } => {}
     }
 
     Ok(())

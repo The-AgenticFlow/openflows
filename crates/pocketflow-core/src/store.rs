@@ -205,6 +205,21 @@ impl SharedStore {
         })
     }
 
+    /// Return the tenant associated with this store instance.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// Create a clone of this SharedStore scoped to a different tenant,
+    /// sharing the same underlying storage backend connection/map.
+    pub fn for_tenant(&self, tenant: impl Into<String>) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            ring_buffer: self.ring_buffer.clone(),
+            tenant: tenant.into(),
+        }
+    }
+
     /// Build a tenant-namespaced key: `ns:{tenant}:{key}`.
     fn ns_key(&self, key: &str) -> String {
         format!("ns:{}:{}", self.tenant, key)

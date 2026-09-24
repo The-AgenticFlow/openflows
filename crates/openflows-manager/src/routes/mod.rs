@@ -1,10 +1,16 @@
 //! Versioned HTTP route composition for the OpenFlows Manager API.
 
 use crate::server::AppState;
-use axum::{routing::get, Json, Router};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Serialize;
 
+pub mod fleet;
 pub mod health;
+pub mod tenants;
+pub mod tickets;
 
 pub fn router() -> Router<AppState> {
     // Keep platform-oriented probes at the root because orchestrators and load
@@ -18,9 +24,27 @@ pub fn router() -> Router<AppState> {
 }
 
 fn api_v1_router() -> Router<AppState> {
-    // The index route gives clients a cheap way to confirm the v1 mount exists
-    // while the manager API surface is still growing.
-    Router::new().route("/", get(api_index))
+    Router::new()
+        .route("/", get(api_index))
+        // Fleet routes
+        .route("/fleet", get(fleet::get_fleet))
+        .route("/fleet/{tenant}", get(fleet::get_tenant_fleet))
+        // Tenant routes
+        .route(
+            "/tenants",
+            get(tenants::list_tenants).post(tenants::create_tenant),
+        )
+        .route(
+            "/tenants/{tenant}",
+            get(tenants::get_tenant).delete(tenants::remove_tenant),
+        )
+        .route("/tenants/{tenant}/clean", post(tenants::clean_tenant))
+        // Ticket / Kanban routes
+        .route("/tenants/{tenant}/tickets", get(tickets::list_tickets))
+        .route(
+            "/tenants/{tenant}/tickets/{ticket}",
+            get(tickets::get_ticket),
+        )
 }
 
 #[derive(Serialize)]

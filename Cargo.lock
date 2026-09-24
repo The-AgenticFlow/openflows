@@ -1586,6 +1586,7 @@ dependencies = [
  "dotenvy",
  "mockito",
  "openflows-harness",
+ "openflows-manager",
  "pocketflow-core",
  "provisioner",
  "reqwest",
@@ -1623,9 +1624,12 @@ name = "openflows-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "coder-client",
  "config",
  "pocketflow-core",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",

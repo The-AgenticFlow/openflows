@@ -31,6 +31,7 @@ agent-lore      = { version = "0.1.0", path = "../crates/agent-lore" }
 provisioner    = { version = "0.1.0", path = "../crates/provisioner" }
 coder-client    = { version = "0.1.0", path = "../crates/coder-client" }
 openflows-harness = { version = "1.2.1", path = "../crates/openflows-harness" }
+openflows-manager = { version = "0.1.0", path = "../crates/openflows-manager" }
 clap            = { version = "4", features = ["derive"] }
 
   anyhow      = { workspace = true }
