@@ -23,6 +23,7 @@ pub struct TenantDetail {
 /// Request to create/register a tenant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantCreateRequest {
+    #[serde(alias = "repository")]
     pub repo: String,
     pub name: Option<String>,
     #[serde(default = "default_fleet")]
