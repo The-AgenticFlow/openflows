@@ -177,7 +177,11 @@ impl SentinelNode {
     /// (`ticket:{id}:pr` -> `{pr_number, branch, title}`). This guarantees the
     /// GitHub review submission (approve / request-changes) always targets the
     /// right PR instead of being silently skipped.
-    async fn resolve_pr_number(store: &SharedStore, ticket_id: &str, pr_number: Option<u64>) -> Option<u64> {
+    async fn resolve_pr_number(
+        store: &SharedStore,
+        ticket_id: &str,
+        pr_number: Option<u64>,
+    ) -> Option<u64> {
         if pr_number.is_some() {
             return pr_number;
         }
@@ -186,7 +190,10 @@ impl SentinelNode {
         struct StoredPr {
             pr_number: u64,
         }
-        store.get_typed::<StoredPr>(&pr_key).await.map(|p| p.pr_number)
+        store
+            .get_typed::<StoredPr>(&pr_key)
+            .await
+            .map(|p| p.pr_number)
     }
 
     /// Derive inline review comments from a SENTINEL report body. Lines matching
@@ -495,8 +502,12 @@ impl Node for SentinelNode {
                     // verdict omitted it, so the APPROVE review always lands.
                     let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
                     let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
-                    let pr_number =
-                        Self::resolve_pr_number(store, ticket_id, review_payload.as_ref().and_then(|r| r.pr_number)).await;
+                    let pr_number = Self::resolve_pr_number(
+                        store,
+                        ticket_id,
+                        review_payload.as_ref().and_then(|r| r.pr_number),
+                    )
+                    .await;
                     if let Some(pr_number) = pr_number {
                         let report = review_payload
                             .as_ref()

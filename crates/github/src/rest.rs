@@ -1209,7 +1209,8 @@ fn map_status_state(state: &str) -> CiStatus {
 /// fall back to the modern Checks API instead of aborting.
 fn is_status_api_forbidden(err: &anyhow::Error) -> bool {
     let msg = format!("{err}");
-    msg.contains("GitHub API error 403") && (msg.contains("not accessible") || msg.contains("forbidden"))
+    msg.contains("GitHub API error 403")
+        && (msg.contains("not accessible") || msg.contains("forbidden"))
 }
 
 fn extract_ticket_id(title: &str, body: &Option<String>, branch: &str) -> Option<String> {

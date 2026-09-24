@@ -9,8 +9,8 @@ use coder_client::CoderClient;
 use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
-        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
+        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
+        KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
@@ -1677,7 +1677,7 @@ impl VesselNode {
                 );
                 self.handle_conflicts(owner, repo, pr_info).await
             }
-             CiPollResult::Timeout => {
+            CiPollResult::Timeout => {
                 warn!(
                     pr_number,
                     "CI timed out — checking for conflicts as likely cause"
@@ -2754,9 +2754,7 @@ impl VesselNode {
             Ok(_) => {
                 info!(
                     ticket_id,
-                    pr_number,
-                    chat_id,
-                    "Dispatched /ci_fix to existing forge chat"
+                    pr_number, chat_id, "Dispatched /ci_fix to existing forge chat"
                 );
                 true
             }
@@ -2786,8 +2784,7 @@ impl VesselNode {
         store.set(&key, json!(directive)).await;
         info!(
             ticket_id,
-            role,
-            "Persisted rework directive for NEXUS to use as forge chat initial prompt"
+            role, "Persisted rework directive for NEXUS to use as forge chat initial prompt"
         );
     }
 
@@ -2827,11 +2824,7 @@ impl VesselNode {
                 .iter()
                 .any(|p| p["number"].as_u64() == Some(pr_number));
             if !already_tracked {
-                if let Ok(pr_info) = self
-                    .client
-                    .get_pull_request(owner, repo, pr_number)
-                    .await
-                {
+                if let Ok(pr_info) = self.client.get_pull_request(owner, repo, pr_number).await {
                     pending_prs.push(json!({
                         "number": pr_info.number,
                         "ticket_id": pr_info.ticket_id,
@@ -3378,7 +3371,9 @@ mod tests {
             )
             .await;
         // Already dispatched for this exact head SHA — FORGE is still working.
-        store.set("_address_review_dispatched_42", json!("sha-abc")).await;
+        store
+            .set("_address_review_dispatched_42", json!("sha-abc"))
+            .await;
 
         let config = VesselConfig::default();
         let node = VesselNode::new(config);
@@ -3432,10 +3427,7 @@ mod tests {
     async fn test_rearm_review_prs_does_not_duplicate_existing_pr() {
         let store = SharedStore::new_in_memory();
         store
-            .set(
-                "pending_prs",
-                json!([{"number": 42, "ticket_id": "T-42"}]),
-            )
+            .set("pending_prs", json!([{"number": 42, "ticket_id": "T-42"}]))
             .await;
         store.set("_address_review_rearmed_42", json!(true)).await;
 

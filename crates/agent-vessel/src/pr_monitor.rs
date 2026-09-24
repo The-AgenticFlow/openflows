@@ -201,11 +201,7 @@ pub async fn collect_rework(
 /// This is a **pointer**, not a dump: it names the PR, its review state, and
 /// tells FORGE to use the `/address_review` command to pull the full review
 /// context (inline comments / conflicts) itself, then re-arm the PR.
-pub fn build_directive(
-    state: PrMonitorState,
-    pr_number: u64,
-    reason: Option<&str>,
-) -> String {
+pub fn build_directive(state: PrMonitorState, pr_number: u64, reason: Option<&str>) -> String {
     let mut out = String::from("/address_review\n");
     out.push_str(&format!("state: {}\n", state.as_str()));
     out.push_str(&format!("pr: {}\n", pr_number));
