@@ -64,11 +64,15 @@ data "coder_parameter" "branch" {
 
 # The requested branch is interpolated directly into the startup bash script.
 # A branch name containing shell metacharacters (e.g. `$(...)`) would otherwise
-# be evaluated by bash as command substitution, so validate it against a strict
-# git-ref-safe charset and fall back to the default branch when it does not match.
+# be evaluated by bash as command substitution, so validate it against a charset
+# that accepts all git-valid, shell-safe characters and fall back to the default
+# branch when it does not match. `+`, `=`, `@`, `.`, `_`, `-`, `/` are all legal
+# in git ref names and safe in the shell; anything else (dollar, backtick,
+# parens, quotes, spaces, `;`, `&`, `|`, `<`, `>`, `!`, `*`, `?`, `[`, `]`,
+# `~`, `\`, `#`) is rejected so a malicious branch cannot inject shell commands.
 locals {
   requested_branch = data.coder_parameter.branch.value
-  safe_branch      = can(regex("^[A-Za-z0-9._/-]+$", local.requested_branch)) ? local.requested_branch : ""
+  safe_branch      = can(regex("^[A-Za-z0-9._/+@=-]+$", local.requested_branch)) ? local.requested_branch : ""
 }
 
 data "coder_parameter" "tenant" {
@@ -260,16 +264,22 @@ resource "coder_agent" "main" {
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace
       if [ -n "$TARGET_BRANCH" ]; then
-        # Create/reset a LOCAL tracking branch instead of checking out
-        # `origin/$TARGET_BRANCH` directly. A direct remote-tracking checkout
-        # leaves HEAD detached, and the CI-fix / /address_review flow pushes
-        # with plain `git push`, which cannot publish from a detached HEAD.
-        if git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH" 2>/dev/null; then
+        # Resume the PR branch on a NAMED local branch (never detached, so the
+        # CI-fix / /address_review flow can push with plain `git push`). Prefer
+        # an already-existing local branch (reused workspace) to avoid discarding
+        # in-flight work, then create a tracking branch from origin. If the PR
+        # branch is not present locally or under origin (e.g. a fork-backed PR
+        # whose head ref is not on this origin), fall back to the default branch
+        # WITHOUT fabricating a branch of the PR's name at origin/HEAD — doing so
+        # would start rework without the PR's commits and could reset existing
+        # local work.
+        if git rev-parse --verify --quiet "refs/heads/$TARGET_BRANCH" >/dev/null; then
+          git checkout "$TARGET_BRANCH" 2>/dev/null
+          log "Checked out existing local branch: $TARGET_BRANCH"
+        elif git checkout -B "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" 2>/dev/null; then
           log "Checked out target branch: $TARGET_BRANCH"
-        elif git checkout -B "$TARGET_BRANCH" "origin/HEAD" 2>/dev/null; then
-          log "WARNING: no origin branch '$TARGET_BRANCH' — created local branch from default"
         else
-          log "WARNING: could not check out branch '$TARGET_BRANCH' — falling back to default branch"
+          log "WARNING: branch '$TARGET_BRANCH' not found locally or on origin — falling back to default branch"
           git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
         fi
       else
