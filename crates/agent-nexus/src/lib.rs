@@ -483,13 +483,30 @@ Before significant work, read the relevant skill file to understand the workflow
                         continue;
                     }
 
+                    // A PR whose ticket has been escalated to a human must not be
+                    // re-added to automatic processing, even if a stale
+                    // /address_review dispatch marker is still present. VESSEL
+                    // leaves the marker set after exhausting its review attempts,
+                    // so without this guard the next discovery pass would put the
+                    // PR back into the polling loop.
+                    let ticket = tickets.iter().find(|t| t.id == *tid);
+                    if let Some(ticket) = ticket {
+                        if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
+                            info!(
+                                pr_number = pr.number,
+                                ticket_id = %tid,
+                                "Skipping re-add of PR for ticket awaiting human intervention"
+                            );
+                            continue;
+                        }
+                    }
+
                     // If FORGE is (or was) addressing a VESSEL-dispatched
                     // `/address_review` for this PR, always re-add it. This
                     // overrides the ticket-state skip rules below (Failed /
-                    // InProgress / awaiting human) so VESSEL can resume polling
-                    // once FORGE re-arms — otherwise a rework ticket in those
-                    // states would never re-enter pending_prs and the PR would
-                    // strand forever.
+                    // InProgress) so VESSEL can resume polling once FORGE
+                    // re-arms — otherwise a rework ticket in those states would
+                    // never re-enter pending_prs and the PR would strand forever.
                     let dispatch_key = address_review_dispatched_key(pr.number);
                     if store.get(&dispatch_key).await.is_some() {
                         info!(
@@ -511,14 +528,6 @@ Before significant work, read the relevant skill file to understand the workflow
                     }
 
                     if let Some(ticket) = tickets.iter().find(|t| t.id == *tid) {
-                        if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
-                            info!(
-                                pr_number = pr.number,
-                                ticket_id = %tid,
-                                "Skipping re-add of PR for ticket awaiting human intervention"
-                            );
-                            continue;
-                        }
                         if let TicketStatus::Failed { reason, .. } = &ticket.status {
                             if reason.contains("Merge conflicts")
                                 || reason.contains("merge conflict")
@@ -1490,18 +1499,11 @@ Before significant work, read the relevant skill file to understand the workflow
 
         // If VESSEL persisted a targeted rework directive (`/ci_fix` / `/address_review`)
         // because no live forge chat existed at dispatch time, use ONLY that directive as
-        // the initial chat prompt instead of the full ticket-assignment blast, then clear
-        // the key so it is not re-sent on every reconciliation.
+        // the initial chat prompt instead of the full ticket-assignment blast. The key is
+        // cleared only AFTER the chat is successfully created below, so a failed chat
+        // creation does not lose the rework request.
         let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
         let rework_directive = store.get_typed::<String>(&rework_key).await;
-        if rework_directive.is_some() {
-            store.del(&rework_key).await;
-            info!(
-                ticket_id,
-                role,
-                "Consumed persisted rework directive — new chat will start with only the targeted directive"
-            );
-        }
 
         // Build ticket content with full context
         let ticket_content = format!(
@@ -1572,6 +1574,7 @@ Use `openflows-harness` for all coordination:
         // When VESSEL persisted a targeted rework directive (no live forge chat at
         // dispatch time), start the new chat with ONLY that directive instead of the
         // full ticket-assignment blast — the agent resumes its existing branch/work.
+        let had_rework_directive = rework_directive.is_some();
         let initial_prompt = match rework_directive {
             Some(directive) => format!(
                 "You are resuming existing work on ticket {}.\n\n{}\n\n\
@@ -1637,6 +1640,19 @@ Use `openflows-harness` for all coordination:
         let Some(chat) = created else {
             return;
         };
+
+        // The rework directive has now been delivered as the new chat's initial
+        // prompt, so it is safe to clear it. Clearing only after successful chat
+        // creation means a failed/retried creation keeps the directive intact for
+        // the next reconciliation attempt.
+        if had_rework_directive {
+            store.del(&rework_key).await;
+            info!(
+                ticket_id,
+                role,
+                "Consumed persisted rework directive — new chat started with only the targeted directive"
+            );
+        }
 
         // Also check the initial chat status for diagnostics.
         let chat_status = chat.status();
