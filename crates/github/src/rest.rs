@@ -12,6 +12,7 @@ use pocketflow_core::{CiStatus, MergeMethod, MergeResult, PrInfo, PrState};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -328,10 +329,24 @@ impl GithubRestClient {
         let combined = match combined_result {
             Ok(c) => c,
             Err(e) if is_status_api_forbidden(&e) => {
-                warn!(
-                    error = %e,
-                    "Combined status (legacy Statuses) API not accessible — relying on Checks API only"
-                );
+                // The legacy Combined-status API is not granted to every GitHub App
+                // installation (it needs the "Statuses" permission). This is a known,
+                // handled condition that resolves to the Checks API fallback below —
+                // and get_ci_status is polled on every CI tick, so we must not re-log
+                // the warning on each iteration and saturate the logs. Emit it once,
+                // then degrade to debug for the steady-state fallback.
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        error = %e,
+                        "Combined status (legacy Statuses) API not accessible — relying on Checks API only"
+                    );
+                } else {
+                    debug!(
+                        error = %e,
+                        "Combined status (legacy Statuses) API not accessible — relying on Checks API only"
+                    );
+                }
                 return checks_result;
             }
             Err(e) => return Err(e),

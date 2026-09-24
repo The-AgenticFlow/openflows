@@ -137,6 +137,40 @@ pub const KEY_TICKET_CHAT: &str = "chat";
 /// Full key: `ticket:{id}:review:{role}`
 pub const KEY_TICKET_REVIEW: &str = "review";
 
+// ── Sentinel review-type namespaces ─────────────────────────────────────
+// SENTINEL performs distinct reviews at different lifecycle points. These
+// review types must never share a chat binding or verdict key, otherwise a
+// completed planning-gate review can occupy the slot meant for the PR review
+// (which blocks the final PR reviewer from spawning). All SENTINEL chat /
+// verdict / action keys are therefore namespaced by review type as:
+//   `ticket:{id}:chat:{role}:{review_type}`
+//   `ticket:{id}:review:{role}:{review_type}`
+//   `ticket:{id}:chat_action:{role}:{review_type}`
+
+/// SENTINEL reviews the plan before implementation (planning gate).
+pub const REVIEW_TYPE_PLANNING_GATE: &str = "planning_gate";
+/// SENTINEL reviews the completed pull request (final/PR review). "Segment"
+/// evaluations (`segment-N-eval.md`) are part of this same review.
+pub const REVIEW_TYPE_PR: &str = "pr_review";
+
+/// Build the review-type-scoped SENTINEL chat binding key.
+/// e.g. `ticket:T-42:chat:sentinel:pr_review`
+pub fn review_chat_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:chat:sentinel:{}", ticket_id, review_type)
+}
+
+/// Build the review-type-scoped SENTINEL verdict key.
+/// e.g. `ticket:T-42:review:sentinel:pr_review`
+pub fn review_verdict_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:review:sentinel:{}", ticket_id, review_type)
+}
+
+/// Build the review-type-scoped SENTINEL chat-action key.
+/// e.g. `ticket:T-42:chat_action:sentinel:pr_review`
+pub fn review_action_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:chat_action:sentinel:{}", ticket_id, review_type)
+}
+
 /// Key suffix for vessel deployment status.
 /// Full key: `ticket:{id}:deployment`
 pub const KEY_TICKET_DEPLOYMENT: &str = "deployment";
@@ -156,6 +190,14 @@ pub const KEY_TICKET_RECOVERY_ATTEMPTS: &str = "recovery_attempts";
 /// Key suffix for the diff_status payload from coder chats.
 /// Full key: `ticket:{id}:diff_status:{role}`
 pub const KEY_TICKET_DIFF_STATUS: &str = "diff_status";
+
+/// Key suffix for a pending rework directive (e.g. `/ci_fix` or `/address_review`)
+/// that VESSEL could not deliver because no live forge chat existed at dispatch time.
+/// NEXUS reads this when it creates/reuses the forge chat so the new chat starts with
+/// only the targeted rework directive instead of the full ticket-assignment blast, then
+/// clears the key.
+/// Full key: `ticket:{id}:rework_directive:{role}`
+pub const KEY_TICKET_REWORK_DIRECTIVE: &str = "rework_directive";
 
 /// Heartbeat key pattern: `heartbeat:{role}-T-{ticket_id}`
 pub fn heartbeat_key(role: &str, ticket_id: &str) -> String {

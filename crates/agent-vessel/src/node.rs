@@ -10,7 +10,7 @@ use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
         full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_DEPLOYMENT, KEY_WORKER_SLOTS,
+        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
@@ -2601,6 +2601,9 @@ impl VesselNode {
                 ticket_id,
                 pr_number, "No Coder client — cannot dispatch /address_review"
             );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive_text)
+                .await;
             return false;
         };
         let Some(chat_id) = chat_id else {
@@ -2608,6 +2611,9 @@ impl VesselNode {
                 ticket_id,
                 pr_number, "No forge chat binding — cannot dispatch /address_review"
             );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive_text)
+                .await;
             return false;
         };
 
@@ -2654,6 +2660,9 @@ impl VesselNode {
         reason: &str,
         failure_detail: Option<&github::CiFailureDetail>,
     ) -> bool {
+        let directive =
+            build_ci_fix_directive(pr_number, ticket_id, head_branch, reason, failure_detail);
+
         let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
         let chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
         let Some(client) = Self::coder_client_from_store(store).await else {
@@ -2661,6 +2670,9 @@ impl VesselNode {
                 ticket_id,
                 pr_number, "No Coder client — cannot dispatch /ci_fix"
             );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive)
+                .await;
             return false;
         };
         let Some(chat_id) = chat_id else {
@@ -2668,10 +2680,11 @@ impl VesselNode {
                 ticket_id,
                 pr_number, "No forge chat binding — cannot dispatch /ci_fix"
             );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive)
+                .await;
             return false;
         };
-
-        let directive = build_ci_fix_directive(pr_number, ticket_id, head_branch, reason, failure_detail);
 
         match client
             .send_chat_message(
@@ -2698,6 +2711,26 @@ impl VesselNode {
                 false
             }
         }
+    }
+
+    /// Persist a rework directive (`/ci_fix` / `/address_review`) that could not be
+    /// delivered because no live forge chat existed. NEXUS reads it when it creates
+    /// the forge chat so the new chat starts with only the targeted directive instead
+    /// of the full ticket-assignment blast, then clears the key.
+    async fn persist_rework_directive(
+        &self,
+        store: &SharedStore,
+        ticket_id: &str,
+        role: &str,
+        directive: &str,
+    ) {
+        let key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        store.set(&key, json!(directive)).await;
+        info!(
+            ticket_id,
+            role,
+            "Persisted rework directive for NEXUS to use as forge chat initial prompt"
+        );
     }
 
     /// Re-arm review PRs that FORGE signalled it addressed via `review_ready`.

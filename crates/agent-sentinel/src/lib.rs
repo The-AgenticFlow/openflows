@@ -8,8 +8,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
 use config::state::{
-    full_ticket_key, full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-    KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
+    full_ticket_key, full_ticket_key_flat, review_action_key, review_chat_key, review_verdict_key,
+    KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS,
+    KEY_WORKER_SLOTS, REVIEW_TYPE_PLANNING_GATE, REVIEW_TYPE_PR,
 };
 use config::{Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
@@ -257,7 +258,7 @@ impl Node for SentinelNode {
             };
 
             // ── Check for PR review verdicts ──
-            let review_key = full_ticket_key(&ticket.id, "review", "sentinel");
+            let review_key = review_verdict_key(&ticket.id, REVIEW_TYPE_PR);
             let review_payload: Option<ReviewPayload> = store.get_typed(&review_key).await;
             let has_review = review_payload.is_some();
 
@@ -290,7 +291,7 @@ impl Node for SentinelNode {
 
                 if gate_approval.is_none() {
                     // Gate not yet approved — SENTINEL is reviewing or needs to review
-                    let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let chat_key = review_chat_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE);
                     let chat_id: Option<String> = store.get_typed(&chat_key).await;
 
                     // Only add to planning_gate_pending if SENTINEL has been spawned
@@ -312,13 +313,24 @@ impl Node for SentinelNode {
                 }
             }
 
-            let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-            let chat_id: Option<String> = store.get_typed(&chat_key).await;
+            // Monitor the review-type-scoped SENTINEL chat for the current phase so
+            // a planning-gate chat and a PR-review chat are tracked independently.
+            let (monitor_chat_key, monitor_action_key) = if phase == Some("planning") {
+                (
+                    review_chat_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE),
+                    review_action_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE),
+                )
+            } else {
+                (
+                    review_chat_key(&ticket.id, REVIEW_TYPE_PR),
+                    review_action_key(&ticket.id, REVIEW_TYPE_PR),
+                )
+            };
+            let chat_id: Option<String> = store.get_typed(&monitor_chat_key).await;
             if let Some(chat_id) = chat_id {
                 if let Some(client) = Self::coder_client_from_store(store).await {
                     if let Ok(chat) = client.get_chat(&chat_id).await {
-                        let action_key =
-                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                        let action_key = monitor_action_key;
                         let last_action: Option<String> = store.get_typed(&action_key).await;
 
                         match chat.status() {
@@ -454,12 +466,12 @@ impl Node for SentinelNode {
                     let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
                     store.set(&status_key, json!("approved")).await;
 
-                    let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                    let action_key = review_action_key(ticket_id, REVIEW_TYPE_PR);
                     store.set(&action_key, json!("completed")).await;
 
                     // Read the review payload (pr_number, report) before consuming
                     // it so we can mirror the approve verdict on GitHub.
-                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                    let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
                     let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
                     if let Some(pr_number) = review_payload.as_ref().and_then(|r| r.pr_number) {
                         let report = review_payload
@@ -496,7 +508,7 @@ impl Node for SentinelNode {
                         "Sentinel: review REJECTED — routing back to forge"
                     );
 
-                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                    let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
                     let review_payload = store.get_typed::<ReviewPayload>(&review_key).await;
                     let report = review_payload
                         .as_ref()
@@ -565,7 +577,7 @@ impl Node for SentinelNode {
 
                     Self::remove_rejected_pr_from_pending(store, ticket_id, pr_number).await;
 
-                    let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                    let sentinel_chat_key = review_chat_key(ticket_id, REVIEW_TYPE_PR);
                     if let Some(ref client) = &client {
                         if let Some(sentinel_chat_id) =
                             store.get_typed::<String>(&sentinel_chat_key).await
@@ -612,7 +624,7 @@ impl Node for SentinelNode {
                         )
                         .await;
 
-                    let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                    let action_key = review_action_key(ticket_id, REVIEW_TYPE_PR);
                     store.set(&action_key, json!("completed")).await;
 
                     // Consume the review verdict so it is not replayed on the
@@ -658,14 +670,15 @@ impl Node for SentinelNode {
                                     .to_string(),
                                 pr_number: None,
                             };
-                            let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                            let review_key =
+                                review_verdict_key(ticket_id, REVIEW_TYPE_PLANNING_GATE);
                             store
                                 .set(&review_key, serde_json::to_value(&review_payload).unwrap())
                                 .await;
 
                             // Archive the sentinel chat
                             let sentinel_chat_key =
-                                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                                review_chat_key(ticket_id, REVIEW_TYPE_PLANNING_GATE);
                             if let Some(ref client) = &client {
                                 if let Some(sentinel_chat_id) =
                                     store.get_typed::<String>(&sentinel_chat_key).await
@@ -682,7 +695,7 @@ impl Node for SentinelNode {
 
                             // Mark action as completed and continue
                             let action_key =
-                                full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                                review_action_key(ticket_id, REVIEW_TYPE_PLANNING_GATE);
                             store.set(&action_key, json!("completed")).await;
                         } else {
                             info!(
@@ -692,7 +705,7 @@ impl Node for SentinelNode {
 
                             // Archive the sentinel chat since gate review is complete
                             let sentinel_chat_key =
-                                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                                review_chat_key(ticket_id, REVIEW_TYPE_PLANNING_GATE);
                             if let Some(ref client) = &client {
                                 if let Some(sentinel_chat_id) =
                                     store.get_typed::<String>(&sentinel_chat_key).await
@@ -710,6 +723,19 @@ impl Node for SentinelNode {
                             // Release the SENTINEL reviewer slot, not the Forge
                             // owner carried in `worker_id`.
                             Self::release_sentinel_slots_for_ticket(store, ticket_id).await?;
+
+                            // Clear the sentinel chat binding now that the planning-gate
+                            // review is complete. The planning and PR reviews are
+                            // namespaced by review type
+                            // (`ticket:{id}:chat:sentinel:planning_gate` vs
+                            // `ticket:{id}:chat:sentinel:pr_review`), so clearing the
+                            // planning binding here keeps the namespaces clean and
+                            // guarantees a fresh PR-review sentinel is spawned later
+                            // (mirrors the reject path, which deletes its binding).
+                            store.del(&sentinel_chat_key).await;
+                            let sentinel_action_key =
+                                review_action_key(ticket_id, REVIEW_TYPE_PLANNING_GATE);
+                            store.del(&sentinel_action_key).await;
 
                             any_planning_approved = true;
                         }
@@ -807,7 +833,7 @@ mod tests {
         let ticket_id = "T-9";
 
         // Seed the sentinel review payload (reject).
-        let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+        let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
         let payload = ReviewPayload {
             verdict: "reject".to_string(),
             report: "src/api.rs:78 — missing pagination; required per spec".to_string(),
@@ -818,7 +844,7 @@ mod tests {
             .await;
 
         // Seed a sentinel chat binding (archived + removed on reject).
-        let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+        let sentinel_chat_key = review_chat_key(ticket_id, REVIEW_TYPE_PR);
         store
             .set(&sentinel_chat_key, json!("chat-sentinel-1"))
             .await;

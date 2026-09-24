@@ -8,9 +8,10 @@ use coder_client::{
 use config::{
     state::{
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
-        HeartbeatRecord, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
-        KEY_TICKET_REVIEW, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        review_action_key, review_chat_key, review_verdict_key, HeartbeatRecord, KEY_COMMAND_GATE,
+        KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
+        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS, REVIEW_TYPE_PLANNING_GATE, REVIEW_TYPE_PR,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -1163,15 +1164,15 @@ Before significant work, read the relevant skill file to understand the workflow
     /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
     /// rework workspace resumes the branch where the work was already done), falling
     /// back to the conventional `{worker}/{ticket}` branch for first-time work.
-    fn resolve_workspace_branch(
-        pending_prs: &[Value],
-        worker_id: &str,
-        ticket_id: &str,
-    ) -> String {
+    fn resolve_workspace_branch(pending_prs: &[Value], worker_id: &str, ticket_id: &str) -> String {
         pending_prs
             .iter()
             .find(|p| p.get("ticket_id").and_then(|v| v.as_str()) == Some(ticket_id))
-            .and_then(|p| p.get("head_branch").and_then(|v| v.as_str()).map(String::from))
+            .and_then(|p| {
+                p.get("head_branch")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| format!("{}/{}", worker_id, ticket_id))
     }
@@ -1487,6 +1488,21 @@ Before significant work, read the relevant skill file to understand the workflow
         // Load skills for this role
         let skills_content = self.load_skills_for_role(role);
 
+        // If VESSEL persisted a targeted rework directive (`/ci_fix` / `/address_review`)
+        // because no live forge chat existed at dispatch time, use ONLY that directive as
+        // the initial chat prompt instead of the full ticket-assignment blast, then clear
+        // the key so it is not re-sent on every reconciliation.
+        let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        let rework_directive = store.get_typed::<String>(&rework_key).await;
+        if rework_directive.is_some() {
+            store.del(&rework_key).await;
+            info!(
+                ticket_id,
+                role,
+                "Consumed persisted rework directive — new chat will start with only the targeted directive"
+            );
+        }
+
         // Build ticket content with full context
         let ticket_content = format!(
             "## Task\n\n**Title:** {}\n\n**Description:**\n{}\n",
@@ -1553,10 +1569,21 @@ Use `openflows-harness` for all coordination:
             ),
         };
 
-        let initial_prompt = format!(
-            "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness status set planning` and wait for SENTINEL gate approval before implementation.\n",
-            base_prompt
-        );
+        // When VESSEL persisted a targeted rework directive (no live forge chat at
+        // dispatch time), start the new chat with ONLY that directive instead of the
+        // full ticket-assignment blast — the agent resumes its existing branch/work.
+        let initial_prompt = match rework_directive {
+            Some(directive) => format!(
+                "You are resuming existing work on ticket {}.\n\n{}\n\n\
+                 Address the rework directive above. Re-check `openflows-harness status get` \
+                 and `openflows-harness dispatch read` for context.\n",
+                ticket_id, directive
+            ),
+            None => format!(
+                "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness status set planning` and wait for SENTINEL gate approval before implementation.\n",
+                base_prompt
+            ),
+        };
 
         info!(
             worker_id,
@@ -1949,10 +1976,11 @@ Use `openflows-harness` for all coordination:
                     store.del(&notification_key).await;
 
                     // Check if SENTINEL chat already exists for plan review.
-                    let sentinel_chat_key =
-                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    // The planning-gate review has its own namespace so it can
+                    // never collide with (or block) the later PR review.
+                    let sentinel_chat_key = review_chat_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE);
                     let sentinel_action_key =
-                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                        review_action_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE);
                     let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
 
@@ -2242,17 +2270,17 @@ Use `openflows-harness` for all coordination:
 
                     // Check if Sentinel chat already exists for this ticket.
                     // If the chat is orphaned (Waiting with no review written),
-                    // clear it so a fresh one can be spawned.
-                    let sentinel_chat_key =
-                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    // clear it so a fresh one can be spawned. The PR review uses
+                    // its own `pr_review` namespace, distinct from the
+                    // `planning_gate` review chat.
+                    let sentinel_chat_key = review_chat_key(&ticket.id, REVIEW_TYPE_PR);
                     let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
 
                     if let Some(ref chat_id) = existing_sentinel_chat {
                         match client.get_chat_opt(chat_id).await {
                             Ok(Some(chat)) if matches!(chat.status(), ChatStatus::Waiting) => {
-                                let review_key =
-                                    full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+                                let review_key = review_verdict_key(&ticket.id, REVIEW_TYPE_PR);
                                 let existing_review: Option<Value> =
                                     store.get_typed(&review_key).await;
                                 // Hardening: only treat a Waiting sentinel chat as
@@ -2274,22 +2302,30 @@ Use `openflows-harness` for all coordination:
                                             .map(|p| p == "review_ready")
                                     })
                                     .unwrap_or(false);
+                                // The sentinel chat bound to this key may be a leftover
+                                // from the PLANNING-gate review (its `review_type` label
+                                // is `planning_gate`), not a PR reviewer. If so it must
+                                // never be treated as the existing PR-review chat — clear
+                                // it so a fresh `pr_review` sentinel is spawned. This is
+                                // what keeps the final PR review from silently never
+                                // spawning after the planning gate completes.
+                                let review_type =
+                                    chat.labels.get("review_type").and_then(|v| v.as_str());
+                                let is_pr_review = review_type == Some("pr_review");
                                 if Self::should_clear_orphaned_sentinel(
                                     existing_review.is_some(),
                                     still_review_ready,
-                                ) {
+                                ) || !is_pr_review
+                                {
                                     warn!(
                                         ticket_id = %ticket.id,
                                         chat_id = %chat_id,
-                                        "Sentinel chat is orphaned (Waiting with no review) \
-                                         — clearing stale chat to re-spawn"
+                                        review_type,
+                                        "Sentinel chat is stale (orphaned or non-pr_review) \
+                                         — clearing to spawn a fresh PR-review reviewer"
                                     );
                                     store.del(&sentinel_chat_key).await;
-                                    let action_key = full_ticket_key(
-                                        &ticket.id,
-                                        KEY_TICKET_CHAT_ACTION,
-                                        "sentinel",
-                                    );
+                                    let action_key = review_action_key(&ticket.id, REVIEW_TYPE_PR);
                                     store.del(&action_key).await;
                                     existing_sentinel_chat = None;
                                 }
@@ -2301,8 +2337,7 @@ Use `openflows-harness` for all coordination:
                                     "Stored sentinel chat no longer exists — clearing key"
                                 );
                                 store.del(&sentinel_chat_key).await;
-                                let action_key =
-                                    full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                                let action_key = review_action_key(&ticket.id, REVIEW_TYPE_PR);
                                 store.del(&action_key).await;
                                 existing_sentinel_chat = None;
                             }
@@ -2327,7 +2362,7 @@ Use `openflows-harness` for all coordination:
                     }
 
                     // Check if Sentinel already reviewed (approved or rejected)
-                    let review_key = full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+                    let review_key = review_verdict_key(&ticket.id, REVIEW_TYPE_PR);
                     let existing_review: Option<Value> = store.get_typed(&review_key).await;
                     if existing_review.is_some() {
                         debug!(ticket_id = %ticket.id, "Sentinel review already exists, skipping spawn");
@@ -3179,7 +3214,9 @@ Use `openflows-harness` for all coordination:
                         let phase = Self::ticket_phase(store, ticket_id).await;
                         let gate_key = Self::ticket_gate_key(ticket_id, "planning");
                         let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
-                        let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
+                        // A PR-review verdict completes the sentinel's work on the
+                        // ticket (planning completion is covered by the gate key above).
+                        let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
                         let review_done: Option<Value> = store.get_typed(&review_key).await;
                         let review_complete = phase
                             .as_deref()
@@ -5101,7 +5138,7 @@ mod tests {
         // not have an orphaned-clear decision treat it as spawneable.
         let store = SharedStore::new_in_memory();
         let ticket_id = "T-100";
-        let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
+        let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
         store
             .set(
                 &review_key,
