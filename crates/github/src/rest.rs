@@ -1472,6 +1472,30 @@ struct WorkflowJob {
 
 // ── PR Review & Comment Types ──────────────────────────────────────────────
 
+/// Deserialize a GitHub `user` payload into an optional login string.
+///
+/// GitHub returns `user` as an object (`{"login": "...", ...}`) on review and
+/// review-comment responses, but some callers and fixtures pass a plain login
+/// string. This accepts both shapes, plus `null`/absent, mapping the result to
+/// the reviewer's login.
+fn deserialize_optional_login<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Object(map) => Ok(map
+            .get("login")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)),
+        _ => Err(D::Error::custom("expected a user object or login string")),
+    }
+}
+
 /// A review submitted on a pull request.
 ///
 /// GitHub returns every review ever submitted, including superseded ones.
@@ -1480,7 +1504,7 @@ pub struct PrReview {
     /// `APPROVED`, `CHANGES_REQUESTED`, or `COMMENTED`.
     pub state: String,
     /// Reviewer's GitHub login (from the nested `user` object).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_login")]
     pub user: Option<String>,
     #[serde(default)]
     pub submitted_at: Option<String>,
@@ -1532,7 +1556,7 @@ pub struct ReviewComment {
     pub line: Option<u64>,
     #[serde(default)]
     pub body: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_login")]
     pub user: Option<String>,
 }
 
