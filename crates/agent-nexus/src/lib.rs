@@ -1071,7 +1071,26 @@ Before significant work, read the relevant skill file to understand the workflow
         if let Ok(artifacts_dir) = std::env::var("ARTIFACTS_DIR") {
             let orch_path = std::path::PathBuf::from(artifacts_dir);
             let worker_role = Self::worker_role(worker_id);
-            let reg = self.load_registry();
+
+            // Load the agent registry BEFORE the retry loop. The registry is
+            // deterministic for a given path/env, so if it fails here it will
+            // fail on every retry — and `provision_role` cannot run without it.
+            // Bail out immediately instead of burning the loop on futile SSH
+            // waits (12 checks x 20s) that delay the controller pass for no
+            // progress.
+            let reg = match self.load_registry() {
+                Ok(reg) => reg,
+                Err(e) => {
+                    warn!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        role = worker_role,
+                        error = %e,
+                        "Failed to load agent registry — skipping workspace configuration provisioning"
+                    );
+                    return Ok(Some(workspace.id));
+                }
+            };
 
             const MAX_PROVISION_ATTEMPTS: u32 = 12;
             for attempt in 1..=MAX_PROVISION_ATTEMPTS {
@@ -1095,41 +1114,39 @@ Before significant work, read the relevant skill file to understand the workflow
 
                 let transport = CoderTransport::new(client.clone(), &workspace.id);
                 let provisioner = Provisioner::new(&orch_path);
-                if let Ok(ref reg) = reg {
-                    match provisioner
-                        .provision_role(&transport, worker_role, reg)
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                worker_id,
-                                workspace_id = %workspace.id,
-                                role = worker_role,
-                                "Provisioned workspace configuration (skills, standards, persona)"
-                            );
-                            break;
-                        }
-                        Err(e) => {
+                match provisioner
+                    .provision_role(&transport, worker_role, &reg)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            worker_id,
+                            workspace_id = %workspace.id,
+                            role = worker_role,
+                            "Provisioned workspace configuration (skills, standards, persona)"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            worker_id,
+                            workspace_id = %workspace.id,
+                            role = worker_role,
+                            attempt,
+                            max = MAX_PROVISION_ATTEMPTS,
+                            error = %e,
+                            "Failed to provision workspace configuration — will retry"
+                        );
+                        if attempt == MAX_PROVISION_ATTEMPTS {
                             warn!(
                                 worker_id,
                                 workspace_id = %workspace.id,
                                 role = worker_role,
-                                attempt,
-                                max = MAX_PROVISION_ATTEMPTS,
-                                error = %e,
-                                "Failed to provision workspace configuration — will retry"
+                                "Gave up provisioning workspace configuration after {} attempts — continuing anyway",
+                                MAX_PROVISION_ATTEMPTS
                             );
-                            if attempt == MAX_PROVISION_ATTEMPTS {
-                                warn!(
-                                    worker_id,
-                                    workspace_id = %workspace.id,
-                                    role = worker_role,
-                                    "Gave up provisioning workspace configuration after {} attempts — continuing anyway",
-                                    MAX_PROVISION_ATTEMPTS
-                                );
-                            } else {
-                                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                            }
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                         }
                     }
                 }
@@ -4450,20 +4467,84 @@ impl Node for NexusNode {
                 .map(|(id, _)| id.clone())
                 .collect();
 
-            for pr in &pending_prs_vec {
-                let Some(tid) = pr["ticket_id"].as_str() else {
-                    continue;
-                };
+            // Map ticket_id -> pr_number from pending_prs (best effort, used only
+            // for diagnostics below).
+            let pr_for_ticket: std::collections::HashMap<&str, u64> = pending_prs_vec
+                .iter()
+                .filter_map(|pr| {
+                    pr["ticket_id"]
+                        .as_str()
+                        .map(|tid| (tid, pr["number"].as_u64().unwrap_or(0)))
+                })
+                .collect();
+
+            // An optional Coder client used to verify that a stored forge chat is
+            // actually live before we decide it can carry the rework directive.
+            let client = Self::coder_client_from_store(store).await;
+
+            // Detect tickets that carry a persisted rework directive. We iterate
+            // the TICKETS list (not pending_prs): VESSEL removes the PR from
+            // pending_prs when it persists the directive, and discovery skips
+            // re-adding PRs for InProgress tickets, so scanning pending_prs alone
+            // would never find the directive for those tickets and no replacement
+            // FORGE chat would ever receive the rework feedback.
+            for ticket in &tickets {
+                let tid = &ticket.id;
                 let rework_key = full_ticket_key(tid, KEY_TICKET_REWORK_DIRECTIVE, "forge");
                 if store.get(&rework_key).await.is_none() {
                     continue;
                 }
+
+                // A forge chat binding may exist but be STALE (deleted on Coder,
+                // or bound to a re-provisioned/old workspace). Presence of the key
+                // alone does not prove the chat can carry the rework — treat the
+                // binding as needing replacement when the chat no longer exists.
                 let forge_chat_key = full_ticket_key(tid, KEY_TICKET_CHAT, "forge");
-                if store.get(&forge_chat_key).await.is_some() {
-                    // A live forge chat already exists — the rework can be
-                    // delivered there, so no provisioning is needed.
-                    continue;
+                let stored_forge_chat: Option<String> = store.get_typed(&forge_chat_key).await;
+                if let Some(chat_id) = stored_forge_chat {
+                    match &client {
+                        Some(c) => match c.get_chat_opt(&chat_id).await {
+                            // 404 — the chat was deleted. Clear the stale binding so
+                            // we provision a replacement that can deliver the rework.
+                            Ok(None) => {
+                                info!(
+                                    ticket_id = %tid,
+                                    chat_id = %chat_id,
+                                    "Stored forge chat no longer exists — clearing stale binding to provision replacement"
+                                );
+                                store.del(&forge_chat_key).await;
+                            }
+                            // A live forge chat exists — the rework can be delivered
+                            // there, so no provisioning is needed.
+                            Ok(Some(_)) => {
+                                continue;
+                            }
+                            // Transient lookup error: we cannot confirm the chat is
+                            // stale. Keep the existing binding and skip provisioning
+                            // this pass (do not risk a duplicate chat); the next poll
+                            // retries.
+                            Err(_) => {
+                                debug!(
+                                    ticket_id = %tid,
+                                    chat_id = %chat_id,
+                                    "Could not verify forge chat liveness — keeping binding and skipping rework provisioning this pass"
+                                );
+                                continue;
+                            }
+                        },
+                        // No Coder client available, so we cannot confirm the chat is
+                        // stale. Keep the binding and skip provisioning this pass.
+                        None => {
+                            debug!(
+                                ticket_id = %tid,
+                                chat_id = %chat_id,
+                                "No Coder client to verify forge chat liveness — keeping binding and skipping rework provisioning this pass"
+                            );
+                            continue;
+                        }
+                    }
                 }
+
                 // Prefer the forge worker already bound to the ticket, else the
                 // first idle forge worker.
                 let ticket_forge = worker_slots_map
@@ -4483,7 +4564,7 @@ impl Node for NexusNode {
                     rework_provision.push(json!({
                         "ticket_id": tid,
                         "worker_id": worker,
-                        "pr_number": pr["number"].as_u64().unwrap_or(0),
+                        "pr_number": pr_for_ticket.get(tid.as_str()).copied().unwrap_or(0),
                     }));
                 }
             }
