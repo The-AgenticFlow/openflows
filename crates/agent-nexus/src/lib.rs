@@ -4623,11 +4623,9 @@ impl Node for NexusNode {
                                 .await
                                 .and_then(|d| directive_pr_number(&d));
                             if let Some(pr) = prs.iter().find(|pr| {
-                                directive_pr
-                                    .map(|n| pr.number == n)
-                                    .unwrap_or_else(|| {
-                                        pr.ticket_id.as_deref() == Some(tid.as_str())
-                                    })
+                                directive_pr.map(|n| pr.number == n).unwrap_or_else(|| {
+                                    pr.ticket_id.as_deref() == Some(tid.as_str())
+                                })
                             }) {
                                 info!(
                                     pr_number = pr.number,
@@ -5381,14 +5379,19 @@ mod tests {
     #[test]
     fn directive_pr_number_extracts_pr_field() {
         assert_eq!(
-            directive_pr_number("/address_review\nstate: changes_requested\npr: 123\nreason: fix it"),
+            directive_pr_number(
+                "/address_review\nstate: changes_requested\npr: 123\nreason: fix it"
+            ),
             Some(123)
         );
         assert_eq!(
             directive_pr_number("/ci_fix\nstate: ci_failed\npr: 456\nticket: T-001"),
             Some(456)
         );
-        assert_eq!(directive_pr_number("/address_review\nstate: conflicts"), None);
+        assert_eq!(
+            directive_pr_number("/address_review\nstate: conflicts"),
+            None
+        );
         assert_eq!(directive_pr_number("pr: abc"), None);
         assert_eq!(directive_pr_number(""), None);
     }
