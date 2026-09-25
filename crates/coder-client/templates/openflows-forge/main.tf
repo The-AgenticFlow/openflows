@@ -277,7 +277,11 @@ resource "coder_agent" "main" {
         echo "pushing here would update the wrong branch, not the PR."
         echo "Resolve the local conflict or uncommitted changes and switch to \`$intended\`"
         echo "before performing any push."
-      } > /home/coder/workspace/REWORK_BRANCH_MISMATCH.md
+      # Best-effort marker: if the workspace is not writable by `coder` the write
+      # may fail. It must never abort startup via `set -e` — the log warning above
+      # already carries the message, and FORGE must stay available to resolve the
+      # mismatch.
+      } > /home/coder/workspace/REWORK_BRANCH_MISMATCH.md || true
     }
 
     # Checkout the target branch. For rework of an existing PR, this resumes the
