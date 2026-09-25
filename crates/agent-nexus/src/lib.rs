@@ -4326,10 +4326,10 @@ impl Node for NexusNode {
             store.set(KEY_WORKER_SLOTS, json!(worker_slots)).await;
         }
 
-        let open_prs = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
+        let mut open_prs = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
         let command_gate = store.get(KEY_COMMAND_GATE).await.unwrap_or(json!({}));
 
-        let pending_prs_vec: Vec<Value> = open_prs.as_array().cloned().unwrap_or_default();
+        let mut pending_prs_vec: Vec<Value> = open_prs.as_array().cloned().unwrap_or_default();
         let worker_slots_map: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let mut recovery = Self::reconcile(&tickets, &worker_slots_map, &pending_prs_vec);
@@ -4467,17 +4467,6 @@ impl Node for NexusNode {
                 .map(|(id, _)| id.clone())
                 .collect();
 
-            // Map ticket_id -> pr_number from pending_prs (best effort, used only
-            // for diagnostics below).
-            let pr_for_ticket: std::collections::HashMap<&str, u64> = pending_prs_vec
-                .iter()
-                .filter_map(|pr| {
-                    pr["ticket_id"]
-                        .as_str()
-                        .map(|tid| (tid, pr["number"].as_u64().unwrap_or(0)))
-                })
-                .collect();
-
             // An optional Coder client used to verify that a stored forge chat is
             // actually live before we decide it can carry the rework directive.
             let client = Self::coder_client_from_store(store).await;
@@ -4488,8 +4477,23 @@ impl Node for NexusNode {
             // re-adding PRs for InProgress tickets, so scanning pending_prs alone
             // would never find the directive for those tickets and no replacement
             // FORGE chat would ever receive the rework feedback.
+            let mut rework_tickets: Vec<String> = Vec::new();
             for ticket in &tickets {
                 let tid = &ticket.id;
+
+                // Never restart automatic rework on a ticket that was escalated
+                // for human intervention — the human owns it now. Without this,
+                // a lingering rework directive would let NEXUS pick the released
+                // idle FORGE slot and flip the ticket back to Assigned, undoing
+                // the escalation.
+                if matches!(&ticket.status, TicketStatus::AwaitingHuman { .. }) {
+                    debug!(
+                        ticket_id = %tid,
+                        "Skipping rework provisioning — ticket is awaiting human intervention"
+                    );
+                    continue;
+                }
+
                 let rework_key = full_ticket_key(tid, KEY_TICKET_REWORK_DIRECTIVE, "forge");
                 if store.get(&rework_key).await.is_none() {
                     continue;
@@ -4545,6 +4549,75 @@ impl Node for NexusNode {
                     }
                 }
 
+                rework_tickets.push(tid.clone());
+            }
+
+            // The replacement workspace must be provisioned on the PR's head
+            // branch, but `provision_coder_workspace` resolves that branch from
+            // `pending_prs`. VESSEL removes the PR from pending_prs when it
+            // persists the directive, so for any rework ticket whose PR is not
+            // tracked there, re-fetch open PRs from GitHub and re-add the matching
+            // PR. Otherwise FORGE would be provisioned on the default
+            // `{worker}/{ticket}` branch and start without the PR's commits,
+            // unable to resume (or push) the requested rework.
+            let needs_pr_restore: Vec<&String> = rework_tickets
+                .iter()
+                .filter(|tid| {
+                    !pending_prs_vec
+                        .iter()
+                        .any(|p| p["ticket_id"].as_str() == Some(tid.as_str()))
+                })
+                .collect();
+            if !needs_pr_restore.is_empty() {
+                let token = self
+                    .resolve_github_token()
+                    .ok()
+                    .or_else(|| self.resolve_github_token_from_env_or_file());
+                if let Some(token) = token {
+                    let gh = github::GithubRestClient::new(&token);
+                    if let Ok(prs) = gh.list_open_prs(&owner, &repo_name).await {
+                        for tid in &needs_pr_restore {
+                            if let Some(pr) = prs
+                                .iter()
+                                .find(|pr| pr.ticket_id.as_deref() == Some(tid.as_str()))
+                            {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Restoring rework PR to pending_prs so the replacement workspace checks out the PR branch"
+                                );
+                                pending_prs_vec.push(json!({
+                                    "number": pr.number,
+                                    "ticket_id": pr.ticket_id,
+                                    "head_sha": pr.head_sha,
+                                    "head_branch": pr.head_branch,
+                                    "base_branch": pr.base_branch,
+                                    "title": pr.title,
+                                    "mergeable": pr.mergeable,
+                                    "has_conflicts": pr.has_conflicts(),
+                                }));
+                            }
+                        }
+                        // Persist the restored PRs and refresh the value returned in
+                        // the prep context so discovery stays consistent.
+                        store.set(KEY_PENDING_PRS, json!(pending_prs_vec)).await;
+                        open_prs = json!(pending_prs_vec);
+                    }
+                }
+            }
+
+            // Map ticket_id -> pr_number from pending_prs (best effort, used only
+            // for diagnostics below).
+            let pr_for_ticket: std::collections::HashMap<&str, u64> = pending_prs_vec
+                .iter()
+                .filter_map(|pr| {
+                    pr["ticket_id"]
+                        .as_str()
+                        .map(|tid| (tid, pr["number"].as_u64().unwrap_or(0)))
+                })
+                .collect();
+
+            for tid in &rework_tickets {
                 // Prefer the forge worker already bound to the ticket, else the
                 // first idle forge worker.
                 let ticket_forge = worker_slots_map
