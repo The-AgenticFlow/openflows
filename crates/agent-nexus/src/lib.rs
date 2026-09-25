@@ -4552,6 +4552,39 @@ impl Node for NexusNode {
                 rework_tickets.push(tid.clone());
             }
 
+            // Determine which rework tickets can actually be handled this pass —
+            // a forge worker is available to carry the rework. A ticket with no
+            // worker must NOT have its PR restored to pending_prs here: restoring
+            // it without assigning a handler would re-route it back to VESSEL,
+            // where another failed `/address_review` dispatch counts toward the
+            // attempt limit and can escalate a ticket that was merely waiting for
+            // a free FORGE.
+            let mut provisionable: Vec<(String, String)> = Vec::new();
+            for tid in &rework_tickets {
+                // Prefer the forge worker already bound to the ticket, else the
+                // first idle forge worker.
+                let ticket_forge = worker_slots_map
+                    .iter()
+                    .find(|(_, s)| {
+                        Self::worker_role(&s.id) == "forge"
+                            && matches!(
+                                &s.status,
+                                WorkerStatus::Assigned { ticket_id, .. }
+                                | WorkerStatus::Working { ticket_id, .. }
+                                if ticket_id == tid
+                            )
+                    })
+                    .map(|(id, _)| id.clone());
+                if let Some(worker) = ticket_forge.or_else(|| idle_forge.first().cloned()) {
+                    provisionable.push((tid.clone(), worker));
+                } else {
+                    debug!(
+                        ticket_id = %tid,
+                        "Rework directive pending but no forge worker available — not restoring PR or provisioning this pass"
+                    );
+                }
+            }
+
             // The replacement workspace must be provisioned on the PR's head
             // branch, but `provision_coder_workspace` resolves that branch from
             // `pending_prs`. VESSEL removes the PR from pending_prs when it
@@ -4560,8 +4593,9 @@ impl Node for NexusNode {
             // PR. Otherwise FORGE would be provisioned on the default
             // `{worker}/{ticket}` branch and start without the PR's commits,
             // unable to resume (or push) the requested rework.
-            let needs_pr_restore: Vec<&String> = rework_tickets
+            let needs_pr_restore: Vec<&String> = provisionable
                 .iter()
+                .map(|(tid, _)| tid)
                 .filter(|tid| {
                     !pending_prs_vec
                         .iter()
@@ -4577,10 +4611,24 @@ impl Node for NexusNode {
                     let gh = github::GithubRestClient::new(&token);
                     if let Ok(prs) = gh.list_open_prs(&owner, &repo_name).await {
                         for tid in &needs_pr_restore {
-                            if let Some(pr) = prs
-                                .iter()
-                                .find(|pr| pr.ticket_id.as_deref() == Some(tid.as_str()))
-                            {
+                            // Identify the PR this rework actually targets. The
+                            // persisted directive embeds `pr: <number>`; prefer
+                            // that over a ticket_id match so that when several
+                            // open PRs reference the same ticket we restore the
+                            // PR the rework was created for, not the first match.
+                            let rework_key =
+                                full_ticket_key(tid, KEY_TICKET_REWORK_DIRECTIVE, "forge");
+                            let directive_pr: Option<u64> = store
+                                .get_typed::<String>(&rework_key)
+                                .await
+                                .and_then(|d| directive_pr_number(&d));
+                            if let Some(pr) = prs.iter().find(|pr| {
+                                directive_pr
+                                    .map(|n| pr.number == n)
+                                    .unwrap_or_else(|| {
+                                        pr.ticket_id.as_deref() == Some(tid.as_str())
+                                    })
+                            }) {
                                 info!(
                                     pr_number = pr.number,
                                     ticket_id = %tid,
@@ -4617,29 +4665,12 @@ impl Node for NexusNode {
                 })
                 .collect();
 
-            for tid in &rework_tickets {
-                // Prefer the forge worker already bound to the ticket, else the
-                // first idle forge worker.
-                let ticket_forge = worker_slots_map
-                    .iter()
-                    .find(|(_, s)| {
-                        Self::worker_role(&s.id) == "forge"
-                            && matches!(
-                                &s.status,
-                                WorkerStatus::Assigned { ticket_id, .. }
-                                | WorkerStatus::Working { ticket_id, .. }
-                                if ticket_id == tid
-                            )
-                    })
-                    .map(|(id, _)| id.clone());
-                let worker = ticket_forge.or_else(|| idle_forge.first().cloned());
-                if let Some(worker) = worker {
-                    rework_provision.push(json!({
-                        "ticket_id": tid,
-                        "worker_id": worker,
-                        "pr_number": pr_for_ticket.get(tid.as_str()).copied().unwrap_or(0),
-                    }));
-                }
+            for (tid, worker) in &provisionable {
+                rework_provision.push(json!({
+                    "ticket_id": tid,
+                    "worker_id": worker,
+                    "pr_number": pr_for_ticket.get(tid.as_str()).copied().unwrap_or(0),
+                }));
             }
             if !rework_provision.is_empty() {
                 info!(
@@ -5111,6 +5142,18 @@ impl Node for NexusNode {
     }
 }
 
+/// Extract the `pr: <number>` field from a persisted rework directive
+/// (`/address_review` or `/ci_fix`). Returns `None` when the directive does not
+/// name a PR, so callers can fall back to a ticket_id-based match.
+fn directive_pr_number(directive: &str) -> Option<u64> {
+    directive.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("pr:")
+            .or_else(|| line.strip_prefix("pr :"))
+            .and_then(|rest| rest.trim().parse::<u64>().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5324,6 +5367,21 @@ mod tests {
         assert_eq!(NexusNode::worker_role("forge-1"), "forge");
         assert_eq!(NexusNode::worker_role("forge-42"), "forge");
         assert_eq!(NexusNode::worker_role("sentinel"), "sentinel");
+    }
+
+    #[test]
+    fn directive_pr_number_extracts_pr_field() {
+        assert_eq!(
+            directive_pr_number("/address_review\nstate: changes_requested\npr: 123\nreason: fix it"),
+            Some(123)
+        );
+        assert_eq!(
+            directive_pr_number("/ci_fix\nstate: ci_failed\npr: 456\nticket: T-001"),
+            Some(456)
+        );
+        assert_eq!(directive_pr_number("/address_review\nstate: conflicts"), None);
+        assert_eq!(directive_pr_number("pr: abc"), None);
+        assert_eq!(directive_pr_number(""), None);
     }
 
     #[test]
