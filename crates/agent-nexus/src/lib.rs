@@ -1059,30 +1059,79 @@ Before significant work, read the relevant skill file to understand the workflow
         // ── Provision configuration into the workspace ──────────────────
         // Copy skills, standards, and persona files via SSH so the agent
         // has everything it needs when it starts working.
+        //
+        // A freshly-provisioned workspace can report ready/SSH-available
+        // before its filesystem is actually usable — the agent's startup
+        // script is still copying the repo seed and checking out the target
+        // branch, and exec into the workspace fails with "No such file or
+        // directory" until that finishes. Retry the provisioning with backoff
+        // (re-verifying SSH before each attempt) instead of giving up after a
+        // single failure; otherwise the forge starts without its persona,
+        // skills, and standards and cannot do the rework correctly.
         if let Ok(artifacts_dir) = std::env::var("ARTIFACTS_DIR") {
             let orch_path = std::path::PathBuf::from(artifacts_dir);
-            let transport = CoderTransport::new(client.clone(), &workspace.id);
-            let provisioner = Provisioner::new(&orch_path);
             let worker_role = Self::worker_role(worker_id);
-            if let Ok(reg) = self.load_registry() {
-                if let Err(e) = provisioner
-                    .provision_role(&transport, worker_role, &reg)
+            let reg = self.load_registry();
+
+            const MAX_PROVISION_ATTEMPTS: u32 = 12;
+            for attempt in 1..=MAX_PROVISION_ATTEMPTS {
+                // Re-verify SSH reachability before each attempt. The first
+                // pass may run while the workspace FS is not yet exec-able.
+                let ssh_ok = client
+                    .wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(30))
                     .await
-                {
+                    .is_ok();
+                if !ssh_ok {
                     warn!(
                         worker_id,
                         workspace_id = %workspace.id,
-                        role = %worker_role,
-                        error = %e,
-                        "Failed to provision workspace configuration — continuing anyway"
+                        attempt,
+                        max = MAX_PROVISION_ATTEMPTS,
+                        "Workspace SSH not ready for config provisioning — will retry"
                     );
-                } else {
-                    info!(
-                        worker_id,
-                        workspace_id = %workspace.id,
-                        role = %worker_role,
-                        "Provisioned workspace configuration (skills, standards, persona)"
-                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    continue;
+                }
+
+                let transport = CoderTransport::new(client.clone(), &workspace.id);
+                let provisioner = Provisioner::new(&orch_path);
+                if let Ok(ref reg) = reg {
+                    match provisioner
+                        .provision_role(&transport, worker_role, reg)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                worker_id,
+                                workspace_id = %workspace.id,
+                                role = worker_role,
+                                "Provisioned workspace configuration (skills, standards, persona)"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                worker_id,
+                                workspace_id = %workspace.id,
+                                role = worker_role,
+                                attempt,
+                                max = MAX_PROVISION_ATTEMPTS,
+                                error = %e,
+                                "Failed to provision workspace configuration — will retry"
+                            );
+                            if attempt == MAX_PROVISION_ATTEMPTS {
+                                warn!(
+                                    worker_id,
+                                    workspace_id = %workspace.id,
+                                    role = worker_role,
+                                    "Gave up provisioning workspace configuration after {} attempts — continuing anyway",
+                                    MAX_PROVISION_ATTEMPTS
+                                );
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4381,6 +4430,71 @@ impl Node for NexusNode {
             tickets.iter().filter(|t| t.is_assignable()).collect()
         };
 
+        // ── Rework provisioning ─────────────────────────────────────────────
+        // VESSEL persists a `/address_review` (or `/ci_fix`) rework directive
+        // for a ticket when it could not dispatch into a live FORGE chat (no
+        // chat binding / no FORGE workspace). NEXUS must provision a FORGE
+        // worker whose new chat starts with that directive so the rework
+        // actually reaches a FORGE — otherwise the pending PR loops
+        // VESSEL → forge_pair(no_tickets) → NEXUS forever. Detect those tickets
+        // here (before the merge_prs short-circuit in exec would route the
+        // pending PR straight back to VESSEL) and hand the first one to
+        // exec/post for provisioning.
+        let mut rework_provision: Vec<Value> = Vec::new();
+        {
+            let idle_forge: Vec<String> = worker_slots_map
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(s.status, WorkerStatus::Idle) && Self::worker_role(&s.id) == "forge"
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for pr in &pending_prs_vec {
+                let Some(tid) = pr["ticket_id"].as_str() else {
+                    continue;
+                };
+                let rework_key = full_ticket_key(tid, KEY_TICKET_REWORK_DIRECTIVE, "forge");
+                if store.get(&rework_key).await.is_none() {
+                    continue;
+                }
+                let forge_chat_key = full_ticket_key(tid, KEY_TICKET_CHAT, "forge");
+                if store.get(&forge_chat_key).await.is_some() {
+                    // A live forge chat already exists — the rework can be
+                    // delivered there, so no provisioning is needed.
+                    continue;
+                }
+                // Prefer the forge worker already bound to the ticket, else the
+                // first idle forge worker.
+                let ticket_forge = worker_slots_map
+                    .iter()
+                    .find(|(_, s)| {
+                        Self::worker_role(&s.id) == "forge"
+                            && matches!(
+                                &s.status,
+                                WorkerStatus::Assigned { ticket_id, .. }
+                                | WorkerStatus::Working { ticket_id, .. }
+                                if ticket_id == tid
+                            )
+                    })
+                    .map(|(id, _)| id.clone());
+                let worker = ticket_forge.or_else(|| idle_forge.first().cloned());
+                if let Some(worker) = worker {
+                    rework_provision.push(json!({
+                        "ticket_id": tid,
+                        "worker_id": worker,
+                        "pr_number": pr["number"].as_u64().unwrap_or(0),
+                    }));
+                }
+            }
+            if !rework_provision.is_empty() {
+                info!(
+                    count = rework_provision.len(),
+                    "Nexus prep: pending rework directives need FORGE provisioning"
+                );
+            }
+        }
+
         Ok(json!({
             "tickets": tickets,
             "assignable_tickets": assignable_tickets,
@@ -4393,6 +4507,7 @@ impl Node for NexusNode {
             "ci_readiness": ci_readiness,
             "ci_must_go_first": ci_must_go_first,
             "flow_recovery": recovery,
+            "rework_provision": rework_provision,
         }))
     }
 
@@ -4457,6 +4572,42 @@ impl Node for NexusNode {
                     .collect()
             })
             .unwrap_or_default();
+
+        // ── Rework provisioning decision ───────────────────────────────────
+        // If prep detected a persisted rework directive for a ticket with no
+        // live FORGE chat (VESSEL could not dispatch `/address_review`), route
+        // to FORGE provisioning. This must run BEFORE the merge_prs
+        // short-circuit below, otherwise the pending PR would be handed back to
+        // VESSEL and loop forever instead of spawning the FORGE that can
+        // actually do the rework.
+        if let Some(first) = context
+            .get("rework_provision")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+        {
+            let ticket_id = first
+                .get("ticket_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let worker_id = first
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let (Some(ticket_id), Some(worker_id)) = (ticket_id, worker_id) {
+                info!(
+                    ticket_id = %ticket_id,
+                    assign_to = %worker_id,
+                    "Nexus: provisioning FORGE for persisted rework directive"
+                );
+                return Ok(json!(AgentDecision {
+                    action: "rework_assigned".to_string(),
+                    notes: "Provisioning FORGE for persisted rework directive".to_string(),
+                    assign_to: Some(worker_id),
+                    ticket_id: Some(ticket_id),
+                    issue_url: None,
+                }));
+            }
+        }
 
         if !pending_prs.is_empty() {
             return Ok(json!(AgentDecision {
@@ -4696,6 +4847,67 @@ impl Node for NexusNode {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        if decision.action == "rework_assigned" {
+            store.set(KEY_NO_WORK_COUNT, json!(0)).await;
+
+            if let Some(worker_id) = &decision.assign_to {
+                if let Some(ticket_id) = &decision.ticket_id {
+                    info!(
+                        worker_id,
+                        ticket_id, "Nexus: provisioning FORGE for persisted rework directive"
+                    );
+
+                    // Mark the ticket Assigned so FORGE_PAIR monitors it during
+                    // rework (it is often Completed(pr_opened), which is not
+                    // otherwise assignable).
+                    let mut tickets: Vec<Ticket> =
+                        store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                    if let Some(ticket) = tickets.iter_mut().find(|t| t.id == *ticket_id) {
+                        ticket.status = TicketStatus::Assigned {
+                            worker_id: worker_id.clone(),
+                        };
+                    }
+                    store.set(KEY_TICKETS, json!(tickets)).await;
+
+                    // Mark the worker slot Assigned and provision a workspace
+                    // if it does not already have one.
+                    let mut slots: HashMap<String, WorkerSlot> =
+                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    let mut should_provision_coder = false;
+                    if let Some(slot) = slots.get_mut(worker_id) {
+                        should_provision_coder = slot.workspace_id.is_none();
+                        slot.status = WorkerStatus::Assigned {
+                            ticket_id: ticket_id.clone(),
+                            issue_url: None,
+                        };
+                        store
+                            .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                            .await;
+                    }
+
+                    if should_provision_coder {
+                        if let Err(e) = self
+                            .provision_coder_workspace(store, worker_id, ticket_id)
+                            .await
+                        {
+                            warn!(
+                                worker_id,
+                                ticket_id,
+                                error = %e,
+                                "Failed to provision Coder workspace for rework"
+                            );
+                        }
+                    }
+
+                    // Create the FORGE chat. `create_chat_for_ticket_id`
+                    // consumes the persisted rework directive as the new chat's
+                    // initial prompt, delivering `/address_review` to FORGE.
+                    self.create_chat_for_ticket_id(store, worker_id, ticket_id)
+                        .await;
                 }
             }
         }

@@ -13,7 +13,7 @@ use config::{
         KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
-    ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
+    ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, CiStatus, Node, PrInfo, SharedStore};
@@ -154,10 +154,13 @@ impl VesselNode {
     }
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
-        let coder_url: Option<String> = store.get_typed("coder_url").await;
-        let coder_token: Option<String> = config::CoderConfig::init_from_env()
-            .ok()
-            .and_then(|coder| coder.session_token)
+        let coder = config::CoderConfig::init_from_env().ok();
+        let coder_url: Option<String> = store
+            .get_typed("coder_url")
+            .await
+            .or_else(|| coder.as_ref().map(|c| c.url.clone()));
+        let coder_token: Option<String> = coder
+            .and_then(|c| c.session_token)
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
         let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
@@ -714,6 +717,7 @@ impl Node for VesselNode {
         let mut any_ci_fix = false;
         let mut any_awaiting_human = false;
         let mut any_address_review = false;
+        let mut any_rework_provision = false;
         let mut any_needs_review = false;
         let mut failed_ticket_ids: Vec<String> = Vec::new();
 
@@ -1407,14 +1411,15 @@ impl Node for VesselNode {
                         warn!(
                             pr_number,
                             ticket_id = %tid,
-                            "Could not dispatch /address_review (no forge chat or client) — persisting directive for NEXUS"
+                            "Could not dispatch /address_review (no forge chat or client) — persisting directive for NEXUS to provision a FORGE"
                         );
                         // No live FORGE chat to dispatch to. Persist the targeted
                         // `/address_review` directive (with the actual review
-                        // feedback) so NEXUS provisions the FORGE chat with it as
-                        // its initial prompt. Do NOT fall through to the conflict
-                        // handler here: that would tell FORGE to resolve conflict
-                        // markers and drop the review feedback entirely.
+                        // feedback) so NEXUS provisions a FORGE worker whose new
+                        // chat starts with it as the initial prompt. Do NOT fall
+                        // through to the conflict handler here: that would tell
+                        // FORGE to resolve conflict markers and drop the review
+                        // feedback entirely.
                         let repository: Option<String> = store.get_typed("repository").await;
                         let (owner, repo) = parse_repository(repository.as_deref());
                         let reason = collect_rework(&self.client, owner, repo, *pr_number)
@@ -1426,7 +1431,7 @@ impl Node for VesselNode {
                             .await;
                         self.increment_address_review_attempts(store, *pr_number)
                             .await;
-                        any_address_review = true;
+                        any_rework_provision = true;
                     }
 
                     self.remove_from_pending_prs(store, *pr_number).await;
@@ -1447,6 +1452,11 @@ impl Node for VesselNode {
             Ok(Action::new(Action::AWAITING_HUMAN))
         } else if any_conflicts {
             Ok(Action::new(ACTION_CONFLICTS_DETECTED))
+        } else if any_rework_provision {
+            // No live FORGE chat existed to dispatch `/address_review` into, so
+            // route to NEXUS to provision a FORGE worker that delivers the
+            // persisted rework directive as its chat initial prompt.
+            Ok(Action::new(ACTION_REWORK_PROVISION_NEEDED))
         } else if any_address_review {
             Ok(Action::new(ACTION_ADDRESS_REVIEW_DISPATCHED))
         } else if any_needs_review {
@@ -3353,8 +3363,11 @@ mod tests {
             "has_work": true,
         });
 
+        // No FORGE chat binding exists in the store, so VESSEL cannot dispatch
+        // `/address_review` directly — it must route to NEXUS to provision a
+        // FORGE that delivers the persisted rework directive.
         let action = node.post(&store, exec_result).await.unwrap();
-        assert_eq!(action.as_str(), ACTION_ADDRESS_REVIEW_DISPATCHED);
+        assert_eq!(action.as_str(), ACTION_REWORK_PROVISION_NEEDED);
 
         // The PR is removed from pending_prs and the dispatch counter is bumped.
         let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
@@ -3364,6 +3377,11 @@ mod tests {
             .await
             .unwrap_or(0);
         assert_eq!(attempts, 1);
+
+        // The rework directive is persisted for NEXUS to deliver as the new
+        // FORGE chat's initial prompt.
+        let directive: Option<String> = store.get_typed("ticket:T-42:rework_directive:forge").await;
+        assert!(directive.is_some());
     }
 
     #[tokio::test]

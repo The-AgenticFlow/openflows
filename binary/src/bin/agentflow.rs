@@ -444,7 +444,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         ACTION_ADDRESS_REVIEW_DISPATCHED, ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
         ACTION_DEPLOYED, ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED,
         ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PLANNING_GATE, ACTION_PR_OPENED,
-        ACTION_WORK_ASSIGNED,
+        ACTION_REWORK_PROVISION_NEEDED, ACTION_WORK_ASSIGNED,
     };
 
     let review_approve = "review_approve";
@@ -460,6 +460,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 (ACTION_MERGE_PRS, "vessel"),
                 ("approve_command", "forge_pair"),
                 ("reject_command", "nexus"),
+                ("rework_assigned", "forge_pair"),
                 ("sentinel_spawned", "sentinel"), // After spawning Sentinel, route to it
             ],
         )
@@ -491,6 +492,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 ("merge_blocked", "nexus"),
                 (ACTION_CONFLICTS_DETECTED, "forge_pair"),
                 (ACTION_ADDRESS_REVIEW_DISPATCHED, "forge_pair"),
+                (ACTION_REWORK_PROVISION_NEEDED, "nexus"),
                 (pocketflow_core::Action::AWAITING_HUMAN, "nexus"),
                 ("no_work", "nexus"),
             ];

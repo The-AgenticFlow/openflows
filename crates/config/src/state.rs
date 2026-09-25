@@ -108,6 +108,10 @@ pub const ACTION_MERGE_BLOCKED: &str = "merge_blocked";
 pub const ACTION_MERGE_PRS: &str = "merge_prs";
 pub const ACTION_CONFLICTS_DETECTED: &str = "conflicts_detected";
 pub const ACTION_ADDRESS_REVIEW_DISPATCHED: &str = "address_review_dispatched";
+/// VESSEL could not dispatch `/address_review` because no live FORGE chat
+/// existed — route to NEXUS so it provisions a FORGE worker that delivers the
+/// persisted rework directive as its chat initial prompt.
+pub const ACTION_REWORK_PROVISION_NEEDED: &str = "rework_provision_needed";
 pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
 pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
 pub const ACTION_DOCS_PENDING: &str = "docs_pending";
