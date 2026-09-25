@@ -67,6 +67,13 @@ openflows-harness review submit --verdict approve --report final-review.md
 Do NOT write a `STATUS.json` file expecting the controller to read it. Keep your verdict's
 machine-readable record in the harness Redis key via the command above.
 
+> **GitHub mirror (automatic):** When you submit your final PR verdict via the harness, the
+> controller also mirrors it on GitHub — `approve` becomes a GitHub **APPROVE** review;
+> `reject` becomes a GitHub **REQUEST_CHANGES** review with inline comments derived from your
+> report's `file:line` guidance. Keep that guidance specific so the inline comments are
+> actionable. This mirror is non-fatal: if GitHub submission fails (e.g. token scope), your
+> sharedstore verdict still routes normally.
+
 ### Example segment eval
 
 ```markdown

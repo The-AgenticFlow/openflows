@@ -5,7 +5,10 @@
 
 use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
-use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
+use config::state::{
+    full_ticket_key, full_ticket_key_flat, heartbeat_key, review_verdict_key, HeartbeatRecord,
+    REVIEW_TYPE_PR,
+};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -443,6 +446,11 @@ impl HarnessStore {
     }
 
     /// Submit a review verdict (sentinel).
+    ///
+    /// Only SENTINEL may write the PR-review verdict. This mirrors
+    /// [`authorize_gate_approver`]: FORGE/other roles must not be able to submit
+    /// an `approve` for their own ticket, which would otherwise be treated as
+    /// SENTINEL's verdict and let the builder bypass the independent reviewer.
     pub async fn review_submit(
         &self,
         ticket: &str,
@@ -451,6 +459,14 @@ impl HarnessStore {
         report_path: &Path,
         pr: Option<u64>,
     ) -> Result<()> {
+        if !role.eq_ignore_ascii_case("sentinel") {
+            bail!(
+                "Review submit rejected: role '{}' is not SENTINEL. \
+                 Only SENTINEL may record a PR review verdict; FORGE/other roles \
+                 cannot submit an approval for their own ticket.",
+                role
+            );
+        }
         if !VALID_VERDICTS.contains(&verdict) {
             bail!(
                 "Invalid verdict '{}'. Valid verdicts: {}",
@@ -467,7 +483,10 @@ impl HarnessStore {
             report,
             pr_number: pr,
         };
-        let key = self.key(&full_ticket_key(ticket, "review", role));
+        // `review submit` records the SENTINEL PR/final review verdict. It is
+        // namespaced by review type (`pr_review`) so it never collides with the
+        // planning-gate review state (`ticket:{id}:gate:planning`).
+        let key = self.key(&review_verdict_key(ticket, REVIEW_TYPE_PR));
         let json = serde_json::to_string(&payload)?;
         let _: Result<(), _> = self
             .client

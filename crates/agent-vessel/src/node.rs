@@ -8,13 +8,15 @@ use async_trait::async_trait;
 use coder_client::CoderClient;
 use config::{
     state::{
-        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_DEPLOYMENT, KEY_WORKER_SLOTS,
+        address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
+        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
+        KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
-    Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_CI_FIX_NEEDED,
-    ACTION_CONFLICTS_DETECTED,
+    Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
+    ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
+use pocketflow_core::{node::PAUSE_SIGNAL, Action, CiStatus, Node, PrInfo, SharedStore};
 use provisioner::transport::{CoderTransport, WorkspaceTransport};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
+use crate::pr_monitor::{build_directive, classify, collect_rework, PrMonitorState};
 use crate::types::{VesselConfig, VesselOutcome};
 use crate::{CiPoller, PrMerger, VesselNotifier};
 
@@ -44,6 +47,10 @@ const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
 
 /// Maximum number of CI fix attempts before giving up.
 const MAX_CI_FIX_ATTEMPTS: u32 = 3;
+
+/// Maximum number of `/address_review` dispatch attempts before the PR is
+/// surfaced to a human instead of looping forever.
+const MAX_ADDRESS_REVIEW_ATTEMPTS: u32 = 3;
 
 /// Lightweight struct to carry PR identification info for CI_FIX.md writing.
 struct CiFixPrInfo {
@@ -147,10 +154,13 @@ impl VesselNode {
     }
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
-        let coder_url: Option<String> = store.get_typed("coder_url").await;
-        let coder_token: Option<String> = config::CoderConfig::init_from_env()
-            .ok()
-            .and_then(|coder| coder.session_token)
+        let coder = config::CoderConfig::init_from_env().ok();
+        let coder_url: Option<String> = store
+            .get_typed("coder_url")
+            .await
+            .or_else(|| coder.as_ref().map(|c| c.url.clone()));
+        let coder_token: Option<String> = coder
+            .and_then(|c| c.session_token)
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
         let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
@@ -576,6 +586,11 @@ impl Node for VesselNode {
 
         let (owner, repo) = parse_repository(repository.as_deref());
 
+        // Event-driven re-arm: FORGE writes `_address_review_rearmed_{pr}` after it
+        // addresses a `/address_review` and re-arms the PR. Re-add those PRs so we
+        // resume polling them without depending on NEXUS re-discovery.
+        self.rearm_review_prs(store, owner, repo).await;
+
         let has_ci_workflows = match ci_readiness {
             Some(crate::types::CiReadiness::Ready) => true,
             Some(crate::types::CiReadiness::Missing)
@@ -701,6 +716,9 @@ impl Node for VesselNode {
         let mut any_conflicts = false;
         let mut any_ci_fix = false;
         let mut any_awaiting_human = false;
+        let mut any_address_review = false;
+        let mut any_rework_provision = false;
+        let mut any_needs_review = false;
         let mut failed_ticket_ids: Vec<String> = Vec::new();
 
         for outcome in outcomes {
@@ -839,8 +857,33 @@ impl Node for VesselNode {
                                 .unwrap_or_else(|| format!("unknown/{}", pr_number))
                         });
 
-                    let ci_fix_md_written = self
-                        .write_ci_fix_md(
+                    // Prefer chat-based `/ci_fix` dispatch into the existing FORGE
+                    // chat/workspace so the existing forge is reused (it checks out
+                    // the already-existing branch) instead of spawning a fresh
+                    // workspace and starting from scratch. If no forge chat / Coder
+                    // client is available, fall back to the file-based `CI_FIX.md`
+                    // marker + worker reassignment below (which lets NEXUS
+                    // provision/reuse a forge for the issue).
+                    let ci_chat_dispatched = self
+                        .dispatch_ci_fix_for_pr(
+                            store,
+                            *pr_number,
+                            &tid,
+                            &head_branch,
+                            reason,
+                            failure_detail.as_ref(),
+                        )
+                        .await;
+
+                    let ci_fix_md_written = if ci_chat_dispatched {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "Dispatched /ci_fix to existing forge chat — reusing forge workspace"
+                        );
+                        false
+                    } else {
+                        self.write_ci_fix_md(
                             &CiFixPrInfo {
                                 pr_number: *pr_number,
                                 head_branch: head_branch.clone(),
@@ -849,7 +892,8 @@ impl Node for VesselNode {
                             reason,
                             failure_detail.as_ref(),
                         )
-                        .await;
+                        .await
+                    };
 
                     if ci_fix_md_written {
                         info!(
@@ -857,7 +901,7 @@ impl Node for VesselNode {
                             ticket_id = %tid,
                             "Wrote CI_FIX.md — routing to forge_pair for CI fix"
                         );
-                    } else {
+                    } else if !ci_chat_dispatched {
                         warn!(
                             pr_number,
                             ticket_id = %tid,
@@ -1014,8 +1058,26 @@ impl Node for VesselNode {
                                 .unwrap_or_else(|| format!("unknown/{}", pr_number))
                         });
 
-                    let ci_fix_md_written = self
-                        .write_ci_fix_md(
+                    let ci_chat_dispatched = self
+                        .dispatch_ci_fix_for_pr(
+                            store,
+                            *pr_number,
+                            &tid,
+                            &head_branch,
+                            "CI timed out — possible stuck or flaky CI run",
+                            None,
+                        )
+                        .await;
+
+                    let ci_fix_md_written = if ci_chat_dispatched {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "Dispatched /ci_fix to existing forge chat — reusing forge workspace (timeout)"
+                        );
+                        false
+                    } else {
+                        self.write_ci_fix_md(
                             &CiFixPrInfo {
                                 pr_number: *pr_number,
                                 head_branch: head_branch.clone(),
@@ -1024,7 +1086,8 @@ impl Node for VesselNode {
                             "CI timed out — possible stuck or flaky CI run",
                             None,
                         )
-                        .await;
+                        .await
+                    };
 
                     if ci_fix_md_written {
                         info!(
@@ -1169,6 +1232,16 @@ impl Node for VesselNode {
                     )
                     .await;
 
+                    // Additive `/address_review` chat dispatch for conflicts.
+                    // The existing CONFLICT_RESOLUTION.md file fallback remains.
+                    self.dispatch_address_review_for_pr(
+                        store,
+                        *pr_number,
+                        PrMonitorState::Conflicts,
+                        &tid,
+                    )
+                    .await;
+
                     let derived_worker_id = pending_prs
                         .iter()
                         .find(|p| p["number"].as_u64() == Some(*pr_number))
@@ -1233,6 +1306,136 @@ impl Node for VesselNode {
                         any_failure = true;
                     }
                 }
+                VesselOutcome::Reviews {
+                    ticket_id,
+                    pr_number,
+                    state,
+                } => {
+                    let tid = ticket_id
+                        .clone()
+                        .unwrap_or_else(|| format!("T-{}", pr_number));
+                    let current_attempts =
+                        self.get_address_review_attempts(store, *pr_number).await;
+
+                    let monitor_state = match state.as_str() {
+                        "changes_requested" => PrMonitorState::ChangesRequested,
+                        "comments" => PrMonitorState::Comments,
+                        "needs_review" => PrMonitorState::NeedsReview,
+                        _ => PrMonitorState::Comments,
+                    };
+
+                    // ── NeedsReview: SENTINEL has not yet submitted an approve
+                    // review on GitHub. This is a gating wait, NOT a rework
+                    // request to FORGE. Check it BEFORE the attempt cap so a PR
+                    // that is simply awaiting SENTINEL's approve review stays
+                    // pending instead of being escalated to human after the
+                    // rework-attempt cap is exhausted. We must not dispatch
+                    // `/address_review`, must not mark the ticket failed, and
+                    // must not drop the PR from pending_prs — it stays queued so
+                    // the next poll re-classifies once SENTINEL's review lands.
+                    if monitor_state == PrMonitorState::NeedsReview {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "PR not yet approved by SENTINEL — keeping pending until the final review is submitted"
+                        );
+                        any_needs_review = true;
+                        continue;
+                    }
+
+                    if current_attempts >= MAX_ADDRESS_REVIEW_ATTEMPTS {
+                        warn!(
+                            pr_number,
+                            ticket_id = %tid,
+                            attempts = current_attempts,
+                            "Max /address_review dispatch attempts exceeded — surfacing to human"
+                        );
+                        self.mark_ticket_awaiting_human(
+                            store,
+                            &tid,
+                            &format!(
+                                "PR #{} in review-rework state ({}) not addressed after {} dispatch attempts",
+                                pr_number, state, current_attempts
+                            ),
+                        )
+                        .await;
+                        self.remove_from_pending_prs(store, *pr_number).await;
+                        any_awaiting_human = true;
+                        continue;
+                    }
+
+                    // Dedup guard: if we already dispatched `/address_review` for
+                    // this exact PR head SHA, FORGE is still addressing it and has
+                    // not pushed new changes. Re-dispatching would overwhelm the
+                    // builder, so we do nothing and let it finish.
+                    let current_head_sha = self.pending_pr_head_sha(store, *pr_number).await;
+                    let already_dispatched_for_head = match current_head_sha {
+                        Some(ref sha) => {
+                            self.get_address_review_dispatched_sha(store, *pr_number)
+                                .await
+                                .as_deref()
+                                == Some(sha.as_str())
+                        }
+                        None => false,
+                    };
+                    if already_dispatched_for_head {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            head_sha = current_head_sha.as_deref().unwrap_or(""),
+                            "Already dispatched /address_review for this head — waiting for FORGE to finish"
+                        );
+                        self.remove_from_pending_prs(store, *pr_number).await;
+                        continue;
+                    }
+
+                    let dispatched = self
+                        .dispatch_address_review_for_pr(store, *pr_number, monitor_state, &tid)
+                        .await;
+
+                    if dispatched {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            state,
+                            "Dispatched /address_review to forge chat"
+                        );
+                        if let Some(sha) = current_head_sha {
+                            self.set_address_review_dispatched_sha(store, *pr_number, &sha)
+                                .await;
+                        }
+                        self.increment_address_review_attempts(store, *pr_number)
+                            .await;
+                        any_address_review = true;
+                    } else {
+                        warn!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "Could not dispatch /address_review (no forge chat or client) — persisting directive for NEXUS to provision a FORGE"
+                        );
+                        // No live FORGE chat to dispatch to. Persist the targeted
+                        // `/address_review` directive (with the actual review
+                        // feedback) so NEXUS provisions a FORGE worker whose new
+                        // chat starts with it as the initial prompt. Do NOT fall
+                        // through to the conflict handler here: that would tell
+                        // FORGE to resolve conflict markers and drop the review
+                        // feedback entirely.
+                        let repository: Option<String> = store.get_typed("repository").await;
+                        let (owner, repo) = parse_repository(repository.as_deref());
+                        let reason = collect_rework(&self.client, owner, repo, *pr_number)
+                            .await
+                            .reason;
+                        let directive =
+                            build_directive(monitor_state, *pr_number, reason.as_deref());
+                        self.persist_rework_directive(store, &tid, "forge", &directive)
+                            .await;
+                        self.increment_address_review_attempts(store, *pr_number)
+                            .await;
+                        any_rework_provision = true;
+                    }
+
+                    self.remove_from_pending_prs(store, *pr_number).await;
+                }
                 VesselOutcome::DocsPrClosed { pr_number, reason } => {
                     info!(
                         pr_number,
@@ -1249,6 +1452,17 @@ impl Node for VesselNode {
             Ok(Action::new(Action::AWAITING_HUMAN))
         } else if any_conflicts {
             Ok(Action::new(ACTION_CONFLICTS_DETECTED))
+        } else if any_rework_provision {
+            // No live FORGE chat existed to dispatch `/address_review` into, so
+            // route to NEXUS to provision a FORGE worker that delivers the
+            // persisted rework directive as its chat initial prompt.
+            Ok(Action::new(ACTION_REWORK_PROVISION_NEEDED))
+        } else if any_address_review {
+            Ok(Action::new(ACTION_ADDRESS_REVIEW_DISPATCHED))
+        } else if any_needs_review {
+            // Waiting on SENTINEL's GitHub approve review. Keep the PR pending
+            // and let the controller poll again — do not treat as success/failure.
+            Ok(Action::new(PAUSE_SIGNAL))
         } else if any_success {
             Ok(Action::DEPLOYED.into())
         } else if any_ci_fix {
@@ -1345,6 +1559,50 @@ impl VesselNode {
 
         match poll_result {
             CiPollResult::Status(CiStatus::Success) => {
+                // Monitor the GitHub-native PR lifecycle: before merging, check
+                // the review state. If a reviewer requested changes or left
+                // unaddressed review comments, dispatch `/address_review` to the
+                // responsible FORGE instead of merging. The actual chat dispatch
+                // happens in post() where the SharedStore (forge chat binding) is
+                // available; here we only decide and carry the rework directive.
+                let monitor_state =
+                    classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
+                        .await
+                        .unwrap_or(PrMonitorState::ReadyForMerge);
+
+                // SENTINEL has not yet approved the PR on GitHub. Do not merge
+                // and do not ask FORGE to rework — keep the PR pending so the
+                // cycle waits for the final review to land.
+                if monitor_state == PrMonitorState::NeedsReview {
+                    debug!(
+                        pr_number,
+                        "PR not yet approved by SENTINEL — keeping pending for final review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: PrMonitorState::NeedsReview.as_str().to_string(),
+                    });
+                }
+
+                if matches!(
+                    monitor_state,
+                    PrMonitorState::ChangesRequested | PrMonitorState::Comments
+                ) {
+                    let directive = collect_rework(&self.client, owner, repo, pr_number).await;
+                    warn!(
+                        pr_number,
+                        state = monitor_state.as_str(),
+                        reason = directive.reason.as_deref().unwrap_or(""),
+                        "PR in review-rework state — dispatching /address_review to FORGE"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: monitor_state.as_str().to_string(),
+                    });
+                }
+
                 match self.merger.merge(owner, repo, &pr_info).await {
                     Ok(result) if result.merged => Ok(VesselOutcome::Merged {
                         ticket_id: ticket_id.unwrap_or_else(|| format!("T-{}", pr_number)),
@@ -1440,6 +1698,46 @@ impl VesselNode {
                         return self.handle_conflicts(owner, repo, fresh_pr.unwrap()).await;
                     }
                 }
+
+                // Even when CI times out, never merge a PR that has not received
+                // SENTINEL's GitHub approve review. This mirrors the
+                // CI-Success path so a timeout cannot bypass the review gate.
+                let monitor_state =
+                    classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
+                        .await
+                        .unwrap_or(PrMonitorState::ReadyForMerge);
+                if monitor_state == PrMonitorState::NeedsReview {
+                    debug!(
+                        pr_number,
+                        "CI timed out and PR not yet approved by SENTINEL — keeping pending for final review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: PrMonitorState::NeedsReview.as_str().to_string(),
+                    });
+                }
+
+                // A timeout must not bypass outstanding review feedback. If the
+                // PR is in a review-rework state (changes requested or open
+                // comments), route it back to FORGE via /address_review instead
+                // of merging — mirroring the CI-Success path.
+                if matches!(
+                    monitor_state,
+                    PrMonitorState::ChangesRequested | PrMonitorState::Comments
+                ) {
+                    warn!(
+                        pr_number,
+                        state = monitor_state.as_str(),
+                        "CI timed out with outstanding review feedback — routing to /address_review"
+                    );
+                    return Ok(VesselOutcome::Reviews {
+                        ticket_id,
+                        pr_number,
+                        state: monitor_state.as_str().to_string(),
+                    });
+                }
+
                 match self.merger.merge(owner, repo, &pr_info).await {
                     Ok(result) if result.merged => Ok(VesselOutcome::CiMissing {
                         ticket_id,
@@ -2301,6 +2599,284 @@ impl VesselNode {
         store.get_typed::<u32>(&key).await.unwrap_or(0)
     }
 
+    /// Increment the `/address_review` dispatch counter for a PR. Stored in a
+    /// separate key so it survives pending_prs removal/re-add cycles.
+    async fn increment_address_review_attempts(&self, store: &SharedStore, pr_number: u64) {
+        let key = format!("_address_review_attempts_{}", pr_number);
+        let current: u32 = store.get_typed::<u32>(&key).await.unwrap_or(0);
+        let next = current + 1;
+        info!(
+            pr_number,
+            attempts = next,
+            max = MAX_ADDRESS_REVIEW_ATTEMPTS,
+            "Incremented /address_review attempt counter"
+        );
+        store.set(&key, json!(next)).await;
+    }
+
+    /// Get the current `/address_review` dispatch count for a PR.
+    async fn get_address_review_attempts(&self, store: &SharedStore, pr_number: u64) -> u32 {
+        let key = format!("_address_review_attempts_{}", pr_number);
+        store.get_typed::<u32>(&key).await.unwrap_or(0)
+    }
+
+    /// Return the PR head SHA that was last dispatched `/address_review` for,
+    /// if any. Used to avoid re-dispatching while FORGE is still addressing the
+    /// same head (i.e. it has not pushed new changes yet).
+    async fn get_address_review_dispatched_sha(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+    ) -> Option<String> {
+        let key = address_review_dispatched_key(pr_number);
+        store.get_typed::<String>(&key).await
+    }
+
+    /// Record the PR head SHA for which `/address_review` was dispatched.
+    async fn set_address_review_dispatched_sha(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        head_sha: &str,
+    ) {
+        let key = address_review_dispatched_key(pr_number);
+        store.set(&key, json!(head_sha)).await;
+    }
+
+    /// Resolve the current head SHA of a PR from the `pending_prs` entry.
+    async fn pending_pr_head_sha(&self, store: &SharedStore, pr_number: u64) -> Option<String> {
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        pending_prs
+            .iter()
+            .find(|p| p["number"].as_u64() == Some(pr_number))
+            .and_then(|p| p["head_sha"].as_str().map(|s| s.to_string()))
+    }
+
+    /// Dispatch a `/address_review` directive into the responsible FORGE's
+    /// existing Coder chat, keyed by role name (`ticket:{id}:chat:forge`).
+    ///
+    /// Returns `true` if the directive was sent. When `address_review_enabled`
+    /// is false, or no forge chat / Coder client is resolvable, returns `false`
+    /// so the caller can fall back to the file-based rework markers.
+    async fn dispatch_address_review_for_pr(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        state: PrMonitorState,
+        ticket_id: &str,
+    ) -> bool {
+        if !self.config.address_review_enabled {
+            debug!(
+                ticket_id,
+                pr_number, "address_review dispatch disabled by config"
+            );
+            return false;
+        }
+
+        let repository: Option<String> = store.get_typed("repository").await;
+        let (owner, repo) = parse_repository(repository.as_deref());
+        let directive = collect_rework(&self.client, owner, repo, pr_number).await;
+        let directive_text = build_directive(state, pr_number, directive.reason.as_deref());
+
+        let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+        let chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
+        let Some(client) = Self::coder_client_from_store(store).await else {
+            warn!(
+                ticket_id,
+                pr_number, "No Coder client — cannot dispatch /address_review"
+            );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive_text)
+                .await;
+            return false;
+        };
+        let Some(chat_id) = chat_id else {
+            warn!(
+                ticket_id,
+                pr_number, "No forge chat binding — cannot dispatch /address_review"
+            );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive_text)
+                .await;
+            return false;
+        };
+
+        match client
+            .send_chat_message(
+                &chat_id,
+                vec![coder_client::types::ChatInputPart::text(directive_text)],
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    ticket_id,
+                    pr_number, chat_id, "Dispatched /address_review to forge chat"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    ticket_id,
+                    pr_number,
+                    error = %e, "Failed to dispatch /address_review to forge chat"
+                );
+                false
+            }
+        }
+    }
+
+    /// Dispatch a `/ci_fix` directive into the responsible FORGE's **existing**
+    /// Coder chat, keyed by role name (`ticket:{id}:chat:forge`).
+    ///
+    /// The goal is to reuse the existing FORGE workspace/chat for the issue so it
+    /// checks out the already-existing branch and addresses the failing checks —
+    /// not spawn a fresh workspace and start from scratch. Returns `true` when the
+    /// directive was sent. When no forge chat or Coder client is resolvable,
+    /// returns `false` so the caller falls back to the file-based `CI_FIX.md` +
+    /// worker reassignment path (which lets NEXUS provision/reuse a forge).
+    async fn dispatch_ci_fix_for_pr(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        ticket_id: &str,
+        head_branch: &str,
+        reason: &str,
+        failure_detail: Option<&github::CiFailureDetail>,
+    ) -> bool {
+        let directive =
+            build_ci_fix_directive(pr_number, ticket_id, head_branch, reason, failure_detail);
+
+        let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+        let chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
+        let Some(client) = Self::coder_client_from_store(store).await else {
+            warn!(
+                ticket_id,
+                pr_number, "No Coder client — cannot dispatch /ci_fix"
+            );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive)
+                .await;
+            return false;
+        };
+        let Some(chat_id) = chat_id else {
+            warn!(
+                ticket_id,
+                pr_number, "No forge chat binding — cannot dispatch /ci_fix"
+            );
+            // Persist so NEXUS uses only this directive when it creates the forge chat.
+            self.persist_rework_directive(store, ticket_id, "forge", &directive)
+                .await;
+            return false;
+        };
+
+        match client
+            .send_chat_message(
+                &chat_id,
+                vec![coder_client::types::ChatInputPart::text(directive)],
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    ticket_id,
+                    pr_number, chat_id, "Dispatched /ci_fix to existing forge chat"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    ticket_id,
+                    pr_number,
+                    error = %e, "Failed to dispatch /ci_fix to forge chat"
+                );
+                false
+            }
+        }
+    }
+
+    /// Persist a rework directive (`/ci_fix` / `/address_review`) that could not be
+    /// delivered because no live forge chat existed. NEXUS reads it when it creates
+    /// the forge chat so the new chat starts with only the targeted directive instead
+    /// of the full ticket-assignment blast, then clears the key.
+    async fn persist_rework_directive(
+        &self,
+        store: &SharedStore,
+        ticket_id: &str,
+        role: &str,
+        directive: &str,
+    ) {
+        let key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        store.set(&key, json!(directive)).await;
+        info!(
+            ticket_id,
+            role, "Persisted rework directive for NEXUS to use as forge chat initial prompt"
+        );
+    }
+
+    /// Re-arm review PRs that FORGE signalled it addressed via `review_ready`.
+    ///
+    /// FORGE writes `_address_review_rearmed_{pr}` once it has re-armed the PR after
+    /// a `/address_review`. We re-add those PRs to `pending_prs` (fetching current
+    /// info from GitHub) so the next poll resumes processing them, then clear the
+    /// marker. This makes re-notification event-driven instead of depending on
+    /// NEXUS re-discovery.
+    async fn rearm_review_prs(&self, store: &SharedStore, owner: &str, repo: &str) {
+        let marker_keys = store.keys("_address_review_rearmed_*").await;
+        if marker_keys.is_empty() {
+            return;
+        }
+
+        for key in marker_keys {
+            // Parse the pr_number from the trailing digits of the marker key.
+            // `keys()` may return fully-qualified (namespaced) keys, so scan for the
+            // marker substring and take whatever follows it.
+            let pr_number = key
+                .rsplit("_address_review_rearmed_")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<u64>().ok());
+            let Some(pr_number) = pr_number else {
+                continue;
+            };
+
+            info!(
+                pr_number,
+                "FORGE re-armed PR after /address_review — re-adding to pending_prs"
+            );
+
+            let mut pending_prs: Vec<Value> =
+                store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+            let already_tracked = pending_prs
+                .iter()
+                .any(|p| p["number"].as_u64() == Some(pr_number));
+            if !already_tracked {
+                if let Ok(pr_info) = self.client.get_pull_request(owner, repo, pr_number).await {
+                    pending_prs.push(json!({
+                        "number": pr_info.number,
+                        "ticket_id": pr_info.ticket_id,
+                        "head_sha": pr_info.head_sha,
+                        "head_branch": pr_info.head_branch,
+                        "base_branch": pr_info.base_branch,
+                        "title": pr_info.title,
+                        "mergeable": pr_info.mergeable,
+                        "has_conflicts": pr_info.mergeable == Some(false),
+                    }));
+                    store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
+                } else {
+                    warn!(
+                        pr_number,
+                        "Failed to fetch re-armed PR from GitHub — leaving out of pending_prs"
+                    );
+                }
+            }
+
+            // Clear the marker so we don't re-add it on every poll. Use the logical
+            // key (store.del re-applies the namespace); `keys()` returns the fully
+            // qualified form which must not be re-namespaced.
+            store.del(&address_review_rearmed_key(pr_number)).await;
+        }
+    }
+
     async fn write_ci_fix_md(
         &self,
         pr_placeholder: &CiFixPrInfo,
@@ -2494,6 +3070,58 @@ fn is_merge_conflict_message(msg: &str) -> bool {
     lower.contains("merge conflict")
         || lower.contains("merge_conflict")
         || (lower.contains("405") && lower.contains("method not allowed"))
+}
+
+/// Build the lightweight `/ci_fix` chat directive for FORGE.
+///
+/// This is a **pointer**, not a dump of the whole CI output: it names the PR, the
+/// ticket, the branch, the failure reason, and the failed check names + `path:line`
+/// annotations so FORGE can reproduce and fix in its existing workspace. FORGE is
+/// instructed to reuse its existing workspace/branch (via the `/ci_fix` command and
+/// `forge-ci-fix` skill) rather than start from scratch.
+fn build_ci_fix_directive(
+    pr_number: u64,
+    ticket_id: &str,
+    head_branch: &str,
+    reason: &str,
+    failure_detail: Option<&github::CiFailureDetail>,
+) -> String {
+    let mut out = String::from("/ci_fix\n");
+    out.push_str("state: ci_failed\n");
+    out.push_str(&format!("pr: {}\n", pr_number));
+    out.push_str(&format!("ticket: {}\n", ticket_id));
+    if !head_branch.is_empty() {
+        out.push_str(&format!("branch: {}\n", head_branch));
+    }
+    if !reason.trim().is_empty() {
+        out.push_str(&format!("reason: {}\n", reason.trim()));
+    }
+
+    if let Some(detail) = failure_detail {
+        let check_names = detail.failed_check_names();
+        if !check_names.is_empty() {
+            out.push_str("checks:\n");
+            for name in check_names {
+                out.push_str(&format!("- {}\n", name));
+            }
+        }
+        if !detail.annotations.is_empty() {
+            out.push_str("annotations:\n");
+            for a in &detail.annotations {
+                out.push_str(&format!(
+                    "- **{}** `{}:{}` {}\n",
+                    a.check_name, a.path, a.start_line, a.message
+                ));
+            }
+        }
+    }
+
+    out.push_str(
+        "\nReuse your existing workspace and branch (you already have this PR checked \
+         out). Match the failed checks to .github/workflows/, reproduce and fix ALL \
+         errors locally, push, then re-run: openflows-harness status set review_ready",
+    );
+    out
 }
 
 fn parse_repository(repository: Option<&str>) -> (&str, &str) {
@@ -2705,5 +3333,201 @@ mod tests {
         let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|pr| pr["number"] != 42));
+    }
+
+    #[tokio::test]
+    async fn test_post_handles_address_review_outcome() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                "pending_prs",
+                json!([{"number": 42, "ticket_id": "T-42", "worker_id": "forge-1"}]),
+            )
+            .await;
+        store
+            .set(
+                "tickets",
+                json!([{"id": "T-42", "status": {"type": "in_progress"}}]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let exec_result = json!({
+            "outcomes": [VesselOutcome::Reviews {
+                ticket_id: Some("T-42".to_string()),
+                pr_number: 42,
+                state: "changes_requested".to_string(),
+            }],
+            "has_work": true,
+        });
+
+        // No FORGE chat binding exists in the store, so VESSEL cannot dispatch
+        // `/address_review` directly — it must route to NEXUS to provision a
+        // FORGE that delivers the persisted rework directive.
+        let action = node.post(&store, exec_result).await.unwrap();
+        assert_eq!(action.as_str(), ACTION_REWORK_PROVISION_NEEDED);
+
+        // The PR is removed from pending_prs and the dispatch counter is bumped.
+        let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
+        assert!(pending.is_empty());
+        let attempts: u32 = store
+            .get_typed("_address_review_attempts_42")
+            .await
+            .unwrap_or(0);
+        assert_eq!(attempts, 1);
+
+        // The rework directive is persisted for NEXUS to deliver as the new
+        // FORGE chat's initial prompt.
+        let directive: Option<String> = store.get_typed("ticket:T-42:rework_directive:forge").await;
+        assert!(directive.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_post_reviews_dedup_same_head_does_not_redispatch() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                "pending_prs",
+                json!([{
+                    "number": 42,
+                    "ticket_id": "T-42",
+                    "worker_id": "forge-1",
+                    "head_sha": "sha-abc",
+                }]),
+            )
+            .await;
+        store
+            .set(
+                "tickets",
+                json!([{"id": "T-42", "status": {"type": "in_progress"}}]),
+            )
+            .await;
+        // Already dispatched for this exact head SHA — FORGE is still working.
+        store
+            .set("_address_review_dispatched_42", json!("sha-abc"))
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let exec_result = json!({
+            "outcomes": [VesselOutcome::Reviews {
+                ticket_id: Some("T-42".to_string()),
+                pr_number: 42,
+                state: "changes_requested".to_string(),
+            }],
+            "has_work": true,
+        });
+
+        let action = node.post(&store, exec_result).await.unwrap();
+        // No re-dispatch — nothing to route on (all outcomes deduped).
+        assert_eq!(action.as_str(), "no_work");
+
+        // The dispatch counter is NOT incremented for the same head.
+        let attempts: u32 = store
+            .get_typed("_address_review_attempts_42")
+            .await
+            .unwrap_or(0);
+        assert_eq!(attempts, 0);
+
+        // PR still removed from pending_prs (FORGE is handling it).
+        let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rearm_review_prs_clears_marker_even_when_fetch_fails() {
+        let store = SharedStore::new_in_memory();
+        // FORGE re-armed a PR after addressing a /address_review.
+        store.set("_address_review_rearmed_42", json!(true)).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        // No repo configured → GitHub fetch fails → the marker must still be
+        // cleared so VESSEL does not re-process it on every poll, and the call
+        // must not panic.
+        node.rearm_review_prs(&store, "", "").await;
+
+        let marker_keys = store.keys("_address_review_rearmed_*").await;
+        assert!(marker_keys.is_empty(), "re-arm marker should be cleared");
+        let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rearm_review_prs_does_not_duplicate_existing_pr() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set("pending_prs", json!([{"number": 42, "ticket_id": "T-42"}]))
+            .await;
+        store.set("_address_review_rearmed_42", json!(true)).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        node.rearm_review_prs(&store, "", "").await;
+
+        let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
+        // Already tracked → not duplicated.
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["number"], 42);
+        // Marker still cleared.
+        let marker_keys = store.keys("_address_review_rearmed_*").await;
+        assert!(marker_keys.is_empty());
+    }
+
+    #[test]
+    fn build_ci_fix_directive_is_minimal_pointer() {
+        let detail = github::CiFailureDetail {
+            failed_checks: vec![github::FailedCheck {
+                name: "check-lint".to_string(),
+                conclusion: "failure".to_string(),
+            }],
+            still_running: vec![],
+            job_logs: vec![(
+                "check-lint".to_string(),
+                "##[error]lint failed\n".to_string(),
+            )],
+            annotations: vec![github::CheckAnnotationDetail {
+                check_name: "check-lint".to_string(),
+                path: "src/api.rs".to_string(),
+                start_line: 78,
+                message: "missing pagination".to_string(),
+            }],
+        };
+        let d = build_ci_fix_directive(
+            42,
+            "T-034",
+            "forge-1/T-034",
+            "CI status: Failure",
+            Some(&detail),
+        );
+        assert!(d.contains("/ci_fix"));
+        assert!(d.contains("state: ci_failed"));
+        assert!(d.contains("pr: 42"));
+        assert!(d.contains("ticket: T-034"));
+        assert!(d.contains("branch: forge-1/T-034"));
+        assert!(d.contains("reason: CI status: Failure"));
+        // Pointer, not a dump: full job-log text must NOT be embedded.
+        assert!(!d.contains("##[error]lint failed"));
+        assert!(d.contains("check-lint"));
+        assert!(d.contains("src/api.rs"));
+        // FORGE is told to reuse its existing workspace and re-arm the PR.
+        assert!(d.contains("Reuse your existing workspace"));
+        assert!(d.contains("openflows-harness status set review_ready"));
+    }
+
+    #[test]
+    fn build_ci_fix_directive_omits_missing_parts() {
+        let d = build_ci_fix_directive(7, "T-007", "", "CI status: Failure", None);
+        assert!(d.contains("/ci_fix"));
+        assert!(d.contains("pr: 7"));
+        // No branch and no reason lines when absent.
+        assert!(!d.contains("branch:"));
+        assert!(!d.contains("checks:"));
+        assert!(!d.contains("annotations:"));
     }
 }

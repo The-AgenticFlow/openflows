@@ -139,6 +139,55 @@ session or re-provision — NEXUS routes the rejection back into your existing c
 
 If you can no longer proceed, set `status set blocked` with an exact, answerable question.
 
+### Handling `/address_review` from VESSEL
+
+VESSEL may dispatch a structured `/address_review` directive into your **existing chat
+session** when your PR is in a GitHub-native review state that blocks merging: conflicts,
+`changes_requested`, or unaddressed inline comments. The directive carries the `state`, PR
+number, the latest review body, and inline `path:line` comments (and conflicted files when
+relevant).
+
+1. Read the directive and note every comment (`path:line`) and any conflicted files.
+2. For `conflicts`: fetch the latest base branch, resolve every conflict marker (integrate
+   both sides — never just pick one), stage, and commit.
+3. Address **every** inline comment / review point — fix all, not just the first.
+4. Verify your work compiles / tests pass, then push. **Never force-push or bypass branch
+   protection.**
+5. Re-arm the PR for review:
+   ```bash
+   openflows-harness status set review_ready
+   ```
+   VESSEL re-polls and SENTINEL re-reviews the updated head. Stay in the same chat session.
+6. If you cannot resolve the feedback, set `status set blocked` with an exact question.
+
+See `orchestration/plugin/commands/address_review.md` for the full command contract.
+
+### Handling `/ci_fix` from VESSEL
+
+VESSEL may dispatch a structured `/ci_fix` directive into your **existing chat session** when
+CI checks failed on a PR you opened. The directive carries the PR number, ticket id, the
+branch, a short failure reason, and (when available) the failed check names and `path:line`
+annotations.
+
+**Reuse your existing workspace and branch — do NOT start from scratch.**
+
+1. Read the directive and note the failing check names and annotations.
+2. Confirm you are on the PR branch and have the latest base merged in; resolve any conflict
+   markers (integrate both sides — never just pick one).
+3. Match each failed check to its job in `.github/workflows/`.
+4. Reproduce and fix locally (install the tools/deps the workflow expects, run the failing
+   job's exact `run:` steps). Fix **ALL** errors, not just the first.
+5. Verify all checks pass locally, then push. **Never force-push or bypass branch
+   protection.**
+6. Re-arm the PR for review:
+   ```bash
+   openflows-harness status set review_ready
+   ```
+   VESSEL re-polls CI and SENTINEL re-reviews the updated head. Stay in the same chat session.
+7. If you cannot resolve the failure, set `status set blocked` with an exact question.
+
+See `orchestration/plugin/commands/ci_fix.md` for the full command contract.
+
 ---
 
 # Escalation Protocol

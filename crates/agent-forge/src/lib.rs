@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
 use config::{
     state::{
-        full_ticket_key, full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
+        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
         KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, ACTION_FAILED, ACTION_PR_OPENED,
@@ -328,6 +329,29 @@ impl BatchNode for ForgePairNode {
                             );
                             Self::sync_harness_pr_to_pending(store, ticket_id, worker_id, &pr_info)
                                 .await;
+
+                            // Event-driven re-arm signal for VESSEL: if this PR was the
+                            // subject of a VESSEL-dispatched `/address_review`, write a
+                            // marker so VESSEL re-polls it even if NEXUS would otherwise
+                            // skip re-adding it (e.g. ticket in a Failed/InProgress state).
+                            if store
+                                .get(&address_review_dispatched_key(pr_info.pr_number))
+                                .await
+                                .is_some()
+                            {
+                                store
+                                    .set(
+                                        &address_review_rearmed_key(pr_info.pr_number),
+                                        json!(true),
+                                    )
+                                    .await;
+                                info!(
+                                    ticket_id,
+                                    pr_number = pr_info.pr_number,
+                                    "Wrote /address_review re-arm marker for VESSEL"
+                                );
+                            }
+
                             has_pr_opened = true;
                         } else {
                             // No PR info but review_ready — signal for Sentinel spawn

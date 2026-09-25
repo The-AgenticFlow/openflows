@@ -55,6 +55,26 @@ data "coder_parameter" "repo_url" {
   type        = "string"
 }
 
+data "coder_parameter" "branch" {
+  name        = "branch"
+  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = default branch."
+  default     = ""
+  type        = "string"
+}
+
+# The requested branch is interpolated directly into the startup bash script.
+# A branch name containing shell metacharacters (e.g. `$(...)`) would otherwise
+# be evaluated by bash as command substitution, so validate it against a charset
+# that accepts all git-valid, shell-safe characters and fall back to the default
+# branch when it does not match. `+`, `=`, `@`, `.`, `_`, `-`, `/` are all legal
+# in git ref names and safe in the shell; anything else (dollar, backtick,
+# parens, quotes, spaces, `;`, `&`, `|`, `<`, `>`, `!`, `*`, `?`, `[`, `]`,
+# `~`, `\`, `#`) is rejected so a malicious branch cannot inject shell commands.
+locals {
+  requested_branch = data.coder_parameter.branch.value
+  safe_branch      = can(regex("^[A-Za-z0-9._/+@=-]+$", local.requested_branch)) ? local.requested_branch : ""
+}
+
 data "coder_parameter" "tenant" {
   name        = "tenant"
   description  = "OpenFlows tenant identifier"
@@ -208,10 +228,15 @@ resource "coder_agent" "main" {
     # workspace, because an agent with no repo cannot do useful work and the
     # old silent `2>/dev/null` clone was the root cause of empty workspaces.
     GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    # The target branch: when the controller passes a PR `branch` (rework of an
+    # existing PR), check that out so already-done work is NOT redone. When
+    # empty, fall back to the default branch (fresh work).
+    TARGET_BRANCH="${local.safe_branch}"
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
+      git fetch --all --prune 2>/dev/null || true
     elif [ -d "$GOLDEN_REPO/.git" ]; then
       sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
       sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
@@ -219,18 +244,81 @@ resource "coder_agent" "main" {
       # Refresh to latest before checkout (design: copy -> refresh -> checkout).
       cd /home/coder/workspace
       git fetch --all --prune 2>/dev/null || true
-      # Checkout the default branch head so work never begins on a stale tree.
-      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
       if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
+        cd /home/coder/workspace
+        git fetch --all --prune 2>/dev/null || true
       else
         log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
     else
       log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
+    fi
+
+    # When we cannot get onto the intended PR branch, record it so the rework
+    # flow does not treat the current branch as the PR branch and push the fix
+    # to the wrong remote branch. The agent stays available, but the mismatch is
+    # made visible via a workspace-root marker plus a prominent startup log.
+    warn_branch_mismatch() {
+      local intended="$1"
+      local current
+      current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+      log "WARNING: workspace is on branch '$current', NOT the intended PR branch '$intended' — rework must NOT push to the current branch"
+      {
+        echo "# REWORK BRANCH MISMATCH"
+        echo ""
+        echo "The startup script could not switch to the intended PR branch \`$intended\`."
+        echo "The workspace is currently on branch \`$current\`, which is NOT the PR branch."
+        echo ""
+        echo "**Do NOT run \`git push\` on the current branch** — it is not the PR branch and"
+        echo "pushing here would update the wrong branch, not the PR."
+        echo "Resolve the local conflict or uncommitted changes and switch to \`$intended\`"
+        echo "before performing any push."
+      # Best-effort marker: if the workspace is not writable by `coder` the write
+      # may fail. It must never abort startup via `set -e` — the log warning above
+      # already carries the message, and FORGE must stay available to resolve the
+      # mismatch.
+      } > /home/coder/workspace/REWORK_BRANCH_MISMATCH.md || true
+    }
+
+    # Checkout the target branch. For rework of an existing PR, this resumes the
+    # branch where the work was already done (never redo completed work). Fall
+    # back to the default branch head when no branch was requested.
+    if [ -d /home/coder/workspace/.git ]; then
+      cd /home/coder/workspace
+      if [ -n "$TARGET_BRANCH" ]; then
+        # Resume the PR branch on a NAMED local branch (never detached, so the
+        # CI-fix / /address_review flow can push with plain `git push`). Prefer
+        # an already-existing local branch (reused workspace) to avoid discarding
+        # in-flight work, then create a tracking branch from origin. If the PR
+        # branch is not present locally or under origin (e.g. a fork-backed PR
+        # whose head ref is not on this origin), fall back to the default branch
+        # WITHOUT fabricating a branch of the PR's name at origin/HEAD — doing so
+        # would start rework without the PR's commits and could reset existing
+        # local work.
+        if git rev-parse --verify --quiet "refs/heads/$TARGET_BRANCH" >/dev/null; then
+          # The local branch exists but the switch can still fail (uncommitted
+          # work or an unresolved merge blocks it). That must NOT abort startup
+          # via `set -e` — keep the agent available, but flag the mismatch so the
+          # rework flow does not push to the wrong branch.
+          if git checkout "$TARGET_BRANCH" 2>/dev/null; then
+            log "Checked out existing local branch: $TARGET_BRANCH"
+          else
+            warn_branch_mismatch "$TARGET_BRANCH"
+          fi
+        elif git checkout -B "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" 2>/dev/null; then
+          log "Checked out target branch: $TARGET_BRANCH"
+        else
+          git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+          warn_branch_mismatch "$TARGET_BRANCH"
+        fi
+      else
+        # Checkout the default branch head so work never begins on a stale tree.
+        git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+      fi
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).

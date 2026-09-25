@@ -107,6 +107,11 @@ pub const ACTION_DEPLOY_FAILED: &str = "deploy_failed";
 pub const ACTION_MERGE_BLOCKED: &str = "merge_blocked";
 pub const ACTION_MERGE_PRS: &str = "merge_prs";
 pub const ACTION_CONFLICTS_DETECTED: &str = "conflicts_detected";
+pub const ACTION_ADDRESS_REVIEW_DISPATCHED: &str = "address_review_dispatched";
+/// VESSEL could not dispatch `/address_review` because no live FORGE chat
+/// existed — route to NEXUS so it provisions a FORGE worker that delivers the
+/// persisted rework directive as its chat initial prompt.
+pub const ACTION_REWORK_PROVISION_NEEDED: &str = "rework_provision_needed";
 pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
 pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
 pub const ACTION_DOCS_PENDING: &str = "docs_pending";
@@ -136,6 +141,40 @@ pub const KEY_TICKET_CHAT: &str = "chat";
 /// Full key: `ticket:{id}:review:{role}`
 pub const KEY_TICKET_REVIEW: &str = "review";
 
+// ── Sentinel review-type namespaces ─────────────────────────────────────
+// SENTINEL performs distinct reviews at different lifecycle points. These
+// review types must never share a chat binding or verdict key, otherwise a
+// completed planning-gate review can occupy the slot meant for the PR review
+// (which blocks the final PR reviewer from spawning). All SENTINEL chat /
+// verdict / action keys are therefore namespaced by review type as:
+//   `ticket:{id}:chat:{role}:{review_type}`
+//   `ticket:{id}:review:{role}:{review_type}`
+//   `ticket:{id}:chat_action:{role}:{review_type}`
+
+/// SENTINEL reviews the plan before implementation (planning gate).
+pub const REVIEW_TYPE_PLANNING_GATE: &str = "planning_gate";
+/// SENTINEL reviews the completed pull request (final/PR review). "Segment"
+/// evaluations (`segment-N-eval.md`) are part of this same review.
+pub const REVIEW_TYPE_PR: &str = "pr_review";
+
+/// Build the review-type-scoped SENTINEL chat binding key.
+/// e.g. `ticket:T-42:chat:sentinel:pr_review`
+pub fn review_chat_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:chat:sentinel:{}", ticket_id, review_type)
+}
+
+/// Build the review-type-scoped SENTINEL verdict key.
+/// e.g. `ticket:T-42:review:sentinel:pr_review`
+pub fn review_verdict_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:review:sentinel:{}", ticket_id, review_type)
+}
+
+/// Build the review-type-scoped SENTINEL chat-action key.
+/// e.g. `ticket:T-42:chat_action:sentinel:pr_review`
+pub fn review_action_key(ticket_id: &str, review_type: &str) -> String {
+    format!("ticket:{}:chat_action:sentinel:{}", ticket_id, review_type)
+}
+
 /// Key suffix for vessel deployment status.
 /// Full key: `ticket:{id}:deployment`
 pub const KEY_TICKET_DEPLOYMENT: &str = "deployment";
@@ -155,6 +194,14 @@ pub const KEY_TICKET_RECOVERY_ATTEMPTS: &str = "recovery_attempts";
 /// Key suffix for the diff_status payload from coder chats.
 /// Full key: `ticket:{id}:diff_status:{role}`
 pub const KEY_TICKET_DIFF_STATUS: &str = "diff_status";
+
+/// Key suffix for a pending rework directive (e.g. `/ci_fix` or `/address_review`)
+/// that VESSEL could not deliver because no live forge chat existed at dispatch time.
+/// NEXUS reads this when it creates/reuses the forge chat so the new chat starts with
+/// only the targeted rework directive instead of the full ticket-assignment blast, then
+/// clears the key.
+/// Full key: `ticket:{id}:rework_directive:{role}`
+pub const KEY_TICKET_REWORK_DIRECTIVE: &str = "rework_directive";
 
 /// Heartbeat key pattern: `heartbeat:{role}-T-{ticket_id}`
 pub fn heartbeat_key(role: &str, ticket_id: &str) -> String {
@@ -180,4 +227,24 @@ pub fn full_ticket_key(ticket_id: &str, subkey: &str, role: &str) -> String {
 /// e.g. `ticket:T-42:status`
 pub fn full_ticket_key_flat(ticket_id: &str, subkey: &str) -> String {
     format!("ticket:{}:{}", ticket_id, subkey)
+}
+
+// ── `/address_review` rework-loop keys (shared VESSEL/FORGE/NEXUS) ───────
+
+/// Flat key for the PR head SHA VESSEL last dispatched `/address_review` for.
+/// A live value means FORGE is (or was) addressing the review on that head and
+/// the PR must not be re-dispatched for the same SHA. NEXUS treats a live value
+/// as a reason to keep re-adding the PR so VESSEL can resume polling.
+/// Full key: `_address_review_dispatched_{pr_number}`
+pub fn address_review_dispatched_key(pr_number: u64) -> String {
+    format!("_address_review_dispatched_{}", pr_number)
+}
+
+/// Flat key FORGE writes after it has addressed a VESSEL-dispatched
+/// `/address_review` and re-armed the PR with `status set review_ready`. VESSEL
+/// watches for these markers so it re-polls the PR without depending on NEXUS
+/// re-discovery, then clears the marker once it re-adds the PR.
+/// Full key: `_address_review_rearmed_{pr_number}`
+pub fn address_review_rearmed_key(pr_number: u64) -> String {
+    format!("_address_review_rearmed_{}", pr_number)
 }

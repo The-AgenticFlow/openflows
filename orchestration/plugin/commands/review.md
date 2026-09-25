@@ -29,10 +29,12 @@ After SENTINEL finishes reviewing a PR (or completed work):
 
 ## What it does
 
-Writes `ticket:{id}:review:sentinel` (a `ReviewPayload` `{verdict, report, pr_number}`)
-to SharedStore. The controller (SENTINEL node) reads this key to route the ticket. This
-is the **machine-readable handshake** — the controller does **not** read `STATUS.json`
-or the report file directly.
+Writes `ticket:{id}:review:sentinel:pr_review` (a `ReviewPayload` `{verdict, report, pr_number}`)
+to SharedStore. This is the **PR/final review** verdict — it is namespaced by review type
+(`pr_review`) so it never collides with the planning-gate review state
+(`ticket:{id}:gate:planning`). The controller (SENTINEL node) reads this key to route the
+ticket. This is the **machine-readable handshake** — the controller does **not** read
+`STATUS.json` or the report file directly.
 
 ## Examples
 
