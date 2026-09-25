@@ -4634,9 +4634,18 @@ impl Node for NexusNode {
                                     ticket_id = %tid,
                                     "Restoring rework PR to pending_prs so the replacement workspace checks out the PR branch"
                                 );
+                                // Associate the PR with the rework ticket's id, not
+                                // GitHub's extracted id: when the directive locates
+                                // the PR by number but GitHub cannot extract the
+                                // ticket id from that PR (title/body/branch), the
+                                // extracted id would be None or wrong, and
+                                // `resolve_workspace_branch` (which matches the
+                                // rework ticket id) would fail to find this PR and
+                                // fall back to `{worker}/{ticket}` — starting FORGE
+                                // without the PR's commits.
                                 pending_prs_vec.push(json!({
                                     "number": pr.number,
-                                    "ticket_id": pr.ticket_id,
+                                    "ticket_id": tid,
                                     "head_sha": pr.head_sha,
                                     "head_branch": pr.head_branch,
                                     "base_branch": pr.base_branch,
