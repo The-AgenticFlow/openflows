@@ -4116,20 +4116,27 @@ Use `openflows-harness` for all coordination:
                         }
                     }
                     WorkspaceStatus::Unknown(_) => {
-                        // If the workspace status is unknown but the agent is connected
-                        // and ready, the workspace is healthy — the unknown top-level
-                        // status is cosmetic/transient. Do NOT stop+start (the stop can
-                        // delete the workspace and the subsequent start 404s), and do NOT
-                        // burn a recovery attempt. Just reset the counter and move on.
+                        // Unknown status with a ready agent is healthy — don't
+                        // stop+start (can delete the workspace and 404 on start).
                         if workspace.is_agent_ready() {
-                            info!(
-                                workspace_id = %crashed_workspace.workspace_id,
-                                ticket_id = %crashed_workspace.ticket_id,
-                                "Workspace status unknown but agent ready — no restart needed (healthy)"
-                            );
-                            // The workspace is actually healthy; clear the recovery
-                            // counter so a later, genuinely-unrelated crash gets a full
-                            // retry budget instead of inheriting this false positive's bill.
+                            // If the crash was heartbeat-based, clear the stale
+                            // record or the next pass re-flags it forever.
+                            let role = Self::worker_role(&crashed_workspace.worker_id);
+                            let hb_key = heartbeat_key(role, &crashed_workspace.ticket_id);
+                            if crashed_workspace.reason.contains("heartbeat") {
+                                if store.get_typed::<HeartbeatRecord>(&hb_key).await.is_some() {
+                                    info!(
+                                        workspace_id = %crashed_workspace.workspace_id,
+                                        ticket_id = %crashed_workspace.ticket_id,
+                                        reason = %crashed_workspace.reason,
+                                        "Workspace healthy but heartbeat stale — clearing stale heartbeat to break crash loop"
+                                    );
+                                    store.del(&hb_key).await;
+                                }
+                            }
+                            // Clear the recovery counter so a later, genuinely-unrelated
+                            // crash gets a full retry budget instead of inheriting this
+                            // false positive's bill.
                             self.reset_recovery_attempts(store, &crashed_workspace.ticket_id)
                                 .await;
                         } else {

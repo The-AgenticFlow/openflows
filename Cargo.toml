@@ -18,6 +18,13 @@ members = [
     "crates/notifier",
 ]
 
+# Release builds do full LTO+lld linking; incremental compilation produces
+# stale hidden LLVM anon-symbol units that make `rust-lld` fail with
+# "undefined hidden symbol: anon...llvm" after editing workspace crates.
+# Incremental gives little benefit in release mode, so keep it off there.
+[profile.release]
+incremental = false
+
 [workspace.dependencies]
 # async
 tokio       = { version = "1", features = ["full"] }

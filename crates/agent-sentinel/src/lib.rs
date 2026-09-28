@@ -53,7 +53,7 @@ impl SentinelNode {
         let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
         } else {
-            store.get_typed("coder_api_token").await
+            store.get_typed("coder_session_token").await
         };
         match (coder_url, coder_token) {
             (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
