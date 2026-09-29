@@ -2604,9 +2604,10 @@ impl VesselNode {
     /// Move a single slot back to Idle after its Coder workspace was destroyed.
     /// Only clears the slot's workspace reference when it still points at the
     /// destroyed workspace, and only sets the slot to Idle when it is still bound
-    /// to the queued ticket — so a slot reassigned to another ticket during the
-    /// delete is never interrupted, and a slot that has since acquired a new
-    /// workspace is left untouched.
+    /// to a queued ticket that is confirmed merged — so a slot reassigned to
+    /// another ticket, or a slot whose ticket is still active (e.g. NEXUS is
+    /// provisioning a replacement workspace for it), is never force-recycled.
+    /// A slot that has since acquired a new workspace is left untouched.
     async fn recycle_slot_after_destroy(
         &self,
         store: &SharedStore,
@@ -2630,15 +2631,35 @@ impl VesselNode {
         if slot.workspace_id.is_some() {
             return;
         }
-        if let Some(queued_tid) = queued_ticket {
-            if Self::slot_ticket_id(slot) != Some(queued_tid) {
-                debug!(
-                    worker_id,
-                    queued_ticket = queued_tid,
-                    slot_ticket = ?Self::slot_ticket_id(slot),
-                    "Slot reassigned during pending destroy — not interrupting new ticket"
-                );
-                return;
+        // Only recycle to Idle when the queued ticket is confirmed merged. The
+        // queue is created from a merge-recycle, so a merged ticket is the normal
+        // "done, free the pair" case. But NEXUS can clear a slot's workspace_id
+        // and provision a replacement for a still-active ticket; in that case the
+        // slot must NOT go Idle (an Idle slot holding an active workspace could be
+        // handed to another assignment).
+        match queued_ticket {
+            Some(tid) => {
+                if !self.ticket_is_merged(store, tid).await {
+                    debug!(
+                        worker_id,
+                        queued_ticket = tid,
+                        "Slot ticket still active — not recycling to Idle"
+                    );
+                    return;
+                }
+                if Self::slot_ticket_id(slot) != Some(tid) {
+                    debug!(
+                        worker_id,
+                        queued_ticket = tid,
+                        slot_ticket = ?Self::slot_ticket_id(slot),
+                        "Slot reassigned during pending destroy — not interrupting new ticket"
+                    );
+                    return;
+                }
+            }
+            None => {
+                // No ticket recorded — assume the merge-recycle completed and it is
+                // safe to free the slot (best effort).
             }
         }
         info!(
@@ -2647,6 +2668,24 @@ impl VesselNode {
         );
         slot.status = WorkerStatus::Idle;
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+    }
+
+    /// Whether a ticket has reached the merged state. VESSEL writes
+    /// `ticket:{id}:status` = `"Merged"` on merge, and also sets the ticket's
+    /// status type to `"merged"` in the `tickets` list. A ticket that is not
+    /// merged is still being worked (e.g. NEXUS may be provisioning a replacement
+    /// workspace), so its slot must not be freed.
+    async fn ticket_is_merged(&self, store: &SharedStore, ticket_id: &str) -> bool {
+        let status_key = format!("ticket:{}:status", ticket_id);
+        if let Some(status) = store.get_typed::<String>(&status_key).await {
+            if status.eq_ignore_ascii_case("merged") {
+                return true;
+            }
+        }
+        let tickets: Vec<Value> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        tickets
+            .iter()
+            .any(|t| t["id"].as_str() == Some(ticket_id) && t["status"]["type"] == json!("merged"))
     }
 
     /// Return the ticket a slot is bound to, if any.
@@ -4034,7 +4073,44 @@ mod tests {
         let store = SharedStore::new_in_memory();
         // `destroy_coder_workspace` clears the slot's workspace_id on success, so
         // recycle_slot_after_destroy sees workspace_id == None. The slot is still
-        // bound to the queued ticket, so it must be recycled to Idle.
+        // bound to the merged ticket, so it must be recycled to Idle.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+        // T-42 is confirmed merged, so the pair is safe to free.
+        store.set("ticket:T-42:status", json!("Merged")).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Idle),
+            "slot must be recycled to Idle after a successful destroy, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_recycle_active_ticket() {
+        let store = SharedStore::new_in_memory();
+        // NEXUS cleared the old workspace id and is provisioning a replacement for
+        // the still-active ticket T-42 (its status is NOT merged). Even though the
+        // queued ws-42 was destroyed, the slot must NOT go Idle — an Idle slot
+        // holding a replacement workspace could be handed to another assignment.
         store
             .set(
                 "worker_slots",
@@ -4057,8 +4133,8 @@ mod tests {
             store.get_typed("worker_slots").await.unwrap_or_default();
         let slot = slots.get("forge-1").unwrap();
         assert!(
-            matches!(slot.status, WorkerStatus::Idle),
-            "slot must be recycled to Idle after a successful destroy, got {:?}",
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "slot bound to an active (non-merged) ticket must not be recycled, got {:?}",
             slot.status
         );
     }
@@ -4067,7 +4143,8 @@ mod tests {
     async fn test_recycle_slot_after_destroy_does_not_recycle_reassigned_ticket() {
         let store = SharedStore::new_in_memory();
         // The slot was reassigned to T-99 during the delete. Even though its
-        // workspace is gone, it must NOT be set to Idle (it now serves T-99).
+        // workspace is gone (and T-42 is merged), it must NOT be set to Idle
+        // because it now serves T-99.
         store
             .set(
                 "worker_slots",
@@ -4080,6 +4157,7 @@ mod tests {
                 }),
             )
             .await;
+        store.set("ticket:T-42:status", json!("Merged")).await;
 
         let config = VesselConfig::default();
         let node = VesselNode::new(config);
