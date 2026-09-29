@@ -52,6 +52,11 @@ const KEY_NO_WORK_COUNT: &str = "_no_work_count";
 const KEY_CI_READINESS: &str = "ci_readiness";
 const MAX_CONFLICT_RESOLUTION_ATTEMPTS: u32 = 3;
 const HEARTBEAT_STALE_AFTER_SECS: u64 = 90;
+/// Heartbeats are renewed every 30s by each workspace (see harness
+/// `heartbeat_start`); the retry queue key TTL is 120s. A stale record within
+/// `STALE_AFTER + WRITE_INTERVAL` is a transient blip, while anything older
+/// almost certainly means the producing process has died.
+const HEARTBEAT_WRITE_INTERVAL_SECS: u64 = 30;
 /// Maximum CI fix attempts before refusing to re-add a PR.
 /// Must match vessel::node::MAX_CI_FIX_ATTEMPTS to stay in sync.
 const MAX_CI_FIX_ATTEMPTS_NEXUS: u32 = 3;
@@ -4116,20 +4121,53 @@ Use `openflows-harness` for all coordination:
                         }
                     }
                     WorkspaceStatus::Unknown(_) => {
-                        // If the workspace status is unknown but the agent is connected
-                        // and ready, the workspace is healthy — the unknown top-level
-                        // status is cosmetic/transient. Do NOT stop+start (the stop can
-                        // delete the workspace and the subsequent start 404s), and do NOT
-                        // burn a recovery attempt. Just reset the counter and move on.
+                        // Unknown status with a ready agent is healthy — don't
+                        // stop+start (can delete the workspace and 404 on start).
                         if workspace.is_agent_ready() {
-                            info!(
-                                workspace_id = %crashed_workspace.workspace_id,
-                                ticket_id = %crashed_workspace.ticket_id,
-                                "Workspace status unknown but agent ready — no restart needed (healthy)"
-                            );
-                            // The workspace is actually healthy; clear the recovery
-                            // counter so a later, genuinely-unrelated crash gets a full
-                            // retry budget instead of inheriting this false positive's bill.
+                            // If the crash was heartbeat-based, clear the stale
+                            // record or the next pass re-flags it forever — but only
+                            // when the producing process is plausibly still alive
+                            // (the record is only slightly past the stale threshold,
+                            // i.e. a transient blip). An unusually old record means
+                            // the heartbeat process has likely died; clearing it
+                            // would hide a genuinely dead process behind a ready
+                            // agent, so we leave it for recovery to act on.
+                            let role = Self::worker_role(&crashed_workspace.worker_id);
+                            let hb_key = heartbeat_key(role, &crashed_workspace.ticket_id);
+                            if crashed_workspace.reason.contains("heartbeat") {
+                                if let Some(heartbeat) =
+                                    store.get_typed::<HeartbeatRecord>(&hb_key).await
+                                {
+                                    let now_secs = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let age_secs = now_secs.saturating_sub(heartbeat.ts);
+                                    if age_secs
+                                        <= HEARTBEAT_STALE_AFTER_SECS
+                                            + HEARTBEAT_WRITE_INTERVAL_SECS
+                                    {
+                                        info!(
+                                            workspace_id = %crashed_workspace.workspace_id,
+                                            ticket_id = %crashed_workspace.ticket_id,
+                                            reason = %crashed_workspace.reason,
+                                            age_secs,
+                                            "Workspace healthy but heartbeat stale — clearing stale heartbeat to break crash loop"
+                                        );
+                                        store.del(&hb_key).await;
+                                    } else {
+                                        warn!(
+                                            workspace_id = %crashed_workspace.workspace_id,
+                                            ticket_id = %crashed_workspace.ticket_id,
+                                            age_secs,
+                                            "Heartbeat very stale but agent ready — not suppressing signal (heartbeat process may be dead)"
+                                        );
+                                    }
+                                }
+                            }
+                            // Clear the recovery counter so a later, genuinely-unrelated
+                            // crash gets a full retry budget instead of inheriting this
+                            // false positive's bill.
                             self.reset_recovery_attempts(store, &crashed_workspace.ticket_id)
                                 .await;
                         } else {

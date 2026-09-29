@@ -92,6 +92,7 @@ pub enum WorkerStatus {
 pub const KEY_TICKETS: &str = "tickets";
 pub const KEY_WORKER_SLOTS: &str = "worker_slots";
 pub const KEY_PENDING_PRS: &str = "pending_prs";
+pub const KEY_PENDING_WORKSPACE_DESTRUCTIONS: &str = "pending_workspace_destructions";
 #[deprecated(note = "Use KEY_PENDING_PRS for clarity")]
 pub const KEY_OPEN_PRS: &str = "open_prs";
 pub const KEY_COMMAND_GATE: &str = "command_gate";

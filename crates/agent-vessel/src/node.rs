@@ -9,8 +9,8 @@ use coder_client::CoderClient;
 use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
-        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
-        KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
+        full_ticket_key_flat, KEY_PENDING_PRS, KEY_PENDING_WORKSPACE_DESTRUCTIONS, KEY_TICKETS,
+        KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
@@ -165,7 +165,7 @@ impl VesselNode {
         let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
         } else {
-            store.get_typed("coder_api_token").await
+            store.get_typed("coder_session_token").await
         };
         match (coder_url, coder_token) {
             (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
@@ -213,114 +213,75 @@ impl VesselNode {
         Some((worker_id, CoderTransport::new(client, &workspace_id)))
     }
 
-    async fn stop_coder_workspace_for_worker(
-        &self,
-        store: &SharedStore,
-        worker_id: &str,
-        workspace_id: &str,
-    ) {
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            if let Err(e) = client.stop_workspace(workspace_id).await {
-                warn!(
-                    worker_id,
-                    workspace_id,
-                    error = %e,
-                    "Failed to stop Coder workspace"
-                );
-            }
-        }
-
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get_mut(worker_id) {
-            if slot.workspace_id.as_deref() == Some(workspace_id) {
-                slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-            }
-        }
-    }
-
     /// Destroy a Coder workspace and archive all associated chats.
     /// Called during merge/cleanup to tear down ephemeral workspaces.
+    /// Destroy a Coder workspace. Returns `true` when the workspace was deleted
+    /// (or there was nothing to delete); `false` when destruction failed so the
+    /// caller can avoid orphaning the workspace reference.
     async fn destroy_coder_workspace(
         &self,
         store: &SharedStore,
         worker_id: &str,
         workspace_id: &str,
-    ) {
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            // Archive all chats associated with this workspace
-            let chats = client.list_chats().await.unwrap_or_default();
-            let ws_chats: Vec<_> = chats
-                .iter()
-                .filter(|c| c.workspace_id == workspace_id)
-                .collect();
-
-            let mut archived = 0;
-            for chat in &ws_chats {
-                if client.archive_chat(&chat.id).await.is_ok() {
-                    archived += 1;
-                }
-            }
-
-            if !ws_chats.is_empty() {
-                info!(
-                    workspace_id,
-                    archived,
-                    total = ws_chats.len(),
-                    "Archived chats before workspace destruction"
-                );
-            }
-
-            // Delete the workspace
-            if let Err(e) = client.delete_workspace(workspace_id).await {
+    ) -> bool {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(client) => client,
+            None => {
                 warn!(
                     worker_id,
-                    workspace_id,
-                    error = %e,
-                    "Failed to delete Coder workspace"
+                    workspace_id, "No Coder client available to destroy workspace"
                 );
-            } else {
-                info!(worker_id, workspace_id, "Destroyed Coder workspace");
+                return false;
             }
+        };
+
+        // Archive all chats associated with this workspace
+        let chats = client.list_chats().await.unwrap_or_default();
+        let ws_chats: Vec<_> = chats
+            .iter()
+            .filter(|c| c.workspace_id == workspace_id)
+            .collect();
+
+        let mut archived = 0;
+        for chat in &ws_chats {
+            if client.archive_chat(&chat.id).await.is_ok() {
+                archived += 1;
+            }
+        }
+
+        if !ws_chats.is_empty() {
+            info!(
+                workspace_id,
+                archived,
+                total = ws_chats.len(),
+                "Archived chats before workspace destruction"
+            );
+        }
+
+        // Delete the workspace. Only clear the slot's workspace_id on success so
+        // a failed delete keeps the reference for a later retry instead of
+        // silently orphaning a live Coder workspace.
+        if let Err(e) = client.delete_workspace(workspace_id).await {
+            warn!(
+                worker_id,
+                workspace_id,
+                error = %e,
+                "Failed to delete Coder workspace — keeping workspace_id for retry"
+            );
+            return false;
         }
 
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get_mut(worker_id) {
+        for slot in slots.values_mut() {
             if slot.workspace_id.as_deref() == Some(workspace_id) {
                 slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
             }
         }
-    }
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
-    /// Stop a Coder workspace for the worker associated with a merged PR.
-    async fn stop_coder_workspace_for_pr(
-        &self,
-        store: &SharedStore,
-        pending_prs: &[Value],
-        pr_number: u64,
-    ) {
-        let pr_entry = match pending_prs
-            .iter()
-            .find(|p| p["number"].as_u64() == Some(pr_number))
-        {
-            Some(e) => e,
-            None => return,
-        };
-        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
-        }
-        let slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
-            }
-        }
+        info!(worker_id, workspace_id, "Destroyed Coder workspace");
+        true
     }
 
     /// Destroy a Coder workspace for the worker associated with a merged PR.
@@ -342,11 +303,25 @@ impl VesselNode {
         if worker_id.is_empty() {
             return;
         }
+        let pr_ticket_id = pr_entry["ticket_id"].as_str();
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         if let Some(slot) = slots.get(worker_id) {
+            // Guard against destroying a workspace that now belongs to a different
+            // ticket than the merged PR (the slot may have been reassigned).
+            if let Some(pr_tid) = pr_ticket_id {
+                if Self::slot_ticket_id(slot) != Some(pr_tid) {
+                    debug!(
+                        worker_id,
+                        slot_ticket = ?Self::slot_ticket_id(slot),
+                        pr_ticket = pr_tid,
+                        "Skipping workspace destroy — slot bound to a different ticket"
+                    );
+                    return;
+                }
+            }
             if let Some(ref ws_id) = slot.workspace_id {
-                self.destroy_coder_workspace(store, worker_id, ws_id).await;
+                let _ = self.destroy_coder_workspace(store, worker_id, ws_id).await;
             }
         }
     }
@@ -585,6 +560,11 @@ impl Node for VesselNode {
         let ci_readiness: Option<crate::types::CiReadiness> = store.get_typed("ci_readiness").await;
 
         let (owner, repo) = parse_repository(repository.as_deref());
+
+        // Retry Coder workspace destructions that failed during an earlier merge
+        // recycle, so a transient deletion error doesn't permanently occupy the
+        // FORGE–SENTINEL pair.
+        self.retry_pending_destructions(store).await;
 
         // Event-driven re-arm: FORGE writes `_address_review_rearmed_{pr}` after it
         // addresses a `/address_review` and re-arms the PR. Re-add those PRs so we
@@ -1166,8 +1146,8 @@ impl Node for VesselNode {
                     .await;
                     VesselNotifier::set_ticket_status_merged(store, &tid).await;
 
-                    // Stop Coder workspace if this worker was using one
-                    self.stop_coder_workspace_for_pr(store, &pending_prs, *pr_number)
+                    // Destroy Coder workspace (archive chats + delete) for this worker
+                    self.destroy_coder_workspace_for_pr(store, &pending_prs, *pr_number)
                         .await;
 
                     self.update_ticket_status(store, &tid, "merged_no_ci").await;
@@ -2402,41 +2382,388 @@ impl VesselNode {
         }
     }
 
-    /// Recycle a worker from Done back to Idle after its PR is merged.
-    /// Also stops the Coder workspace if one was assigned.
+    /// Recycle the whole FORGE–SENTINEL pair bound to the merged ticket back
+    /// to Idle, destroying each member's Coder workspace.
+    ///
+    /// Only slots still bound to the merged ticket are touched, so a slot that
+    /// has since been reassigned to another ticket is never freed and its
+    /// workspace is never deleted. When no ticket is known (e.g. a re-arm
+    /// pending entry without `ticket_id`), the explicitly-named pair members
+    /// are recycled instead.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
-        let worker_id = pr["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
+        let ticket_id = pr["ticket_id"].as_str().map(String::from);
+
+        // The pending_prs entry may not carry `worker_id` (e.g. PRs re-added by
+        // the /address_review re-arm path), so derive it directly or from the
+        // branch as a secondary anchor for the paired SENTINEL when no ticket is
+        // available.
+        let worker_id = pr["worker_id"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                pr["head_branch"]
+                    .as_str()
+                    .and_then(Self::derive_worker_id_from_branch)
+            });
+
+        // Clean up the ticket-scoped state, locks, and context for this pair.
+        if let Some(tid) = ticket_id.as_deref() {
+            self.cleanup_ticket_state(store, tid).await;
         }
 
-        // Stop Coder workspace if this worker was using one
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
+
+        // Determine the exact set of slots to recycle, checked against ticket
+        // ownership BEFORE any workspace is destroyed. This is the only place we
+        // collect targets; the paired SENTINEL is never added twice, and a slot
+        // reassigned to a different ticket is never included.
+        let recycle_targets = match ticket_id.as_deref() {
+            // Ticket-centric: recycle every slot still bound to the merged ticket
+            // (forge + paired sentinel + any fallback all bound to it).
+            Some(tid) => slots
+                .iter()
+                .filter(|(_, slot)| Self::slot_ticket_id(slot) == Some(tid))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<String>>(),
+            // No ticket known: fall back to the named forge worker + its paired
+            // SENTINEL (the only anchors available).
+            None => {
+                let mut targets: Vec<String> = Vec::new();
+                if let Some(wid) = &worker_id {
+                    targets.push(wid.clone());
+                    if let Some(paired) = Self::paired_sentinel_worker(wid) {
+                        if slots.contains_key(&paired) {
+                            targets.push(paired);
+                        }
+                    }
+                }
+                targets
+            }
+        };
+
+        // Destroy each selected slot's Coder workspace first. A failure is
+        // recorded for a later poll to retry (see retry_pending_destructions in
+        // prep) rather than silently orphaning the live workspace.
+        let mut failed_destroy: Vec<String> = Vec::new();
+        for wid in &recycle_targets {
+            let ws_id = slots.get(wid).and_then(|s| s.workspace_id.clone());
+            if let Some(ws) = ws_id {
+                let ok = self.destroy_coder_workspace(store, wid, &ws).await;
+                if !ok {
+                    failed_destroy.push(wid.clone());
+                }
             }
         }
 
-        // Re-fetch slots after stop_coder_workspace_for_worker may have modified them
+        // Re-fetch slots after destroy_coder_workspace may have modified them.
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
-        if let Some(slot) = slots.get_mut(worker_id) {
-            match &slot.status {
-                WorkerStatus::Done { .. } => {
-                    info!(worker_id, "Recycling worker from Done to Idle after merge");
-                    slot.status = WorkerStatus::Idle;
-                    slot.workspace_id = None;
-                    store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        for wid in &recycle_targets {
+            if failed_destroy.contains(wid) {
+                warn!(
+                    worker_id = wid,
+                    "Skipping recycle — workspace destruction failed; will retry on a later poll"
+                );
+                self.enqueue_pending_destruction(
+                    store,
+                    wid,
+                    &slots.get(wid).and_then(|s| s.workspace_id.clone()),
+                    ticket_id.as_deref(),
+                )
+                .await;
+                continue;
+            }
+            let Some(slot) = slots.get_mut(wid) else {
+                continue;
+            };
+            // Re-check ticket ownership right before recycling: the slot was
+            // selected while it belonged to the merged ticket, but a Coder delete
+            // takes time and another controller may have reassigned the slot to a
+            // new ticket in the meantime. Only recycle it if it is still bound to
+            // the merged ticket, so we never interrupt another ticket's work.
+            let still_matches = match ticket_id.as_deref() {
+                Some(tid) => Self::slot_ticket_id(slot) == Some(tid),
+                None => true,
+            };
+            if !still_matches {
+                debug!(
+                    worker_id = wid,
+                    slot_ticket = ?Self::slot_ticket_id(slot),
+                    "Slot reassigned during workspace destroy — skipping recycle"
+                );
+                continue;
+            }
+            info!(
+                worker_id = wid,
+                slot_ticket = ?Self::slot_ticket_id(slot),
+                "Recycling pair worker to Idle after merge"
+            );
+            slot.status = WorkerStatus::Idle;
+            slot.workspace_id = None;
+        }
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+    }
+
+    /// Record a slot whose Coder workspace could not be destroyed so a later
+    /// poll retries it. If the workspace reference was already cleared, nothing
+    /// is recorded. The entry is keyed by `worker_id` so repeated failures don't
+    /// accumulate duplicates.
+    async fn enqueue_pending_destruction(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        workspace_id: &Option<String>,
+        ticket_id: Option<&str>,
+    ) {
+        let Some(ws_id) = workspace_id.as_deref() else {
+            return;
+        };
+        let mut pending: Vec<Value> = store
+            .get_typed(KEY_PENDING_WORKSPACE_DESTRUCTIONS)
+            .await
+            .unwrap_or_default();
+        if pending
+            .iter()
+            .any(|p| p["worker_id"].as_str() == Some(worker_id))
+        {
+            return;
+        }
+        let mut entry = json!({
+            "worker_id": worker_id,
+            "workspace_id": ws_id,
+        });
+        if let Some(tid) = ticket_id {
+            entry["ticket_id"] = json!(tid);
+        }
+        pending.push(entry);
+        store
+            .set(KEY_PENDING_WORKSPACE_DESTRUCTIONS, json!(pending))
+            .await;
+        warn!(
+            worker_id,
+            workspace_id = %ws_id,
+            "Queued workspace destruction for retry on a later poll"
+        );
+    }
+
+    /// Retry destroying workspaces that failed during an earlier merge recycle.
+    /// Called from `prep` on every poll so a transient Coder failure does not
+    /// permanently occupy the pair: each entry that now succeeds is removed from
+    /// the queue and its slot recycled; failures are kept for the next poll.
+    ///
+    /// The queued workspace is the merged ticket's workspace and is destroyed
+    /// regardless of what the slot now references — deleting it never harms a
+    /// different live workspace (workspace ids are unique), and a slot whose
+    /// `workspace_id` was cleared by NEXUS (e.g. it could not verify readiness
+    /// and provisioned a replacement without deleting the old one) must still
+    /// have its orphaned workspace cleaned up. The recycle step afterwards is
+    /// where reassignment is re-checked, so a slot bound to a new ticket is
+    /// never interrupted.
+    async fn retry_pending_destructions(&self, store: &SharedStore) {
+        let pending: Vec<Value> = store
+            .get_typed(KEY_PENDING_WORKSPACE_DESTRUCTIONS)
+            .await
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut remaining: Vec<Value> = Vec::new();
+        for entry in pending {
+            let worker_id = entry["worker_id"].as_str().unwrap_or("");
+            let ws_id = entry["workspace_id"].as_str().unwrap_or("");
+            let queued_ticket = entry["ticket_id"].as_str();
+            if worker_id.is_empty() || ws_id.is_empty() {
+                continue;
+            }
+
+            let ok = self.destroy_coder_workspace(store, worker_id, ws_id).await;
+            if ok {
+                info!(
+                    worker_id,
+                    workspace_id = ws_id,
+                    "Retried and destroyed previously-failed Coder workspace"
+                );
+                // Recycle the slot now that its workspace is gone, but only if the
+                // slot still references the destroyed workspace and is still bound
+                // to the queued ticket (recheck after the delete).
+                self.recycle_slot_after_destroy(store, worker_id, ws_id, queued_ticket)
+                    .await;
+            } else {
+                remaining.push(entry);
+            }
+        }
+        store
+            .set(KEY_PENDING_WORKSPACE_DESTRUCTIONS, json!(remaining))
+            .await;
+    }
+
+    /// Move a single slot back to Idle after its Coder workspace was destroyed.
+    /// Only clears the slot's workspace reference when it still points at the
+    /// destroyed workspace, and only sets the slot to Idle when it is still bound
+    /// to a queued ticket that is confirmed merged — so a slot reassigned to
+    /// another ticket, or a slot whose ticket is still active (e.g. NEXUS is
+    /// provisioning a replacement workspace for it), is never force-recycled.
+    /// A slot that has since acquired a new workspace is left untouched.
+    ///
+    /// The slot map is re-read immediately before writing and only this slot is
+    /// modified on that fresh copy, so concurrent updates (a new assignment or a
+    /// replacement workspace recorded by another controller while the merged-
+    /// ticket check awaits) are not overwritten by a stale pre-await snapshot.
+    async fn recycle_slot_after_destroy(
+        &self,
+        store: &SharedStore,
+        worker_id: &str,
+        destroyed_ws_id: &str,
+        queued_ticket: Option<&str>,
+    ) {
+        // Phase 1 — decide (read-only, may await). No mutation yet.
+        {
+            let slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            let Some(slot) = slots.get(worker_id) else {
+                return;
+            };
+            // If the slot has since acquired a different live workspace, leave it
+            // attached and occupied — never clear a workspace we didn't destroy.
+            if slot.workspace_id.as_deref() != Some(destroyed_ws_id) && slot.workspace_id.is_some()
+            {
+                return;
+            }
+            // Only recycle to Idle when the queued ticket is confirmed merged. The
+            // queue is created from a merge-recycle, so a merged ticket is the
+            // normal "done, free the pair" case. But NEXUS can clear a slot's
+            // workspace_id and provision a replacement for a still-active ticket;
+            // in that case the slot must NOT go Idle (an Idle slot holding an
+            // active workspace could be handed to another assignment).
+            match queued_ticket {
+                Some(tid) => {
+                    if !self.ticket_is_merged(store, tid).await {
+                        debug!(
+                            worker_id,
+                            queued_ticket = tid,
+                            "Slot ticket still active — not recycling to Idle"
+                        );
+                        return;
+                    }
+                    if Self::slot_ticket_id(slot) != Some(tid) {
+                        debug!(
+                            worker_id,
+                            queued_ticket = tid,
+                            slot_ticket = ?Self::slot_ticket_id(slot),
+                            "Slot reassigned during pending destroy — not interrupting new ticket"
+                        );
+                        return;
+                    }
                 }
-                other => {
-                    debug!(worker_id, status = ?other, "Worker not in Done state, skipping recycle");
+                None => {
+                    // No ticket recorded — assume the merge-recycle completed and it
+                    // is safe to free the slot (best effort).
                 }
             }
         }
+
+        // Phase 2 — apply against the freshest map so concurrent writes to other
+        // slots (or a new assignment / replacement workspace on this slot) are not
+        // clobbered by an older snapshot.
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let Some(slot) = slots.get_mut(worker_id) else {
+            return;
+        };
+        // Re-check on the fresh read: only act if the slot still holds the destroyed
+        // workspace or none at all — never clear a workspace we didn't destroy, and
+        // never recycle a slot that picked up a new assignment while we awaited.
+        match slot.workspace_id.as_deref() {
+            Some(ws) if ws == destroyed_ws_id => {
+                slot.workspace_id = None;
+            }
+            None => {}
+            Some(_) => return,
+        }
+        if let Some(tid) = queued_ticket {
+            if Self::slot_ticket_id(slot) != Some(tid) {
+                return;
+            }
+        }
+        info!(
+            worker_id,
+            "Recycling slot to Idle after pending workspace destruction"
+        );
+        slot.status = WorkerStatus::Idle;
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+    }
+
+    /// Whether a ticket has reached the merged state. VESSEL writes
+    /// `ticket:{id}:status` = `"Merged"` on merge, and also sets the ticket's
+    /// status type to `"merged"` in the `tickets` list. A ticket that is not
+    /// merged is still being worked (e.g. NEXUS may be provisioning a replacement
+    /// workspace), so its slot must not be freed.
+    async fn ticket_is_merged(&self, store: &SharedStore, ticket_id: &str) -> bool {
+        let status_key = format!("ticket:{}:status", ticket_id);
+        if let Some(status) = store.get_typed::<String>(&status_key).await {
+            if status.eq_ignore_ascii_case("merged") {
+                return true;
+            }
+        }
+        let tickets: Vec<Value> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        tickets
+            .iter()
+            .any(|t| t["id"].as_str() == Some(ticket_id) && t["status"]["type"] == json!("merged"))
+    }
+
+    /// Return the ticket a slot is bound to, if any.
+    fn slot_ticket_id(slot: &WorkerSlot) -> Option<&str> {
+        match &slot.status {
+            WorkerStatus::Idle => None,
+            WorkerStatus::Assigned { ticket_id, .. }
+            | WorkerStatus::Working { ticket_id, .. }
+            | WorkerStatus::Done { ticket_id, .. }
+            | WorkerStatus::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
+        }
+    }
+
+    /// The 1:1 paired SENTINEL slot for a FORGE worker id: `forge-i` pairs with
+    /// `sentinel-i`. Returns `None` for non-indexed slots (e.g. `lore`).
+    fn paired_sentinel_worker(forge_worker_id: &str) -> Option<String> {
+        let (base, suffix) = forge_worker_id.rsplit_once('-')?;
+        if base != "forge" {
+            return None;
+        }
+        suffix
+            .parse::<u32>()
+            .ok()
+            .map(|i| format!("sentinel-{}", i))
+    }
+
+    /// Remove all ticket-scoped SharedStore state (`ticket:{id}:*`) so the
+    /// recycled pair leaves no dispatch, chat, workspace, review, deployment,
+    /// or lock/context residue behind for the next ticket.
+    async fn cleanup_ticket_state(&self, store: &SharedStore, ticket_id: &str) {
+        let pattern = format!("ticket:{}:*", ticket_id);
+        let keys = store.keys(&pattern).await;
+        if keys.is_empty() {
+            return;
+        }
+        // Preserve the durable merge state (`ticket:{id}:status` +
+        // `ticket:{id}:deployment`) while removing the transient per-ticket
+        // residue (dispatch, chat, workspace, review, locks, context). The
+        // returned keys are fully-qualified, so match on the leaf suffix.
+        let mut removed = 0usize;
+        for key in &keys {
+            if key.ends_with(":status") || key.ends_with(":deployment") {
+                continue;
+            }
+            store.raw_del(key).await;
+            removed += 1;
+        }
+        info!(
+            ticket_id,
+            removed, "Cleaned up ticket-scoped state after merge"
+        );
     }
 
     fn derive_worker_id_from_branch(head_branch: &str) -> Option<String> {
@@ -3223,6 +3550,693 @@ mod tests {
 
         let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_recycles_working_slot_after_merge() {
+        let store = SharedStore::new_in_memory();
+        // Simulate a real slot: a FORGE worker in `Working` state (the actual state
+        // a slot holds through PR open until merge — slots never reach `Done`).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let pr = json!({
+            "number": 42,
+            "worker_id": "forge-1",
+            "ticket_id": "T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").expect("slot should exist");
+        assert!(
+            matches!(slot.status, WorkerStatus::Idle),
+            "expected slot to be recycled to Idle, got {:?}",
+            slot.status
+        );
+        assert!(slot.workspace_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_recycles_associated_pair_after_merge() {
+        let store = SharedStore::new_in_memory();
+        // A FORGE worker in `Working` plus its 1:1 paired SENTINEL also in
+        // `Working`, both bound to the same ticket. On merge, the whole pair
+        // must be recycled to Idle so NEXUS can reuse both slots.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        }
+                    },
+                    "sentinel-1": {
+                        "id": "sentinel-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let pr = json!({
+            "number": 42,
+            "worker_id": "forge-1",
+            "ticket_id": "T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        assert!(
+            matches!(
+                slots
+                    .get("forge-1")
+                    .expect("forge slot should exist")
+                    .status,
+                WorkerStatus::Idle
+            ),
+            "expected paired forge to be recycled to Idle"
+        );
+        assert!(
+            matches!(
+                slots
+                    .get("sentinel-1")
+                    .expect("sentinel slot should exist")
+                    .status,
+                WorkerStatus::Idle
+            ),
+            "expected paired sentinel to be recycled to Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_recycles_pair_when_pending_entry_lacks_worker_id() {
+        let store = SharedStore::new_in_memory();
+        // The /address_review re-arm path re-adds PRs to pending_prs WITHOUT a
+        // `worker_id` field. Even so, the merge must recycle the whole pair via
+        // the ticket-bound scan (forge + sentinel bound to T-42).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        }
+                    },
+                    "sentinel-1": {
+                        "id": "sentinel-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        // Note: NO "worker_id" key — mirrors the re-arm pending_prs entry.
+        let pr = json!({
+            "number": 42,
+            "ticket_id": "T-42",
+            "head_branch": "forge-1/T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        assert!(
+            matches!(
+                slots
+                    .get("forge-1")
+                    .expect("forge slot should exist")
+                    .status,
+                WorkerStatus::Idle
+            ),
+            "expected forge to be recycled despite missing worker_id"
+        );
+        assert!(
+            matches!(
+                slots
+                    .get("sentinel-1")
+                    .expect("sentinel slot should exist")
+                    .status,
+                WorkerStatus::Idle
+            ),
+            "expected paired sentinel to be recycled despite missing worker_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_does_not_recycle_slot_bound_to_other_ticket() {
+        let store = SharedStore::new_in_memory();
+        // Slot is bound to a DIFFERENT ticket than the merged PR — must not be freed.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-99",
+                            "issue_url": "https://github.com/x/y/issues/99"
+                        }
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let pr = json!({
+            "number": 42,
+            "worker_id": "forge-1",
+            "ticket_id": "T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").expect("slot should exist");
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "slot bound to another ticket must NOT be recycled, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_does_not_destroy_workspace_of_other_ticket() {
+        let store = SharedStore::new_in_memory();
+        // A forge worker that was reassigned to a DIFFERENT ticket (T-99) while
+        // the merged PR is for T-42: its workspace must NOT be destroyed, and no
+        // pending destruction may be queued for it (the reference is kept).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-99",
+                            "issue_url": "https://github.com/x/y/issues/99"
+                        },
+                        "workspace_id": "ws-99"
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let pr = json!({
+            "number": 42,
+            "worker_id": "forge-1",
+            "ticket_id": "T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").expect("slot should exist");
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "reassigned slot must stay occupied, got {:?}",
+            slot.status
+        );
+        assert_eq!(
+            slot.workspace_id.as_deref(),
+            Some("ws-99"),
+            "workspace serving T-99 must not be destroyed"
+        );
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert!(
+            pending.is_empty(),
+            "no destruction may be queued for a slot bound to another ticket: {:?}",
+            pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_queues_failed_destruction_once_per_slot() {
+        let store = SharedStore::new_in_memory();
+        // With no Coder client available, destroy_coder_workspace fails. Each
+        // selected slot must be queued exactly once (no duplicate entries), and
+        // the slot stays occupied so a later poll can retry.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        },
+                        "workspace_id": "ws-42"
+                    },
+                    "sentinel-1": {
+                        "id": "sentinel-1",
+                        "status": {
+                            "type": "working",
+                            "ticket_id": "T-42",
+                            "issue_url": "https://github.com/x/y/issues/42"
+                        },
+                        "workspace_id": "ws-42-sentinel"
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let pr = json!({
+            "number": 42,
+            "worker_id": "forge-1",
+            "ticket_id": "T-42",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        // The paired SENTINEL must appear exactly once even though it is both a
+        // named pair member and bound to the merged ticket (double-delete guard).
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        let sentinel_entries = pending
+            .iter()
+            .filter(|p| p["worker_id"].as_str() == Some("sentinel-1"))
+            .count();
+        let forge_entries = pending
+            .iter()
+            .filter(|p| p["worker_id"].as_str() == Some("forge-1"))
+            .count();
+        assert_eq!(
+            sentinel_entries, 1,
+            "sentinel must be queued exactly once, got {}: {:?}",
+            sentinel_entries, pending
+        );
+        assert_eq!(forge_entries, 1, "forge must be queued exactly once");
+
+        // Slots stay occupied (not recycled) because destruction failed.
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        assert!(
+            matches!(
+                slots.get("sentinel-1").unwrap().status,
+                WorkerStatus::Working { .. }
+            ),
+            "sentinel must remain occupied when destruction is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pending_destructions_requeues_still_failing_and_drops_succeeded() {
+        let store = SharedStore::new_in_memory();
+        // Seed two pending destructions with matching worker slots (bound to T-42,
+        // holding the queued workspace). Without a Coder client both fail, so both
+        // must remain queued after a retry pass (kept for the next poll).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": "ws-42"
+                    },
+                    "sentinel-1": {
+                        "id": "sentinel-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": "ws-42s"
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                "pending_workspace_destructions",
+                json!([
+                    { "worker_id": "forge-1", "workspace_id": "ws-42", "ticket_id": "T-42" },
+                    { "worker_id": "sentinel-1", "workspace_id": "ws-42s", "ticket_id": "T-42" }
+                ]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.retry_pending_destructions(&store).await;
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both still failing entries must be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pending_destructions_keeps_entry_when_slot_workspace_changed() {
+        let store = SharedStore::new_in_memory();
+        // The queued entry references ws-42, but the slot now holds a DIFFERENT
+        // workspace (ws-99, serving another ticket). The queued workspace is the
+        // merged ticket's workspace and must still be destroyed on retry — it is
+        // not dropped. Without a Coder client the delete fails, so the entry is
+        // retained for the next poll; the live ws-99 is untouched and the
+        // reassigned slot is not recycled.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-99" },
+                        "workspace_id": "ws-99"
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                "pending_workspace_destructions",
+                json!([
+                    { "worker_id": "forge-1", "workspace_id": "ws-42", "ticket_id": "T-42" }
+                ]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.retry_pending_destructions(&store).await;
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued workspace for the merged ticket must still be retried"
+        );
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert_eq!(
+            slot.workspace_id.as_deref(),
+            Some("ws-99"),
+            "the reassigned live workspace must not be touched"
+        );
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "the reassigned slot must not be recycled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pending_destructions_keeps_entry_when_slot_reassigned_ticket() {
+        let store = SharedStore::new_in_memory();
+        // The queued entry is for T-42, but the slot is now bound to T-99 with the
+        // same workspace still attached. The queued workspace must still be retried
+        // (not dropped); the slot must not be recycled (it serves another ticket).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-99" },
+                        "workspace_id": "ws-42"
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                "pending_workspace_destructions",
+                json!([
+                    { "worker_id": "forge-1", "workspace_id": "ws-42", "ticket_id": "T-42" }
+                ]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.retry_pending_destructions(&store).await;
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued workspace must still be retried even after ticket reassignment"
+        );
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "reassigned slot must not be recycled or interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pending_destructions_keeps_entry_when_nexus_cleared_workspace_id() {
+        let store = SharedStore::new_in_memory();
+        // NEXUS could not verify readiness and cleared the slot's workspace_id
+        // WITHOUT deleting the workspace (it provisions a replacement). The queued
+        // deletion for the old ws-42 must be retained and retried so the orphaned
+        // workspace is eventually cleaned up, rather than dropped as "stale".
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                "pending_workspace_destructions",
+                json!([
+                    { "worker_id": "forge-1", "workspace_id": "ws-42", "ticket_id": "T-42" }
+                ]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.retry_pending_destructions(&store).await;
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued deletion must not be dropped when NEXUS cleared the workspace_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_sets_idle_when_workspace_already_cleared() {
+        let store = SharedStore::new_in_memory();
+        // `destroy_coder_workspace` clears the slot's workspace_id on success, so
+        // recycle_slot_after_destroy sees workspace_id == None. The slot is still
+        // bound to the merged ticket, so it must be recycled to Idle.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+        // T-42 is confirmed merged, so the pair is safe to free.
+        store.set("ticket:T-42:status", json!("Merged")).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Idle),
+            "slot must be recycled to Idle after a successful destroy, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_recycle_active_ticket() {
+        let store = SharedStore::new_in_memory();
+        // NEXUS cleared the old workspace id and is provisioning a replacement for
+        // the still-active ticket T-42 (its status is NOT merged). Even though the
+        // queued ws-42 was destroyed, the slot must NOT go Idle — an Idle slot
+        // holding a replacement workspace could be handed to another assignment.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "slot bound to an active (non-merged) ticket must not be recycled, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_recycle_reassigned_ticket() {
+        let store = SharedStore::new_in_memory();
+        // The slot was reassigned to T-99 during the delete. Even though its
+        // workspace is gone (and T-42 is merged), it must NOT be set to Idle
+        // because it now serves T-99.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-99" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+        store.set("ticket:T-42:status", json!("Merged")).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "reassigned slot must not be interrupted, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_touch_new_workspace() {
+        let store = SharedStore::new_in_memory();
+        // The slot now references a DIFFERENT live workspace (ws-99). Even though
+        // the queued ws-42 was destroyed, the new workspace must not be cleared
+        // and the slot must stay occupied.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": "ws-99"
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert_eq!(
+            slot.workspace_id.as_deref(),
+            Some("ws-99"),
+            "a different live workspace must not be cleared"
+        );
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "slot with a new workspace must not be recycled"
+        );
     }
 
     #[tokio::test]
