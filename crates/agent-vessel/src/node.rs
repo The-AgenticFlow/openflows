@@ -2608,6 +2608,11 @@ impl VesselNode {
     /// another ticket, or a slot whose ticket is still active (e.g. NEXUS is
     /// provisioning a replacement workspace for it), is never force-recycled.
     /// A slot that has since acquired a new workspace is left untouched.
+    ///
+    /// The slot map is re-read immediately before writing and only this slot is
+    /// modified on that fresh copy, so concurrent updates (a new assignment or a
+    /// replacement workspace recorded by another controller while the merged-
+    /// ticket check awaits) are not overwritten by a stale pre-await snapshot.
     async fn recycle_slot_after_destroy(
         &self,
         store: &SharedStore,
@@ -2615,51 +2620,73 @@ impl VesselNode {
         destroyed_ws_id: &str,
         queued_ticket: Option<&str>,
     ) {
+        // Phase 1 — decide (read-only, may await). No mutation yet.
+        {
+            let slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            let Some(slot) = slots.get(worker_id) else {
+                return;
+            };
+            // If the slot has since acquired a different live workspace, leave it
+            // attached and occupied — never clear a workspace we didn't destroy.
+            if slot.workspace_id.as_deref() != Some(destroyed_ws_id) && slot.workspace_id.is_some()
+            {
+                return;
+            }
+            // Only recycle to Idle when the queued ticket is confirmed merged. The
+            // queue is created from a merge-recycle, so a merged ticket is the
+            // normal "done, free the pair" case. But NEXUS can clear a slot's
+            // workspace_id and provision a replacement for a still-active ticket;
+            // in that case the slot must NOT go Idle (an Idle slot holding an
+            // active workspace could be handed to another assignment).
+            match queued_ticket {
+                Some(tid) => {
+                    if !self.ticket_is_merged(store, tid).await {
+                        debug!(
+                            worker_id,
+                            queued_ticket = tid,
+                            "Slot ticket still active — not recycling to Idle"
+                        );
+                        return;
+                    }
+                    if Self::slot_ticket_id(slot) != Some(tid) {
+                        debug!(
+                            worker_id,
+                            queued_ticket = tid,
+                            slot_ticket = ?Self::slot_ticket_id(slot),
+                            "Slot reassigned during pending destroy — not interrupting new ticket"
+                        );
+                        return;
+                    }
+                }
+                None => {
+                    // No ticket recorded — assume the merge-recycle completed and it
+                    // is safe to free the slot (best effort).
+                }
+            }
+        }
+
+        // Phase 2 — apply against the freshest map so concurrent writes to other
+        // slots (or a new assignment / replacement workspace on this slot) are not
+        // clobbered by an older snapshot.
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let Some(slot) = slots.get_mut(worker_id) else {
             return;
         };
-        // `destroy_coder_workspace` clears the slot's workspace_id on success, so
-        // by the time we get here it is normally already None. Clear it again only
-        // if it still points at the destroyed workspace (defensive).
-        if slot.workspace_id.as_deref() == Some(destroyed_ws_id) {
-            slot.workspace_id = None;
-        }
-        // If the slot has since acquired a different live workspace, leave it
-        // attached and occupied — never clear a workspace we didn't destroy.
-        if slot.workspace_id.is_some() {
-            return;
-        }
-        // Only recycle to Idle when the queued ticket is confirmed merged. The
-        // queue is created from a merge-recycle, so a merged ticket is the normal
-        // "done, free the pair" case. But NEXUS can clear a slot's workspace_id
-        // and provision a replacement for a still-active ticket; in that case the
-        // slot must NOT go Idle (an Idle slot holding an active workspace could be
-        // handed to another assignment).
-        match queued_ticket {
-            Some(tid) => {
-                if !self.ticket_is_merged(store, tid).await {
-                    debug!(
-                        worker_id,
-                        queued_ticket = tid,
-                        "Slot ticket still active — not recycling to Idle"
-                    );
-                    return;
-                }
-                if Self::slot_ticket_id(slot) != Some(tid) {
-                    debug!(
-                        worker_id,
-                        queued_ticket = tid,
-                        slot_ticket = ?Self::slot_ticket_id(slot),
-                        "Slot reassigned during pending destroy — not interrupting new ticket"
-                    );
-                    return;
-                }
+        // Re-check on the fresh read: only act if the slot still holds the destroyed
+        // workspace or none at all — never clear a workspace we didn't destroy, and
+        // never recycle a slot that picked up a new assignment while we awaited.
+        match slot.workspace_id.as_deref() {
+            Some(ws) if ws == destroyed_ws_id => {
+                slot.workspace_id = None;
             }
-            None => {
-                // No ticket recorded — assume the merge-recycle completed and it is
-                // safe to free the slot (best effort).
+            None => {}
+            Some(_) => return,
+        }
+        if let Some(tid) = queued_ticket {
+            if Self::slot_ticket_id(slot) != Some(tid) {
+                return;
             }
         }
         info!(
