@@ -2554,12 +2554,14 @@ impl VesselNode {
     /// permanently occupy the pair: each entry that now succeeds is removed from
     /// the queue and its slot recycled; failures are kept for the next poll.
     ///
-    /// Before touching anything the retry re-validates ownership: it only deletes
-    /// the queued workspace if the slot still holds exactly that workspace and is
-    /// still bound to the ticket it was queued for. If the slot was reassigned to
-    /// another ticket (or swapped to a new workspace) in the meantime, the stale
-    /// entry is dropped without deleting anything, so another ticket's live
-    /// workspace is never destroyed and its slot is never interrupted.
+    /// The queued workspace is the merged ticket's workspace and is destroyed
+    /// regardless of what the slot now references — deleting it never harms a
+    /// different live workspace (workspace ids are unique), and a slot whose
+    /// `workspace_id` was cleared by NEXUS (e.g. it could not verify readiness
+    /// and provisioned a replacement without deleting the old one) must still
+    /// have its orphaned workspace cleaned up. The recycle step afterwards is
+    /// where reassignment is re-checked, so a slot bound to a new ticket is
+    /// never interrupted.
     async fn retry_pending_destructions(&self, store: &SharedStore) {
         let pending: Vec<Value> = store
             .get_typed(KEY_PENDING_WORKSPACE_DESTRUCTIONS)
@@ -2578,39 +2580,6 @@ impl VesselNode {
                 continue;
             }
 
-            // Re-validate ownership before deleting. If the slot was reassigned or
-            // its workspace swapped, this entry is stale — drop it without touching
-            // whatever the slot now serves.
-            let slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-            let slot = match slots.get(worker_id) {
-                Some(slot) => slot,
-                None => {
-                    // Slot no longer exists — drop the stale entry.
-                    continue;
-                }
-            };
-            if slot.workspace_id.as_deref() != Some(ws_id) {
-                debug!(
-                    worker_id,
-                    queued_workspace = ws_id,
-                    current_workspace = ?slot.workspace_id,
-                    "Dropping stale pending destruction — slot workspace changed"
-                );
-                continue;
-            }
-            if let Some(queued_tid) = queued_ticket {
-                if Self::slot_ticket_id(slot) != Some(queued_tid) {
-                    debug!(
-                        worker_id,
-                        queued_ticket = queued_tid,
-                        slot_ticket = ?Self::slot_ticket_id(slot),
-                        "Dropping stale pending destruction — slot reassigned to another ticket"
-                    );
-                    continue;
-                }
-            }
-
             let ok = self.destroy_coder_workspace(store, worker_id, ws_id).await;
             if ok {
                 info!(
@@ -2618,9 +2587,10 @@ impl VesselNode {
                     workspace_id = ws_id,
                     "Retried and destroyed previously-failed Coder workspace"
                 );
-                // Recycle the slot now that its workspace is gone, but only if it
-                // is still bound to the queued ticket (recheck after the delete).
-                self.recycle_slot_after_destroy(store, worker_id, queued_ticket)
+                // Recycle the slot now that its workspace is gone, but only if the
+                // slot still references the destroyed workspace and is still bound
+                // to the queued ticket (recheck after the delete).
+                self.recycle_slot_after_destroy(store, worker_id, ws_id, queued_ticket)
                     .await;
             } else {
                 remaining.push(entry);
@@ -2632,13 +2602,16 @@ impl VesselNode {
     }
 
     /// Move a single slot back to Idle after its Coder workspace was destroyed.
-    /// Only acts when the slot still holds no workspace and, when a ticket was
-    /// queued, is still bound to that ticket — so a slot reassigned to another
-    /// ticket during the delete is never interrupted.
+    /// Only clears the slot's workspace reference when it still points at the
+    /// destroyed workspace, and only sets the slot to Idle when it is still bound
+    /// to the queued ticket — so a slot reassigned to another ticket during the
+    /// delete is never interrupted, and a slot that has since acquired a new
+    /// workspace is left untouched.
     async fn recycle_slot_after_destroy(
         &self,
         store: &SharedStore,
         worker_id: &str,
+        destroyed_ws_id: &str,
         queued_ticket: Option<&str>,
     ) {
         let mut slots: HashMap<String, WorkerSlot> =
@@ -2646,9 +2619,12 @@ impl VesselNode {
         let Some(slot) = slots.get_mut(worker_id) else {
             return;
         };
-        if slot.workspace_id.is_some() {
-            // A workspace is still attached — leave it occupied so we don't
-            // recycle a slot that is mid-flight.
+        if slot.workspace_id.as_deref() == Some(destroyed_ws_id) {
+            // The slot still points at the workspace we just destroyed — clear it.
+            slot.workspace_id = None;
+        } else {
+            // The slot now references a different (live) workspace — leave it
+            // attached and occupied.
             return;
         }
         if let Some(queued_tid) = queued_ticket {
@@ -3900,11 +3876,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_pending_destructions_drops_when_slot_workspace_changed() {
+    async fn test_retry_pending_destructions_keeps_entry_when_slot_workspace_changed() {
         let store = SharedStore::new_in_memory();
         // The queued entry references ws-42, but the slot now holds a DIFFERENT
-        // workspace (ws-99, serving another ticket). The retry must drop the stale
-        // entry without deleting the live workspace and without recycling the slot.
+        // workspace (ws-99, serving another ticket). The queued workspace is the
+        // merged ticket's workspace and must still be destroyed on retry — it is
+        // not dropped. Without a Coder client the delete fails, so the entry is
+        // retained for the next poll; the live ws-99 is untouched and the
+        // reassigned slot is not recycled.
         store
             .set(
                 "worker_slots",
@@ -3934,9 +3913,10 @@ mod tests {
             .get_typed("pending_workspace_destructions")
             .await
             .unwrap_or_default();
-        assert!(
-            pending.is_empty(),
-            "stale entry must be dropped when the slot's workspace changed"
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued workspace for the merged ticket must still be retried"
         );
 
         let slots: HashMap<String, WorkerSlot> =
@@ -3954,11 +3934,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_pending_destructions_drops_when_slot_reassigned_ticket() {
+    async fn test_retry_pending_destructions_keeps_entry_when_slot_reassigned_ticket() {
         let store = SharedStore::new_in_memory();
         // The queued entry is for T-42, but the slot is now bound to T-99 with the
-        // same workspace still attached. The retry must drop the stale entry and
-        // NOT recycle the slot (which now serves another ticket).
+        // same workspace still attached. The queued workspace must still be retried
+        // (not dropped); the slot must not be recycled (it serves another ticket).
         store
             .set(
                 "worker_slots",
@@ -3988,9 +3968,10 @@ mod tests {
             .get_typed("pending_workspace_destructions")
             .await
             .unwrap_or_default();
-        assert!(
-            pending.is_empty(),
-            "stale entry must be dropped when the slot was reassigned to another ticket"
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued workspace must still be retried even after ticket reassignment"
         );
 
         let slots: HashMap<String, WorkerSlot> =
@@ -3999,6 +3980,49 @@ mod tests {
         assert!(
             matches!(slot.status, WorkerStatus::Working { .. }),
             "reassigned slot must not be recycled or interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pending_destructions_keeps_entry_when_nexus_cleared_workspace_id() {
+        let store = SharedStore::new_in_memory();
+        // NEXUS could not verify readiness and cleared the slot's workspace_id
+        // WITHOUT deleting the workspace (it provisions a replacement). The queued
+        // deletion for the old ws-42 must be retained and retried so the orphaned
+        // workspace is eventually cleaned up, rather than dropped as "stale".
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                "pending_workspace_destructions",
+                json!([
+                    { "worker_id": "forge-1", "workspace_id": "ws-42", "ticket_id": "T-42" }
+                ]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.retry_pending_destructions(&store).await;
+
+        let pending: Vec<Value> = store
+            .get_typed("pending_workspace_destructions")
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            pending.len(),
+            1,
+            "queued deletion must not be dropped when NEXUS cleared the workspace_id"
         );
     }
 
