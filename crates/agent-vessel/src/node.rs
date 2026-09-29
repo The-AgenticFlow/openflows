@@ -2619,12 +2619,15 @@ impl VesselNode {
         let Some(slot) = slots.get_mut(worker_id) else {
             return;
         };
+        // `destroy_coder_workspace` clears the slot's workspace_id on success, so
+        // by the time we get here it is normally already None. Clear it again only
+        // if it still points at the destroyed workspace (defensive).
         if slot.workspace_id.as_deref() == Some(destroyed_ws_id) {
-            // The slot still points at the workspace we just destroyed — clear it.
             slot.workspace_id = None;
-        } else {
-            // The slot now references a different (live) workspace — leave it
-            // attached and occupied.
+        }
+        // If the slot has since acquired a different live workspace, leave it
+        // attached and occupied — never clear a workspace we didn't destroy.
+        if slot.workspace_id.is_some() {
             return;
         }
         if let Some(queued_tid) = queued_ticket {
@@ -4023,6 +4026,111 @@ mod tests {
             pending.len(),
             1,
             "queued deletion must not be dropped when NEXUS cleared the workspace_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_sets_idle_when_workspace_already_cleared() {
+        let store = SharedStore::new_in_memory();
+        // `destroy_coder_workspace` clears the slot's workspace_id on success, so
+        // recycle_slot_after_destroy sees workspace_id == None. The slot is still
+        // bound to the queued ticket, so it must be recycled to Idle.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Idle),
+            "slot must be recycled to Idle after a successful destroy, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_recycle_reassigned_ticket() {
+        let store = SharedStore::new_in_memory();
+        // The slot was reassigned to T-99 during the delete. Even though its
+        // workspace is gone, it must NOT be set to Idle (it now serves T-99).
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-99" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "reassigned slot must not be interrupted, got {:?}",
+            slot.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recycle_slot_after_destroy_does_not_touch_new_workspace() {
+        let store = SharedStore::new_in_memory();
+        // The slot now references a DIFFERENT live workspace (ws-99). Even though
+        // the queued ws-42 was destroyed, the new workspace must not be cleared
+        // and the slot must stay occupied.
+        store
+            .set(
+                "worker_slots",
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "working", "ticket_id": "T-42" },
+                        "workspace_id": "ws-99"
+                    }
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+        node.recycle_slot_after_destroy(&store, "forge-1", "ws-42", Some("T-42"))
+            .await;
+
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let slot = slots.get("forge-1").unwrap();
+        assert_eq!(
+            slot.workspace_id.as_deref(),
+            Some("ws-99"),
+            "a different live workspace must not be cleared"
+        );
+        assert!(
+            matches!(slot.status, WorkerStatus::Working { .. }),
+            "slot with a new workspace must not be recycled"
         );
     }
 
