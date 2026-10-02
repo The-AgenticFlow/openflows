@@ -103,28 +103,6 @@ pub fn authorize_gate_approver(role: &str) -> Result<()> {
 }
 
 impl HarnessStore {
-    pub async fn verification_repair(
-        &self,
-        ticket: &str,
-        role: &str,
-        reason: String,
-    ) -> Result<()> {
-        let state = self.lifecycle.lifecycle(ticket).await?;
-        self.lifecycle
-            .transition(
-                ticket,
-                state.version,
-                role,
-                Event::BlockVerification { reason },
-            )
-            .await?;
-        Ok(())
-    }
-
-    pub async fn lifecycle_state(&self, ticket: &str) -> Result<config::lifecycle::Lifecycle> {
-        self.lifecycle.lifecycle(ticket).await
-    }
-
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
         let client = Builder::from_config(config).build()?;
@@ -170,17 +148,12 @@ impl HarnessStore {
     /// Testing captures a clean checkout head; later stages require its evidence.
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
         let phase = Phase::parse(phase)?;
-        let state = self.lifecycle.lifecycle(ticket).await?;
         let head = if phase == Phase::Testing {
-            let head = Self::checkout_head()?;
-            let environment =
-                crate::sandbox::PreparedEnvironment::load(&std::env::current_dir()?, &head)?;
-            anyhow::ensure!(environment.lifecycle_version == state.version || state.phase == Phase::Testing,
-                "Lifecycle changed since preparation; run verify prepare again before entering testing");
-            Some(head)
+            Some(Self::checkout_head()?)
         } else {
             None
         };
+        let state = self.lifecycle.lifecycle(ticket).await?;
         self.lifecycle
             .transition(ticket, state.version, role, Event::Move { phase, head })
             .await?;
@@ -495,16 +468,26 @@ impl HarnessStore {
             if let Some(result) = client.get_task_status(&task_id).await? {
                 // The result is durable (mirrored by the relay before ack);
                 // surface it as JSON for the caller.
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                let stdout: Option<String> = self
+                    .client
+                    .get(self.key(&format!("audit:a2a:{task_id}:stdout")))
+                    .await?;
+                let stderr: Option<String> = self
+                    .client
+                    .get(self.key(&format!("audit:a2a:{task_id}:stderr")))
+                    .await?;
+                let mut output = serde_json::to_value(&result)?;
+                output["argv"] = serde_json::json!(&request.argv);
+                output["stdout"] = serde_json::json!(stdout.unwrap_or_default());
+                output["stderr"] = serde_json::json!(stderr.as_deref().unwrap_or_default());
+                println!("{}", serde_json::to_string_pretty(&output)?);
                 if result.timed_out {
                     bail!("verification timed out");
                 }
                 if result.exit_code.is_none() {
-                    let diagnostic_key = self.key(&format!("audit:a2a:{task_id}:stderr"));
-                    let diagnostic: Option<String> = self.client.get(&diagnostic_key).await?;
                     bail!(
                         "Verification executor failed: {}",
-                        diagnostic
+                        stderr
                             .as_deref()
                             .unwrap_or("inspect FORGE verify.log for runtime failure")
                     );

@@ -268,7 +268,7 @@ async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Res
 
 /// tasks/claim: Forge executor claims the next pending task for its pair.
 ///
-/// `params: { "pair_id", "role": "forge", "checkout_version": 2, "pair_token" }` → returns the task
+/// `params: { "pair_id", "role": "forge", "checkout_version": 3, "pair_token" }` → returns the task
 /// (request included) or null when no pending task exists for the pair.
 async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let pair_id = params
@@ -293,8 +293,8 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
         .await?;
 
     anyhow::ensure!(
-        params.get("checkout_version").and_then(Value::as_u64) == Some(2),
-        "Executor upgrade required: prepared verification environment version 2 is mandatory"
+        params.get("checkout_version").and_then(Value::as_u64) == Some(3),
+        "Executor upgrade required: verification checkout with workspace login environment (version 3) is mandatory"
     );
     match state.relay.claim_next_task(pair_id).await? {
         Some(entry) => Ok(json!({
@@ -576,7 +576,7 @@ mod regression_tests {
     }
 
     #[tokio::test]
-    async fn executors_without_prepared_environment_cannot_claim_tasks() {
+    async fn executors_without_current_workspace_environment_cannot_claim_tasks() {
         let relay = Arc::new(A2ARelay::new(Arc::new(
             pocketflow_core::SharedStore::new_in_memory(),
         )));
@@ -588,10 +588,9 @@ mod regression_tests {
         )
         .await
         .is_err());
-        assert!(handle_tasks_claim(
-            &state,
-            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":1, "pair_token":PAIR_TOKEN})
-        ).await.is_err());
+        for version in [1, 2] {
+            assert!(handle_tasks_claim(&state, &json!({"role":"forge", "pair_id":"T-066", "checkout_version":version, "pair_token":PAIR_TOKEN})).await.is_err());
+        }
         assert!(handle_tasks_claim(
             &state,
             &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1, "pair_token":PAIR_TOKEN})
@@ -600,7 +599,7 @@ mod regression_tests {
         .is_err());
         assert!(handle_tasks_claim(
             &state,
-            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":2, "pair_token":PAIR_TOKEN})
+            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":3, "pair_token":PAIR_TOKEN})
         )
         .await
         .unwrap()

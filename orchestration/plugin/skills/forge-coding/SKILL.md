@@ -71,10 +71,14 @@ both PR approvals for the new head. Never jump directly from rework to submit.
 
 ## Blockers and continuity
 
-Use `openflows-harness status set blocked` for an operational failure and give
-one precise, answerable unblock question with evidence. Wait for authorized
-recovery; blocked recovery returns to planning. Configuration errors and policy
-denials are not transient failures to retry in a loop.
+When SENTINEL returns a failing command or executor setup diagnostic, fix it in
+building under the existing approved plan, then return to testing. Use the same
+project tool setup for builds and verification; persist activation in the user's
+login profile or invoke a project script. Checkout-local dependencies must be
+installed in the temporary checkout with the project's normal commands.
+Use `openflows-harness status set blocked` only for an external prerequisite you
+cannot resolve, with one precise unblock question and evidence. Its recovery
+returns to planning. Do not retry unchanged configuration/policy failures in a loop.
 
 Before context reset, preserve progress and remaining work using
 `openflows-harness handoff write --contract <file> --notes <notes>`. On resume,

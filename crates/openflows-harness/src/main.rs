@@ -217,17 +217,6 @@ enum PlanAction {
 
 #[derive(Subcommand)]
 enum VerifyAction {
-    /// Pause testing and ask FORGE to repair infrastructure without changing the candidate
-    Repair {
-        /// Exact failing command, error and task ID, or missing external prerequisite
-        #[arg(long)]
-        reason: String,
-    },
-    /// Prove project readiness in a fresh checkout and publish this shell's environment
-    Prepare {
-        #[arg(last = true, required = true)]
-        command_argv: Vec<String>,
-    },
     /// Submit a verify request (SENTINEL-side, task 3 of issue #143)
     Request {
         /// One command token per flag; use --argv=--flag for option tokens
@@ -425,33 +414,6 @@ async fn main() -> Result<()> {
             action: GateAction::Status { phase },
         } => {
             store.gate_status(&ticket, &phase).await?;
-        }
-        Commands::Verify {
-            action: VerifyAction::Repair { reason },
-        } => {
-            store.verification_repair(&ticket, &role, reason).await?;
-        }
-        Commands::Verify {
-            action: VerifyAction::Prepare { command_argv },
-        } => {
-            anyhow::ensure!(
-                role == "forge",
-                "Only FORGE prepares the verification environment"
-            );
-            let state = store.lifecycle_state(&ticket).await?;
-            anyhow::ensure!(
-                matches!(
-                    state.phase,
-                    config::lifecycle::Phase::Building | config::lifecycle::Phase::Blocked
-                ),
-                "Prepare the environment during building or blocked recovery, not during review"
-            );
-            openflows_harness::sandbox::PreparedEnvironment::prepare(
-                &std::env::current_dir()?,
-                &command_argv,
-                state.version,
-            )?;
-            println!("Project environment prepared for this HEAD; readiness is not gate evidence.");
         }
         Commands::Verify {
             action:

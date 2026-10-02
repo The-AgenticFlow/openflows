@@ -15,26 +15,16 @@ test result as evidence for a new candidate.
 
 ## Testing: verify the approved plan through FORGE
 
-Infrastructure failure is not a code-review rejection. If the relay is unreachable,
-returns an internal error, or a task is never claimed/completed, write the exact
-command, error/task ID, and missing evidence to `review.md`, run
-`openflows-harness verify repair --reason "<command, error, task ID and missing prerequisite>"`,
-and stop this review round. This enters blocked while preserving the candidate.
-Do not use `gate decide --verdict
-reject` to restart building for an infrastructure-only failure. NEXUS wakes FORGE
-for bounded environment repair at the same HEAD; successful preparation opens a
-new testing round. Re-read status before reviewing again. A healthy relay
-or advertised capability does not prove an executor is available. Submission
-errors alone do not prove the executor is absent: tasks are queued before claim.
-For a command-policy rejection, inspect the specific denied operation. Correct
-argument mistakes; do not cycle through unrelated commands. Report real policy
-or workspace toolchain blockers and stop.
-Project-specific verification commands are allowed in the temporary FORGE checkout. Known
-destructive/control-plane operations have explicit denials. `echo hello` checks
-transport only and never proves acceptance criteria. Missing toolchains or offline
-dependencies require FORGE to prepare the project's environment and retry
-verification in a new round. Escalate unresolved external prerequisites; readiness
-is not acceptance-test evidence.
+Send project verification commands to FORGE with `verify request`. Each runs in a
+temporary checkout using FORGE's current login-shell environment. The response
+includes argv, candidate HEAD, exit code, stdout and stderr. Correct malformed
+arguments first. For failing commands, timeouts, missing dependencies or executor
+setup failures, record those details in `review.md` and reject the current testing
+round with actionable feedback. This returns FORGE to building under the existing
+approved plan. Distinguish a failed test from a command that could not start.
+Transport errors mean evidence is missing, not that tests failed; report the exact
+error and return actionable executor repair to FORGE. Reserve blocked for external
+prerequisites FORGE cannot resolve. Never approve smoke tests as acceptance evidence.
 
 
 FORGE commits the implementation, enters `testing` with a clean checkout, and

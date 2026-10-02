@@ -1,115 +1,13 @@
 //! Disposable verification checkout using FORGE's installed tools and environment.
 //! This isolates ordinary checkout changes, not processes or credentials.
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Workspace-local handoff, never committed or sent through the relay.
-#[derive(Serialize, Deserialize)]
-pub struct PreparedEnvironment {
-    pub head: String,
-    pub lifecycle_version: u64,
-    pub probe: Vec<String>,
-    pub variables: BTreeMap<String, String>,
-}
-
-impl PreparedEnvironment {
-    fn path(repo: &Path) -> Result<PathBuf> {
-        let output = Command::new("git")
-            .current_dir(repo)
-            .args(["rev-parse", "--absolute-git-dir"])
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "Cannot locate workspace Git directory"
-        );
-        Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim())
-            .join("openflows-verification.json"))
-    }
-
-    pub fn load(repo: &Path, head: &str) -> Result<Self> {
-        let data = std::fs::read(Self::path(repo)?)
-            .context("Verification environment is not prepared; FORGE must run verify prepare from its configured project shell")?;
-        let environment: Self = serde_json::from_slice(&data)?;
-        anyhow::ensure!(
-            environment.head == head,
-            "Verification environment belongs to another HEAD; run verify prepare again"
-        );
-        Ok(environment)
-    }
-
-    /// Probe a fresh checkout before publishing the caller's environment atomically.
-    pub fn prepare(repo: &Path, argv: &[String], lifecycle_version: u64) -> Result<()> {
-        // Invalidate any previous readiness even if the new probe fails.
-        let path = Self::path(repo)?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        let variables = std::env::vars_os()
-            .filter(|(key, _)| !key.to_string_lossy().starts_with("GIT_"))
-            .map(|(key, value)| {
-                Ok((
-                    key.into_string()
-                        .map_err(|_| anyhow::anyhow!("Non-UTF8 environment key"))?,
-                    value
-                        .into_string()
-                        .map_err(|_| anyhow::anyhow!("Non-UTF8 environment value"))?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        let mut sandbox = Sandbox::create_unprepared(repo, argv)?;
-        sandbox.environment = Some(variables.clone());
-        checked(&mut sandbox.command())
-            .context("Project readiness probe failed (60 second limit)")?;
-        anyhow::ensure!(
-            sandbox.source_unchanged()?,
-            "Readiness probe modified committed source"
-        );
-        anyhow::ensure!(
-            candidate_head(repo)? == sandbox.head,
-            "Workspace HEAD changed during readiness preparation"
-        );
-        let environment = Self {
-            head: sandbox.head.clone(),
-            lifecycle_version,
-            probe: argv.to_vec(),
-            variables,
-        };
-        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        // NamedTempFile is owner-only (0600); environment values may include credentials.
-        use std::io::Write;
-        file.write_all(&serde_json::to_vec(&environment)?)?;
-        file.persist(path)?;
-        Ok(())
-    }
-}
 
 pub struct Sandbox {
     pub head: String,
     root: tempfile::TempDir,
     argv: Vec<String>,
-    environment: Option<BTreeMap<String, String>>,
-}
-
-fn candidate_head(repo: &Path) -> Result<String> {
-    let status = Command::new("git")
-        .current_dir(repo)
-        .args(["status", "--porcelain"])
-        .output()?;
-    anyhow::ensure!(
-        status.status.success() && status.stdout.is_empty(),
-        "Verification requires a clean candidate checkout"
-    );
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    anyhow::ensure!(output.status.success(), "Cannot read candidate HEAD");
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 fn checked(command: &mut Command) -> Result<()> {
@@ -127,10 +25,6 @@ fn checked(command: &mut Command) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait()? {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(child.id() as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
             break status;
         }
         if Instant::now() >= deadline {
@@ -148,22 +42,29 @@ fn checked(command: &mut Command) -> Result<()> {
         stderr.seek(SeekFrom::Start(length.saturating_sub(16384)))?;
         let mut tail = String::new();
         stderr.read_to_string(&mut tail)?;
-        bail!("Verification checkout setup failed ({status}): {tail}");
+        bail!("Verification checkout setup failed: {tail}");
     }
     Ok(())
 }
 
 impl Sandbox {
     pub fn create(repo: &Path, argv: &[String]) -> Result<Self> {
-        let mut sandbox = Self::create_unprepared(repo, argv)?;
-        sandbox.environment = Some(PreparedEnvironment::load(repo, &sandbox.head)?.variables);
-        Ok(sandbox)
-    }
-
-    fn create_unprepared(repo: &Path, argv: &[String]) -> Result<Self> {
         a2a_protocol::validate_command_argv(argv)?;
         let repo = repo.canonicalize()?;
-        let head = candidate_head(&repo)?;
+        let status = Command::new("git")
+            .current_dir(&repo)
+            .args(["status", "--porcelain"])
+            .output()?;
+        anyhow::ensure!(
+            status.status.success() && status.stdout.is_empty(),
+            "Verification requires a clean candidate checkout"
+        );
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        anyhow::ensure!(output.status.success(), "Cannot read candidate HEAD");
+        let head = String::from_utf8(output.stdout)?.trim().to_owned();
         // Independent object databases and indexes prevent ordinary Git commands
         // in tests from modifying FORGE's branch or index.
         let root = tempfile::Builder::new()
@@ -197,7 +98,6 @@ impl Sandbox {
             head,
             root,
             argv: argv.to_vec(),
-            environment: None,
         })
     }
 
@@ -247,18 +147,29 @@ impl Sandbox {
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.argv[0]);
-        if let Some(environment) = &self.environment {
-            command.env_clear().envs(
-                environment
-                    .iter()
-                    .filter(|(key, _)| !key.starts_with("GIT_")),
-            );
-        }
+        // Load the workspace user's current login environment for every task.
+        // The daemon may predate tools installed/configured while FORGE built.
+        // Pass argv literally; never concatenate a requested command into shell code.
+        let mut command = Command::new("bash");
         command
-            .args(&self.argv[1..])
+            .args([
+                "-lc",
+                r#"
+for name in "${!GIT_@}"; do unset "$name"; done
+cd -- "$1" || exit
+shift
+export CI=true
+if ! type -P -- "$1" >/dev/null; then
+    printf '[EXECUTOR_SETUP] Command not executable: %s\n' "$1" >&2
+    exit 127
+fi
+exec -- "$@"
+"#,
+                "openflows-verify",
+            ])
+            .arg(self.checkout_path())
+            .args(&self.argv)
             .current_dir(self.checkout_path())
-            .env("PWD", self.checkout_path())
             .env("CI", "true");
         // Reuse PATH, HOME, caches and tools. Do not allow inherited Git overrides
         // to redirect commands back to the working checkout.

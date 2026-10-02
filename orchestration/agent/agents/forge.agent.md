@@ -28,24 +28,18 @@ Before editing, verify `git branch --show-current` is `forge-{worker-id}/{ticket
 Create/resume that branch if startup has not done so; never implement on a detached
 HEAD or the default branch. Use absolute file-tool paths under `/home/coder/workspace`.
 
-During building, prepare the project's tools, versions, dependencies and services
-from repository instructions. Do not assume a particular language is preinstalled.
-After committing, activate/export that environment and run
-`openflows-harness verify prepare -- <project readiness command>` from that shell.
-This probes a fresh checkout (60-second limit) and captures the environment for
-the executor. Use the project's setup wrapper for checkout-local dependencies;
-probe-generated files are discarded. Readiness does not prove acceptance criteria.
-Then set `testing`. Keep the checkout clean
+During building, install/configure the project's tools and dependencies in this
+workspace. Persist tool activation in the user's login-shell configuration or use
+the project's executable setup/test script: exports in a one-off shell cannot
+update the separate executor. For checkout-local dependencies (e.g. node_modules),
+use the project's normal install/test command inside the temporary checkout.
+After building, commit all changes, then set `testing`. Keep the checkout clean
 and keep the template-managed `openflows-harness verify serve` executor running.
 Its log is `/home/coder/.local/state/openflows/verify.log`; inspect it when
-verification cannot run. Do not start duplicate executors. Infrastructure failure
-must use `verify repair --reason "<command, error, task ID>"` during testing,
-not repeated building/testing transitions. This enters blocked and preserves the
-candidate. Ordinary `status set blocked` does not request automatic repair. When NEXUS requests
-environment repair, preserve source and HEAD, fix project prerequisites, prepare
-again, then set `testing` to open a fresh round. At most two repairs may resume
-the same build; if unsuccessful, report the exact external prerequisite and stop.
-SENTINEL runs tests through
+verification cannot run. Do not start duplicate executors. SENTINEL returns failed
+commands and setup failures to building with their diagnostics. Fix the code or
+environment under the existing approved plan, then return to testing. Reserve
+blocked for external prerequisites you cannot resolve. SENTINEL runs tests through
 `verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
 --verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
@@ -60,8 +54,8 @@ Every rework cycle returns to `building`, then repeats testing and both review
 gates. Never jump directly from building to submit. Testing/submit freeze source.
 VESSEL requires current-head CI success, SENTINEL and human PR approval, and
 confirmed merge before done. Missing or timed-out CI never counts as success.
-Use `blocked` for an operational failure. Testing environment repair resumes the
-same HEAD through preparation; other blockers recover through planning.
+Use `blocked` only for external prerequisites you cannot resolve; its recovery
+returns to planning. Repairable verification failures belong in building.
 
 
 

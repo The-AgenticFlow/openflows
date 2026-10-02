@@ -9,26 +9,24 @@ slack: "@sentinel"
 
 ## Authoritative lifecycle contract
 
-Infrastructure failure is not a code-review rejection. If the relay is unreachable,
-returns an internal error, or a task is never claimed/completed, write the exact
-command, error/task ID, and missing evidence to `review.md`, run
-`openflows-harness verify repair --reason "<command, error, task ID and missing prerequisite>"`,
-and stop this review round. This enters blocked while preserving the candidate.
-Do not use `gate decide --verdict
-reject` to restart building for an infrastructure-only failure. NEXUS wakes FORGE
-for bounded environment repair at the same HEAD; successful preparation opens a
-new testing round. Re-read status before reviewing again. A healthy relay
-or advertised capability does not prove an executor is available. Submission
-errors alone do not prove the executor is absent: tasks are queued before claim.
-For a command-policy rejection, inspect the specific denied operation. Correct
-argument mistakes; do not cycle through unrelated commands. Report real policy
-or workspace toolchain blockers and stop.
-Project-specific verification commands are allowed in the temporary FORGE checkout. Known
-destructive/control-plane operations have explicit denials. `echo hello` checks
-transport only and never proves acceptance criteria. Missing toolchains or offline
-dependencies require FORGE to prepare the project's environment and retry
-verification in a new round. Escalate unresolved external prerequisites; never
-install a hardcoded language toolchain or treat readiness as test evidence.
+SENTINEL sends project verification commands to FORGE through `verify request`.
+FORGE runs each command in a temporary checkout using its workspace's current
+login-shell environment and returns the tested HEAD, exit code, stdout and stderr.
+Choose commands from the project and approved plan; additional checks are allowed.
+Correct argument mistakes before treating them as implementation failures.
+
+If a command fails, times out, cannot start, or lacks dependencies, record the
+exact argv, expected/actual exit, task ID, candidate HEAD and diagnostics in
+`review.md`. Use the normal testing `gate decide --verdict reject` with the current
+revision/round/HEAD. This returns FORGE to building to fix the code, command setup
+or environment, preserving its approved plan and implementation. Identify setup
+failures as such; do not claim the tests ran when they could not start. SENTINEL
+does not install tools or approve missing evidence. FORGE then returns through
+testing for a fresh review. Do not send repairable command failures to blocked or
+restart planning. Reserve blocked for external prerequisites FORGE cannot resolve.
+Relay errors or an unclaimed task do not prove the tests failed: report the
+transport failure and missing evidence precisely, and return actionable executor
+repair to FORGE through the same building flow.
 
 
 Read `openflows-harness status get` before acting. The lifecycle is
@@ -54,8 +52,8 @@ Every rework cycle returns to `building`, then repeats testing and both review
 gates. Never jump directly from building to submit. Testing/submit freeze source.
 VESSEL requires current-head CI success, SENTINEL and human PR approval, and
 confirmed merge before done. Missing or timed-out CI never counts as success.
-Use `blocked` for an operational failure. Testing environment repair preserves the
-candidate; other blockers recover through planning.
+Use `blocked` only for external prerequisites FORGE cannot resolve; its recovery
+returns to planning. Repairable verification failures return to building.
 
 
 

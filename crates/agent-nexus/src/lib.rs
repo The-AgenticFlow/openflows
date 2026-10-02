@@ -2452,47 +2452,6 @@ Use `openflows-harness` for all coordination:
                         }
                     }
                 }
-                Some("blocked") => {
-                    let Ok(state) = store.lifecycle(&ticket.id).await else {
-                        continue;
-                    };
-                    if state.phase != config::lifecycle::Phase::Blocked
-                        || state.blocked_from != Some(config::lifecycle::Phase::Testing)
-                        || state.head.is_none()
-                        || state.environment_repair_attempts >= 2
-                    {
-                        continue;
-                    }
-                    let key = format!(
-                        "ticket:{}:environment_repair_notified:{}",
-                        ticket.id, state.version
-                    );
-                    if store.get(&key).await.is_none() {
-                        if let Some(chat) = store
-                            .get_typed::<String>(&full_ticket_key(
-                                &ticket.id,
-                                KEY_TICKET_CHAT,
-                                "forge",
-                            ))
-                            .await
-                        {
-                            let prompt = format!(
-                                "Verification is blocked by infrastructure at HEAD {}. Read status get and the latest verify results/logs. Repair only the project environment (tools, PATH, dependencies, services); source remains frozen. Follow the repository's setup instructions, not a fixed language toolchain. From the configured project shell run `openflows-harness verify prepare -- <project readiness command>`; the probe runs in a fresh checkout. Then run `openflows-harness status set testing` to resume this same HEAD in a new review round. If repair fails, report the exact external prerequisite and remain blocked; do not reject the code or restart planning. Automatic repair attempt {} of 2.",
-                                state.head.as_deref().unwrap(), state.environment_repair_attempts + 1,
-                            );
-                            if client
-                                .send_chat_message(
-                                    &chat,
-                                    vec![coder_client::types::ChatInputPart::text(prompt)],
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                store.set(&key, json!(true)).await;
-                            }
-                        }
-                    }
-                }
                 Some("plan_rejected") | Some("building") => {
                     if let Ok(state) = store.lifecycle(&ticket.id).await {
                         if Some(state.phase.as_str()) != phase {

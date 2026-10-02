@@ -1,122 +1,50 @@
 //! Verification checkout tests using the workspace's Git and shell; no Docker required.
-use openflows_harness::sandbox::PreparedEnvironment;
-
-// Run preparation in another process to emulate the builder's configured shell,
-// without changing the parallel test runner's environment.
-#[test]
-fn environment_capture_child() {
-    if let Some(repo) = std::env::var_os("OPENFLOWS_ENV_TEST_REPO") {
-        PreparedEnvironment::prepare(std::path::Path::new(&repo), &["project-tool".into()], 0)
-            .unwrap();
-    }
-}
-
-#[test]
-fn preparation_hands_off_builder_environment_to_an_existing_executor() {
-    use std::os::unix::fs::PermissionsExt;
-    let repo = repository();
-    let tools = tempfile::tempdir().unwrap();
-    let program = tools.path().join("project-tool");
-    std::fs::write(
-        &program,
-        "#!/bin/sh\ntest \"$PROJECT_SDK\" = custom-version && printf prepared\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut paths = vec![tools.path().to_path_buf()];
-    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "environment_capture_child", "--nocapture"])
-        .env("OPENFLOWS_ENV_TEST_REPO", repo.path())
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .env("PROJECT_SDK", "custom-version")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let sandbox = Sandbox::create(repo.path(), &["project-tool".into()]).unwrap();
-    let output = sandbox.command().output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"prepared");
-}
 use openflows_harness::sandbox::Sandbox;
 use std::process::Command;
 
 #[test]
-fn failed_preparation_invalidates_readiness_and_changed_head_requires_preparation() {
-    let repo = repository();
-    assert!(PreparedEnvironment::prepare(
-        repo.path(),
-        &["sh".into(), "-c".into(), "exit 19".into()],
-        0
-    )
-    .is_err());
-    assert!(Sandbox::create(repo.path(), &["true".into()]).is_err());
-    PreparedEnvironment::prepare(repo.path(), &["true".into()], 0).unwrap();
-    assert!(Command::new("git")
-        .current_dir(repo.path())
-        .args(["commit", "--allow-empty", "-m", "next"])
-        .output()
-        .unwrap()
-        .status
-        .success());
-    let error = Sandbox::create(repo.path(), &["true".into()])
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("another HEAD"));
-}
-
-#[test]
-fn executor_reloads_project_environment_without_language_specific_paths() {
+fn login_environment_is_loaded_per_task_and_arguments_stay_literal() {
     use std::os::unix::fs::PermissionsExt;
     let repo = repository();
-    let tools = tempfile::tempdir().unwrap();
-    // Simulate a project tool installed outside the daemon's startup PATH.
-    let program = tools.path().join("project-tool");
-    std::fs::write(&program, "#!/bin/sh\nprintf '%s' \"$PROJECT_SDK\"\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("bin")).unwrap();
+    let program = home.path().join("bin/project-tool");
+    std::fs::write(&program, "#!/bin/sh\ntest -z \"$GIT_DIR\" || exit 91\nprintf '%s\\n' \"$PWD\" \"$PROJECT_TOOL_VERSION\" \"$@\"\n").unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let handoff = repo.path().join(".git/openflows-verification.json");
-    assert_eq!(
-        std::fs::metadata(&handoff).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    for version in ["sdk-one", "sdk-two"] {
-        let mut environment: PreparedEnvironment =
-            serde_json::from_slice(&std::fs::read(&handoff).unwrap()).unwrap();
-        environment
-            .variables
-            .insert("PATH".into(), tools.path().to_string_lossy().into_owned());
-        environment
-            .variables
-            .insert("PROJECT_SDK".into(), version.into());
-        environment
-            .variables
-            .insert("GIT_DIR".into(), "/invalid".into());
-        std::fs::write(&handoff, serde_json::to_vec(&environment).unwrap()).unwrap();
-        let sandbox = Sandbox::create(repo.path(), &["project-tool".into()]).unwrap();
-        let output = sandbox.command().output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), version);
-        assert!(!sandbox
-            .command()
-            .get_envs()
-            .any(|(key, value)| key == "GIT_DIR" && value.is_some()));
+    let argv = ["project-tool", "two words", "$(touch injected)", "; exit 3"].map(str::to_owned);
+    let sandbox = Sandbox::create(repo.path(), &argv).unwrap();
+    let mut command = sandbox.command();
+    command.env("HOME", home.path());
+    for version in ["one", "two"] {
+        // Configure tools after constructing the command, as happens during building.
+        std::fs::write(home.path().join(".bash_profile"), format!("export PATH=\"$HOME/bin:$PATH\"\nexport PROJECT_TOOL_VERSION={version}\nexport GIT_DIR=/invalid\ncd \"$HOME\"\n")).unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = format!(
+            "{}\n{version}\ntwo words\n$(touch injected)\n; exit 3\n",
+            sandbox.checkout_path().display()
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(!sandbox.checkout_path().join("injected").exists());
     }
+    assert!(sandbox.source_unchanged().unwrap());
 }
 
 #[test]
-fn readiness_probe_cannot_modify_candidate_source() {
+fn unavailable_command_returns_diagnostic_and_shell_exit_127() {
     let repo = repository();
-    assert!(PreparedEnvironment::prepare(
-        repo.path(),
-        &["sh".into(), "-c".into(), "echo changed > source.txt".into()],
-        0
-    )
-    .is_err());
-    assert!(Sandbox::create(repo.path(), &["true".into()]).is_err());
+    let home = tempfile::tempdir().unwrap();
+    let sandbox =
+        Sandbox::create(repo.path(), &["openflows-fixture-nonexistent-tool".into()]).unwrap();
+    let output = sandbox.command().env("HOME", home.path()).output().unwrap();
+    assert_eq!(output.status.code(), Some(127));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("[EXECUTOR_SETUP] Command not executable: openflows-fixture-nonexistent-tool"));
+    assert!(sandbox.source_unchanged().unwrap());
 }
 
 fn repository() -> tempfile::TempDir {
@@ -150,8 +78,6 @@ fn repository() -> tempfile::TempDir {
         .unwrap()
         .status
         .success());
-    openflows_harness::sandbox::PreparedEnvironment::prepare(dir.path(), &["true".into()], 0)
-        .unwrap();
     dir
 }
 

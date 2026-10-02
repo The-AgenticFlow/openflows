@@ -100,21 +100,18 @@ cat <<'EOF'
      Start/revise in planning.
   2. Write the plan at the current chat-specific path; run plan write --file <absolute-plan-path>; set plan_ready.
   3. Wait for SENTINEL approval, then set building and implement.
-  4. Prepare project tools/dependencies, commit ALL work, and activate that environment.
-     Run verify prepare -- <project readiness command> (fresh checkout, 60-second limit),
-     then set testing and check the template-managed verify executor.
+  4. Commit ALL work, set testing, and check the template-managed verify executor.
      Inspect /home/coder/.local/state/openflows/verify.log for infrastructure failures.
-     During testing use verify repair --reason "<command, error, task ID>" for infrastructure
-     failures; do not cycle building/testing. Ordinary blocked does not request repair.
+     Persist project tool activation in the user's login-shell config or a project script.
+     SENTINEL returns failing commands/setup diagnostics to building; repair and retest.
+     Reserve blocked for external prerequisites you cannot resolve.
   5. Wait for successful A2A verification and SENTINEL testing approval, then set submit.
   6. Open/update PR; run pr opened --pr <N> --branch <branch> --title <title>.
   7. Wait for SENTINEL and HUMAN PR approval and CI success.
 
   Source is frozen during plan_ready, testing and submit. For corrections,
   return to building and repeat testing. For plan changes, return to planning.
-  For a testing environment blocker, repair prerequisites without source changes,
-  run verify prepare again, and set testing at the same HEAD (two resumptions maximum).
-  Other blockers recover through planning; unresolved prerequisites require escalation.
+  Use blocked only for external prerequisites you cannot resolve; recover through planning.
   Read revision/review_round/head from status get for every review decision.
 
 EOF
