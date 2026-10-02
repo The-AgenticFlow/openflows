@@ -245,7 +245,7 @@ Standalone note: when `task_id` is `None` (self-test path), a fresh id is genera
 | **Single kill switch** | One relay server; `A2A_RELAY_ADDR` bind. |
 | **Unguessable IDs** | UUIDv4 task IDs add a layer against accidental cross-talk. |
 
-**Known trust boundary:** Nexus derives a pair token from `CODER_CHAT_HOOK_SECRET` and the ticket id, injects it into the paired SENTINEL/FORGE workspaces as `A2A_PAIR_TOKEN`, and stores only its SHA-256 hash for relay validation. This prevents another reachable workspace from claiming a different `pair_id` by self-declaration alone. It does not make FORGE execution a process sandbox: once authenticated, verification still runs with FORGE's workspace permissions, environment, caches, and network access.
+**Known trust boundary:** Nexus derives a pair token from `CODER_CHAT_HOOK_SECRET` and the ticket id, injects it into the paired SENTINEL/FORGE workspaces as `A2A_PAIR_TOKEN`, and stores only its SHA-256 hash in the relay for validation. This prevents another reachable workspace from claiming a different `pair_id` by self-declaration alone. It does not make FORGE execution a process sandbox: once authenticated, verification still runs with FORGE's workspace permissions, environment, caches, and network access.
 
 The companion principle outside the relay: **SENTINEL must hard-fail — never approve — when a required artifact (PLAN.md, a diff, a persisted verify result) is missing or unreadable.** The relay exists to get evidence *into* SENTINEL's hands, not to excuse approving without it.
 
