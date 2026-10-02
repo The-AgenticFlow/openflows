@@ -69,6 +69,8 @@ pub struct Lifecycle {
     pub pr_number: Option<u64>,
     pub merge_sha: Option<String>,
     pub feedback: Option<String>,
+    pub blocked_from: Option<Phase>,
+    pub environment_repair_attempts: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransitionRecord {
@@ -81,6 +83,9 @@ pub struct TransitionRecord {
 }
 #[derive(Debug, Clone)]
 pub enum Event {
+    BlockVerification {
+        reason: String,
+    },
     Move {
         phase: Phase,
         head: Option<String>,
@@ -193,6 +198,26 @@ impl Lifecycle {
         };
         let mut next = self.clone();
         match event {
+            Event::BlockVerification { reason } => {
+                ensure!(
+                    matches!(actor.as_str(), "forge" | "sentinel")
+                        && self.phase == Phase::Testing
+                        && self.head.is_some(),
+                    "Environment repair requires a testing candidate and FORGE or SENTINEL"
+                );
+                ensure!(
+                    !reason.trim().is_empty(),
+                    "Environment repair requires a diagnostic reason"
+                );
+                next.phase = Phase::Blocked;
+                next.blocked_from = Some(Phase::Testing);
+                next.test_decision = None;
+                next.test_human = None;
+                next.verified_head = None;
+                next.verification_task = None;
+                next.pr_delivery = None;
+                next.feedback = Some(reason);
+            }
             Event::Plan { content } => {
                 ensure!(
                     actor == "forge" && self.phase == Phase::Planning,
@@ -217,6 +242,12 @@ impl Lifecycle {
                     return Ok(self.clone());
                 }
                 let permitted = match (self.phase, phase) {
+                    (Phase::Blocked, Phase::Testing) => {
+                        self.blocked_from == Some(Phase::Testing)
+                            && self.head.is_some()
+                            && head == self.head
+                            && self.environment_repair_attempts < 2
+                    }
                     (_, Phase::Blocked) => true,
                     (
                         Phase::Blocked
@@ -261,14 +292,21 @@ impl Lifecycle {
                 if matches!(phase, Phase::Planning | Phase::Blocked) {
                     next.clear_work();
                     next.plan_decision = None;
+                    next.blocked_from = None;
+                    next.environment_repair_attempts = 0;
                     if phase == Phase::Planning {
                         next.plan.clear();
                     }
                 }
                 if phase == Phase::Building {
                     next.clear_work();
+                    next.environment_repair_attempts = 0;
                 }
                 if phase == Phase::Testing {
+                    if self.phase == Phase::Blocked {
+                        next.environment_repair_attempts += 1;
+                    }
+                    next.blocked_from = None;
                     next.head = head;
                 }
                 if matches!(phase, Phase::PlanReady | Phase::Testing | Phase::Submit) {
@@ -490,6 +528,135 @@ mod tests {
             },
         );
     }
+    #[test]
+    fn environment_repair_preserves_candidate_but_requires_fresh_review_and_is_bounded() {
+        let mut state = Lifecycle {
+            phase: Phase::Testing,
+            head: Some("candidate".into()),
+            review_round: 3,
+            revision: 2,
+            plan: "approved scope".into(),
+            verified_head: Some("candidate".into()),
+            verification_task: Some("old-task".into()),
+            ..Lifecycle::default()
+        };
+        for attempt in 0..3 {
+            state = state
+                .apply(
+                    "sentinel",
+                    Event::BlockVerification {
+                        reason: "Project tool unavailable (task fixture)".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            assert_eq!(state.head.as_deref(), Some("candidate"));
+            assert_eq!(state.plan, "approved scope");
+            assert_eq!(state.revision, 2);
+            assert!(state.verified_head.is_none());
+            assert!(state.verification_task.is_none());
+            assert!(state
+                .apply(
+                    "forge",
+                    Event::Move {
+                        phase: Phase::Testing,
+                        head: Some("other".into())
+                    },
+                    2
+                )
+                .is_err());
+            assert!(state
+                .apply(
+                    "sentinel",
+                    Event::Move {
+                        phase: Phase::Testing,
+                        head: Some("candidate".into())
+                    },
+                    2
+                )
+                .is_err());
+            let resumed = state.apply(
+                "forge",
+                Event::Move {
+                    phase: Phase::Testing,
+                    head: Some("candidate".into()),
+                },
+                2,
+            );
+            if attempt == 2 {
+                assert!(resumed.is_err());
+            } else {
+                state = resumed.unwrap();
+                assert_eq!(state.review_round, 4 + attempt);
+                assert!(state.test_decision.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_blocker_without_candidate_cannot_resume_testing() {
+        let state = Lifecycle {
+            phase: Phase::Blocked,
+            ..Lifecycle::default()
+        };
+        assert!(state
+            .apply(
+                "forge",
+                Event::Move {
+                    phase: Phase::Testing,
+                    head: Some("guessed".into())
+                },
+                1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn generic_blockers_do_not_trigger_environment_repair() {
+        let state = Lifecycle {
+            phase: Phase::Testing,
+            head: Some("candidate".into()),
+            ..Lifecycle::default()
+        };
+        let blocked = state
+            .apply(
+                "forge",
+                Event::Move {
+                    phase: Phase::Blocked,
+                    head: None,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(blocked.blocked_from.is_none());
+        assert!(blocked
+            .apply(
+                "forge",
+                Event::Move {
+                    phase: Phase::Testing,
+                    head: Some("candidate".into())
+                },
+                2
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                "human",
+                Event::BlockVerification {
+                    reason: "missing tool".into()
+                },
+                1
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                "sentinel",
+                Event::BlockVerification { reason: "".into() },
+                1
+            )
+            .is_err());
+    }
+
     #[test]
     fn sentinel_can_block_testing_but_cannot_move_to_building() {
         let state = Lifecycle {

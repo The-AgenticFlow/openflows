@@ -103,6 +103,28 @@ pub fn authorize_gate_approver(role: &str) -> Result<()> {
 }
 
 impl HarnessStore {
+    pub async fn verification_repair(
+        &self,
+        ticket: &str,
+        role: &str,
+        reason: String,
+    ) -> Result<()> {
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        self.lifecycle
+            .transition(
+                ticket,
+                state.version,
+                role,
+                Event::BlockVerification { reason },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lifecycle_state(&self, ticket: &str) -> Result<config::lifecycle::Lifecycle> {
+        self.lifecycle.lifecycle(ticket).await
+    }
+
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
         let client = Builder::from_config(config).build()?;
@@ -148,12 +170,17 @@ impl HarnessStore {
     /// Testing captures a clean checkout head; later stages require its evidence.
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
         let phase = Phase::parse(phase)?;
+        let state = self.lifecycle.lifecycle(ticket).await?;
         let head = if phase == Phase::Testing {
-            Some(Self::checkout_head()?)
+            let head = Self::checkout_head()?;
+            let environment =
+                crate::sandbox::PreparedEnvironment::load(&std::env::current_dir()?, &head)?;
+            anyhow::ensure!(environment.lifecycle_version == state.version || state.phase == Phase::Testing,
+                "Lifecycle changed since preparation; run verify prepare again before entering testing");
+            Some(head)
         } else {
             None
         };
-        let state = self.lifecycle.lifecycle(ticket).await?;
         self.lifecycle
             .transition(ticket, state.version, role, Event::Move { phase, head })
             .await?;

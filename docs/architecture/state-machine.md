@@ -19,6 +19,7 @@ stateDiagram-v2
     submit --> building: PR/CI rejection or changed head
     submit --> done: SENTINEL + human approval + CI success + confirmed merge
     blocked --> planning: recover
+    blocked --> testing: environment prepared, same HEAD, new round (max 2)
     done --> [*]
 ```
 
@@ -26,6 +27,15 @@ Any nonterminal stage can report `blocked` unless a merge is being reconciled. D
 uploading a new plan; returning to building invalidates testing and PR evidence.
 Every transition records actor, time, version, previous/next phase and detail in
 history. Operational worker allocation and ticket scheduling remain projections.
+
+`verify repair --reason "<command, error, task ID>"` during testing preserves the candidate HEAD and approved
+plan while clearing testing evidence. NEXUS wakes FORGE once for that blocked
+version to repair the project environment. `verify prepare -- <readiness command>`
+must succeed in a temporary checkout before `status set testing` can resume the
+same HEAD in a new review round. Two resumptions per build are allowed; unresolved
+prerequisites stay blocked. Other blockers (including legacy records that lost
+their HEAD) retain the planning recovery path.
+Generic `status set blocked` never opts into automatic environment repair.
 
 ## Worker commands
 
@@ -45,7 +55,8 @@ openflows-harness gate decide --phase plan_ready --revision 1 --round 1 \
 
 Reject uses the same command with `--verdict reject`. FORGE reads the feedback,
 returns to planning, revises/uploads, and resubmits. After approval FORGE enters
-building. After committing all work it enters testing with a clean checkout and
+building. After committing all work, FORGE runs `verify prepare -- <project readiness command>`
+from its configured shell, then enters testing with a clean checkout and
 runs `openflows-harness verify serve` so SENTINEL can request verification:
 
 ```sh

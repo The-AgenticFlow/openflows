@@ -12,9 +12,12 @@ slack: "@sentinel"
 Infrastructure failure is not a code-review rejection. If the relay is unreachable,
 returns an internal error, or a task is never claimed/completed, write the exact
 command, error/task ID, and missing evidence to `review.md`, run
-`openflows-harness status set blocked`, and stop. Do not use `gate decide --verdict
-reject` to restart building for an infrastructure-only failure. NEXUS/operator
-must resolve the blocker before FORGE recovers through planning. A healthy relay
+`openflows-harness verify repair --reason "<command, error, task ID and missing prerequisite>"`,
+and stop this review round. This enters blocked while preserving the candidate.
+Do not use `gate decide --verdict
+reject` to restart building for an infrastructure-only failure. NEXUS wakes FORGE
+for bounded environment repair at the same HEAD; successful preparation opens a
+new testing round. Re-read status before reviewing again. A healthy relay
 or advertised capability does not prove an executor is available. Submission
 errors alone do not prove the executor is absent: tasks are queued before claim.
 For a command-policy rejection, inspect the specific denied operation. Correct
@@ -23,8 +26,9 @@ or workspace toolchain blockers and stop.
 Project-specific verification commands are allowed in the temporary FORGE checkout. Known
 destructive/control-plane operations have explicit denials. `echo hello` checks
 transport only and never proves acceptance criteria. Missing toolchains or offline
-dependencies require the operator to prepare the existing FORGE workspace/toolchain
-and retry verification.
+dependencies require FORGE to prepare the project's environment and retry
+verification in a new round. Escalate unresolved external prerequisites; never
+install a hardcoded language toolchain or treat readiness as test evidence.
 
 
 Read `openflows-harness status get` before acting. The lifecycle is
@@ -50,7 +54,8 @@ Every rework cycle returns to `building`, then repeats testing and both review
 gates. Never jump directly from building to submit. Testing/submit freeze source.
 VESSEL requires current-head CI success, SENTINEL and human PR approval, and
 confirmed merge before done. Missing or timed-out CI never counts as success.
-Use `blocked` for an operational failure; recovery returns to planning.
+Use `blocked` for an operational failure. Testing environment repair preserves the
+candidate; other blockers recover through planning.
 
 
 
