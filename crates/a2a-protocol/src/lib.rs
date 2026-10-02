@@ -22,28 +22,66 @@ pub use verify::{
 /// this constant's meaning.
 pub const TASK_TYPE_VERIFY: &str = "verify";
 
-/// Command allowlist enforced by the nexus relay before dispatching a
-/// `verify` request (task 2 of the plan). Kept here so both the relay and
-/// any future client-side pre-validation share one definition.
-pub const DEFAULT_COMMAND_ALLOWLIST: &[&[&str]] = &[
-    &["cargo", "test"],
-    &["cargo", "build"],
-    &["cargo", "clippy"],
-    &["npm", "test"],
-    &["pnpm", "test"],
-    &["make", "test"],
-    &["bun", "test"],
-];
-
-/// True if `argv` starts with one of the allowlisted command prefixes.
-/// Empty `argv` is always rejected.
+/// Compatibility predicate: unknown tools are permitted; known dangerous operations are denied.
+/// This is a diagnostic guard, not a sandbox. All execution requires isolation.
 pub fn is_allowlisted(argv: &[String]) -> bool {
-    if argv.is_empty() {
-        return false;
+    !argv.is_empty() && prohibited_operation(argv).is_none()
+}
+
+fn prohibited_operation(argv: &[String]) -> Option<&'static str> {
+    let program = argv.first()?.rsplit('/').next()?;
+    let args = &argv[1..];
+    if matches!(
+        program,
+        "sudo"
+            | "su"
+            | "redis-cli"
+            | "docker"
+            | "podman"
+            | "mount"
+            | "umount"
+            | "mkfs"
+            | "dd"
+            | "shutdown"
+            | "reboot"
+            | "openflows-harness"
+    ) {
+        return Some("privileged, destructive, or coordination-control operation");
     }
-    DEFAULT_COMMAND_ALLOWLIST.iter().any(|prefix| {
-        prefix.len() <= argv.len() && prefix.iter().zip(argv.iter()).all(|(p, a)| p == a)
-    })
+    if program == "rm" && args.iter().any(|a| a == "/" || a == "/*") {
+        return Some("filesystem-root deletion");
+    }
+    if program == "git" && args.first().is_some_and(|a| a == "push") {
+        return Some("verification cannot push repository changes");
+    }
+    let subcommand = args.first().map(String::as_str);
+    let script = args.get(1).map(String::as_str);
+    if (matches!(program, "cargo" | "npm" | "pnpm")
+        && matches!(subcommand, Some("publish" | "deploy")))
+        || (matches!(program, "npm" | "pnpm")
+            && subcommand == Some("run")
+            && matches!(script, Some("publish" | "deploy")))
+    {
+        return Some("publishing or deployment is not verification");
+    }
+    None
+}
+
+/// Validate literal argv without splitting strings or invoking a shell.
+/// Report malformed command tokenization separately from unsupported commands.
+pub fn validate_command_argv(argv: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !argv.is_empty(),
+        "Missing verification command. Use: verify request --expect-exit 0 -- cargo test"
+    );
+    anyhow::ensure!(
+        !argv[0].chars().any(char::is_whitespace),
+        "The executable contains whitespace: the command was passed as a single argument. Use `verify request --expect-exit 0 -- cargo test --workspace --all-features`, or one --argv per token. Do not quote the whole command. Received argv: {:?}", argv
+    );
+    if let Some(reason) = prohibited_operation(argv) {
+        anyhow::bail!("verification policy denied: {reason}; argv: {:?}", argv);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -62,9 +100,52 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_rejects_unknown_or_empty() {
+    fn policy_rejects_known_dangerous_or_empty() {
         assert!(!is_allowlisted(&["rm".into(), "-rf".into(), "/".into()]));
         assert!(!is_allowlisted(&[]));
         assert!(!is_allowlisted(&["cargo".into(), "publish".into()]));
+    }
+}
+
+#[cfg(test)]
+mod verification_script_tests {
+    use super::*;
+    #[test]
+    fn permits_only_named_npm_verification_scripts() {
+        for script in ["test", "test:unit", "build", "lint"] {
+            assert!(
+                is_allowlisted(&["npm".into(), "run".into(), script.into()]),
+                "{script}"
+            );
+        }
+        for script in ["deploy", "publish"] {
+            assert!(!is_allowlisted(&[
+                "npm".into(),
+                "run".into(),
+                script.into()
+            ]));
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_policy_tests {
+    use super::*;
+    #[test]
+    fn unfamiliar_project_commands_are_not_policy_failures() {
+        for argv in [
+            vec!["pytest", "-q"],
+            vec!["go", "test", "./..."],
+            vec!["./scripts/check-custom"],
+            vec!["python3", "-m", "unittest"],
+            vec!["npm", "run", "typecheck"],
+            vec!["echo", "hello"],
+            vec!["cargo", "test", "publish"],
+            vec!["git", "log", "--grep", "push"],
+            vec!["sh", "-c", "printf test"],
+        ] {
+            validate_command_argv(&argv.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                .unwrap();
+        }
     }
 }

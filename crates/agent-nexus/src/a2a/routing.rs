@@ -245,9 +245,7 @@ impl A2ARelay {
         }
 
         // Rule 2: Command allowlist
-        if !a2a_protocol::is_allowlisted(&req.argv) {
-            return Err(anyhow!("command not allowlisted: {}", req.argv.join(" ")));
-        }
+        a2a_protocol::validate_command_argv(&req.argv)?;
 
         // Rule 3: cwd validation
         // Only "repo" and "worktree" are allowed; nothing else.
@@ -284,14 +282,31 @@ impl A2ARelay {
     ) -> Result<String> {
         let idempotency_key = req.idempotency_seed()?;
 
-        // Dedup: reuse the existing task_id for an identical (pair, body).
-        if let Some(task_id) = self.idempotency.lock().await.get(&idempotency_key) {
-            debug!(
-                task_id = %task_id,
-                pair_id = %req.pair_id,
-                "Task already exists (dedup)"
-            );
-            return Ok(task_id.clone());
+        // Dedup in-flight work only. Terminal tasks must be retryable so an
+        // infrastructure fix can rerun the exact same verification request.
+        let existing_task_id = {
+            let idempotency = self.idempotency.lock().await;
+            idempotency.get(&idempotency_key).cloned()
+        };
+        if let Some(task_id) = existing_task_id {
+            let state = {
+                let tasks = self.tasks.lock().await;
+                tasks.get(&task_id).map(|task| task.state)
+            };
+            match state {
+                Some(TaskState::Pending | TaskState::Running) => {
+                    debug!(
+                        task_id = %task_id,
+                        pair_id = %req.pair_id,
+                        "Task already exists (dedup)"
+                    );
+                    return Ok(task_id);
+                }
+                Some(TaskState::Completed | TaskState::Cancelled) | None => {
+                    self.idempotency.lock().await.remove(&idempotency_key);
+                    self.idempotency_ts.lock().await.remove(&idempotency_key);
+                }
+            }
         }
 
         // Generate new task_id (uuid v4)

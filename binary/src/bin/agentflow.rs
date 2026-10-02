@@ -315,39 +315,14 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
     if let Ok(env_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
         if !env_json.trim().is_empty() {
-            match serde_json::from_str::<config::Registry>(&env_json) {
-                Ok(validated) => match serde_json::to_string_pretty(&validated) {
-                    Ok(pretty) => {
-                        if let Err(e) = std::fs::write(&registry_path, pretty) {
-                            tracing::warn!(
-                                error = %e,
-                                path = %registry_path.display(),
-                                "OPENFLOWS_REGISTRY_JSON was set but the on-disk registry could \
-                                 not be overwritten; continuing with the bundled registry"
-                            );
-                        } else {
-                            tracing::info!(
-                                path = %registry_path.display(),
-                                "Overwrote on-disk registry from OPENFLOWS_REGISTRY_JSON (tenant fleet)"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "OPENFLOWS_REGISTRY_JSON parsed but could not be serialized; \
-                             keeping on-disk registry"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "OPENFLOWS_REGISTRY_JSON is set but invalid; ignoring it and keeping \
-                         the on-disk registry"
-                    );
-                }
-            }
+            let validated: config::Registry = serde_json::from_str(&env_json).context(
+                "Invalid OPENFLOWS_REGISTRY_JSON; refusing to discard the requested tenant fleet",
+            )?;
+            let pretty = serde_json::to_string_pretty(&validated)?;
+            std::fs::write(&registry_path, pretty).context(
+                "Cannot persist requested tenant fleet registry; refusing bundled defaults",
+            )?;
+            tracing::info!(path = %registry_path.display(), "Loaded requested tenant fleet registry");
         }
     }
 
@@ -383,6 +358,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         Some(agent_nexus::hooks::HookBootstrapContext {
             persona_by_role,
             skills_dir: Some(orch_dir.join("plugin/skills")),
+            skills_by_role: registry
+                .active_agents()
+                .map(|e| (e.id.clone(), e.skills.clone()))
+                .collect(),
             commands_dir: Some(orch_dir.join("plugin/commands")),
         })
     };

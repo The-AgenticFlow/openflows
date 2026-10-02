@@ -12,7 +12,6 @@ use config::{
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
         KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
         KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
-        REVIEW_TYPE_PR,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -738,13 +737,20 @@ Before significant work, read the relevant skill file to understand the workflow
     }
 
     async fn sync_registry(&self, store: &SharedStore) -> Result<()> {
-        let registry = match self.load_registry() {
-            Ok(registry) => registry,
-            Err(e) => {
-                warn!(error = %e, "Unable to load registry for sync");
-                return Ok(());
-            }
-        };
+        let registry = self
+            .load_registry()
+            .context("Cannot initialize worker fleet from registry")?;
+        anyhow::ensure!(
+            !registry.forge_slots().is_empty(),
+            "Worker fleet has no enabled FORGE slots; check enabled and max_instances in {}",
+            self.registry_path.display()
+        );
+        anyhow::ensure!(
+            registry
+                .get("sentinel")
+                .is_some_and(|e| e.effective_instances() > 0),
+            "Worker fleet requires an enabled SENTINEL with max_instances > 0"
+        );
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
@@ -786,6 +792,8 @@ Before significant work, read the relevant skill file to understand the workflow
         }
 
         if changed {
+            info!(registry = %self.registry_path.display(), workers = ?all_slot_ids,
+                "Initialized worker fleet from registry");
             store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
 
@@ -959,6 +967,12 @@ Before significant work, read the relevant skill file to understand the workflow
         }
 
         let workspace = client.create_workspace(&request).await?;
+        store
+            .set(
+                &format!("workspace:{}:instructions_pending", workspace.id),
+                json!(true),
+            )
+            .await;
 
         // Persist the workspace ID immediately so that even if readiness
         // polling times out, retries can reuse the same workspace rather
@@ -1068,96 +1082,36 @@ Before significant work, read the relevant skill file to understand the workflow
         // before its filesystem is actually usable — the agent's startup
         // script is still copying the repo seed and checking out the target
         // branch, and exec into the workspace fails with "No such file or
-        // directory" until that finishes. Retry the provisioning with backoff
-        // (re-verifying SSH before each attempt) instead of giving up after a
-        // single failure; otherwise the forge starts without its persona,
-        // skills, and standards and cannot do the rework correctly.
-        if let Ok(artifacts_dir) = std::env::var("ARTIFACTS_DIR") {
-            let orch_path = std::path::PathBuf::from(artifacts_dir);
-            let worker_role = Self::worker_role(worker_id);
-
-            // Load the agent registry BEFORE the retry loop. The registry is
-            // deterministic for a given path/env, so if it fails here it will
-            // fail on every retry — and `provision_role` cannot run without it.
-            // Bail out immediately instead of burning the loop on futile SSH
-            // waits (12 checks x 20s) that delay the controller pass for no
-            // progress.
-            let reg = match self.load_registry() {
-                Ok(reg) => reg,
-                Err(e) => {
-                    warn!(
-                        worker_id,
-                        workspace_id = %workspace.id,
-                        role = worker_role,
-                        error = %e,
-                        "Failed to load agent registry — skipping workspace configuration provisioning"
-                    );
-                    return Ok(Some(workspace.id));
-                }
-            };
-
-            const MAX_PROVISION_ATTEMPTS: u32 = 12;
-            for attempt in 1..=MAX_PROVISION_ATTEMPTS {
-                // Re-verify SSH reachability before each attempt. The first
-                // pass may run while the workspace FS is not yet exec-able.
-                let ssh_ok = client
-                    .wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(30))
-                    .await
-                    .is_ok();
-                if !ssh_ok {
-                    warn!(
-                        worker_id,
-                        workspace_id = %workspace.id,
-                        attempt,
-                        max = MAX_PROVISION_ATTEMPTS,
-                        "Workspace SSH not ready for config provisioning — will retry"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                    continue;
-                }
-
-                let transport = CoderTransport::new(client.clone(), &workspace.id);
-                let provisioner = Provisioner::new(&orch_path);
-                match provisioner
-                    .provision_role(&transport, worker_role, &reg)
-                    .await
-                {
-                    Ok(()) => {
-                        info!(
-                            worker_id,
-                            workspace_id = %workspace.id,
-                            role = worker_role,
-                            "Provisioned workspace configuration (skills, standards, persona)"
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            worker_id,
-                            workspace_id = %workspace.id,
-                            role = worker_role,
-                            attempt,
-                            max = MAX_PROVISION_ATTEMPTS,
-                            error = %e,
-                            "Failed to provision workspace configuration — will retry"
-                        );
-                        if attempt == MAX_PROVISION_ATTEMPTS {
-                            warn!(
-                                worker_id,
-                                workspace_id = %workspace.id,
-                                role = worker_role,
-                                "Gave up provisioning workspace configuration after {} attempts — continuing anyway",
-                                MAX_PROVISION_ATTEMPTS
-                            );
-                        } else {
-                            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                        }
-                    }
-                }
-            }
-        }
+        // directory" until that finishes. Failed provisioning leaves a durable pending marker;
+        // chat creation retries setup and cannot proceed until it succeeds.
+        self.ensure_workspace_instructions(store, &client, &workspace.id, worker_id)
+            .await?;
 
         Ok(Some(workspace.id))
+    }
+
+    /// A persisted workspace ID is not proof that instruction provisioning succeeded.
+    async fn ensure_workspace_instructions(
+        &self,
+        store: &SharedStore,
+        client: &coder_client::CoderClient,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        let key = format!("workspace:{workspace_id}:instructions_pending");
+        if store.get(&key).await.is_none() {
+            return Ok(());
+        }
+        let artifacts = std::env::var("ARTIFACTS_DIR").map_err(|_| {
+            anyhow::anyhow!("ARTIFACTS_DIR is required to provision agent instructions")
+        })?;
+        let registry = self.load_registry()?;
+        let transport = CoderTransport::new(client.clone(), workspace_id);
+        Provisioner::new(artifacts)
+            .provision_role(&transport, Self::worker_role(worker_id), &registry)
+            .await?;
+        store.del(&key).await;
+        Ok(())
     }
 
     /// Destroy a Coder workspace and archive all associated chats.
@@ -1270,6 +1224,13 @@ Before significant work, read the relevant skill file to understand the workflow
         let ticket_id = &ticket.id;
         debug!(worker_id, ticket_id, "create_chat_for_assignment: starting");
 
+        // Review chats belong exclusively to the phase/revision/round scheduler.
+        // Generic recovery uses a different chat key and would create a second
+        // reviewer (and overwrite its dispatch with builder instructions).
+        if Self::worker_role(worker_id) == "sentinel" {
+            return;
+        }
+
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1307,72 +1268,6 @@ Before significant work, read the relevant skill file to understand the workflow
             .rsplit_once('-')
             .map(|(base, _)| base)
             .unwrap_or(worker_id);
-
-        // Sentinel chats are keyed by role (`ticket:{id}:chat:sentinel`), which is
-        // SHARED across every sentinel slot. Only the 1:1 paired sentinel for the
-        // ticket (the slot with the same index as the ticket's forge) may own it.
-        // Without this guard, any stale extra sentinel slot still bound to the
-        // ticket would delete/recreate the shared chat key against its own
-        // workspace, causing the infinite "rotating chat to bind" churn seen when
-        // multiple sentinel slots are left bound to one ticket.
-        if role == "sentinel" {
-            let forge_worker_id = match &ticket.status {
-                TicketStatus::Assigned { worker_id } | TicketStatus::InProgress { worker_id } => {
-                    worker_id.clone()
-                }
-                _ => String::new(),
-            };
-            let paired = Self::paired_sentinel_slot(&forge_worker_id);
-            let is_paired = paired.as_deref() == Some(worker_id);
-            let is_ticket_sentinel = matches!(
-                &slot.status,
-                WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. }
-                    if *ticket_id == ticket.id
-            );
-            // Only one sentinel may own the shared `ticket:{id}:chat:sentinel`
-            // key. The paired `sentinel-i` is the primary owner. When the
-            // paired slot is momentarily busy a fallback sentinel is assigned to
-            // the ticket; that single fallback is the legitimate owner and must
-            // be able to (re)create the shared chat during recovery after its
-            // workspace is re-provisioned. To avoid the chat-rotation churn this
-            // guard exists to prevent, a duplicate sentinel bound to the same
-            // ticket but a different workspace must NOT be allowed to operate on
-            // the shared chat. Ownership of an existing chat is decided by
-            // workspace match; when the chat is confirmed missing (not yet
-            // created, or its workspace was destroyed during recovery) an assigned
-            // sentinel is allowed to (re)create it. A transient lookup failure is
-            // NOT treated as "missing" — granting ownership on a transient error
-            // would let the fallback rotate a live shared chat once the next
-            // lookup succeeds and finds it attached to another workspace.
-            let shared_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
-            let (chat_exists, chat_healthy, chat_workspace_matches, lookup_errored) =
-                match store.get_typed::<String>(&shared_chat_key).await {
-                    Some(stored_chat_id) => match client.get_chat_opt(&stored_chat_id).await {
-                        Ok(Some(chat)) => (true, true, chat.workspace_id == *workspace_id, false),
-                        Ok(None) => (false, false, false, false),
-                        Err(_) => (false, false, false, true),
-                    },
-                    None => (false, false, false, false),
-                };
-            let owns_shared_chat = Self::sentinel_may_own_shared_chat(
-                is_paired,
-                is_ticket_sentinel,
-                chat_exists,
-                chat_healthy,
-                chat_workspace_matches,
-                lookup_errored,
-            );
-            if !owns_shared_chat {
-                debug!(
-                    worker_id,
-                    ticket_id,
-                    paired = ?paired,
-                    "Skipping sentinel chat: slot is not the paired sentinel nor the shared-chat owner"
-                );
-                return;
-            }
-        }
 
         // Build dispatch payload with ticket CONTENT for the harness to read
         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
@@ -1606,10 +1501,10 @@ Use `openflows-harness` for all coordination:
 | `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
-1. Analyze task, write PLAN.md, then upload it with `plan write --file PLAN.md` and set `status set plan_ready` and wait for SENTINEL approval
-2. `building` → After SENTINEL approval, implement and set `status set building`
+1. Analyze task, write the plan at the current chat's plan path, then upload it with `plan write --file <absolute-plan-path>` and set `status set plan_ready` and wait for SENTINEL approval
+2. `building` → SENTINEL plan approval moves shared state to building; read status and implement
 3. `testing` → Run tests, verify, set `status set testing`
-4. After SENTINEL and human testing approval, set `status set submit`, open/record PR, and wait for SENTINEL and human PR approval.
+4. After A2A verification and SENTINEL testing approval (human testing review is TODO), set `status set submit`, open/record PR, and wait for SENTINEL and human PR approval.
 5. `blocked` → Stuck? Set status and explain
 "#;
 
@@ -1625,7 +1520,7 @@ Use `openflows-harness` for all coordination:
         let base_prompt = match persona {
             Some(_) => format!(
                 "You are the **{}** agent.\n\nYour full persona, skills, and standards are \
-                 provisioned in this workspace as `AGENTS.md` and `{}.agent.md` — read them \
+                 provisioned in this workspace as `/home/coder/workspace/AGENTS.md` and `/home/coder/workspace/{}.agent.md` — use absolute file paths and read them \
                  for your identity, capabilities, and protocols.\n\n{}\n\n{}\n\n{}\n\n{}",
                 role, role, ticket_content, skills_content, dispatch_info, coordination_info
             ),
@@ -1653,7 +1548,7 @@ Use `openflows-harness` for all coordination:
                 ticket_id, directive
             ),
             None => format!(
-                "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness plan write --file PLAN.md` and `openflows-harness status set plan_ready` and wait for SENTINEL gate approval before implementation.\n",
+                "{}\n\n**Begin work immediately.** Read harness status and dispatch, inspect source files and existing deployment/runtime configuration without modifying source, then write a grounded plan at the exact chat-specific path supplied by Coder or the startup hook. Run `openflows-harness plan write --file <absolute-plan-path>` and `openflows-harness status set plan_ready` and wait for SENTINEL gate approval before implementation.\n",
                 base_prompt
             ),
         };
@@ -1680,6 +1575,13 @@ Use `openflows-harness` for all coordination:
         // `AGENTS.md` (see Provisioner::provision_role), so the first message is
         // smaller and materially less likely to trip a failure in the first place.
         const CREATE_CHAT_MAX_ATTEMPTS: u32 = 3;
+        if let Err(e) = self
+            .ensure_workspace_instructions(store, &client, &workspace_id, worker_id)
+            .await
+        {
+            warn!(error = %e, "Agent instructions unavailable; deferring chat");
+            return;
+        }
         let mut attempt = 1u32;
         let created = loop {
             match client.create_chat(&chat_req).await {
@@ -1851,6 +1753,30 @@ Use `openflows-harness` for all coordination:
     /// - A ticket reaches `planning` phase (SENTINEL reviews the plan and approves the gate)
     /// - A ticket reaches `review_ready` phase (SENTINEL reviews the PR)
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
+        for ticket in tickets {
+            let key = format!("ticket:{}:review_poll_lease", ticket.id);
+            let token = uuid::Uuid::new_v4().to_string();
+            match store.try_claim(&key, &token, 900).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    warn!(ticket_id = %ticket.id, %error, "Cannot claim review scheduling; skipping");
+                    continue;
+                }
+            }
+            self.poll_harness_status_and_spawn_agents_inner(store, std::slice::from_ref(ticket))
+                .await;
+            if let Err(error) = store.release_claim(&key, &token).await {
+                warn!(ticket_id = %ticket.id, %error, "Cannot release review scheduling lease");
+            }
+        }
+    }
+
+    async fn poll_harness_status_and_spawn_agents_inner(
+        &self,
+        store: &SharedStore,
+        tickets: &[Ticket],
+    ) {
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1923,6 +1849,9 @@ Use `openflows-harness` for all coordination:
                             continue;
                         }
                     };
+                    if Some(lifecycle.phase.as_str()) != phase {
+                        continue; // State advanced since the polling snapshot.
+                    }
                     let testing = lifecycle.phase == config::lifecycle::Phase::Testing;
                     let review_namespace = format!(
                         "{}:{}:{}:{}",
@@ -1947,12 +1876,16 @@ Use `openflows-harness` for all coordination:
                         lifecycle.plan_decision.as_ref().is_some_and(|d| d.approved)
                     };
                     if reviewed {
-                        // Keep a durable decision while waiting for the human; never re-spawn a reviewer.
-                        if testing && !lifecycle.test_human.as_ref().is_some_and(|d| d.approved) {
-                            continue;
-                        }
-                        let key =
-                            format!("ticket:{}:gate_notified:{}", ticket.id, lifecycle.version);
+                        // TODO(human-testing-review): add a human testing gate here
+                        // when implemented. SENTINEL approval is sufficient for now.
+                        // Preserve the decision; do not spawn another reviewer.
+                        let key = format!(
+                            "ticket:{}:gate_notified:{}:{}:{}",
+                            ticket.id,
+                            lifecycle.phase.as_str(),
+                            lifecycle.revision,
+                            lifecycle.review_round
+                        );
                         if store.get(&key).await.is_none() {
                             if let Some(chat) = store
                                 .get_typed::<String>(&full_ticket_key(
@@ -2142,7 +2075,7 @@ Use `openflows-harness` for all coordination:
                     }
 
                     // Read the plan directly from Redis SharedStore.
-                    // FORGE writes it via `openflows-harness plan write --file PLAN.md`
+                    // FORGE writes it via `openflows-harness plan write --file <absolute-plan-path>`
                     // before signaling `status set planning`. This eliminates the fragile
                     // Coder API filesystem bridge — the plan lives in SharedStore alongside
                     // all other pair artifacts and is cleaned up when the workspace is
@@ -2178,7 +2111,7 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = if testing {
-                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 --argv <test command and arguments>` to run tests in FORGE. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Approval waits for human testing approval before submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
+                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. For infrastructure failure or unavailable sandbox/toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the mandatory verification sandbox. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
                     } else {
                         format!("Review plan revision {} for {}. Read `openflows-harness plan read`. Write review.md with actionable feedback. Run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict approve --report review.md` (or reject). Do not change source. A rejection is recorded and returned to FORGE.",lifecycle.revision,ticket.id,lifecycle.revision,lifecycle.review_round)
                     };
@@ -2207,7 +2140,21 @@ Use `openflows-harness` for all coordination:
                         labels: Some(labels),
                     };
 
-                    let chat_result = client.create_chat(&chat_req).await;
+                    if let Err(e) = self
+                        .ensure_workspace_instructions(store, &client, &workspace_id, "sentinel")
+                        .await
+                    {
+                        warn!(error = %e, "Sentinel instructions unavailable; deferring review");
+                        continue;
+                    }
+                    let chat_result = Self::continue_sentinel_review(
+                        store,
+                        &client,
+                        &ticket.id,
+                        &sentinel_chat_key,
+                        &chat_req,
+                    )
+                    .await;
 
                     match chat_result {
                         Ok(chat) => {
@@ -2242,7 +2189,13 @@ Use `openflows-harness` for all coordination:
                 }
                 Some("submit") => {
                     let lifecycle = match store.lifecycle(&ticket.id).await {
-                        Ok(s) if s.pr_number.is_some() && s.pr_decision.is_none() => s,
+                        Ok(s)
+                            if s.phase == config::lifecycle::Phase::Submit
+                                && s.pr_number.is_some()
+                                && s.pr_decision.is_none() =>
+                        {
+                            s
+                        }
                         _ => continue,
                     };
                     let review_namespace = pr_review_namespace(
@@ -2250,22 +2203,6 @@ Use `openflows-harness` for all coordination:
                         lifecycle.head.as_deref().unwrap_or(""),
                         lifecycle.review_round,
                     );
-                    match Self::retire_stale_pr_reviews(
-                        store,
-                        &client,
-                        &ticket.id,
-                        &review_namespace,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => continue, // Old reviewer has not stopped yet.
-                        Err(error) => {
-                            warn!(ticket_id = %ticket.id, %error, "Could not retire old PR reviewer; retaining its slot");
-                            continue;
-                        }
-                    }
-
                     // ── PR Review: SENTINEL reviews completed work ──
 
                     // Check if Sentinel chat already exists for this ticket.
@@ -2279,58 +2216,6 @@ Use `openflows-harness` for all coordination:
 
                     if let Some(ref chat_id) = existing_sentinel_chat {
                         match client.get_chat_opt(chat_id).await {
-                            Ok(Some(chat)) if matches!(chat.status(), ChatStatus::Waiting) => {
-                                let review_key = review_verdict_key(&ticket.id, &review_namespace);
-                                let existing_review: Option<Value> =
-                                    store.get_typed(&review_key).await;
-                                // Hardening: only treat a Waiting sentinel chat as
-                                // "orphaned" while the ticket is STILL in review_ready
-                                // and no verdict has been recorded. The reject path
-                                // (agent-sentinel) moves the phase off review_ready and
-                                // records a review key before deleting the sentinel
-                                // binding, so re-checking the current phase here prevents
-                                // clearing/re-spawning a reviewer for an already-decided
-                                // (especially already-rejected) ticket.
-                                let status_key =
-                                    full_ticket_key_flat(&ticket.id, KEY_TICKET_STATUS);
-                                let still_review_ready = store
-                                    .get_typed::<Value>(&status_key)
-                                    .await
-                                    .and_then(|v| {
-                                        v.get("phase")
-                                            .and_then(|p| p.as_str())
-                                            .map(|p| p == "submit")
-                                    })
-                                    .unwrap_or(false);
-                                // The sentinel chat bound to this key may be a leftover
-                                // from the PLANNING-gate review (its `review_type` label
-                                // is `planning_gate`), not a PR reviewer. If so it must
-                                // never be treated as the existing PR-review chat — clear
-                                // it so a fresh `pr_review` sentinel is spawned. This is
-                                // what keeps the final PR review from silently never
-                                // spawning after the planning gate completes.
-                                let review_type =
-                                    chat.labels.get("review_type").and_then(|v| v.as_str());
-                                let is_pr_review = review_type == Some("pr_review");
-                                if Self::should_clear_orphaned_sentinel(
-                                    existing_review.is_some(),
-                                    still_review_ready,
-                                ) || !is_pr_review
-                                {
-                                    warn!(
-                                        ticket_id = %ticket.id,
-                                        chat_id = %chat_id,
-                                        review_type,
-                                        "Sentinel chat is stale (orphaned or non-pr_review) \
-                                         — clearing to spawn a fresh PR-review reviewer"
-                                    );
-                                    store.del(&sentinel_chat_key).await;
-                                    let action_key =
-                                        review_action_key(&ticket.id, &review_namespace);
-                                    store.del(&action_key).await;
-                                    existing_sentinel_chat = None;
-                                }
-                            }
                             Ok(None) => {
                                 warn!(
                                     ticket_id = %ticket.id,
@@ -2498,7 +2383,21 @@ Use `openflows-harness` for all coordination:
                         labels: Some(labels),
                     };
 
-                    let chat_result = client.create_chat(&chat_req).await;
+                    if let Err(e) = self
+                        .ensure_workspace_instructions(store, &client, &workspace_id, "sentinel")
+                        .await
+                    {
+                        warn!(error = %e, "Sentinel instructions unavailable; deferring review");
+                        continue;
+                    }
+                    let chat_result = Self::continue_sentinel_review(
+                        store,
+                        &client,
+                        &ticket.id,
+                        &sentinel_chat_key,
+                        &chat_req,
+                    )
+                    .await;
 
                     match chat_result {
                         Ok(chat) => {
@@ -2532,9 +2431,58 @@ Use `openflows-harness` for all coordination:
                 }
                 Some("plan_rejected") | Some("building") => {
                     if let Ok(state) = store.lifecycle(&ticket.id).await {
+                        if Some(state.phase.as_str()) != phase {
+                            continue;
+                        }
+                        // Approval itself has already advanced the lifecycle.
+                        // Wake FORGE once for this decision; never ask it to replay
+                        // a transition from a potentially stale notification.
+                        if state.phase == config::lifecycle::Phase::Building
+                            && state.feedback.is_none()
+                        {
+                            if let Some(decision) = state
+                                .plan_decision
+                                .as_ref()
+                                .filter(|d| d.approved && d.revision == state.revision)
+                            {
+                                let key = format!(
+                                    "ticket:{}:plan_approved_notified:{}:{}",
+                                    ticket.id, decision.revision, decision.round
+                                );
+                                if store.get(&key).await.is_none() {
+                                    if let Some(chat) = store
+                                        .get_typed::<String>(&full_ticket_key(
+                                            &ticket.id,
+                                            KEY_TICKET_CHAT,
+                                            "forge",
+                                        ))
+                                        .await
+                                    {
+                                        let prompt = format!(
+                                            "SENTINEL approved plan revision {}. Shared state is already in building. Read `openflows-harness status get` before continuing; implement only if it still reports building. If blocked, preserve the blocker and wait for resolution.",
+                                            decision.revision
+                                        );
+                                        if client
+                                            .send_chat_message(
+                                                &chat,
+                                                vec![coder_client::types::ChatInputPart::text(
+                                                    prompt,
+                                                )],
+                                            )
+                                            .await
+                                            .is_ok()
+                                        {
+                                            store.set(&key, json!(true)).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(feedback) = &state.feedback {
-                            let key =
-                                format!("ticket:{}:feedback_notified:{}", ticket.id, state.version);
+                            let key = format!(
+                                "ticket:{}:feedback_notified:{}:{}",
+                                ticket.id, state.revision, state.review_round
+                            );
                             if store.get(&key).await.is_none() {
                                 if let Some(chat) = store
                                     .get_typed::<String>(&full_ticket_key(
@@ -2691,6 +2639,13 @@ Use `openflows-harness` for all coordination:
                 labels: Some(labels),
             };
 
+            if let Err(e) = self
+                .ensure_workspace_instructions(store, &client, &workspace_id, &lore_worker_id)
+                .await
+            {
+                warn!(error = %e, "Lore instructions unavailable; deferring chat");
+                continue;
+            }
             let chat_result = client.create_chat(&chat_req).await;
 
             match chat_result {
@@ -3236,46 +3191,26 @@ Use `openflows-harness` for all coordination:
                 }
                 WorkerStatus::Assigned { ticket_id, .. }
                 | WorkerStatus::Working { ticket_id, .. } => {
-                    // Sentinel pair recycling: a SENTINEL slot that has finished its
-                    // review must be returned to Idle so it can serve a later gate for
-                    // another ticket. Without this, an Assigned sentinel slot sits busy
-                    // for the whole ticket lifecycle and the pool exhausts, leaving
-                    // remaining FORGE builders (each needing its own paired SENTINEL)
-                    // with no reviewer — the "pair never spawned" symptom. A sentinel's
-                    // review is done when the ticket is no longer parked on a review
-                    // phase (planning-gate or review_ready) or a verdict is recorded.
+                    // Keep the review conversation and its workspace through all
+                    // rounds. Release only after the ticket is terminal.
                     if Self::worker_role(&slot.id) == "sentinel" {
-                        let phase = Self::ticket_phase(store, ticket_id).await;
-                        let gate_key = Self::ticket_gate_key(ticket_id, "planning");
-                        let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
-                        // A PR-review verdict completes the sentinel's work on the
-                        // ticket (planning completion is covered by the gate key above).
-                        let review_done = store
+                        let complete = tickets.iter().any(|t| {
+                            t.id == *ticket_id
+                                && matches!(
+                                    t.status,
+                                    TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
+                                )
+                        }) || store
                             .lifecycle(ticket_id)
                             .await
                             .ok()
-                            .is_some_and(|state| state.pr_decision.is_some());
-                        let review_complete = phase
-                            .as_deref()
-                            .is_some_and(|p| !matches!(p, "plan_ready" | "testing" | "submit"))
-                            || gate_approved.is_some()
-                            || review_done;
-                        if review_complete {
-                            info!(
-                                worker_id = slot.id,
-                                ticket_id,
-                                phase,
-                                "Recycling SENTINEL slot to Idle after review verdict"
-                            );
+                            .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
+                        if complete {
                             slot.status = WorkerStatus::Idle;
-                            // Sentinel workspaces are named per-ticket; clear the
-                            // binding so a future pairing provisions a fresh,
-                            // correctly-named workspace instead of reusing a stale
-                            // one bound to a previous ticket.
                             slot.workspace_id = None;
                             changed_slots = true;
-                            continue;
                         }
+                        continue;
                     }
                     let ticket_open = tickets
                         .iter()
@@ -3488,139 +3423,83 @@ Use `openflows-harness` for all coordination:
             .map(|(id, slot)| (id.clone(), slot.clone()))
     }
 
-    /// Whether a sentinel slot may operate on the shared
-    /// `ticket:{id}:chat:sentinel` key. Only ONE sentinel may own it at a time.
-    ///
-    /// - The paired `sentinel-i` always owns it (`is_paired`).
-    /// - A fallback sentinel owns it only when it is bound to the ticket
-    ///   (`is_ticket_sentinel`). An existing, healthy chat is owned only by the
-    ///   sentinel whose workspace matches the chat's bound workspace
-    ///   (`chat_workspace_matches`); a duplicate sentinel assigned to the same
-    ///   ticket but bound to a different workspace is not the owner and must not
-    ///   rotate the shared chat. When the chat is confirmed missing (not yet
-    ///   created, or its workspace was destroyed during recovery), the assigned
-    ///   sentinel is allowed to create/recreate it.
-    /// - A transient lookup failure (`lookup_errored`) is kept distinct from a
-    ///   confirmed missing chat: it never grants ownership, so a fallback cannot
-    ///   rotate a live shared chat on a temporary Coder API error. The sentinel
-    ///   simply skips this pass and retries on a later poll.
-    fn sentinel_may_own_shared_chat(
-        is_paired: bool,
-        is_ticket_sentinel: bool,
-        chat_exists: bool,
-        chat_healthy: bool,
-        chat_workspace_matches: bool,
-        lookup_errored: bool,
-    ) -> bool {
-        if is_paired {
-            return true;
-        }
-        if !is_ticket_sentinel {
-            return false;
-        }
-        if lookup_errored {
-            return false;
-        }
-        if chat_exists && chat_healthy {
-            chat_workspace_matches
-        } else {
-            true
-        }
-    }
-
     async fn should_discover_pr(store: &SharedStore, number: u64, ticket_id: Option<&str>) -> bool {
         ticket_id.is_some_and(|id| !id.is_empty())
             || store.get(&format!("pr:{number}:unmanaged")).await.is_none()
     }
 
-    async fn retire_stale_pr_reviews(
+    /// One conversation per ticket; review aliases retain exact revision/head/round.
+    async fn continue_sentinel_review(
         store: &SharedStore,
         client: &CoderClient,
-        ticket_id: &str,
-        current: &str,
-    ) -> Result<bool> {
-        let active_key = format!("ticket:{ticket_id}:pr_review_namespace");
-        let previous: Option<String> = store.get_typed(&active_key).await;
-        if previous.as_deref() == Some(current) {
-            return Ok(true);
-        }
-        // Stop and archive every stale chat before deleting any binding or
-        // releasing its workspace. Failures retain all metadata for retry.
-        let mut retired_chats = std::collections::HashSet::new();
-        for namespace in [Some(REVIEW_TYPE_PR), previous.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if namespace == current {
-                continue;
-            }
-            if let Some(chat_id) = store
-                .get_typed::<String>(&review_chat_key(ticket_id, namespace))
+        ticket: &str,
+        round_key: &str,
+        request: &coder_client::types::CreateChatRequest,
+    ) -> Result<coder_client::types::Chat> {
+        anyhow::ensure!(
+            store
+                .get(&format!(
+                    "workspace:{}:instructions_pending",
+                    request.workspace_id
+                ))
                 .await
-            {
-                if !retired_chats.insert(chat_id.clone()) {
+                .is_none(),
+            "Workspace instructions are not ready"
+        );
+        let session_key = format!("ticket:{ticket}:sentinel_session");
+        let mut session: Option<String> = store.get_typed(&session_key).await;
+        if session.is_none() {
+            // Adopt the newest existing review instead of abandoning its history
+            // when upgrading from per-round conversations.
+            let prefix = format!("ticket:{ticket}:chat:sentinel:");
+            let mut aliases = store.keys(&format!("{prefix}*")).await;
+            aliases.sort_by_key(|key| {
+                std::cmp::Reverse(
+                    key.rsplit(':')
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0),
+                )
+            });
+            for key in aliases {
+                let Some(offset) = key.find(&prefix) else {
                     continue;
-                }
-                if let Some(chat) = client.get_chat_opt(&chat_id).await? {
-                    if matches!(chat.status(), ChatStatus::Running | ChatStatus::Pending) {
-                        client.interrupt_chat(&chat_id).await?;
-                        // Interrupt acknowledgement alone does not prove the worker
-                        // stopped. Poll again on the next controller tick if needed.
-                        match client.get_chat_opt(&chat_id).await? {
-                            Some(chat)
-                                if matches!(
-                                    chat.status(),
-                                    ChatStatus::Running | ChatStatus::Pending
-                                ) =>
-                            {
-                                return Ok(false)
-                            }
-                            None => continue,
-                            _ => {}
+                };
+                if let Some(id) = store.get_typed::<String>(&key[offset..]).await {
+                    if let Some(chat) = client.get_chat_opt(&id).await? {
+                        if chat.workspace_id == request.workspace_id {
+                            session = Some(id);
+                            break;
                         }
                     }
-                    client.archive_chat(&chat_id).await?;
                 }
             }
         }
-        // Retire legacy bindings as well as the previous round. Current round
-        // keys remain intact when recovering after a process restart.
-        for namespace in [Some(REVIEW_TYPE_PR), previous.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if namespace != current {
-                store.del(&review_chat_key(ticket_id, namespace)).await;
-                store.del(&review_action_key(ticket_id, namespace)).await;
-                store.del(&review_verdict_key(ticket_id, namespace)).await;
+        if let Some(id) = session {
+            if let Some(chat) = client.get_chat_opt(&id).await? {
+                anyhow::ensure!(chat.workspace_id == request.workspace_id,
+                    "Existing SENTINEL session belongs to another workspace; recover its workspace before reviewing");
+                store.set(&session_key, json!(id)).await;
+                // Do not inject the next round while the previous review is
+                // still executing. Its stale verdict is independently rejected
+                // by the lifecycle's revision/head/round checks.
+                anyhow::ensure!(!matches!(chat.status(), ChatStatus::Running | ChatStatus::Pending | ChatStatus::RequiresAction),
+                    "SENTINEL is still completing the previous review; wait before sending the next round");
+                client
+                    .send_chat_message(&id, request.content.clone())
+                    .await?;
+                store.set(round_key, json!(id)).await;
+                return Ok(chat);
             }
+            // A confirmed deletion permits replacement; transport errors above
+            // preserve the binding and never create a second conversation.
+            store.del(&session_key).await;
         }
-        if store
-            .get(&review_chat_key(ticket_id, current))
-            .await
-            .is_none()
-        {
-            let mut slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-            for slot in slots.values_mut() {
-                if slot.id.starts_with("sentinel-")
-                    && matches!(&slot.status, WorkerStatus::Assigned { ticket_id: assigned, .. } | WorkerStatus::Working { ticket_id: assigned, .. } if assigned == ticket_id)
-                {
-                    slot.status = WorkerStatus::Idle;
-                }
-            }
-            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-        }
-        store.set(&active_key, json!(current)).await;
-        Ok(true)
-    }
 
-    /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
-    /// for re-spawn. Only when no review verdict has been recorded AND the ticket is
-    /// still in `review_ready`. A decided (approved/rejected) ticket — in particular
-    /// one already sent back to FORGE for rework — must never be cleared/re-spawned.
-    fn should_clear_orphaned_sentinel(existing_review: bool, still_review_ready: bool) -> bool {
-        !existing_review && still_review_ready
+        let chat = client.create_chat(request).await?;
+        store.set(&session_key, json!(chat.id)).await;
+        store.set(round_key, json!(chat.id)).await;
+        Ok(chat)
     }
 
     fn should_resume_existing_chat(status: ChatStatus, last_action: Option<&str>) -> bool {
@@ -3635,10 +3514,6 @@ Use `openflows-harness` for all coordination:
             ),
             _ => false,
         }
-    }
-
-    fn ticket_gate_key(ticket_id: &str, phase: &str) -> String {
-        format!("ticket:{}:gate:{}", ticket_id, phase)
     }
 
     async fn ticket_phase(store: &SharedStore, ticket_id: &str) -> Option<String> {
@@ -4282,9 +4157,7 @@ impl Node for NexusNode {
     }
 
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
-        if let Err(e) = self.sync_registry(store).await {
-            warn!("Failed to sync registry: {}", e);
-        }
+        self.sync_registry(store).await?;
 
         let repository = match config::EnvConfig::from_env()
             .ok()
@@ -5208,6 +5081,49 @@ fn directive_pr_number(directive: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fleet_one_recovers_empty_slots_and_preserves_busy_workers() {
+        let path = std::env::temp_dir().join(format!("fleet-{}.json", uuid::Uuid::new_v4()));
+        let registry: Registry =
+            serde_json::from_str(include_str!("../../../orchestration/agent/registry.json"))
+                .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&registry.with_team_fleet(1)).unwrap(),
+        )
+        .unwrap();
+        let node = NexusNode::new("unused", &path);
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        node.sync_registry(&store).await.unwrap();
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert_eq!(slots.keys().filter(|id| id.starts_with("forge")).count(), 1);
+        assert_eq!(
+            slots.keys().filter(|id| id.starts_with("sentinel")).count(),
+            1
+        );
+        slots.get_mut("forge-1").unwrap().workspace_id = Some("existing-workspace".into());
+        slots.get_mut("forge-1").unwrap().status = WorkerStatus::Working {
+            ticket_id: "T-1".into(),
+            issue_url: None,
+        };
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        node.sync_registry(&store).await.unwrap();
+        let restored: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert_eq!(
+            restored["forge-1"].workspace_id.as_deref(),
+            Some("existing-workspace")
+        );
+        std::fs::write(&path, "invalid registry").unwrap();
+        assert!(node.sync_registry(&store).await.is_err());
+        assert_eq!(store.get(KEY_WORKER_SLOTS).await, Some(json!(slots)));
+        std::fs::write(&path, r#"{"team":[]}"#).unwrap();
+        assert!(node.sync_registry(&store).await.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn test_existing_chat_resume_policy() {
         assert!(NexusNode::should_resume_existing_chat(
@@ -5591,45 +5507,473 @@ mod tests {
         assert_eq!(id, "sentinel-1");
     }
 
-    #[test]
-    fn sentinel_shared_chat_ownership_uses_one_owner() {
-        // The paired sentinel always owns the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            true, false, true, true, false, false
-        ));
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            true, true, true, true, true, false
-        ));
-        // A sentinel that is neither paired nor assigned to the ticket is blocked.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, true, true, false, false
-        ));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, false, false, false, false
-        ));
-        // The assigned fallback owns an existing, healthy chat only when its
-        // workspace matches the chat's bound workspace — a duplicate sentinel
-        // bound to a different workspace must not rotate the shared chat.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            false, true, true, true, true, false
-        ));
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, true, true, true, false, false
-        ));
-        // When the chat is confirmed missing (recovery / first creation), the
-        // assigned sentinel is allowed to (re)create it.
-        assert!(NexusNode::sentinel_may_own_shared_chat(
-            false, true, false, false, false, false
-        ));
-        // A transient lookup failure is NOT treated as missing, so it never
-        // grants ownership — the fallback must not rotate on a temporary error.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, true, false, false, false, true
-        ));
-        // A non-assigned sentinel cannot create the chat in either case.
-        assert!(!NexusNode::sentinel_may_own_shared_chat(
-            false, false, false, false, false, true
-        ));
+    #[tokio::test]
+    async fn approved_building_notifies_forge_once_without_requesting_a_transition() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v2/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::Regex("already.*building".into()))
+            .with_status(200)
+            .with_body(r#"{"queued":true,"queued_message":{"id":12,"content":[]}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Deploy", "body":"Deploy marketplace",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Building,
+            revision: 1,
+            review_round: 1,
+            version: 3,
+            plan: "# Plan".into(),
+            plan_decision: Some(config::lifecycle::Decision {
+                pr_number: None,
+                round: 1,
+                actor: "sentinel".into(),
+                approved: true,
+                report: "approved".into(),
+                revision: 1,
+                head: None,
+            }),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-1", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry");
+        tokio::join!(
+            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+        );
+        for _ in 0..2 {
+            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+                .await;
+        }
+        notify.assert_async().await;
+        // A subsequent blocker must not receive stale approval notifications.
+        let blocked = state
+            .apply(
+                "forge",
+                config::lifecycle::Event::Move {
+                    phase: config::lifecycle::Phase::Blocked,
+                    head: None,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(blocked),
+            )
+            .await;
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn sentinel_testing_approval_notifies_submit_without_human_review() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v2/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::Regex("status set submit".into()))
+            .with_status(200)
+            .with_body(r#"{"id":"notification"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Deploy", "body":"Deploy marketplace",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Testing,
+            revision: 1,
+            review_round: 1,
+            version: 3,
+            plan: "# Plan".into(),
+            head: Some("abc".into()),
+            verified_head: Some("abc".into()),
+            verification_task: Some("a2a-task".into()),
+            test_decision: Some(config::lifecycle::Decision {
+                pr_number: None,
+                round: 1,
+                actor: "sentinel".into(),
+                approved: true,
+                report: "approved".into(),
+                revision: 1,
+                head: Some("abc".into()),
+            }),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-1", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry");
+        for _ in 0..2 {
+            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+                .await;
+        }
+        notify.assert_async().await;
+        // A subsequent blocker must not receive stale approval notifications.
+        let blocked = state
+            .apply(
+                "forge",
+                config::lifecycle::Event::Move {
+                    phase: config::lifecycle::Phase::Blocked,
+                    head: None,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(blocked),
+            )
+            .await;
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn review_scheduler_and_recovery_share_one_plan_reviewer() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = server
+            .mock("GET", "/api/v2/organizations")
+            .with_status(200)
+            .with_body(r#"[{"id":"org","name":"default","is_default":true}]"#)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .match_body(mockito::Matcher::Regex("Review plan revision 1".into()))
+            .with_status(201)
+            .with_body(r#"{"id":"review-chat","workspace_id":"ws"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _existing = server
+            .mock("GET", "/api/v2/chats/review-chat")
+            .with_status(200)
+            .with_body(r#"{"id":"review-chat","workspace_id":"ws","status":"waiting"}"#)
+            .create_async()
+            .await;
+        let followup = server
+            .mock("POST", "/api/v2/chats/review-chat/messages")
+            .with_status(200)
+            .with_body(r#"{"id":"followup"}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Deploy", "body":"Deploy marketplace",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let mut reviewer = slot("sentinel-1", WorkerStatus::Idle);
+        reviewer.workspace_id = Some("ws".into());
+        store
+            .set(KEY_WORKER_SLOTS, json!({"sentinel-1":reviewer}))
+            .await;
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::PlanReady,
+            revision: 1,
+            review_round: 1,
+            version: 2,
+            plan: "# Plan".into(),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry");
+        for _ in 0..3 {
+            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+                .await;
+            node.create_chat_for_assignment(&store, "sentinel-1", &ticket)
+                .await;
+        }
+        for (phase, revision, round, head, pr) in [
+            (config::lifecycle::Phase::PlanReady, 2, 2, None, None),
+            (config::lifecycle::Phase::Testing, 2, 3, Some("abc"), None),
+            (
+                config::lifecycle::Phase::Submit,
+                2,
+                4,
+                Some("abc"),
+                Some(42),
+            ),
+        ] {
+            let next = config::lifecycle::Lifecycle {
+                phase,
+                revision,
+                review_round: round,
+                version: round + 2,
+                head: head.map(str::to_string),
+                pr_number: pr,
+                plan: "# Revised plan".into(),
+                ..Default::default()
+            };
+            store
+                .set(&full_ticket_key_flat("T-1", KEY_TICKET_STATUS), json!(next))
+                .await;
+            for _ in 0..2 {
+                node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+                    .await;
+            }
+        }
+        followup.assert_async().await;
+        create.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_chat_key("T-1", "planning_gate:1:plan:1"))
+                .await
+                .as_deref(),
+            Some("review-chat")
+        );
+        assert!(store
+            .get(&full_ticket_key("T-1", KEY_TICKET_CHAT, "sentinel"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn review_rejection_is_not_requeued_after_unrelated_version_changes() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v2/chats/forge-chat/messages")
+            .with_status(202)
+            .with_body(r#"{"queued":true,"queued_message":{"id":13,"content":[]}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        store
+            .set(
+                &full_ticket_key("T-1", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Deploy", "body":"Deploy marketplace", "priority":0,
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let node = NexusNode::new("missing", "missing");
+        for version in [3, 4, 5] {
+            let state = config::lifecycle::Lifecycle {
+                phase: config::lifecycle::Phase::PlanRejected,
+                revision: 1,
+                review_round: 1,
+                version,
+                feedback: Some("Missing deployment test".into()),
+                ..Default::default()
+            };
+            store
+                .set(
+                    &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                    json!(state),
+                )
+                .await;
+            tokio::join!(
+                node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+                node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+            );
+        }
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pending_instructions_prevent_review_chat_creation() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store
+            .set("workspace:ws:instructions_pending", json!(true))
+            .await;
+        let request = coder_client::types::CreateChatRequest {
+            organization_id: None,
+            workspace_id: "ws".into(),
+            model_config_id: None,
+            content: vec![],
+            labels: None,
+        };
+        let client = CoderClient::new(&server.url(), "test");
+        let err = NexusNode::continue_sentinel_review(&store, &client, "T-1", "round", &request)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("instructions are not ready"));
+        assert!(store
+            .get("workspace:ws:instructions_pending")
+            .await
+            .is_some());
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn review_session_survives_transport_failure_and_running_previous_round() {
+        for (status, body) in [
+            (500, "{}"),
+            (
+                200,
+                r#"{"id":"review-chat","workspace_id":"ws","status":"running"}"#,
+            ),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _get = server
+                .mock("GET", "/api/v2/chats/review-chat")
+                .with_status(status)
+                .with_body(body)
+                .create_async()
+                .await;
+            let create = server
+                .mock("POST", "/api/v2/chats")
+                .expect(0)
+                .create_async()
+                .await;
+            let send = server
+                .mock("POST", "/api/v2/chats/review-chat/messages")
+                .expect(0)
+                .create_async()
+                .await;
+            let store = SharedStore::new_in_memory();
+            store
+                .set("ticket:T-1:sentinel_session", json!("review-chat"))
+                .await;
+            let req = coder_client::types::CreateChatRequest {
+                organization_id: Some("org".into()),
+                workspace_id: "ws".into(),
+                model_config_id: None,
+                content: vec![],
+                labels: None,
+            };
+            assert!(NexusNode::continue_sentinel_review(
+                &store,
+                &CoderClient::new(&server.url(), "test"),
+                "T-1",
+                &review_chat_key("T-1", "testing:2:abc:3"),
+                &req
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                store
+                    .get_typed::<String>("ticket:T-1:sentinel_session")
+                    .await
+                    .as_deref(),
+                Some("review-chat")
+            );
+            create.assert_async().await;
+            send.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_recovery_does_not_create_a_second_sentinel_chat() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = server
+            .mock("GET", "/api/v2/organizations")
+            .with_status(200)
+            .with_body(r#"[{"id":"org","name":"default","is_default":true}]"#)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .with_status(201)
+            .with_body(r#"{"id":"duplicate","workspace_id":"ws"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Deploy", "body":"Deploy marketplace",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let mut reviewer = slot(
+            "sentinel-1",
+            WorkerStatus::Assigned {
+                ticket_id: ticket.id.clone(),
+                issue_url: None,
+            },
+        );
+        reviewer.workspace_id = Some("ws".into());
+        store
+            .set(KEY_WORKER_SLOTS, json!({"sentinel-1":reviewer}))
+            .await;
+        let review_key = review_chat_key("T-1", "planning_gate:1:plan:1");
+        store.set(&review_key, json!("review-chat")).await;
+        let dispatch_key = full_ticket_key("T-1", KEY_TICKET_DISPATCH, "sentinel");
+        let dispatch = json!({"review_type":"planning_gate","plan":"approved scope"});
+        store.set(&dispatch_key, dispatch.clone()).await;
+        let node = NexusNode::new("missing-persona", "missing-registry");
+        node.create_chat_for_assignment(&store, "sentinel-1", &ticket)
+            .await;
+        assert!(
+            store
+                .get(&full_ticket_key("T-1", KEY_TICKET_CHAT, "sentinel"))
+                .await
+                .is_none(),
+            "recovery must not create a generic SENTINEL assignment"
+        );
+        assert_eq!(
+            store.get_typed::<String>(&review_key).await.as_deref(),
+            Some("review-chat")
+        );
+        assert_eq!(store.get(&dispatch_key).await, Some(dispatch));
+        create.assert_async().await;
     }
 
     #[tokio::test]
@@ -5664,315 +6008,5 @@ mod tests {
             ))
             .await
             .is_some());
-    }
-
-    #[tokio::test]
-    async fn pr_review_rotation_retires_old_chat_and_releases_only_its_slot() {
-        let mut server = mockito::Server::new_async().await;
-        let get = server
-            .mock("GET", "/api/v2/chats/live-old-chat")
-            .with_status(200)
-            .with_body(r#"{"id":"live-old-chat","status":"waiting"}"#)
-            .expect(1)
-            .create_async()
-            .await;
-        let archive = server
-            .mock("PATCH", "/api/v2/chats/live-old-chat")
-            .match_body(mockito::Matcher::Json(json!({"archived":true})))
-            .with_status(200)
-            .expect(1)
-            .create_async()
-            .await;
-        let client = CoderClient::new(&server.url(), "test");
-        let store = SharedStore::new_in_memory();
-        let old = "pr_review:1:old-head:3";
-        store
-            .set("ticket:T-1:pr_review_namespace", json!(old))
-            .await;
-        for namespace in [old, REVIEW_TYPE_PR] {
-            store
-                .set(&review_chat_key("T-1", namespace), json!("live-old-chat"))
-                .await;
-            store
-                .set(&review_action_key("T-1", namespace), json!("pending"))
-                .await;
-            store
-                .set(
-                    &review_verdict_key("T-1", namespace),
-                    json!({"verdict":"reject"}),
-                )
-                .await;
-        }
-        let slots = HashMap::from([
-            (
-                "sentinel-1".to_string(),
-                slot(
-                    "sentinel-1",
-                    WorkerStatus::Assigned {
-                        ticket_id: "T-1".into(),
-                        issue_url: None,
-                    },
-                ),
-            ),
-            (
-                "sentinel-2".to_string(),
-                slot(
-                    "sentinel-2",
-                    WorkerStatus::Assigned {
-                        ticket_id: "T-2".into(),
-                        issue_url: None,
-                    },
-                ),
-            ),
-        ]);
-        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-        assert!(NexusNode::retire_stale_pr_reviews(
-            &store,
-            &client,
-            "T-1",
-            "pr_review:1:new-head:5"
-        )
-        .await
-        .unwrap());
-        get.assert_async().await;
-        archive.assert_async().await;
-        assert!(store.get(&review_chat_key("T-1", old)).await.is_none());
-        assert!(store.get(&review_action_key("T-1", old)).await.is_none());
-        assert!(store
-            .get(&review_verdict_key("T-1", REVIEW_TYPE_PR))
-            .await
-            .is_none());
-        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
-        assert!(matches!(slots["sentinel-1"].status, WorkerStatus::Idle));
-        assert!(matches!(
-            slots["sentinel-2"].status,
-            WorkerStatus::Assigned { .. }
-        ));
-        let current = "pr_review:1:new-head:5";
-        store
-            .set(&review_chat_key("T-1", current), json!("current-live-chat"))
-            .await;
-        store
-            .set(&review_action_key("T-1", current), json!("pending"))
-            .await;
-        assert!(
-            NexusNode::retire_stale_pr_reviews(&store, &client, "T-1", current)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .get_typed::<String>(&review_chat_key("T-1", current))
-                .await
-                .as_deref(),
-            Some("current-live-chat")
-        );
-        assert!(store
-            .get(&review_action_key("T-1", current))
-            .await
-            .is_some());
-    }
-
-    #[tokio::test]
-    async fn pr_rotation_keeps_binding_and_slot_when_old_chat_is_running() {
-        let mut server = mockito::Server::new_async().await;
-        let get = server
-            .mock("GET", "/api/v2/chats/old-chat")
-            .with_status(200)
-            .with_body(r#"{"id":"old-chat","status":"running"}"#)
-            .expect(2)
-            .create_async()
-            .await;
-        let interrupt = server
-            .mock("POST", "/api/v2/chats/old-chat/interrupt")
-            .with_status(200)
-            .create_async()
-            .await;
-        let store = SharedStore::new_in_memory();
-        let old = "pr_review:1:old:3";
-        store
-            .set("ticket:T-1:pr_review_namespace", json!(old))
-            .await;
-        store
-            .set(&review_chat_key("T-1", old), json!("old-chat"))
-            .await;
-        store
-            .set(
-                KEY_WORKER_SLOTS,
-                json!(HashMap::from([(
-                    "sentinel-1",
-                    slot(
-                        "sentinel-1",
-                        WorkerStatus::Assigned {
-                            ticket_id: "T-1".into(),
-                            issue_url: None
-                        }
-                    )
-                )])),
-            )
-            .await;
-        let client = CoderClient::new(&server.url(), "test");
-        assert!(
-            !NexusNode::retire_stale_pr_reviews(&store, &client, "T-1", "pr_review:1:new:5")
-                .await
-                .unwrap()
-        );
-        assert!(get.matched_async().await);
-        interrupt.assert_async().await;
-        assert_eq!(
-            store
-                .get_typed::<String>(&review_chat_key("T-1", old))
-                .await
-                .as_deref(),
-            Some("old-chat")
-        );
-        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
-        assert!(matches!(
-            slots["sentinel-1"].status,
-            WorkerStatus::Assigned { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn pr_rotation_retries_without_releasing_slot_on_coder_failures() {
-        for failure in ["lookup", "interrupt", "archive"] {
-            let mut server = mockito::Server::new_async().await;
-            let status = if failure == "interrupt" {
-                "running"
-            } else {
-                "waiting"
-            };
-            let get = server
-                .mock("GET", "/api/v2/chats/old-chat")
-                .with_status(if failure == "lookup" { 500 } else { 200 })
-                .with_body(json!({"id":"old-chat", "status":status}).to_string())
-                .create_async()
-                .await;
-            let interrupt = server
-                .mock("POST", "/api/v2/chats/old-chat/interrupt")
-                .with_status(500)
-                .expect(if failure == "interrupt" { 1 } else { 0 })
-                .create_async()
-                .await;
-            let archive = server
-                .mock("PATCH", "/api/v2/chats/old-chat")
-                .with_status(500)
-                .expect(if failure == "archive" { 1 } else { 0 })
-                .create_async()
-                .await;
-            let store = SharedStore::new_in_memory();
-            let old = "pr_review:1:old:3";
-            store
-                .set("ticket:T-1:pr_review_namespace", json!(old))
-                .await;
-            store
-                .set(&review_chat_key("T-1", old), json!("old-chat"))
-                .await;
-            store
-                .set(
-                    KEY_WORKER_SLOTS,
-                    json!(HashMap::from([(
-                        "sentinel-1",
-                        slot(
-                            "sentinel-1",
-                            WorkerStatus::Working {
-                                ticket_id: "T-1".into(),
-                                issue_url: None,
-                            }
-                        )
-                    )])),
-                )
-                .await;
-            let client = CoderClient::new(&server.url(), "test");
-            assert!(NexusNode::retire_stale_pr_reviews(
-                &store,
-                &client,
-                "T-1",
-                "pr_review:1:new:5"
-            )
-            .await
-            .is_err());
-            assert_eq!(
-                store
-                    .get_typed::<String>("ticket:T-1:pr_review_namespace")
-                    .await
-                    .as_deref(),
-                Some(old)
-            );
-            assert!(store.get(&review_chat_key("T-1", old)).await.is_some());
-            let slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
-            assert!(matches!(
-                slots["sentinel-1"].status,
-                WorkerStatus::Working { .. }
-            ));
-            get.assert_async().await;
-            interrupt.assert_async().await;
-            archive.assert_async().await;
-        }
-    }
-
-    #[test]
-    fn should_not_clear_orphaned_sentinel_when_review_decided() {
-        // A verdict already recorded → never treat as orphaned.
-        assert!(!NexusNode::should_clear_orphaned_sentinel(true, true));
-        // Rejected ticket: phase moved off review_ready (e.g. `building`) with or
-        // without a lingering review key → never clear/re-spawn.
-        assert!(!NexusNode::should_clear_orphaned_sentinel(false, false));
-        assert!(!NexusNode::should_clear_orphaned_sentinel(true, false));
-    }
-
-    #[test]
-    fn should_clear_orphaned_sentinel_only_when_review_ready_and_no_verdict() {
-        // The only legitimate clear: still in review_ready, no verdict, chat Waiting.
-        assert!(NexusNode::should_clear_orphaned_sentinel(false, true));
-    }
-
-    #[tokio::test]
-    async fn review_ready_with_existing_review_is_not_re_spawned() {
-        // Regression: a ticket that already has a sentinel review verdict must
-        // not have an orphaned-clear decision treat it as spawneable.
-        let store = SharedStore::new_in_memory();
-        let ticket_id = "T-100";
-        let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
-        store
-            .set(
-                &review_key,
-                json!({ "verdict": "reject", "report": "fix it" }),
-            )
-            .await;
-        let existing_review = store.get_typed::<Value>(&review_key).await.is_some();
-        assert!(!NexusNode::should_clear_orphaned_sentinel(
-            existing_review,
-            true
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejected_ticket_phase_guard_prevents_orphaned_clear() {
-        // Regression: a rejected ticket sits at `building` (phase != review_ready);
-        // even with no lingering review key the sentinel chat must not be re-spawned.
-        let store = SharedStore::new_in_memory();
-        let ticket_id = "T-101";
-        let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
-        store
-            .set(
-                &status_key,
-                json!({ "phase": "building", "role": "forge", "ts": 1u64 }),
-            )
-            .await;
-        let still_review_ready = store
-            .get_typed::<Value>(&status_key)
-            .await
-            .and_then(|v| {
-                v.get("phase")
-                    .and_then(|p| p.as_str())
-                    .map(|p| p == "review_ready")
-            })
-            .unwrap_or(false);
-        assert!(!NexusNode::should_clear_orphaned_sentinel(
-            false,
-            still_review_ready
-        ));
     }
 }

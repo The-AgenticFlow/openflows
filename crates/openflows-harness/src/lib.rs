@@ -5,6 +5,7 @@
 
 pub mod a2a_client;
 pub mod executor;
+pub mod sandbox;
 pub mod store;
 
 pub use a2a_client::A2AClient;

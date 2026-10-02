@@ -7,7 +7,7 @@
 //! - tasks/resubscribe (resume after disconnect)
 
 use super::routing::{A2ARelay, TaskState};
-use super::verify_handler::submit_verify_request;
+use super::verify_handler::{submit_verify_request, InvalidVerifyRequest};
 use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::Context;
 use axum::{
@@ -157,13 +157,21 @@ async fn handle_rpc(
         }
         .into_response(),
         Err(e) => {
-            warn!(error = %e, "RPC handler error");
+            warn!(error = %e, method = %req.method, request_id = %req.id, "RPC handler error");
             JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32603,
-                    message: "Internal error".into(),
+                    code: if e.is::<InvalidVerifyRequest>() {
+                        -32602
+                    } else {
+                        -32603
+                    },
+                    message: if let Some(invalid) = e.downcast_ref::<InvalidVerifyRequest>() {
+                        invalid.to_string()
+                    } else {
+                        "Internal error; inspect NEXUS relay logs for this request".into()
+                    },
                     data: None,
                 }),
                 id: req.id,
@@ -188,8 +196,8 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
         .and_then(|m| m.get("task"))
         .unwrap_or(params);
 
-    let req: VerifyRequest =
-        serde_json::from_value(raw.clone()).context("params are not a valid VerifyRequest")?;
+    let req: VerifyRequest = serde_json::from_value(raw.clone())
+        .map_err(|e| InvalidVerifyRequest(format!("Invalid VerifyRequest: {e}")))?;
 
     // AuthZ (v1): the Docker network boundary is the trust model for this
     // deployment.  pair_id is caller-supplied (self-declared) — a malicious
@@ -263,6 +271,10 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
         ));
     }
 
+    anyhow::ensure!(
+        params.get("sandbox_version").and_then(Value::as_u64) == Some(1),
+        "Executor upgrade required: isolated verification sandbox version 1 is mandatory"
+    );
     match state.relay.claim_next_task(pair_id).await? {
         Some(entry) => Ok(json!({
             "task_id": entry.task_id,
@@ -478,4 +490,85 @@ async fn handle_stream(
     });
 
     Sse::new(sse_stream).into_response()
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    async fn submit(argv: Value) -> Value {
+        let state = A2AServerState {
+            relay: Arc::new(A2ARelay::new(Arc::new(
+                pocketflow_core::SharedStore::new_in_memory(),
+            ))),
+        };
+        let response = handle_rpc(
+            State(state),
+            Json(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                method: "message/send".into(),
+                id: json!(1),
+                params: json!({"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                "argv":argv, "timeout_secs":30}),
+            }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_command_explains_policy_instead_of_internal_error() {
+        let body = submit(json!(["rm", "-rf", "/"])).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("policy denied"));
+    }
+
+    #[tokio::test]
+    async fn old_unsandboxed_executors_cannot_claim_tasks() {
+        let state = A2AServerState {
+            relay: Arc::new(A2ARelay::new(Arc::new(
+                pocketflow_core::SharedStore::new_in_memory(),
+            ))),
+        };
+        assert!(
+            handle_tasks_claim(&state, &json!({"role":"forge", "pair_id":"T-066"}))
+                .await
+                .is_err()
+        );
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1})
+        )
+        .await
+        .unwrap()
+        .is_null());
+    }
+
+    #[tokio::test]
+    async fn quoted_command_reports_tokenization_error() {
+        let body = submit(json!(["cargo test --workspace --all-features"])).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("single argument"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("-- cargo test"));
+    }
+
+    #[tokio::test]
+    async fn allowed_request_is_queued_without_registered_executor() {
+        let body = submit(json!(["cargo", "test"])).await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert_eq!(body["result"]["status"], "pending");
+        assert!(body["result"]["task_id"].is_string());
+    }
 }

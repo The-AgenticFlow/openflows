@@ -712,9 +712,17 @@ impl Node for VesselNode {
                 continue;
             }
             if state.phase != config::lifecycle::Phase::Submit {
+                info!(
+                    pr_number,
+                    ticket,
+                    phase = state.phase.as_str(),
+                    "Deferring PR: lifecycle is not in submit phase"
+                );
                 continue;
             }
             if state.head.as_deref() != Some(&pr_info.head_sha) {
+                info!(pr_number, ticket, expected_head = ?state.head, actual_head = %pr_info.head_sha,
+                    "Deferring PR: head changed; returning ticket to building");
                 if !state.merge_pending {
                     store
                         .transition(
@@ -731,6 +739,14 @@ impl Node for VesselNode {
                 continue;
             }
             if !state.merge_ready(&pr_info.head_sha) {
+                info!(
+                    pr_number,
+                    ticket,
+                    review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
+                    human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
+                    delivery_pending = state.pr_delivery.is_some(),
+                    "Deferring PR: waiting for lifecycle approvals or review delivery"
+                );
                 continue;
             }
 
@@ -750,12 +766,20 @@ impl Node for VesselNode {
             serde_json::from_value(exec_result["outcomes"].clone()).unwrap_or_default();
         let has_work = exec_result["has_work"].as_bool().unwrap_or(false);
 
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
         if !has_work {
+            if !pending_prs.is_empty() {
+                // Returning no_work routes immediately back to Nexus, which
+                // would send the unchanged queue straight back to Vessel.
+                info!(
+                    pending_count = pending_prs.len(),
+                    "Pending PRs deferred; pausing until the next controller poll"
+                );
+                return Ok(Action::new(PAUSE_SIGNAL));
+            }
             debug!("No PRs were processed");
             return Ok(Action::new("no_work"));
         }
-
-        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
 
         let mut any_success = false;
         let mut any_failure = false;
@@ -3424,6 +3448,43 @@ mod tests {
 
         let events = store.get_events_since(0).await;
         assert!(events.iter().any(|e| e.event_type == "merge_blocked"));
+    }
+
+    #[tokio::test]
+    async fn deferred_lifecycle_prs_pause_without_dropping_or_merging() {
+        for state in [
+            json!({"phase":"planning"}),
+            json!({"phase":"submit", "head":"head", "merge_pending":true}),
+            json!({"phase":"submit", "head":"old-head"}),
+            json!({"phase":"submit", "head":"head"}),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let pr = server.mock("GET", "/repos/org/repo/pulls/42")
+                .with_status(200)
+                .with_body(r#"{"number":42,"title":"Feature","body":null,"head":{"sha":"head","ref":"feature"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true,"merged":false}"#)
+                .expect(2).create_async().await;
+            let merge = server
+                .mock("PUT", "/repos/org/repo/pulls/42/merge")
+                .expect(0)
+                .create_async()
+                .await;
+            let mut node = VesselNode::new(VesselConfig::default());
+            node.client = github::GithubRestClient::with_api_base("test", server.url());
+            let store = SharedStore::new_in_memory();
+            *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+            let pending = json!([{"number":42,"ticket_id":"T-42"}]);
+            store.set(KEY_PENDING_PRS, pending.clone()).await;
+            store.set("ticket:T-42:status", state.clone()).await;
+            let result = node
+                .exec(json!({"owner":"org","repo":"repo","pending_prs":pending}))
+                .await
+                .unwrap();
+            let action = node.post(&store, result).await.unwrap();
+            assert_eq!(action.as_str(), PAUSE_SIGNAL, "state: {state}");
+            assert_eq!(store.get(KEY_PENDING_PRS).await.unwrap(), pending);
+            pr.assert_async().await;
+            merge.assert_async().await;
+        }
     }
 
     #[tokio::test]

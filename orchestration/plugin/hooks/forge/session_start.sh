@@ -95,11 +95,15 @@ cat <<'EOF'
   Plan rejection: plan_rejected -> planning -> revised plan -> plan_ready
   Test/PR/CI rejection: building -> testing -> submit
 
-  1. Read dispatch and status get. Start/revise in planning.
-  2. Write PLAN.md; run plan write --file PLAN.md; set plan_ready.
+  1. Read dispatch and status get. Use absolute file paths under /home/coder/workspace.
+     Verify the worker/ticket branch (e.g. forge-2/T-066), or the dispatched PR branch.
+     Start/revise in planning.
+  2. Write the plan at the current chat-specific path; run plan write --file <absolute-plan-path>; set plan_ready.
   3. Wait for SENTINEL approval, then set building and implement.
-  4. Commit ALL work, set testing, and run verify serve for A2A tests.
-  5. Wait for SENTINEL and HUMAN testing approval, then set submit.
+  4. Commit ALL work, set testing, and check the template-managed verify executor.
+     Inspect /home/coder/.local/state/openflows/verify.log for infrastructure failures.
+     Use blocked for those failures; do not cycle building/testing.
+  5. Wait for successful A2A verification and SENTINEL testing approval, then set submit.
   6. Open/update PR; run pr opened --pr <N> --branch <branch> --title <title>.
   7. Wait for SENTINEL and HUMAN PR approval and CI success.
 

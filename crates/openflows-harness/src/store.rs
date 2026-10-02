@@ -416,6 +416,7 @@ impl HarnessStore {
         expect_exit: Option<i32>,
         artifacts: Option<&str>,
     ) -> Result<()> {
+        a2a_protocol::validate_command_argv(&argv)?;
         let state = self.lifecycle.lifecycle(ticket).await?;
         anyhow::ensure!(
             state.phase == Phase::Testing && state.head.is_some(),
@@ -470,6 +471,16 @@ impl HarnessStore {
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 if result.timed_out {
                     bail!("verification timed out");
+                }
+                if result.exit_code.is_none() {
+                    let diagnostic_key = self.key(&format!("audit:a2a:{task_id}:stderr"));
+                    let diagnostic: Option<String> = self.client.get(&diagnostic_key).await?;
+                    bail!(
+                        "Verification executor failed: {}",
+                        diagnostic
+                            .as_deref()
+                            .unwrap_or("inspect FORGE verify.log for runtime failure")
+                    );
                 }
                 match request.expect.exit_code {
                     Some(expected) if result.exit_code != Some(expected) => {
@@ -633,6 +644,7 @@ impl HarnessStore {
                 &tenant,
                 &request.pair_id,
                 &request.argv,
+                &request.expect.artifacts,
                 request.timeout_secs,
                 &workspace_id,
                 Some(&task_id),
@@ -652,6 +664,16 @@ impl HarnessStore {
                     // synthetic failure so the task does not hang pending
                     // forever on the Sentinel side.
                     eprintln!("  [TASK FAILED] {}: {}", task_id, e);
+                    let stderr_key = self.key(&format!("audit:a2a:{}:stderr", task_id));
+                    self.client
+                        .set::<(), _, _>(
+                            &stderr_key,
+                            format!("[EXECUTOR_SETUP] {e:#}"),
+                            None,
+                            None,
+                            false,
+                        )
+                        .await?;
                     let fail = a2a_protocol::VerifyResult {
                         head_sha: None,
                         task_id: task_id.clone(),
@@ -659,7 +681,7 @@ impl HarnessStore {
                         timed_out: false,
                         duration_ms: 0,
                         stdout_ref: format!("audit:a2a:{}:stdout", task_id),
-                        stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                        stderr_ref: stderr_key,
                         artifacts: vec![],
                         executor: a2a_protocol::ExecutorInfo {
                             role: "forge".to_string(),
@@ -687,7 +709,7 @@ impl HarnessStore {
 
     /// Write a plan artifact (FORGE → Redis at `pair:{id}:plan`).
     ///
-    /// FORGE writes PLAN.md as a local file in its workspace, then calls this
+    /// FORGE writes its plan at the current chat-specific path, then calls this
     /// to persist it directly to Redis SharedStore so SENTINEL (and NEXUS)
     /// can read it without relying on Coder API filesystem access.
     pub async fn plan_write(&self, ticket: &str, file_path: &Path) -> Result<()> {

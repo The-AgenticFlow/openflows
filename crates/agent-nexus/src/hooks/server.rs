@@ -31,7 +31,7 @@ use axum::{
 use config::env::CoderHooksConfig;
 use pocketflow_core::{HookKickPublisher, SharedStore};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
 /// Shared state for the hook consumer.
@@ -152,8 +152,21 @@ async fn handle_hook(
         );
     }
 
-    // Persist a durable audit trail (best-effort; never fail the dispatch).
-    let _ = persist_audit(&state.store, &payload).await;
+    // Leave transport headroom inside Coder's dispatch deadline. Audit storage
+    // is best-effort and must never delay a policy decision or observation ACK.
+    let budget = Duration::from_millis(state.config.chat_hook_timeout_ms / 2);
+    let audit_store = state.store.clone();
+    let audit_payload = payload.clone();
+    tokio::spawn(async move {
+        match tokio::time::timeout(budget, persist_audit(&audit_store, &audit_payload)).await {
+            Ok(Ok(())) => {}
+            result => warn!(
+                dispatch_id = %audit_payload.meta.dispatch_id,
+                ?result,
+                "Hook audit did not complete; continuing without audit"
+            ),
+        }
+    });
 
     // Apply experimental hook-driven behaviour (slices A–D), then serialize the
     // decision into Coder's response schema.
@@ -162,8 +175,38 @@ async fn handle_hook(
     // and returned with a 200 so Coder reads it as a deliberate decision, NOT a
     // dispatch failure. Non-2xx is reserved for real dispatch failures (bad JWT /
     // malformed body) earlier in this handler, which fail closed.
-    let body = route_event(&state, &payload).await;
+    let body = bounded_hook_decision(&payload, budget, route_event(&state, &payload)).await;
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Cancel slow dependency work before Coder turns a dispatch timeout into a
+/// chat error. Mutable hooks still fail closed, using an ordinary policy denial
+/// (HTTP 200); observation hooks cannot authorize an action and may be skipped.
+async fn bounded_hook_decision(
+    payload: &HookPayload,
+    budget: Duration,
+    decision: impl Future<Output = Value>,
+) -> Value {
+    match tokio::time::timeout(budget, decision).await {
+        Ok(body) => body,
+        Err(_) => {
+            warn!(
+                dispatch_id = %payload.meta.dispatch_id,
+                event = ?payload.event,
+                budget_ms = budget.as_millis(),
+                "Hook processing deadline exceeded"
+            );
+            let fallback = if payload.event.is_mutable() {
+                HookDecision::deny(
+                    "Lifecycle policy check timed out. The action was not authorized. \
+                     Retry after checking current harness status; preserve the existing workspace and work.",
+                )
+            } else {
+                HookDecision::observe()
+            };
+            decision_to_response(&fallback)
+        }
+    }
 }
 
 /// Route a single verified dispatch to the experimental slice behaviour and
@@ -442,9 +485,10 @@ async fn prompt_submit_context(
         }
         // Role-specific reminder so the agent acts within its lifecycle.
         if role.eq_ignore_ascii_case("forge") && phase == "planning" && !st.plan_exists {
-            lines.push_str(
-                "\nReminder: you must run `/plan` and write PLAN.md before touching source.",
-            );
+            let plan_path = super::guard::chat_plan_path(chat_id);
+            lines.push_str(&format!(
+                "\nReminder: read source files and inspect the repository before writing a grounded plan at `{plan_path}`. Upload with `openflows-harness plan write --file {plan_path}`. Read-only inspection is allowed; source modifications require SENTINEL approval."
+            ));
         }
         return base.with_model_context(lines);
     }
@@ -524,6 +568,9 @@ fn decide_pre_tool_use(data: &Value) -> HookDecision {
     match tool_name.as_str() {
         "bash" | "sh" | "shell" | "execute" | "exec" => {
             let cmd = extract_command(tool_input).unwrap_or_default();
+            if super::guard::is_verification_request(&cmd) {
+                return HookDecision::observe();
+            }
             classify_command(&cmd)
         }
         "write" | "edit" | "create" | "patch" => {
@@ -852,6 +899,60 @@ mod tests {
 
     fn tool(tool_name: &str, input: Value) -> Value {
         json!({ "tool_name": tool_name, "tool_input": input })
+    }
+
+    #[tokio::test]
+    async fn slow_hooks_return_observation_or_retryable_denial() {
+        for event in [
+            HookEvent::SessionStart,
+            HookEvent::PostToolUse,
+            HookEvent::Stop,
+            HookEvent::PreCompact,
+            HookEvent::PostCompact,
+            HookEvent::PreToolUse,
+            HookEvent::UserPromptSubmit,
+        ] {
+            let payload: HookPayload = serde_json::from_value(json!({
+                "type": event, "meta": {}, "data": {}
+            }))
+            .unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                bounded_hook_decision(&payload, Duration::from_millis(1), std::future::pending()),
+            )
+            .await
+            .expect("a stalled dependency must not stall dispatch");
+            if event.is_mutable() {
+                assert_eq!(response["permission"]["decision"], "deny");
+                assert!(response["permission"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Retry"));
+            } else {
+                assert_eq!(response, json!({}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_hook_preserves_policy_and_context() {
+        let payload: HookPayload = serde_json::from_value(json!({
+            "type": "pre_tool_use", "meta": {}, "data": {}
+        }))
+        .unwrap();
+        for expected in [
+            json!({"permission": {"decision": "deny", "reason": "blocked"}}),
+            json!({"permission": {"decision": "allow", "input_override": {"command": "safe"}}}),
+            json!({"model_context": "guidance"}),
+        ] {
+            let response = bounded_hook_decision(
+                &payload,
+                Duration::from_secs(1),
+                std::future::ready(expected.clone()),
+            )
+            .await;
+            assert_eq!(response, expected);
+        }
     }
 
     #[test]

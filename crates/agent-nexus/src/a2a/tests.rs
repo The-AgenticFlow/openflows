@@ -96,12 +96,12 @@ mod tests {
     }
 
     #[test]
-    fn test_allowlist_validation_rejects_unknown_commands() {
+    fn test_policy_validation_rejects_prohibited_operations() {
         let invalid_commands = vec![
             vec!["rm", "-rf", "/"],
             vec!["cargo", "publish"],
-            vec!["sh", "-c", "evil"],
-            vec!["bash"],
+            vec!["redis-cli", "FLUSHALL"],
+            vec!["sudo", "id"],
             vec![],
         ];
 
@@ -205,6 +205,15 @@ mod tests {
         let entry = relay.get_task(&task_id).await.unwrap();
         assert!(entry.result.is_some());
         assert_eq!(entry.result.unwrap().task_id, task_id);
+
+        // Terminal tasks are retryable. This matters when an executor setup
+        // failure is fixed and Sentinel reruns the same verification request.
+        let retry_task_id = submit_verify_request(&relay, &req, "T-048").await.unwrap();
+        assert_ne!(task_id, retry_task_id);
+        assert_eq!(
+            relay.get_task_state(&retry_task_id).await,
+            Some(TaskState::Pending)
+        );
     }
 
     #[tokio::test]

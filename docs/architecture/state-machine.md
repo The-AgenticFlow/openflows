@@ -49,10 +49,19 @@ building. After committing all work it enters testing with a clean checkout and
 runs `openflows-harness verify serve` so SENTINEL can request verification:
 
 ```sh
-openflows-harness verify request --expect-exit 0 --argv cargo --argv test
+openflows-harness verify request --expect-exit 0 -- cargo test
 openflows-harness gate decide --phase testing --revision 1 --round 2 \
   --head <tested-commit> --verdict approve --report review.md
 ```
+
+Put harness options before `--` and the executable plus its arguments after it.
+Do not quote the entire command: `--argv "cargo test"` is one token, not the
+executable `cargo` followed by `test`. The legacy token form remains supported:
+`--argv cargo --argv test --argv=--workspace --argv=--all-features`.
+Tokenization errors should be corrected and retried. Unfamiliar project tooling is
+allowed in the mandatory disposable verification sandbox; explicit destructive
+and control-plane operations are denied. See [verification sandbox](verification-sandbox.md)
+for isolation, provisioning requirements and executor-first rollout order.
 
 The executor reports a clean checkout head before and after execution. Missing,
 changed, dirty or timed-out evidence cannot satisfy the gate. SENTINEL must

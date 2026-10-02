@@ -272,12 +272,11 @@ impl CoderBootstrapper {
         }
 
         // Fail fast if critical templates could not be pushed. This prevents
-        // bootstrap from silently succeeding when the member's credentials
-        // lack permission to modify templates.
+        // bootstrap from silently succeeding after CLI or Terraform errors.
         if !template_errors.is_empty() {
             anyhow::bail!(
                 "Failed to push {} template(s): {}. \
-                 Verify the session token has template management permissions.",
+                 See the template push diagnostics above for the underlying error.",
                 template_errors.len(),
                 template_errors.join(", ")
             );

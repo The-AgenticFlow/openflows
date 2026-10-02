@@ -206,7 +206,11 @@ impl Lifecycle {
             }
             Event::Move { phase, head } => {
                 ensure!(
-                    actor == "forge" || (actor == "vessel" && phase == Phase::Building),
+                    actor == "forge"
+                        || (actor == "vessel" && phase == Phase::Building)
+                        || (actor == "sentinel"
+                            && self.phase == Phase::Testing
+                            && phase == Phase::Blocked),
                     "Actor cannot move lifecycle"
                 );
                 if self.phase == phase {
@@ -234,9 +238,15 @@ impl Lifecycle {
                         head.as_ref().is_some_and(|s| !s.trim().is_empty())
                     }
                     (Phase::Testing, Phase::Submit) => {
-                        self.test_decision.as_ref().is_some_and(|d| d.approved)
-                            && self.test_human.as_ref().is_some_and(|d| d.approved)
-                            && self.verified_head == self.head
+                        // TODO(human-testing-review): require explicit human approval
+                        // here once that workflow is implemented. Do not fabricate it.
+                        self.test_decision.as_ref().is_some_and(|d| {
+                            d.approved
+                                && d.revision == self.revision
+                                && d.round == self.review_round
+                                && d.head == self.head
+                        }) && self.verified_head == self.head
+                            && self.verification_task.is_some()
                             && self.head.is_some()
                     }
                     (Phase::Testing | Phase::Submit, Phase::Building) => true,
@@ -334,6 +344,12 @@ impl Lifecycle {
                     (Phase::Submit, "sentinel") => next.pr_decision = Some(d),
                     (Phase::Submit, _) => next.pr_human = Some(d),
                     _ => unreachable!(),
+                }
+                if approved && phase == Phase::PlanReady {
+                    // The verdict and permission to build commit atomically.
+                    next.phase = Phase::Building;
+                    next.clear_work();
+                    next.feedback = None;
                 }
                 if !approved {
                     // A human veto supersedes a queued SENTINEL approval.
@@ -474,6 +490,118 @@ mod tests {
             },
         );
     }
+    #[test]
+    fn sentinel_can_block_testing_but_cannot_move_to_building() {
+        let state = Lifecycle {
+            phase: Phase::Testing,
+            head: Some("candidate".into()),
+            review_round: 3,
+            ..Lifecycle::default()
+        };
+        let blocked = state
+            .apply(
+                "sentinel",
+                Event::Move {
+                    phase: Phase::Blocked,
+                    head: None,
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(blocked.phase, Phase::Blocked);
+        assert_eq!(blocked.review_round, 3);
+        assert!(state
+            .apply(
+                "sentinel",
+                Event::Move {
+                    phase: Phase::Building,
+                    head: None
+                },
+                1
+            )
+            .is_err());
+        assert!(blocked
+            .apply(
+                "sentinel",
+                Event::Move {
+                    phase: Phase::Planning,
+                    head: None
+                },
+                1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn plan_approval_enters_building_in_the_same_transition() {
+        let mut state = Lifecycle {
+            phase: Phase::PlanReady,
+            plan: "# Plan".into(),
+            revision: 1,
+            review_round: 1,
+            ..Lifecycle::default()
+        };
+        decide(&mut state, "sentinel", Phase::PlanReady, true);
+        assert_eq!(state.phase, Phase::Building);
+        assert!(state.plan_decision.as_ref().unwrap().approved);
+        assert_eq!(state.version, 1);
+        let transition = state.history.last().unwrap();
+        assert_eq!(transition.actor, "sentinel");
+        assert_eq!(transition.from, Phase::PlanReady);
+        assert_eq!(transition.to, Phase::Building);
+        assert!(state
+            .apply(
+                "sentinel",
+                Event::Decide {
+                    phase: Phase::PlanReady,
+                    round: 1,
+                    revision: 1,
+                    approved: true,
+                    report: "duplicate".into(),
+                    head: None,
+                },
+                2
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn plan_approval_cannot_override_a_later_blocker() {
+        let state = Lifecycle {
+            phase: Phase::PlanReady,
+            revision: 1,
+            review_round: 1,
+            plan: "# Plan".into(),
+            ..Default::default()
+        };
+        let blocked = state
+            .apply(
+                "forge",
+                Event::Move {
+                    phase: Phase::Blocked,
+                    head: None,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(blocked
+            .apply(
+                "sentinel",
+                Event::Decide {
+                    phase: Phase::PlanReady,
+                    revision: 1,
+                    round: 1,
+                    approved: true,
+                    report: "late review".into(),
+                    head: None,
+                },
+                2
+            )
+            .is_err());
+        assert_eq!(blocked.phase, Phase::Blocked);
+        assert!(blocked.plan_decision.is_none());
+    }
+
     fn building() -> Lifecycle {
         let mut s = Lifecycle::default();
         run(
@@ -503,7 +631,7 @@ mod tests {
         s
     }
     #[test]
-    fn full_flow_requires_testing_and_both_human_gates() {
+    fn full_flow_requires_a2a_sentinel_testing_and_human_pr_review() {
         let mut s = building();
         assert!(s
             .apply(
@@ -545,18 +673,43 @@ mod tests {
                 task: "task-1".into(),
             },
         );
-        decide(&mut s, "sentinel", Phase::Testing, true);
-        assert!(s
-            .apply(
+        assert!(
+            s.apply(
                 "forge",
                 Event::Move {
                     phase: Phase::Submit,
-                    head: None
+                    head: None,
                 },
                 1
             )
-            .is_err());
-        decide(&mut s, "human", Phase::Testing, true);
+            .is_err(),
+            "A2A success without SENTINEL approval is insufficient"
+        );
+        decide(&mut s, "sentinel", Phase::Testing, true);
+        assert!(s.test_human.is_none(), "human testing review is deferred");
+        for mismatch in ["revision", "round", "head", "task"] {
+            let mut stale = s.clone();
+            match mismatch {
+                "revision" => stale.test_decision.as_mut().unwrap().revision += 1,
+                "round" => stale.test_decision.as_mut().unwrap().round += 1,
+                "head" => stale.verified_head = Some("different-head".into()),
+                "task" => stale.verification_task = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                stale
+                    .apply(
+                        "forge",
+                        Event::Move {
+                            phase: Phase::Submit,
+                            head: None,
+                        },
+                        1
+                    )
+                    .is_err(),
+                "must reject missing or stale {mismatch} evidence"
+            );
+        }
         run(
             &mut s,
             "forge",

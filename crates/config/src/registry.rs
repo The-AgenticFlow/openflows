@@ -164,26 +164,17 @@ pub fn default_permission_mode_for_role(role: &str) -> &'static str {
     }
 }
 
-/// A single agent entry from registry.json (schema v2 — Coder-only).
-///
-/// v1 fields (cli, instances, model_backend, routing_key, github_token_env,
-/// allowed_domains, coder_module) are kept as serde-optional for backward
-/// compatibility with existing nexus code. Phase 5 will remove their usage.
+/// Runtime role configuration. Legacy active/instances names are input aliases,
+/// not separate switches. Chat models and plan mode are owned by Coder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryEntry {
     pub id: String,
     /// v2: Whether this role is enabled.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "active")]
     pub enabled: bool,
-    /// v2: Coder model hint (matched against the org-scoped
-    /// GET /api/v2/organizations/{organization}/chats/models).
-    #[serde(default)]
-    pub model: Option<String>,
-    /// v2: Create the chat in plan mode (review-only roles).
-    #[serde(default)]
-    pub plan_mode: bool,
     /// v2: Maximum parallel worker instances for this role.
-    #[serde(default = "default_one_instance")]
+    #[serde(default = "default_one_instance", alias = "instances")]
     pub max_instances: u32,
     /// v2: Skill names to provision into the workspace's .agents/skills/.
     #[serde(default)]
@@ -192,13 +183,9 @@ pub struct RegistryEntry {
     #[serde(default)]
     pub mcp: serde_json::Value,
 
-    // ── v1 fields (deprecated — Phase 5 removes usage) ──────────────────
+    // Optional CLI/identity compatibility settings used by existing consumers.
     #[serde(default)]
     pub cli: String,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub instances: u32,
     #[serde(default)]
     pub model_backend: Option<String>,
     #[serde(default)]
@@ -221,6 +208,7 @@ fn default_one_instance() -> u32 {
 
 /// The full registry — a thin wrapper around the team list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registry {
     /// Default CLI backend for agents without explicit cli field
     #[serde(default = "default_cli")]
@@ -311,23 +299,9 @@ impl RegistryEntry {
         }
     }
 
-    /// Effective parallel instance count for this agent.
-    ///
-    /// v2 registries declare `max_instances`; v1 registries declared
-    /// `instances`. The live `orchestration/agent/registry.json` is v2 and
-    /// omits `instances` (which deserializes to `0`), so deriving slot/identity
-    /// counts from `instances` alone silently provisioned **zero** forge
-    /// workers — and the old hard-coded `"forge-1"` assignment operated on a
-    /// phantom worker with no `WorkerSlot`, no workspace, and no chat. Falling
-    /// back to `max_instances` when `instances` is unset restores the intended
-    /// fan-out while staying backward-compatible with v1 entries that set
-    /// `instances` (which remain authoritative when non-zero).
+    /// Canonical worker count, including legacy input normalized at load time.
     pub fn effective_instances(&self) -> u32 {
-        if self.instances > 0 {
-            self.instances
-        } else {
-            self.max_instances
-        }
+        self.max_instances
     }
 }
 
@@ -384,12 +358,12 @@ impl Registry {
 
     /// Active agents only.
     pub fn active_agents(&self) -> impl Iterator<Item = &RegistryEntry> {
-        self.team.iter().filter(|e| e.active)
+        self.team.iter().filter(|e| e.enabled)
     }
 
     /// Look up a specific agent by id. Returns None if not found or inactive.
     pub fn get(&self, id: &str) -> Option<&RegistryEntry> {
-        self.team.iter().find(|e| e.id == id && e.active)
+        self.team.iter().find(|e| e.id == id && e.enabled)
     }
 
     /// Normalize agent ID by stripping instance suffix (e.g., "forge-1" -> "forge").
@@ -423,12 +397,10 @@ impl Registry {
     }
 
     /// All worker slot names including non-forge agents like "lore".
-    /// Returns slots for all active agents with instances > 0.
+    /// Returns slots for all enabled agents with max_instances > 0.
     pub fn all_worker_slots(&self) -> Vec<String> {
         let mut slots = Vec::new();
         for entry in self.active_agents() {
-            // Use effective_instances() so v2 registries that declare only
-            // max_instances still produce slots (instances is 0 when absent).
             let count = entry.effective_instances();
             if count > 0 {
                 if entry.id == "forge" {
@@ -447,14 +419,13 @@ impl Registry {
         slots
     }
 
-    /// Set forge/sentinel max_instances (and v1 instances) to `pairs` each,
+    /// Set forge/sentinel max_instances to `pairs` each,
     /// preserving all other entries, enforcing the FORGE-SENTINEL pair invariant.
     pub fn with_team_fleet(&self, pairs: u32) -> Registry {
         let mut clone = self.clone();
         for entry in clone.team.iter_mut() {
             if entry.id == "forge" || entry.id == "sentinel" {
                 entry.max_instances = pairs;
-                entry.instances = pairs;
             }
         }
         clone
@@ -498,7 +469,7 @@ impl Registry {
                         base_id
                     };
                     anyhow::bail!(
-                        "Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow",
+                        "Agent '{}' exists but is inactive — set enabled: true in registry.json or remove agent from flow",
                         display_id
                     );
                 } else {
@@ -527,6 +498,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn canonical_registry_controls_enabled_roles_and_slots() {
+        let reg: Registry = serde_json::from_str(
+            r#"{"team":[
+            {"id":"forge","enabled":true,"max_instances":2},
+            {"id":"lore","enabled":false,"max_instances":1}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(reg.forge_slots(), vec!["forge-1", "forge-2"]);
+        assert!(reg.get("lore").is_none());
+    }
+
+    #[test]
+    fn legacy_names_serialize_as_canonical_fields() {
+        let reg: Registry =
+            serde_json::from_str(r#"{"team":[{"id":"forge","active":true,"instances":2}]}"#)
+                .unwrap();
+        let json = serde_json::to_value(reg).unwrap();
+        let entry = &json["team"][0];
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["max_instances"], 2);
+        assert!(entry.get("active").is_none());
+        assert!(entry.get("instances").is_none());
+    }
+
+    #[test]
+    fn checked_in_registry_loads() {
+        let reg: Registry =
+            serde_json::from_str(include_str!("../../../orchestration/agent/registry.json"))
+                .unwrap();
+        assert_eq!(reg.forge_slots(), vec!["forge-1", "forge-2"]);
+        assert!(reg.get("lore").is_none());
+    }
+
+    #[test]
+    fn registry_rejects_conflicting_and_unsupported_settings() {
+        for fields in [
+            r#""enabled":true,"active":false"#,
+            r#""max_instances":2,"instances":1"#,
+            r#""model":"ignored-model""#,
+            r#""plan_mode":true"#,
+            r#""max_instnaces":2"#,
+        ] {
+            let input = format!(r#"{{"team":[{{"id":"forge",{fields}}}]}}"#);
+            assert!(serde_json::from_str::<Registry>(&input).is_err(), "{input}");
+        }
+    }
 
     fn sample_registry_json() -> &'static str {
         r#"{
@@ -573,7 +593,7 @@ mod tests {
         let reg = Registry::load(f.path()).unwrap();
         let active: Vec<_> = reg.active_agents().collect();
         assert_eq!(active.len(), 4); // lore is inactive
-        assert!(active.iter().all(|e| e.active));
+        assert!(active.iter().all(|e| e.enabled));
     }
 
     #[test]
@@ -595,7 +615,7 @@ mod tests {
         let f = write_temp(sample_registry_json());
         let reg = Registry::load(f.path()).unwrap();
         let nexus = reg.get("nexus").unwrap();
-        assert_eq!(nexus.instances, 1);
+        assert_eq!(nexus.max_instances, 1);
     }
 
     #[test]
@@ -776,13 +796,13 @@ mod tests {
     }
 
     fn fleet_sample() -> Registry {
-        // Mirrors the live v2 registry shape: max_instances only (instances=0).
+        // Worker counts use the canonical max_instances field.
         let json = r#"{
           "default_cli": "claude",
           "team": [
             { "id": "nexus",    "active": true, "max_instances": 1 },
             { "id": "forge",    "active": true, "max_instances": 2, "skills": ["x"] },
-            { "id": "sentinel", "active": true, "max_instances": 1, "model": "m" },
+            { "id": "sentinel", "active": true, "max_instances": 1, "skills": ["review"] },
             { "id": "vessel",   "active": true, "max_instances": 1 }
           ]
         }"#;
@@ -801,7 +821,7 @@ mod tests {
         assert_eq!(fleet.get("vessel").unwrap().effective_instances(), 1);
         // Unrelated fields preserved verbatim.
         assert_eq!(fleet.get("forge").unwrap().skills, vec!["x"]);
-        assert_eq!(fleet.get("sentinel").unwrap().model.as_deref(), Some("m"));
+        assert_eq!(fleet.get("sentinel").unwrap().skills, vec!["review"]);
         // Original is untouched (immutable copy).
         assert_eq!(reg.get("forge").unwrap().effective_instances(), 2);
     }

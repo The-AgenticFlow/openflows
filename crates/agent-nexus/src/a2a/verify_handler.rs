@@ -8,6 +8,17 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::warn;
 
+/// Caller-correctable verification input error, safe to return over JSON-RPC.
+#[derive(Debug)]
+pub struct InvalidVerifyRequest(pub String);
+
+impl std::fmt::Display for InvalidVerifyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InvalidVerifyRequest {}
+
 /// Validate and submit a verify request. Returns task_id on success.
 /// On validation failure, logs to `audit:a2a:rejected` and returns error.
 pub async fn submit_verify_request(
@@ -19,7 +30,7 @@ pub async fn submit_verify_request(
     if let Err(e) = relay.validate_verify_request(req, requester_pair_id) {
         // Log rejection to audit trail
         log_rejected_request(relay, req, &e.to_string()).await;
-        return Err(e);
+        return Err(InvalidVerifyRequest(e.to_string()).into());
     }
 
     // Idempotency: check if task already exists

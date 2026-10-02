@@ -10,7 +10,7 @@ plan revision, review round, candidate head, decisions, feedback and history.
 
 | Phase | Entry / exit |
 |---|---|
-| planning | Write PLAN.md; upload with `plan write --file PLAN.md` |
+| planning | Write the plan at the current chat-specific path; upload with `plan write --file <absolute-plan-path>` |
 | plan_ready | Submit the uploaded plan; wait for SENTINEL approval |
 | plan_rejected | Read feedback, set planning, revise/upload and resubmit |
 | building | Implement the approved plan, commit changes |

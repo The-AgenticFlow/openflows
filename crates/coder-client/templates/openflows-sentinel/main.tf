@@ -242,6 +242,8 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"

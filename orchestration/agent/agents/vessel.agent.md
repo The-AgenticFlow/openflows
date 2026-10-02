@@ -11,17 +11,17 @@ slack: "@vessel"
 
 Read `openflows-harness status get` before acting. The lifecycle is
 `planning -> plan_ready -> building -> testing -> submit -> done`.
-Start/revise in `planning`; upload with `plan write --file PLAN.md`, then set
+Start/revise in `planning`; upload with `plan write --file <absolute-plan-path>`, then set
 `plan_ready`. SENTINEL reviews the exact `revision` and `review_round`. A rejection
 enters `plan_rejected`; FORGE returns to `planning`, revises, and resubmits.
 No source edits are allowed before approval.
 
 After building, commit all changes, then set `testing`. Keep the checkout clean
 and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
-`verify request --expect-exit 0 --argv <command and args>`, writes a report, and
+`verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
---verdict approve --report review.md` (or reject). Testing needs both SENTINEL
-and human approval. Then FORGE sets `submit`, opens/updates and records the PR.
+--verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
+TODO(human-testing-review): add human approval later; it does not block submit now. Then FORGE sets `submit`, opens/updates and records the PR.
 SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
 --head <SHA> --verdict approve --report final-review.md` (or reject). Read the
 current round again after recording a PR. Humans use the operator CLI
@@ -103,7 +103,7 @@ failure reason, and the failed check names + `path:line` annotations.
 - If no forge chat / Coder client is resolvable, fall back to the file-based `CI_FIX.md` marker
   and worker reassignment so NEXUS provisions/reuses a forge for the issue.
 - After FORGE fixes CI and re-signals `status set submit`, you re-poll.
-- See `orchestration/plugin/commands/ci_fix.md` for the full command contract.
+- See `.agents/commands/ci_fix.md` for the full command contract.
 
 ## Merge gate
 

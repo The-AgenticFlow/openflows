@@ -46,11 +46,50 @@ Builds the OpenFlows controller and makes it available to Coder workspaces:
 ```
 
 This:
-1. Builds the `openflows` release binary (if not already built)
-2. Copies it to `.dev-binaries/` for Docker mounting
-3. Hot-deploys into any running Coder workspace (optional)
+1. Incrementally builds `openflows` and `openflows-harness` for Linux amd64.
+2. Verifies both artifacts are x86-64 ELF binaries and copies them to `.dev-binaries/`.
+3. Hot-deploys the controller into a running Nexus workspace, if present.
 
 **Note:** `./scripts/prod.sh bootstrap` runs this automatically. Use manually if you rebuild the binary and want to hot-deploy into a running workspace.
+
+### macOS hosts (Intel and Apple Silicon)
+
+Run the same `./scripts/prod.sh bootstrap` command on macOS. Install Rust via
+rustup and the Xcode command-line tools (`xcode-select --install`), and start
+Docker Desktop with Linux containers enabled. Allow Docker access to the repo's
+filesystem location. Apple Silicon hosts need amd64 container emulation enabled
+for the current Coder workspace templates.
+
+Two binary formats are intentional:
+
+| Consumer | Artifact | Format |
+|---|---|---|
+| Host bootstrap/tenant/doctor CLI | `target/release/openflows` | Native macOS Mach-O (native ELF on Linux) |
+| Coder workspace controller and harness | `target/x86_64-unknown-linux-musl/release/` → `.dev-binaries/` | Linux amd64 ELF |
+
+Do not run the `.dev-binaries/` executables on macOS or copy the native Mac CLI
+into a Linux workspace. The workspace templates explicitly select `linux/amd64`
+to match their Coder agents, including on Apple Silicon hosts.
+
+`dev-sync.sh` selects an installed Zig toolchain, a musl GCC toolchain, or Docker.
+The Docker fallback uses `messense/rust-musl-cross:x86_64-musl` and runs
+`cargo build` inside it. The image tag is **not** the Rust target triple
+`x86_64-unknown-linux-musl`; confusing them causes Docker's “not found” error.
+The builder image supports Intel and ARM hosts; its compiler still targets amd64.
+Docker builds do not require a Linux Rust target on the Mac; the image supplies it.
+The `.docker-cargo/` cache is separate from the host Cargo cache and ignored by Git.
+
+The first cross-build downloads an image and dependencies and can take time.
+Subsequent builds reuse their caches. A native build still needs Rust installed
+on the host. The helpers resolve their output paths relative to the repository,
+so they can also be invoked from another working directory.
+
+Check script behavior without provisioning infrastructure:
+
+```sh
+python3 -m unittest discover -s tests/scripts -v
+bash -n scripts/dev-sync.sh scripts/prod.sh
+```
 
 ### `reset-controller-state.sh` — Clean Redis
 

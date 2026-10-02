@@ -7,16 +7,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use coder_client::{ChatStatus, CoderClient};
+use config::lifecycle::{Decision, Lifecycle, Phase};
 use config::state::{
-    full_ticket_key, full_ticket_key_flat, pr_review_namespace, review_action_key, review_chat_key,
-    KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_STATUS,
-    KEY_WORKER_SLOTS, REVIEW_TYPE_PLANNING_GATE,
+    full_ticket_key, full_ticket_key_flat, pr_review_namespace, review_action_key, KEY_PENDING_PRS,
+    KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
 };
-use config::{Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus};
+use config::{Envconfig, Ticket, TicketStatus};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 const ACTION_REVIEW_APPROVE: &str = "review_approve";
@@ -71,63 +70,54 @@ impl SentinelNode {
         }
     }
 
-    async fn send_rejection_follow_up(
-        client: &CoderClient,
-        chat_id: &str,
-        ticket_id: &str,
-        report: &str,
+    fn monitor_namespace(state: &Lifecycle) -> Option<String> {
+        match state.phase {
+            Phase::PlanReady | Phase::Testing => Some(format!(
+                "{}:{}:{}:{}",
+                if state.phase == Phase::Testing {
+                    "testing"
+                } else {
+                    "planning_gate"
+                },
+                state.revision,
+                state.head.as_deref().unwrap_or("plan"),
+                state.review_round,
+            )),
+            Phase::Submit => Some(pr_review_namespace(
+                state.revision,
+                state.head.as_deref().unwrap_or(""),
+                state.review_round,
+            )),
+            _ => None,
+        }
+    }
+
+    async fn record_review_delivery(
+        store: &SharedStore,
+        ticket: &str,
+        state: &Lifecycle,
+        decision: &Decision,
     ) -> Result<()> {
-        let follow_up = format!(
-            "Your review was REJECTED. Please address the following issues and re-submit:\n\n{}",
-            report
-        );
-        client
-            .send_chat_message(
-                chat_id,
-                vec![coder_client::types::ChatInputPart::text(&follow_up)],
+        store
+            .transition(
+                ticket,
+                state.version,
+                "sentinel",
+                config::lifecycle::Event::ReviewDelivered {
+                    round: decision.round,
+                },
             )
             .await?;
-        info!(chat_id, ticket_id, "Sent rejection follow-up to forge chat");
-        Ok(())
-    }
-
-    /// Reduce a worker id (`forge-1`) to its role name (`forge`), used for
-    /// looking up chat bindings stored under the role name. Matches
-    /// `ForgePairNode::worker_role` / `NexusNode::worker_role`.
-    fn worker_role(worker_id: &str) -> &str {
-        worker_id
-            .rsplit_once('-')
-            .map(|(base, _)| base)
-            .unwrap_or(worker_id)
-    }
-
-    async fn release_sentinel_slots_for_ticket(store: &SharedStore, ticket_id: &str) -> Result<()> {
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let mut changed = false;
-
-        for slot in slots.values_mut() {
-            if Self::worker_role(&slot.id) != "sentinel" {
-                continue;
-            }
-            let assigned_ticket = match &slot.status {
-                WorkerStatus::Assigned { ticket_id, .. }
-                | WorkerStatus::Working { ticket_id, .. }
-                | WorkerStatus::Done { ticket_id, .. }
-                | WorkerStatus::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
-                WorkerStatus::Idle => None,
-            };
-            if assigned_ticket == Some(ticket_id) {
-                slot.status = WorkerStatus::Idle;
-                changed = true;
-            }
-        }
-
-        if changed {
-            store
-                .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
-                .await;
-        }
+        let namespace = pr_review_namespace(
+            decision.revision,
+            decision.head.as_deref().unwrap_or(""),
+            decision.round,
+        );
+        // Preserve the session, worker assignment, and round aliases until Nexus
+        // closes the ticket. Delivery only completes this round's action.
+        store
+            .set(&review_action_key(ticket, &namespace), json!("completed"))
+            .await;
         Ok(())
     }
 
@@ -297,8 +287,6 @@ impl Node for SentinelNode {
 
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
-        let _slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
         let mut reviewable = Vec::new();
         let planning_gate_pending: Vec<Value> = Vec::new();
@@ -316,31 +304,13 @@ impl Node for SentinelNode {
                 reviewable.push(json!({"ticket_id":ticket.id,"worker_id":worker_id,"verdict":if review.approved {"approve"} else {"reject"},"report":review.report,"revision":review.revision,"round":review.round,"head":review.head,"pr_number":review.pr_number,"review_type":"pr_review"}));
             }
 
-            let status_key = full_ticket_key_flat(&ticket.id, KEY_TICKET_STATUS);
-            let status_json: Option<Value> = store.get_typed(&status_key).await;
-            let phase = status_json
-                .as_ref()
-                .and_then(|v| v.get("phase"))
-                .and_then(|v| v.as_str());
-            // Monitor the review-type-scoped SENTINEL chat for the current phase so
-            // a planning-gate chat and a PR-review chat are tracked independently.
-            let pr_namespace = pr_review_namespace(
-                lifecycle.revision,
-                lifecycle.head.as_deref().unwrap_or(""),
-                lifecycle.review_round,
-            );
-            let (monitor_chat_key, monitor_action_key) = if phase == Some("planning") {
-                (
-                    review_chat_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE),
-                    review_action_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE),
-                )
-            } else {
-                (
-                    review_chat_key(&ticket.id, &pr_namespace),
-                    review_action_key(&ticket.id, &pr_namespace),
-                )
+            let Some(namespace) = Self::monitor_namespace(&lifecycle) else {
+                continue;
             };
-            let chat_id: Option<String> = store.get_typed(&monitor_chat_key).await;
+            let monitor_action_key = review_action_key(&ticket.id, &namespace);
+            let chat_id: Option<String> = store
+                .get_typed(&full_ticket_key_flat(&ticket.id, "sentinel_session"))
+                .await;
             if let Some(chat_id) = chat_id {
                 if let Some(client) = Self::coder_client_from_store(store).await {
                     if let Ok(chat) = client.get_chat(&chat_id).await {
@@ -460,7 +430,6 @@ impl Node for SentinelNode {
             .unwrap_or_default();
         let mut any_approved = false;
         let mut any_rejected = false;
-        let client = Self::coder_client_from_store(store).await;
         for verdict in verdicts {
             let Some(ticket) = verdict["ticket_id"].as_str() else {
                 continue;
@@ -473,28 +442,20 @@ impl Node for SentinelNode {
             // Deliver feedback independently of GitHub availability.
             if !decision.approved {
                 Self::remove_rejected_pr_from_pending(store, ticket, decision.pr_number).await;
-                let marker = format!("ticket:{ticket}:review_feedback:{}", decision.round);
-                if store.get(&marker).await.is_none() {
-                    if let (Some(client), Some(chat)) = (
-                        &client,
-                        store
-                            .get_typed::<String>(&full_ticket_key(ticket, KEY_TICKET_CHAT, "forge"))
-                            .await,
-                    ) {
-                        if Self::send_rejection_follow_up(client, &chat, ticket, &decision.report)
-                            .await
-                            .is_ok()
-                        {
-                            store.set(&marker, json!(true)).await;
-                        }
-                    } else {
-                        store
-                            .set(
-                                &full_ticket_key(ticket, KEY_TICKET_CHAT_ACTION, "forge"),
-                                json!("resume_needed"),
-                            )
-                            .await;
-                    }
+                // NEXUS is the sole feedback sender, using the durable
+                // lifecycle decision and one revision/round notification key.
+                // Sending here as well would duplicate the controller message.
+                if store
+                    .get(&full_ticket_key(ticket, KEY_TICKET_CHAT, "forge"))
+                    .await
+                    .is_none()
+                {
+                    store
+                        .set(
+                            &full_ticket_key(ticket, KEY_TICKET_CHAT_ACTION, "forge"),
+                            json!("resume_needed"),
+                        )
+                        .await;
                 }
                 any_rejected = true;
             }
@@ -521,36 +482,7 @@ impl Node for SentinelNode {
             {
                 continue;
             }
-            store
-                .transition(
-                    ticket,
-                    state.version,
-                    "sentinel",
-                    config::lifecycle::Event::ReviewDelivered {
-                        round: decision.round,
-                    },
-                )
-                .await?;
-            // Delivery belongs to its review round, never a newer review chat.
-            let current = store.lifecycle(ticket).await?;
-            if current.review_round == decision.round {
-                Self::release_sentinel_slots_for_ticket(store, ticket).await?;
-            }
-            let namespace = pr_review_namespace(
-                decision.revision,
-                decision.head.as_deref().unwrap_or(""),
-                decision.round,
-            );
-            let chat_key = review_chat_key(ticket, &namespace);
-            if let (Some(client), Some(chat)) =
-                (&client, store.get_typed::<String>(&chat_key).await)
-            {
-                let _ = client.archive_chat(&chat).await;
-            }
-            store.del(&chat_key).await;
-            store
-                .set(&review_action_key(ticket, &namespace), json!("completed"))
-                .await;
+            Self::record_review_delivery(store, ticket, &state, &decision).await?;
             any_approved |= decision.approved;
         }
         Ok(Action::new(if any_approved {
@@ -566,17 +498,95 @@ impl Node for SentinelNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::state::{review_chat_key, KEY_TICKET_STATUS, KEY_WORKER_SLOTS};
 
     fn node() -> SentinelNode {
         SentinelNode::new("sentinel.agent.md")
     }
 
     #[test]
-    fn worker_role_strips_numeric_suffix() {
-        assert_eq!(SentinelNode::worker_role("forge-1"), "forge");
-        assert_eq!(SentinelNode::worker_role("forge-42"), "forge");
-        assert_eq!(SentinelNode::worker_role("sentinel"), "sentinel");
-        assert_eq!(SentinelNode::worker_role("vessel-1"), "vessel");
+    fn monitoring_uses_current_review_phase_revision_head_and_round() {
+        use config::lifecycle::{Lifecycle, Phase};
+        for (phase, head, expected) in [
+            (Phase::PlanReady, None, Some("planning_gate:2:plan:4")),
+            (Phase::PlanReady, Some("abc"), Some("planning_gate:2:abc:4")),
+            (Phase::Testing, Some("abc"), Some("testing:2:abc:4")),
+            (Phase::Submit, Some("abc"), Some("pr_review:2:abc:4")),
+            (Phase::Planning, None, None),
+            (Phase::Building, Some("abc"), None),
+            (Phase::Done, Some("abc"), None),
+        ] {
+            let state = Lifecycle {
+                phase,
+                revision: 2,
+                review_round: 4,
+                head: head.map(str::to_owned),
+                ..Default::default()
+            };
+            assert_eq!(SentinelNode::monitor_namespace(&state).as_deref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_review_preserves_session_slot_and_round_evidence() {
+        use config::lifecycle::{Decision, Lifecycle, Phase};
+        let store = SharedStore::new_in_memory();
+        let decision = Decision {
+            pr_number: Some(42),
+            round: 3,
+            actor: "sentinel".into(),
+            approved: false,
+            report: "Fix tests".into(),
+            revision: 1,
+            head: Some("abc".into()),
+        };
+        let state = Lifecycle {
+            phase: Phase::Building,
+            version: 8,
+            review_round: 3,
+            revision: 1,
+            pr_number: Some(42),
+            pr_delivery: Some(decision.clone()),
+            ..Default::default()
+        };
+        store
+            .set("ticket:T-42:status", serde_json::to_value(&state).unwrap())
+            .await;
+        store
+            .set("ticket:T-42:sentinel_session", json!("persistent-chat"))
+            .await;
+        let chat_key = review_chat_key("T-42", "pr_review:1:abc:3");
+        store.set(&chat_key, json!("persistent-chat")).await;
+        let slots = json!({"sentinel-1": {"id": "sentinel-1", "status": {
+            "type": "working", "ticket_id": "T-42", "issue_url": null
+        }}});
+        store.set(KEY_WORKER_SLOTS, slots.clone()).await;
+        SentinelNode::record_review_delivery(&store, "T-42", &state, &decision)
+            .await
+            .unwrap();
+        assert!(store.lifecycle("T-42").await.unwrap().pr_delivery.is_none());
+        assert_eq!(
+            store
+                .get_typed::<String>("ticket:T-42:sentinel_session")
+                .await
+                .as_deref(),
+            Some("persistent-chat")
+        );
+        assert_eq!(
+            store.get_typed::<String>(&chat_key).await.as_deref(),
+            Some("persistent-chat")
+        );
+        assert_eq!(
+            store.get_typed::<Value>(KEY_WORKER_SLOTS).await,
+            Some(slots)
+        );
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_action_key("T-42", "pr_review:1:abc:3"))
+                .await
+                .as_deref(),
+            Some("completed")
+        );
     }
 
     #[tokio::test]

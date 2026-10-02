@@ -87,7 +87,8 @@ pub struct CoderHooksConfig {
     #[envconfig(from = "CODER_CHAT_HOOK_SECRET")]
     pub chat_hook_secret: Option<String>,
 
-    /// Per-request dispatch timeout Coder applies. We mirror it for awareness.
+    /// Per-request dispatch timeout Coder applies, in milliseconds. The consumer
+    /// uses half this budget for dependency work, reserving transport headroom.
     #[envconfig(from = "CODER_CHAT_HOOK_TIMEOUT", default = "1500")]
     pub chat_hook_timeout_ms: u64,
 

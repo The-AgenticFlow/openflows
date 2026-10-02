@@ -15,7 +15,6 @@ use anyhow::Result;
 use fred::prelude::*;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
-use std::io::BufRead;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,13 +44,15 @@ pub async fn execute_verify_task(
     tenant: &str,
     pair_id: &str,
     argv: &[String],
+    artifact_paths: &[String],
     timeout_secs: u64,
     workspace_id: &str,
     task_id_opt: Option<&str>,
     progress_tx: Option<mpsc::UnboundedSender<VerifyProgressEvent>>,
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<VerifyResult> {
-    let before_head = clean_head();
+    let sandbox = crate::sandbox::Sandbox::create(&std::env::current_dir()?, argv)?;
+    let before_head = Some(sandbox.head.clone());
     let start = Instant::now();
     let task_id = match task_id_opt {
         Some(id) if !id.is_empty() => id.to_string(),
@@ -67,8 +68,8 @@ pub async fn execute_verify_task(
     );
 
     // Spawn the command with process group isolation and output capture
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut child = sandbox
+        .command()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0) // Create new process group for clean tree kill
@@ -108,7 +109,7 @@ pub async fn execute_verify_task(
             }
 
             // Wait for child to finish
-            let status = child.wait().context("Failed to wait for child")?;
+            let status = wait_for_process(&mut child, cancel_token.as_deref()).await?;
 
             // Collect output
             let stdout_text = stdout_reader.await.context("Stdout reader task failed")??;
@@ -206,18 +207,30 @@ pub async fn execute_verify_task(
         "Task completed"
     );
 
+    let mut artifacts = Vec::new();
+    for (artifact, bytes) in sandbox.artifacts(artifact_paths)? {
+        let key = format!(
+            "ns:{tenant}:audit:a2a:{task_id}:artifact:{}",
+            artifact.sha256
+        );
+        client
+            .set::<(), _, _>(&key, bytes, None, None, false)
+            .await?;
+        artifacts.push(artifact);
+    }
+
     // Build result artifact
     let result = VerifyResult {
-        head_sha: before_head
-            .clone()
-            .filter(|h| clean_head().as_ref() == Some(h)),
+        head_sha: before_head.clone().filter(|h| {
+            clean_head().as_ref() == Some(h) && sandbox.source_unchanged().unwrap_or(false)
+        }),
         task_id: task_id.clone(),
         exit_code,
         timed_out: false,
         duration_ms,
         stdout_ref: stdout_key.clone(),
         stderr_ref: stderr_key.clone(),
-        artifacts: vec![], // TODO: artifact hash collection
+        artifacts,
         executor: ExecutorInfo {
             role: "forge".to_string(),
             workspace: workspace_id.to_string(),
@@ -257,21 +270,32 @@ pub async fn execute_verify_task(
     Ok(result)
 }
 
+async fn wait_for_process(
+    child: &mut std::process::Child,
+    cancel: Option<&AtomicBool>,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            kill_process_group(child.id());
+            let _ = child.wait();
+            anyhow::bail!("Verification cancelled");
+        }
+        if let Some(status) = child.try_wait().context("Failed to wait for child")? {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Kill the entire process group for a given child PID.
-/// Sends SIGTERM first, waits a 5-second grace period, then escalates to SIGKILL.
+/// Kill the attached runtime client; Sandbox drop also removes the container.
 fn kill_process_group(pid: u32) {
     if pid == 0 {
         return;
     }
-    let pgid = Pid::from_raw(-(pid as i32)); // Negative PID = process group
-    match killpg(pgid, Signal::SIGTERM) {
-        Ok(_) => debug!(pid, "Sent SIGTERM to process group"),
-        Err(e) => warn!(pid, error = %e, "Failed to send SIGTERM to process group"),
-    }
-    std::thread::sleep(Duration::from_secs(5));
-    match killpg(pgid, Signal::SIGKILL) {
-        Ok(_) => debug!(pid, "Sent SIGKILL to process group after grace period"),
-        Err(e) => warn!(pid, error = %e, "Failed to send SIGKILL to process group"),
+    let pgid = Pid::from_raw(pid as i32);
+    if let Err(e) = killpg(pgid, Signal::SIGKILL) {
+        warn!(pid, error = %e, "Failed to kill process group");
     }
 }
 
@@ -283,37 +307,37 @@ fn read_stream_sync_with_progress<R: std::io::Read>(
     progress_tx: Option<mpsc::UnboundedSender<VerifyProgressEvent>>,
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<String> {
-    let buf_reader = std::io::BufReader::new(reader);
+    let mut reader = reader;
     let mut output = String::new();
-
-    for line in buf_reader.lines() {
-        // Check cancellation before processing each line
-        if let Some(ref cancel) = cancel_token {
-            if cancel.load(Ordering::SeqCst) {
-                warn!("Stream read cancelled");
-                break;
-            }
+    let mut chunk = [0u8; 4096];
+    let mut progress_chunks = 0;
+    loop {
+        if cancel_token
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::SeqCst))
+        {
+            break;
         }
-
-        match line {
-            Ok(l) => {
-                // Push progress event if sender is available
-                if let Some(ref tx) = progress_tx {
-                    let event = match stream_name {
-                        "stderr" => VerifyProgressEvent::Stderr { chunk: l.clone() },
-                        _ => VerifyProgressEvent::Stdout { chunk: l.clone() },
-                    };
-                    let _ = tx.send(event);
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&chunk[..n]).into_owned();
+        if let Some(tx) = progress_tx.as_ref().filter(|_| progress_chunks < 256) {
+            progress_chunks += 1;
+            let event = if stream_name == "stderr" {
+                VerifyProgressEvent::Stderr {
+                    chunk: text.clone(),
                 }
-
-                output.push_str(&l);
-                output.push('\n');
-            }
-            Err(e) => {
-                warn!(error = %e, "Error reading stream");
-                break;
-            }
+            } else {
+                VerifyProgressEvent::Stdout {
+                    chunk: text.clone(),
+                }
+            };
+            let _ = tx.send(event);
         }
+        output.push_str(&text);
+        output = truncate_to_tail(&output, 10240);
     }
 
     Ok(output)
@@ -325,19 +349,11 @@ fn truncate_to_tail(s: &str, max_bytes: usize) -> String {
         return s.to_string();
     }
 
-    // Find the last line boundary that fits within max_bytes
-    let bytes = s.as_bytes();
-    let mut start = bytes.len().saturating_sub(max_bytes);
-
-    // Skip partial line at the start
-    while start > 0 && bytes[start] != b'\n' {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while start < s.len() && !s.is_char_boundary(start) {
         start += 1;
     }
-    if start > 0 && bytes[start] == b'\n' {
-        start += 1; // Skip the newline
-    }
-
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
+    s[start..].to_owned()
 }
 
 fn clean_head() -> Option<String> {
@@ -361,6 +377,38 @@ fn clean_head() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_wait_yields_so_timeout_and_cancellation_work() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_process(&mut child, None),
+        )
+        .await;
+        kill_process_group(child.id());
+        let _ = child.wait();
+        assert!(result.is_err());
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(wait_for_process(&mut child, Some(&cancel)).await.is_err());
+    }
+
+    #[test]
+    fn stream_output_without_newlines_stays_bounded() {
+        let input = "x".repeat(100_000);
+        let output =
+            read_stream_sync_with_progress(input.as_bytes(), "stdout", None, None).unwrap();
+        assert_eq!(output.len(), 10240);
+    }
 
     #[test]
     fn test_truncate_to_tail_preserves_short_strings() {

@@ -322,7 +322,7 @@ pub fn sentinel_guidance(st: &TicketState) -> String {
              `openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`."
                 .to_string()
         }
-        SentinelJob::TestingReview => "Review implementation against the approved plan; run A2A verification and gate decide --phase testing with exact revision/head and a report. Human approval is also required.".to_string(),
+        SentinelJob::TestingReview => "Review implementation against the approved plan; run A2A verification and gate decide --phase testing with exact revision/head and a report. Map the approved plan criteria to commands and observed results in the report. For infrastructure failure or unavailable sandbox/toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the mandatory verification sandbox. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Human testing review is TODO; successful A2A verification and SENTINEL approval permit submit.".to_string(),
         SentinelJob::PrReview => {
             "SENTINEL PR review: FORGE is `submit` with a PR to review. Read the \
              ticket + diff, write your evaluation report (*-eval.md / final-review.md), \
@@ -366,6 +366,15 @@ pub async fn sentinel_phase_guard(
              (only *-eval.md / final-review.md review reports may be written)",
         )
         .with_model_context(guidance);
+    }
+
+    if matches!(lower.as_str(), "bash" | "sh" | "shell" | "exec" | "execute")
+        && super::guard::is_verification_request(&command_text(input))
+    {
+        if sentinel_job(st) != SentinelJob::TestingReview {
+            return HookDecision::deny("A2A verification requires the testing phase");
+        }
+        return base.with_model_context(guidance);
     }
 
     if matches!(lower.as_str(), "bash" | "sh" | "shell" | "exec")

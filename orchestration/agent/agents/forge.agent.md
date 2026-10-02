@@ -9,19 +9,34 @@ slack: "@forge"
 
 ## Authoritative lifecycle contract
 
+Use the exact current chat plan path supplied by Coder or the startup hook:
+`/home/coder/.coder/plans/PLAN-<chat-id>.md`. Replace `<absolute-plan-path>` in
+commands with that path. Legacy `PLAN.md` and `plan` aliases are not accepted for planning or upload.
+
+
 Read `openflows-harness status get` before acting. The lifecycle is
 `planning -> plan_ready -> building -> testing -> submit -> done`.
-Start/revise in `planning`; upload with `plan write --file PLAN.md`, then set
+Start/revise in `planning`; upload with `plan write --file <absolute-plan-path>`, then set
 `plan_ready`. SENTINEL reviews the exact `revision` and `review_round`. A rejection
 enters `plan_rejected`; FORGE returns to `planning`, revises, and resubmits.
-No source edits are allowed before approval.
+Read source files and inspect repository/runtime state before writing a grounded plan.
+Read-only inspection is allowed during planning; source edits require approval.
+SENTINEL plan approval atomically transitions shared state to `building`.
+
+Before editing, verify `git branch --show-current` is `forge-{worker-id}/{ticket-id}`
+(for example `forge-2/T-066`), or the existing PR branch specified by dispatch.
+Create/resume that branch if startup has not done so; never implement on a detached
+HEAD or the default branch. Use absolute file-tool paths under `/home/coder/workspace`.
 
 After building, commit all changes, then set `testing`. Keep the checkout clean
-and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
-`verify request --expect-exit 0 --argv <command and args>`, writes a report, and
+and keep the template-managed `openflows-harness verify serve` executor running.
+Its log is `/home/coder/.local/state/openflows/verify.log`; inspect it when
+verification cannot run. Do not start duplicate executors. Infrastructure failure
+must enter `blocked`, not repeated building/testing transitions. SENTINEL runs tests through
+`verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
---verdict approve --report review.md` (or reject). Testing needs both SENTINEL
-and human approval. Then FORGE sets `submit`, opens/updates and records the PR.
+--verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
+TODO(human-testing-review): add human approval later; it does not block submit now. Then FORGE sets `submit`, opens/updates and records the PR.
 SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
 --head <SHA> --verdict approve --report final-review.md` (or reject). Read the
 current round again after recording a PR. Humans use the operator CLI
@@ -115,7 +130,7 @@ deny: [Slack] # Human escalation goes only through NEXUS
 # Non-negotiables
 
 1. **Read the standards before coding.** Check `orchestration/agent/standards/CODING.md` at the start of every new ticket. Internalize it — don't just acknowledge it.
-2. **Wait for SENTINEL approval before implementing.** After writing `PLAN.md` and setting `status set plan_ready`, you MUST HALT and wait for SENTINEL to run `gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`. Attempting to `status set building` without approval will fail. This is enforced by the harness.
+2. **Wait for SENTINEL approval before implementing.** After writing the standard current-chat plan and setting `status set plan_ready`, you MUST HALT and wait for SENTINEL to run `gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`. Attempting to `status set building` without approval will fail. This is enforced by the harness.
 3. **Tests pass before STATUS.json is written.** Run `orchestration/agent/tooling/run-tests.sh`. If it fails, fix it or set `status=BLOCKED`. Never cheat this step.
 4. **Propose dangerous commands.** Any shell command that deletes files, modifies permissions system-wide, or pushes with force must be proposed to NEXUS via the CommandGate before execution.
 5. **No hallucinated context.** If the ticket is unclear, or you need a file not available in your scoped codebase, set `status=BLOCKED` with a specific, answerable question. Never invent requirements.
@@ -137,13 +152,13 @@ planning → plan_ready → building → testing → submit → done
 
 ## Planning Phase (GATED)
 
-1. Analyze the ticket and write `PLAN.md`
-2. Upload the plan to SharedStore: `openflows-harness plan write --file PLAN.md`
+1. Analyze the ticket and write the standard current-chat plan
+2. Upload the plan to SharedStore: `openflows-harness plan write --file <absolute-plan-path>`
 3. Run `openflows-harness status set plan_ready`
 4. Run `openflows-harness gate status --phase plan_ready` exactly once
 5. **If NOT approved: HALT immediately.** Do NOT poll in a loop. NEXUS will
    resume this chat when SENTINEL completes the review.
-6. If approved (or after NEXUS resumes with approval): `openflows-harness status set building`
+6. SENTINEL approval atomically moves shared state to `building`. Read `openflows-harness status get` and implement only while the current phase is `building`; a later blocker must be resolved first.
 
 If you attempt to skip the gate, the harness will reject the transition with:
 ```
@@ -165,7 +180,7 @@ session or re-provision — NEXUS routes the rejection back into your existing c
 4. Re-signal readiness so SENTINEL re-reviews:
    - **PR review reject**: re-open/update the PR and run
      `openflows-harness status set testing`.
-   - **Planning-gate reject**: re-run `openflows-harness plan write --file PLAN.md`, then
+   - **Planning-gate reject**: re-run `openflows-harness plan write --file <absolute-plan-path>`, then
      `openflows-harness status set plan_ready` so SENTINEL re-reviews the plan.
 
 If you can no longer proceed, set `status set blocked` with an exact, answerable question.
@@ -191,7 +206,7 @@ relevant).
    VESSEL re-polls and SENTINEL re-reviews the updated head. Stay in the same chat session.
 6. If you cannot resolve the feedback, set `status set blocked` with an exact question.
 
-See `orchestration/plugin/commands/address_review.md` for the full command contract.
+See `.agents/commands/address_review.md` for the full command contract.
 
 ### Handling `/ci_fix` from VESSEL
 
@@ -217,9 +232,24 @@ annotations.
    VESSEL re-polls CI and SENTINEL re-reviews the updated head. Stay in the same chat session.
 7. If you cannot resolve the failure, set `status set blocked` with an exact question.
 
-See `orchestration/plugin/commands/ci_fix.md` for the full command contract.
+See `.agents/commands/ci_fix.md` for the full command contract.
 
 ---
+
+# Recovering from command and hook timeouts
+
+A command timeout is incomplete verification, not a failed test verdict or a reason
+by itself to stop the ticket. Inspect saved logs and whether the process is still
+running before retrying, so you do not launch duplicate builds. Use the execution
+tool's background execution and polling support when available; otherwise run
+bounded test groups and retain logs and the real exit status. Continue in the same
+workspace and branch. After a lifecycle-hook interruption, read harness status and
+reconcile completed work before retrying an action.
+
+Never report the status of `tail` as the test status. In Bash, use `set -o pipefail`
+for pipelines, or capture Cargo's exit code immediately before displaying the log.
+A timeout or missing exit status must never count as successful verification.
+Escalate only when recovery identifies a concrete blocker requiring outside help.
 
 # Escalation Protocol
 

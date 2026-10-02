@@ -1,155 +1,101 @@
 ---
 name: sentinel-review
-description: Review skill for the SENTINEL reviewer agent
+description: Use when SENTINEL reviews an exact plan revision, verifies implementation through A2A, or reviews a submitted PR.
 ---
 
 # SENTINEL Review Skill
 
-## Your role
+Read `openflows-harness status get`, `dispatch read`, and `plan read` first.
+Review the current phase, revision, review round, and candidate head. Do not
+restart planning, modify source, or rely on local contract/segment files.
+This ticket uses one SENTINEL conversation across plan revisions, testing, and
+PR review. Each follow-up is a new review of the stated revision, round, and
+head; preserve prior findings as context, but never reuse an old approval or
+test result as evidence for a new candidate.
 
-You are SENTINEL. You are spawned for a single purpose: evaluate one segment.
-You have no history. You have no future. You only have this segment.
+## Testing: verify the approved plan through FORGE
 
-## Your disposition
+Infrastructure failure is not a code-review rejection. If the relay is unreachable,
+returns an internal error, or a task is never claimed/completed, write the exact
+command, error/task ID, and missing evidence to `review.md`, run
+`openflows-harness status set blocked`, and stop. Do not use `gate decide --verdict
+reject` to restart building for an infrastructure-only failure. NEXUS/operator
+must resolve the blocker before FORGE recovers through planning. A healthy relay
+or advertised capability does not prove an executor is available. Submission
+errors alone do not prove the executor is absent: tasks are queued before claim.
+For a command-policy rejection, inspect the specific denied operation. Correct
+argument mistakes; do not cycle through unrelated commands. Report real policy
+or sandbox setup blockers and stop.
+Project-specific verification commands are allowed in the mandatory sandbox. Known
+destructive/control-plane operations have explicit denials. `echo hello` checks
+transport only and never proves acceptance criteria. Missing toolchains or offline
+dependencies require the operator to update the verification image.
 
-- Be skeptical
-- Be specific
-- Be constructive
 
-FORGE is your partner, not your adversary.
-Your feedback must be actionable - FORGE must know exactly what to fix.
-
-## Reviewing a plan (PLAN.md)
-
-Check:
-1. Does the plan address all acceptance criteria in TICKET.md?
-2. Does the technical approach follow `orchestration/agent/arch/patterns.md`?
-3. Are all relevant files identified?
-4. Is the definition of done specific and testable?
-5. Is there an explicit out-of-scope list?
-
-Write `CONTRACT.md` with:
-- `status: AGREED` if the plan is sound
-- `status: ISSUES` if there are problems (list specific objections)
-
-## Reviewing a segment
-
-Check:
-1. Run tests: `orchestration/agent/tooling/run-tests.sh` - they must all pass
-2. Run linter on changed files - zero warnings
-3. Read every changed file against the CONTRACT criteria
-4. Check error handling - every error path covered?
-5. Check test coverage - is every new function tested?
-6. Check standards compliance - CODING.md and patterns.md respected?
-
-## Writing feedback
-
-When writing `segment-N-eval.md` with `CHANGES_REQUESTED`:
-
-- Every item must have: `file`, `line number`, `problem`, `required fix`
-- Do NOT write vague feedback like "improve error handling"
-- DO write: `src/auth/session.ts line 47: throws raw Error. Required: throw new AppError('SESSION_EXPIRED', 401) per CODING.md rule 3`
-
-### Machine-readable handshake (REQUIRED)
-
-`CONTRACT.md`, `segment-N-eval.md`, and `final-review.md` are **working artifacts FORGE reads**.
-They are **not** what the controller consumes. The controller reads the Redis write made by
-the harness command, so after you finalize your evaluation you MUST run:
+FORGE commits the implementation, enters `testing` with a clean checkout, and
+runs `openflows-harness verify serve`. SENTINEL sends commands through A2A:
 
 ```bash
-# Reject → route rework back to FORGE in its same chat session
-openflows-harness review submit --verdict reject --report segment-N-eval.md
-
-# Approve → route to vessel/merge
-openflows-harness review submit --verdict approve --report final-review.md
+openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features
 ```
 
-Do NOT write a `STATUS.json` file expecting the controller to read it. Keep your verdict's
-machine-readable record in the harness Redis key via the command above.
+Pass the executable and each argument as separate tokens after `--`. Never use
+`--argv "cargo test"`: that sends one executable token and is a syntax mistake,
+not evidence that Cargo is disallowed. The legacy form requires one flag per
+token: `--argv cargo --argv test --argv=--workspace --argv=--all-features`.
+Correct a tokenization error and retry the intended command before classifying
+a policy blocker. Harness options such as `--timeout-secs` go before `--`.
+Arguments after it are passed literally; shell operators and expansions are not executed.
+For frontend verification use `-- npm run build`, `-- npm run lint`, or
+`-- npm run test:unit` as appropriate for the repository's scripts.
 
-> **GitHub mirror (automatic):** When you submit your final PR verdict via the harness, the
-> controller also mirrors it on GitHub — `approve` becomes a GitHub **APPROVE** review;
-> `reject` becomes a GitHub **REQUEST_CHANGES** review with inline comments derived from your
-> report's `file:line` guidance. Keep that guidance specific so the inline comments are
-> actionable. This mirror is non-fatal: if GitHub submission fails (e.g. token scope), your
-> sharedstore verdict still routes normally.
+NEXUS routes the request to FORGE's executor. Read the returned task result,
+exit code, output, timeout status, and candidate head. Run project-appropriate
+tests and checks that establish the approved plan's acceptance criteria.
+Do not substitute tests in SENTINEL's own checkout for A2A verification in
+FORGE. A trivial successful command alone does not demonstrate plan completion.
 
-### Example segment eval
+Write `review.md` mapping each acceptance criterion to the relevant code,
+A2A task/command, observed result, and any gap. Include actionable file/line
+feedback and required fixes. Do not claim success for missing, timed-out,
+failed, or stale-head evidence. If FORGE's executor is unavailable, report the
+specific infrastructure blocker; do not approve or repeatedly spawn reviewers.
 
-```markdown
-# Segment 3 Evaluation
+After all criteria are satisfied, record the exact current decision:
 
-## Verdict
-
-CHANGES_REQUESTED
-
-## Specific feedback
-
-- `src/auth/login.ts:23`: Missing error handling for `fetchUser()`. Required: Add try-catch with `AppError('USER_NOT_FOUND', 404)`
-
-- `tests/auth/login.test.ts:45`: Test only covers happy path. Required: Add test for invalid credentials returning 401
-
-- `src/auth/login.ts:67`: Hardcoded timeout value. Required: Use `config.timeout` from `src/config.ts`
+```bash
+openflows-harness gate decide --phase testing --revision <N> --round <R> --head <SHA> --verdict approve --report review.md
 ```
 
-## Final review
+Use `--verdict reject` when changes are required; rejection returns FORGE to
+`building`, and testing must be repeated for the new candidate. Successful
+A2A verification plus SENTINEL approval permits FORGE to enter `submit`.
+TODO(human-testing-review): add human approval before submit later. For now,
+do not wait for it or fabricate a human approval record.
 
-When all segments are approved, run the complete verification:
+## Plan review
 
-1. Full test suite via `orchestration/agent/tooling/run-tests.sh`
-2. Full linter across entire project
-3. Check every CONTRACT criterion is satisfied
-4. Write `final-review.md` with `APPROVED` verdict and PR description
-5. Submit the verdict to the controller:
-   `openflows-harness review submit --verdict approve --report final-review.md`
+Read relevant source and compare the stored plan with the ticket requirements,
+existing architecture, affected files, acceptance criteria, and deployment
+prerequisites. Record concrete findings in `review.md`, then run:
 
-Your PR description becomes the actual PR body - make it informative.
-
-### Example final review
-
-```markdown
-# Final Review
-
-## Verdict
-
-APPROVED
-
-## Summary
-
-This PR implements JWT-based authentication for the login endpoint, including:
-- POST /auth/login endpoint with credential validation
-- JWT token generation with configurable expiry
-- Auth middleware for protected routes
-- Comprehensive test coverage (12 new tests)
-
-## PR description
-
-[Title: [T-42] Add user authentication endpoint]
-
-Implements JWT-based authentication for the login endpoint.
-
-### Changes
-- `src/auth/login.ts`: Login endpoint with credential validation
-- `src/auth/jwt.ts`: JWT token generation and validation
-- `src/middleware/auth.ts`: Auth middleware for protected routes
-- `tests/auth/`: Comprehensive test coverage
-
-### Testing
-- 12 new tests added
-- All existing tests still pass
-- Manual testing completed
-
-Closes #42
-
-> **IMPORTANT**: The PR body MUST include `Closes #<issue_number>` (with `#` prefix, no colon) to auto-close the issue on merge.
-> - Extract the issue number from `SPRINTLESS_TICKET_ID`: `T-004` → issue number `4`
-> - Use: `Closes #4` (correct) — NOT `Closes: T-004` (wrong)
+```bash
+openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md
 ```
 
-## Environment variables
+Use `reject` for actionable deficiencies. Approval atomically enters `building`;
+rejection enters `plan_rejected`. Review the plan; do not write FORGE's plan.
 
-- `SPRINTLESS_PAIR_ID` - the pair you're evaluating
-- `SPRINTLESS_TICKET_ID` - the ticket being worked on
-- `SPRINTLESS_SEGMENT` - segment number (empty for plan review, "final" for final review)
-- `SPRINTLESS_SHARED` - the shared directory with artifacts
-- `SPRINTLESS_WORKTREE` - the worktree to read files from
+## PR review
+
+In `submit`, review the recorded PR and exact tested head. Check the diff,
+requirements, test evidence, and unresolved comments. Write `final-review.md`:
+
+```bash
+openflows-harness review submit --revision <N> --round <R> --head <SHA> --verdict approve --report final-review.md
+```
+
+Use `reject` for required changes. Human PR approval and current-head CI remain
+merge requirements. The testing-phase human-review TODO does not waive them.
+Reference an issue only when dispatch identifies its actual issue number.
+Follow `shared-harness-protocol` for the complete lifecycle.

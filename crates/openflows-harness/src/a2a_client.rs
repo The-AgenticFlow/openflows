@@ -197,6 +197,7 @@ impl A2AClient {
             "params": {
                 "pair_id": self.pair_id,
                 "role": self.role,
+                "sandbox_version": 1,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });

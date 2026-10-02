@@ -142,14 +142,10 @@ pub const KEY_TICKET_CHAT: &str = "chat";
 pub const KEY_TICKET_REVIEW: &str = "review";
 
 // ── Sentinel review-type namespaces ─────────────────────────────────────
-// SENTINEL performs distinct reviews at different lifecycle points. These
-// review types must never share a chat binding or verdict key, otherwise a
-// completed planning-gate review can occupy the slot meant for the PR review
-// (which blocks the final PR reviewer from spawning). All SENTINEL chat /
-// verdict / action keys are therefore namespaced by review type as:
-//   `ticket:{id}:chat:{role}:{review_type}`
-//   `ticket:{id}:review:{role}:{review_type}`
-//   `ticket:{id}:chat_action:{role}:{review_type}`
+// SENTINEL retains one ticket conversation in ticket:{id}:sentinel_session.
+// Each phase/revision/head/round has separate verdict and action keys. The
+// round-specific chat keys are aliases to the same conversation, not separate
+// reviewers. A completed round must not suppress dispatch of the next round.
 
 /// SENTINEL reviews the plan before implementation (planning gate).
 pub const REVIEW_TYPE_PLANNING_GATE: &str = "planning_gate";

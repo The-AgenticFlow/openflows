@@ -231,6 +231,74 @@ impl SharedStore {
         self.backend.del(&ns_key).await;
     }
 
+    /// Atomically acquire a tenant-scoped lease. Use a unique token per attempt.
+    /// Returns false while another lease is live; backend errors are propagated.
+    pub async fn try_claim(&self, key: &str, token: &str, ttl_secs: u64) -> Result<bool> {
+        anyhow::ensure!(ttl_secs > 0, "Lease TTL must be positive");
+        let key = self.ns_key(key);
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis();
+                let expires_at = now + u128::from(ttl_secs) * 1000;
+                let expires_at = u64::try_from(expires_at)?;
+                if let Some(existing) = map.get(&key) {
+                    // Unknown values also occupy the key; never overwrite them.
+                    if existing
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|expiry| u128::from(expiry) > now)
+                    {
+                        return Ok(false);
+                    }
+                }
+                map.insert(
+                    key,
+                    serde_json::json!({"token": token, "expires_at": expires_at}),
+                );
+                Ok(true)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let claimed: i64 = b.client.eval(
+                    "if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 else return 0 end",
+                    vec![key],
+                    vec![token.to_string(), ttl_secs.to_string()],
+                ).await?;
+                Ok(claimed == 1)
+            }
+        }
+    }
+
+    /// Release a lease only if its current token matches. Missing leases are harmless.
+    pub async fn release_claim(&self, key: &str, token: &str) -> Result<()> {
+        let key = self.ns_key(key);
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                if map
+                    .get(&key)
+                    .and_then(|value| value.get("token"))
+                    .and_then(Value::as_str)
+                    == Some(token)
+                {
+                    map.remove(&key);
+                }
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let _: i64 = b.client.eval(
+                    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+                    vec![key],
+                    vec![token.to_string()],
+                ).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn keys(&self, pattern: &str) -> Vec<String> {
         // For pattern matching, we need to handle both the namespace prefix
         // and the fact that SCAN returns full keys. The pattern should match
@@ -413,5 +481,66 @@ mod lifecycle_tests {
             )
             .await
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_claims_have_one_winner() {
+        let store = SharedStore::new_in_memory();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                store
+                    .try_claim("review:T-1", &i.to_string(), 120)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result.unwrap());
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn release_requires_current_owner() {
+        let store = SharedStore::new_in_memory();
+        assert!(store.try_claim("review:T-1", "owner", 120).await.unwrap());
+        store.release_claim("review:T-1", "other").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "other", 120).await.unwrap());
+        store.release_claim("review:T-1", "owner").await.unwrap();
+        assert!(store.try_claim("review:T-1", "other", 120).await.unwrap());
+        store.release_claim("review:T-1", "owner").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "third", 120).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_claim_can_be_replaced_and_old_owner_cannot_release_it() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                "review:T-1",
+                serde_json::json!({"token": "old", "expires_at": 0}),
+            )
+            .await;
+        assert!(store.try_claim("review:T-1", "new", 120).await.unwrap());
+        store.release_claim("review:T-1", "old").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "third", 120).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn claims_are_namespaced_and_reject_zero_ttl() {
+        let store = SharedStore::new_in_memory_with_tenant("one");
+        let mut other = store.clone();
+        other.tenant = "two".into();
+        assert!(store.try_claim("review:T-1", "owner", 0).await.is_err());
+        assert!(store.try_claim("review:T-1", "owner", 120).await.unwrap());
+        assert!(other.try_claim("review:T-1", "owner", 120).await.unwrap());
     }
 }

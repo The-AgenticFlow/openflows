@@ -64,6 +64,7 @@ async fn bootstrap_builds_context_with_resume_state() {
             m.insert("sentinel".to_string(), p);
             m
         },
+        skills_by_role: Default::default(),
         skills_dir: Some(PathBuf::from("/nonexistent-skills")),
         commands_dir: Some(PathBuf::from("/nonexistent-commands")),
     };
@@ -111,10 +112,10 @@ async fn phase_guard_allows_plan_write_before_plan() {
     seed_chat(&store, "T-4", "forge", "chat-4").await;
     seed_status(&store, "T-4", "planning").await;
 
-    let input = json!({ "path": "PLAN.md" });
+    let input = json!({ "path": "/home/coder/.coder/plans/PLAN-chat-4.md" });
     let base = HookDecision::observe();
     let d = phase_guard(&store, "chat-4", "forge", "write", &input, base).await;
-    assert!(!d.deny, "writing PLAN.md is allowed in planning");
+    assert!(!d.deny, "writing the standard plan is allowed in planning");
 }
 
 #[tokio::test]
@@ -183,7 +184,7 @@ async fn phase_guard_allows_shell_write_to_plan_artifact() {
     seed_chat(&store, "T-23", "forge", "chat-23").await;
     seed_status(&store, "T-23", "planning").await;
 
-    let input = json!({ "command": "printf '# plan' > PLAN.md" });
+    let input = json!({ "command": "printf '# plan' > /home/coder/.coder/plans/PLAN-chat-23.md" });
     let d = phase_guard(
         &store,
         "chat-23",
@@ -193,7 +194,7 @@ async fn phase_guard_allows_shell_write_to_plan_artifact() {
         HookDecision::observe(),
     )
     .await;
-    assert!(!d.deny, "shell writes to PLAN.md stay allowed");
+    assert!(!d.deny, "shell writes to the standard plan stay allowed");
 }
 
 #[tokio::test]
@@ -255,7 +256,7 @@ async fn phase_guard_allows_is_plan_marked_plan_path() {
     seed_status(&store, "T-301", "planning").await;
 
     // Writing the actual plan artifact remains allowed even with the flag set.
-    let input = json!({ "path": "PLAN.md", "is_plan": true });
+    let input = json!({ "path": "/home/coder/.coder/plans/PLAN-chat-301.md", "is_plan": true });
     let d = phase_guard(
         &store,
         "chat-301",
@@ -265,7 +266,10 @@ async fn phase_guard_allows_is_plan_marked_plan_path() {
         HookDecision::observe(),
     )
     .await;
-    assert!(!d.deny, "writing PLAN.md stays allowed in planning");
+    assert!(
+        !d.deny,
+        "writing the standard plan stays allowed in planning"
+    );
 }
 
 #[tokio::test]
@@ -790,6 +794,7 @@ async fn bootstrap_with_commands_content_survives_limit() {
 
     let ctx = HookBootstrapContext {
         persona_by_role: std::collections::HashMap::new(),
+        skills_by_role: Default::default(),
         skills_dir: None,
         commands_dir: Some(tmp),
     };
@@ -840,7 +845,7 @@ async fn phase_guard_allows_missing_plan_recovery_commands() {
     seed_status(&store, "T-18", "building").await;
 
     for command in [
-        "openflows-harness plan write --file /home/coder/workspace/PLAN.md",
+        "openflows-harness plan write --file /home/coder/.coder/plans/PLAN-chat-18.md",
         "openflows-harness status set planning",
         "openflows-harness status set blocked",
     ] {
@@ -1104,4 +1109,322 @@ async fn legacy_building_does_not_authorize_edits_before_new_review() {
     )
     .await;
     assert!(result.deny);
+}
+
+#[tokio::test]
+async fn planning_allows_grounded_readonly_reconnaissance() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-read", "forge", "chat-read").await;
+    for phase in ["planning", "plan_ready", "plan_rejected"] {
+        seed_status(&store, "T-read", phase).await;
+        for command in [
+            "cd /home/coder && ls -la && cat AGENTS.md 2>/dev/null | head -100",
+            "cd /home/coder && openflows-harness status get 2>&1; openflows-harness dispatch read 2>&1 | head -100",
+            "cd /home/coder/workspace && pwd && ls -la && rg --files",
+            "rg -n marketplace src 2>/dev/null",
+            "git status --short && git log --oneline -10",
+            "docker info 2>&1 | head -30",
+            "docker compose config --services 2>/dev/null",
+            "cat src/main.rs >/dev/null 2>&1",
+            "cat src/main.rs 2> /dev/null",
+            "cat src/main.rs 1>&2",
+        ] {
+            let decision = phase_guard(&store, "chat-read", "forge", "execute",
+                &json!({"command": command}), HookDecision::observe()).await;
+            assert!(!decision.deny, "{phase} must allow inspection: {command}");
+        }
+        let decision = phase_guard(
+            &store,
+            "chat-read",
+            "forge",
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(!decision.deny);
+    }
+}
+
+#[tokio::test]
+async fn planning_reconnaissance_does_not_allow_hidden_source_writes() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-write", "forge", "chat-write").await;
+    seed_status(&store, "T-write", "planning").await;
+    for command in [
+        "cat src/main.rs 2>/dev/null; touch src/new.rs",
+        "git checkout -- src/main.rs >/dev/null 2>&1",
+        "dd of=src/main.rs 2>/dev/null",
+        r#"python3 -c 'open("src/main.rs", "w").write("bad")' >/dev/null"#,
+        "cat README.md 2>&1 > src/main.rs",
+        "cat README.md 2> src/main.rs",
+        "cat README.md | tee src/main.rs >/dev/null",
+        "printf bad > src/main.rs && cat README.md 2>&1",
+    ] {
+        let decision = phase_guard(
+            &store,
+            "chat-write",
+            "forge",
+            "execute",
+            &json!({"command": command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(decision.deny, "must retain source edit gate: {command}");
+    }
+    for tool in ["write_file", "edit_file", "apply_patch"] {
+        let decision = phase_guard(
+            &store,
+            "chat-write",
+            "forge",
+            tool,
+            &json!({"path": "src/main.rs", "content": "bad"}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(decision.deny, "must gate native source edits: {tool}");
+    }
+}
+
+#[tokio::test]
+async fn forge_bootstrap_uses_current_phase_instead_of_restarting_planning() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-resume", "forge", "chat-resume").await;
+    let context = HookBootstrapContext::default();
+    for phase in ["planning", "building", "blocked", "testing", "submit"] {
+        seed_status(&store, "T-resume", phase).await;
+        if phase != "planning" {
+            store
+                .set("pair:T-resume:plan", json!("# Approved plan"))
+                .await;
+        }
+        let text = build_bootstrap_context(&store, "chat-resume", &json!({}), &context)
+            .await
+            .unwrap();
+        if phase == "planning" {
+            assert!(
+                text.contains("read source"),
+                "planning must start with investigation"
+            );
+        } else {
+            assert!(
+                !text.contains("Your first action: run `/plan`"),
+                "resume in {phase} must not restart planning"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_plan_path_is_writable_during_planning_and_frozen_during_review() {
+    let store = SharedStore::new_in_memory();
+    let chat = "41b12322-5719-4822-87e9-c01e576b49e4";
+    seed_chat(&store, "T-plan-path", "forge", chat).await;
+    let path = "/home/coder/.coder/plans/PLAN-41b12322-5719-4822-87e9-c01e576b49e4.md";
+    for phase in [
+        "planning",
+        "plan_rejected",
+        "plan_ready",
+        "testing",
+        "submit",
+        "blocked",
+    ] {
+        seed_status(&store, "T-plan-path", phase).await;
+        for (tool, input) in [
+            ("write_file", json!({"path": path, "content": "# Plan"})),
+            ("edit", json!({"file_path": path})),
+            (
+                "bash",
+                json!({"command": format!("printf '# Plan' > {path}")}),
+            ),
+        ] {
+            let decision =
+                phase_guard(&store, chat, "forge", tool, &input, HookDecision::observe()).await;
+            assert_eq!(
+                decision.deny,
+                !matches!(phase, "planning" | "plan_rejected"),
+                "{phase} {tool}: {:?}",
+                decision.reason
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_plan_path_does_not_allow_other_chats_or_source_writes() {
+    let store = SharedStore::new_in_memory();
+    let chat = "41b12322-5719-4822-87e9-c01e576b49e4";
+    seed_chat(&store, "T-plan-scope", "forge", chat).await;
+    seed_status(&store, "T-plan-scope", "planning").await;
+    for path in [
+        "/home/coder/.coder/plans/PLAN-other-chat.md",
+        "/home/coder/workspace/src/PLAN-41b12322-5719-4822-87e9-c01e576b49e4.md",
+        "/home/coder/.coder/plans/../PLAN-41b12322-5719-4822-87e9-c01e576b49e4.md",
+    ] {
+        for (tool, input) in [
+            ("write", json!({"path": path})),
+            ("bash", json!({"command": format!("printf plan > {path}")})),
+        ] {
+            assert!(
+                phase_guard(&store, chat, "forge", tool, &input, HookDecision::observe())
+                    .await
+                    .deny,
+                "{tool} {path}"
+            );
+        }
+    }
+    let command =
+        format!("printf plan > /home/coder/.coder/plans/PLAN-{chat}.md; touch src/main.rs");
+    assert!(
+        phase_guard(
+            &store,
+            chat,
+            "forge",
+            "bash",
+            &json!({"command": command}),
+            HookDecision::observe()
+        )
+        .await
+        .deny
+    );
+}
+
+#[tokio::test]
+async fn chat_plan_path_is_provided_in_startup_and_denial_guidance() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-plan-help", "forge", "chat-plan-help").await;
+    seed_status(&store, "T-plan-help", "planning").await;
+    let expected = "/home/coder/.coder/plans/PLAN-chat-plan-help.md";
+    let context = build_bootstrap_context(
+        &store,
+        "chat-plan-help",
+        &json!({}),
+        &HookBootstrapContext::default(),
+    )
+    .await
+    .unwrap();
+    assert!(context.contains(expected));
+    let decision = phase_guard(
+        &store,
+        "chat-plan-help",
+        "forge",
+        "write",
+        &json!({"path":"src/main.rs"}),
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(decision.reason.unwrap().contains(expected));
+}
+
+#[tokio::test]
+async fn standard_plan_rejects_legacy_paths_for_file_and_shell_writes() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-standard", "forge", "standard-chat").await;
+    seed_status(&store, "T-standard", "planning").await;
+    for path in [
+        "PLAN.md",
+        "plan",
+        "/home/coder/PLAN.md",
+        "/home/coder/workspace/PLAN.md",
+        "src/PLAN.md",
+    ] {
+        for (tool, input) in [
+            ("write", json!({"path":path})),
+            ("bash", json!({"command":format!("printf plan > {path}")})),
+        ] {
+            let decision = phase_guard(
+                &store,
+                "standard-chat",
+                "forge",
+                tool,
+                &input,
+                HookDecision::observe(),
+            )
+            .await;
+            assert!(decision.deny, "legacy plan path allowed: {tool} {path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn standard_plan_upload_requires_current_chat_path() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-upload", "forge", "upload-chat").await;
+    seed_status(&store, "T-upload", "planning").await;
+    for (args, allowed) in [
+        ("--file /home/coder/.coder/plans/PLAN-upload-chat.md", true),
+        ("--file=/home/coder/.coder/plans/PLAN-upload-chat.md", true),
+        ("--file PLAN.md", false),
+        ("--file /home/coder/.coder/plans/PLAN-other-chat.md", false),
+        ("--file src/main.rs", false),
+    ] {
+        for (tool, prefix) in [("bash", "openflows-harness "), ("openflows-harness", "")] {
+            let input = json!({"command":format!("{prefix}plan write {args}")});
+            let decision = phase_guard(
+                &store,
+                "upload-chat",
+                "forge",
+                tool,
+                &input,
+                HookDecision::observe(),
+            )
+            .await;
+            assert_eq!(!decision.deny, allowed, "{tool} {args}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn standard_plan_checks_uploads_after_shell_command_boundaries() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-upload-boundary", "forge", "upload-chat").await;
+    seed_status(&store, "T-upload-boundary", "planning").await;
+    for separator in ["\n", "&&", ";", " || "] {
+        let command = format!("openflows-harness status get{separator}openflows-harness plan write --file /home/coder/PLAN.md");
+        let decision = phase_guard(
+            &store,
+            "upload-chat",
+            "forge",
+            "bash",
+            &json!({"command":command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            decision.deny,
+            "legacy upload after separator {separator:?} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sandbox_delegation_allows_literal_tooling_without_host_shell_bypass() {
+    let store = SharedStore::new_in_memory();
+    seed_status(&store, "T-sandbox", "testing").await;
+    let state = read_ticket_state(&store, "T-sandbox").await;
+    for command in [
+        "openflows-harness verify request --expect-exit 0 -- pytest -q",
+        "openflows-harness verify request --expect-exit 0 -- python3 -c 'print(1); print(2)'",
+        "openflows-harness verify request --expect-exit 0 -- ./scripts/custom-test",
+    ] {
+        assert!(super::guard::is_verification_request(command));
+        let d = sentinel_phase_guard(
+            &store,
+            "T-sandbox",
+            &state,
+            "bash",
+            &json!({"command":command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(!d.deny, "{command}");
+    }
+    for command in [
+        "openflows-harness verify request -- pytest; touch src/main.rs",
+        "openflows-harness verify request -- pytest > src/main.rs",
+        "openflows-harness verify request -- echo $(touch src/main.rs)",
+        "openflows-harness verify request -- echo \"$(touch src/main.rs)\"",
+    ] {
+        assert!(!super::guard::is_verification_request(command), "{command}");
+    }
 }

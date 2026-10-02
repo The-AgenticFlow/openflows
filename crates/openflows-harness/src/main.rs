@@ -207,7 +207,7 @@ enum GateAction {
 enum PlanAction {
     /// Write a plan to SharedStore (FORGE)
     Write {
-        /// Path to the PLAN.md file to upload
+        /// Path to the plan file to upload (including Coder chat-specific plan paths)
         #[arg(long)]
         file: PathBuf,
     },
@@ -219,9 +219,12 @@ enum PlanAction {
 enum VerifyAction {
     /// Submit a verify request (SENTINEL-side, task 3 of issue #143)
     Request {
-        /// Command argv to execute (must be allowlisted)
-        #[arg(long)]
+        /// One command token per flag; use --argv=--flag for option tokens
+        #[arg(long, conflicts_with = "command_argv")]
         argv: Vec<String>,
+        /// Command and arguments after -- (recommended); never interpreted by a shell
+        #[arg(last = true, required_unless_present = "argv")]
+        command_argv: Vec<String>,
         /// Command execution timeout in seconds
         #[arg(long, default_value = "600")]
         timeout_secs: u64,
@@ -252,6 +255,18 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Commands::Verify {
+        action: VerifyAction::Request {
+            argv, command_argv, ..
+        },
+    } = &cli.command
+    {
+        a2a_protocol::validate_command_argv(if command_argv.is_empty() {
+            argv
+        } else {
+            command_argv
+        })?;
+    }
 
     let env = config::EnvConfig::from_env().context("failed to load environment configuration")?;
     let redis_url = env
@@ -404,6 +419,7 @@ async fn main() -> Result<()> {
             action:
                 VerifyAction::Request {
                     argv,
+                    command_argv,
                     timeout_secs,
                     expect_exit,
                     artifacts,
@@ -412,7 +428,11 @@ async fn main() -> Result<()> {
             store
                 .verify_request(
                     &ticket,
-                    argv,
+                    if command_argv.is_empty() {
+                        argv
+                    } else {
+                        command_argv
+                    },
                     timeout_secs,
                     expect_exit,
                     artifacts.as_deref(),
@@ -432,4 +452,118 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod verify_cli_tests {
+    use super::*;
+
+    #[test]
+    fn verification_accepts_command_after_separator() {
+        let result = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--expect-exit",
+            "0",
+            "--",
+            "cargo",
+            "test",
+            "--workspace",
+            "--all-features",
+            "--",
+            "--nocapture",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("{error}"));
+        let Commands::Verify {
+            action: VerifyAction::Request {
+                command_argv, argv, ..
+            },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(argv.is_empty());
+        assert_eq!(
+            command_argv,
+            [
+                "cargo",
+                "test",
+                "--workspace",
+                "--all-features",
+                "--",
+                "--nocapture"
+            ]
+        );
+        a2a_protocol::validate_command_argv(&command_argv).unwrap();
+    }
+    #[test]
+    fn legacy_argv_preserves_tokens_and_flags() {
+        let cli = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--expect-exit",
+            "0",
+            "--argv",
+            "cargo",
+            "--argv",
+            "test",
+            "--argv=--workspace",
+        ])
+        .unwrap();
+        let Commands::Verify {
+            action: VerifyAction::Request {
+                argv, command_argv, ..
+            },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(command_argv.is_empty());
+        assert_eq!(argv, ["cargo", "test", "--workspace"]);
+        a2a_protocol::validate_command_argv(&argv).unwrap();
+    }
+
+    #[test]
+    fn quoted_command_is_an_actionable_error_not_an_allowlist_blocker() {
+        let cli = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--argv",
+            "cargo test",
+        ])
+        .unwrap();
+        let Commands::Verify {
+            action: VerifyAction::Request { argv, .. },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        let error = a2a_protocol::validate_command_argv(&argv)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single argument"));
+        assert!(error.contains("-- cargo test"));
+    }
+
+    #[test]
+    fn missing_or_ambiguous_command_is_rejected() {
+        for args in [
+            vec!["openflows-harness", "verify", "request"],
+            vec![
+                "openflows-harness",
+                "verify",
+                "request",
+                "--argv",
+                "cargo",
+                "--",
+                "npm",
+                "test",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 }

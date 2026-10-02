@@ -48,7 +48,7 @@ pub fn is_valid_phase(phase: &str) -> bool {
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
-        "write" | "edit" | "create" | "patch" | "Write" | "Edit" | "Create" | "Patch"
+        "write" | "edit" | "create" | "patch" | "write_file" | "edit_file" | "apply_patch"
     )
 }
 
@@ -63,6 +63,50 @@ fn is_shell(name: &str) -> bool {
         name.to_lowercase().as_str(),
         "bash" | "sh" | "shell" | "execute" | "exec"
     )
+}
+
+/// A single literal delegation command. Its argv executes in the verification
+/// sandbox, not the agent checkout. Reject host-shell composition/expansion.
+pub(super) fn is_verification_request(command: &str) -> bool {
+    let words: Vec<_> = command.split_whitespace().take(3).collect();
+    if words.len() != 3
+        || words[0].rsplit('/').next() != Some("openflows-harness")
+        || words[1] != "verify"
+        || words[2] != "request"
+    {
+        return false;
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    for c in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote != Some('\'') && c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(c, '$' | '`') {
+            return false;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if matches!(c, '\'' | '"') {
+            quote = Some(c);
+        } else if matches!(c, ';' | '&' | '|' | '<' | '>' | '\n' | '\r') {
+            return false;
+        }
+    }
+    quote.is_none() && !escaped
 }
 
 fn shell_command_writes(command: &str) -> bool {
@@ -90,10 +134,6 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     let mut targets = redirection_targets(&words);
     targets.extend(tee_targets(&words));
     targets.extend(command_operand_targets(&words));
-    if !targets.is_empty() {
-        return Some(targets);
-    }
-
     let cmd = command.to_lowercase();
     if cmd.contains("python ")
         || cmd.contains("python3 ")
@@ -115,7 +155,7 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    Some(Vec::new())
+    Some(targets)
 }
 
 /// The known forwarding wrappers that merely pass control to the real command.
@@ -273,6 +313,15 @@ fn redirection_targets(words: &[String]) -> Vec<String> {
             }
         }
     }
+    // Discarding output or duplicating an existing descriptor does not
+    // modify a source file. Keep this exception local to redirections:
+    // command operands and tee destinations must still be checked normally.
+    targets.retain(|target| {
+        target != "/dev/null"
+            && !target.strip_prefix('&').is_some_and(|fd| {
+                fd == "-" || (!fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
+            })
+    });
     targets
 }
 
@@ -324,6 +373,8 @@ fn command_operand_targets(words: &[String]) -> Vec<String> {
 
 fn shell_words(command: &str) -> Vec<String> {
     command
+        .replace('\n', " ; ")
+        .replace("&&", " && ")
         .replace(">>", " __OPENFLOWS_REDIR__ ")
         .replace('>', " __OPENFLOWS_REDIR__ ")
         .replace('|', " | ")
@@ -358,9 +409,7 @@ fn is_allowed_lifecycle_artifact(path: &str) -> bool {
     let file = p.rsplit(['/', '\\']).next().unwrap_or(p.as_str());
     matches!(
         file,
-        "plan.md"
-            | "plan"
-            | "status.json"
+        "status.json"
             | "blocker"
             | "blocker.md"
             | "blockers.md"
@@ -478,6 +527,50 @@ fn target_path(input: &Value) -> String {
         .to_string()
 }
 
+/// Coder plan location for the chat authenticated by the hook envelope.
+pub(super) fn chat_plan_path(chat_id: &str) -> String {
+    format!("/home/coder/.coder/plans/PLAN-{chat_id}.md")
+}
+
+fn is_plan_path(path: &str, chat_id: &str) -> bool {
+    path == chat_plan_path(chat_id)
+}
+
+/// Reject uploads of aliases or other chats' plans, including shell invocations.
+fn has_nonstandard_plan_upload(tool_name: &str, input: &Value, chat_id: &str) -> bool {
+    if !is_shell(tool_name) && !is_harness(tool_name) {
+        return false;
+    }
+    let words = shell_words(&command_text(input));
+    words.split(|word| is_shell_separator(word)).any(|segment| {
+        if segment.is_empty() {
+            return false;
+        }
+        let executable = resolve_executable_index(segment);
+        let name = segment[executable].rsplit('/').next().unwrap_or("");
+        let args = if name == "openflows-harness" {
+            &segment[executable + 1..]
+        } else if is_harness(tool_name) {
+            segment
+        } else {
+            return false;
+        };
+        if args.get(0).map(String::as_str) != Some("plan")
+            || args.get(1).map(String::as_str) != Some("write")
+        {
+            return false;
+        }
+        let path = args.iter().enumerate().find_map(|(index, arg)| {
+            if arg == "--file" {
+                args.get(index + 1).map(String::as_str)
+            } else {
+                arg.strip_prefix("--file=")
+            }
+        });
+        !path.is_some_and(|p| is_plan_path(p, chat_id))
+    })
+}
+
 /// True when the write is to / creates the plan artifact.
 ///
 /// Plan writes are determined from the *validated target path* or the exact
@@ -485,14 +578,16 @@ fn target_path(input: &Value) -> String {
 /// the tool input. Trusting a caller-supplied `is_plan: true` marker would let
 /// a write to any source path masquerade as a plan write and slip past the
 /// phase gate.
-fn is_plan_write(tool_name: &str, input: &Value) -> bool {
-    if tool_name.to_lowercase().contains("plan") {
+fn is_plan_write(tool_name: &str, input: &Value, chat_id: &str) -> bool {
+    if is_plan_path(&target_path(input), chat_id) {
         return true;
     }
-    let path = target_path(input).to_lowercase();
-    let file = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str());
-    if matches!(file, "plan.md" | "plan") {
-        return true;
+    if is_shell(tool_name) {
+        // Every write target must be a plan, so a trailing source write cannot
+        // borrow the exception from an earlier plan redirection.
+        if let Some(targets) = shell_write_targets(&command_text(input)) {
+            return !targets.is_empty() && targets.iter().all(|p| is_plan_path(p, chat_id));
+        }
     }
     // A harness `plan write` call uploads the plan.
     if is_harness(tool_name) {
@@ -534,12 +629,12 @@ pub fn phase_guidance(phase: &str, plan_exists: bool, role: &str) -> String {
     }
 
     match phase {
-        "planning" => if plan_exists { "Planning: revise the plan if needed, upload it, then set plan_ready. Source edits require approval." } else {"Planning: write PLAN.md and upload with plan write before setting plan_ready. Source edits require approval."}.into(),
+        "planning" => if plan_exists { "Planning: read source, inspect repository state and runtime capabilities before revising the plan. Upload it, then set plan_ready. Source edits require approval." } else {"Planning: first read source, inspect repository state and runtime capabilities to ground the plan. Then write the plan at the current chat-specific path, upload that exact file with plan write, and set plan_ready. Read-only inspection is allowed now; source edits require approval."}.into(),
         "plan_ready" => "Plan is ready for SENTINEL review. Wait for approval, then set building; do not edit source or the submitted plan.".into(),
         "plan_rejected" => "Read rejection feedback in status get. Return to planning, revise/upload the plan, and set plan_ready.".into(),
         "building" if !plan_exists => "Building has no approved plan. Return to planning and run /plan, upload it, then obtain review before implementing.".into(),
         "building" => "Building: implement the approved plan, commit all changes, then set testing with a clean checkout.".into(),
-        "testing" => "Testing freezes source. Run verify serve for SENTINEL A2A tests. Wait for SENTINEL and human testing approval, then set submit. For fixes return to building.".into(),
+        "testing" => "Testing freezes source. Run verify serve for SENTINEL A2A tests. Wait for successful A2A verification and SENTINEL testing approval, then set submit. Human testing review is TODO and does not block submit. For fixes return to building.".into(),
         "submit" => "Submit: open/record the PR. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
         "done" => "Ticket is done and terminal.".into(),
         "blocked" => "Blocked: record a blocker and wait for help. Recovery returns to planning.".into(),
@@ -589,8 +684,14 @@ pub async fn phase_guard(
     };
     let st = read_ticket_state(store, &ticket).await;
     let phase = st.phase.as_deref().unwrap_or("unset");
-    let guidance = phase_guidance(phase, st.plan_exists, role);
+    let plan_path = chat_plan_path(chat_id);
+    let guidance = format!("{} Current chat plan: `{plan_path}`. During planning write the plan there, then upload that exact file with `openflows-harness plan write --file {plan_path}`. Do not write /home/coder/PLAN.md.", phase_guidance(phase, st.plan_exists, role));
     let mut decision = HookDecision::observe();
+    if has_nonstandard_plan_upload(&lower, input, chat_id) {
+        return HookDecision::deny(format!(
+            "Use the standard current-chat plan path: `openflows-harness plan write --file {plan_path}`. Legacy PLAN.md paths and other chats' plans are not accepted."
+        )).with_model_context(guidance);
+    }
 
     // Only gate write-ish tools and harness/shell coordination. Non-write,
     // non-coordination tools (e.g. Read, MCP reads) fall through.
@@ -598,16 +699,22 @@ pub async fn phase_guard(
         return base;
     }
 
+    if phase == "testing" && is_shell(&lower) && is_verification_request(&command_text(input)) {
+        return decision.with_model_context(guidance);
+    }
+
     // ── PLANNING ──────────────────────────────────────────────────────────
     if matches!(phase, "planning" | "plan_ready" | "plan_rejected" | "unset") {
         if is_write_attempt(&lower, input)
-            && !(phase != "plan_ready" && is_plan_write(&lower, input))
+            && !(phase != "plan_ready" && is_plan_write(&lower, input, chat_id))
         {
             // First write must be the plan.
-            decision = HookDecision::deny(
-                "openflows policy: FORGE is in the planning phase and must write \
-                 PLAN.md (or `openflows-harness plan write`) before touching source",
-            );
+            decision = HookDecision::deny(format!(
+                "openflows policy: source modifications require an approved plan and the building phase. \
+                 During planning, read source files and inspect repository/runtime state, then write `{plan_path}` \
+                 and submit it with `openflows-harness plan write --file {plan_path}` and `status set plan_ready`. \
+                 During plan_ready the plan is frozen; wait for review."
+            ));
         }
         return decision.with_model_context(guidance);
     }
@@ -615,14 +722,14 @@ pub async fn phase_guard(
     // ── BUILDING ──────────────────────────────────────────────────────────
     if phase == "building" {
         if !st.plan_exists {
-            if is_plan_write(&lower, input) || is_plan_recovery_command(&lower, input) {
+            if is_plan_write(&lower, input, chat_id) || is_plan_recovery_command(&lower, input) {
                 return decision.with_model_context(guidance);
             }
             // Out-of-sequence: trying to build before a plan was ever uploaded.
             decision = HookDecision::deny(
                 "openflows policy: FORGE is in the building phase but no plan exists \
                  in the shared store. Write and upload a plan first: run `/plan`, then \
-                 `openflows-harness plan write --file PLAN.md`.",
+                 `openflows-harness plan write --file <absolute-plan-path>`.",
             );
         }
         // Otherwise building writes are allowed; attach guidance regardless.
@@ -640,7 +747,7 @@ pub async fn phase_guard(
             );
         }
         if !st.plan_exists {
-            if is_plan_write(&lower, input) || is_plan_recovery_command(&lower, input) {
+            if is_plan_write(&lower, input, chat_id) || is_plan_recovery_command(&lower, input) {
                 return decision.with_model_context(guidance);
             }
             decision = HookDecision::deny(
