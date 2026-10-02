@@ -25,8 +25,8 @@ or advertised capability does not prove an executor is available. Submission
 errors alone do not prove the executor is absent: tasks are queued before claim.
 For a command-policy rejection, inspect the specific denied operation. Correct
 argument mistakes; do not cycle through unrelated commands. Report real policy
-or sandbox setup blockers and stop.
-Project-specific verification commands are allowed in the mandatory sandbox. Known
+or workspace toolchain blockers and stop.
+Project-specific verification commands are allowed in the temporary FORGE checkout. Known
 destructive/control-plane operations have explicit denials. `echo hello` checks
 transport only and never proves acceptance criteria. Missing toolchains or offline
 dependencies require the operator to update the verification image.

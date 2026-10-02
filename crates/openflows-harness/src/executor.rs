@@ -1,7 +1,7 @@
 // crates/openflows-harness/src/executor.rs
-//! Sandbox task executor for verify serve (Forge role).
+//! Temporary checkout task executor for verify serve (Forge role).
 //!
-//! Executes commands in a restricted environment with:
+//! Executes commands with FORGE workspace permissions and:
 //! - Process group isolation (for clean timeout/kill)
 //! - Timeout enforcement via tokio::time::timeout
 //! - Stdout/stderr capture and streaming
@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Execute a verify task in a sandbox with timeout enforcement.
+/// Execute a verify task in a temporary checkout with timeout enforcement.
 ///
 /// `task_id` is the relay-assigned task id this execution reports back under;
 /// when `None`, a fresh id is generated (used by the standalone/self-test
@@ -77,6 +77,9 @@ pub async fn execute_verify_task(
         .context("Failed to spawn command")?;
 
     let child_pid = child.id();
+    // Clean up descendants on every exit, including cancellation of this future.
+    // This guard drops before the checkout, so children cannot keep writing to it.
+    let _process_group = VerificationProcessGroup(child_pid);
 
     // Get stdout and stderr readers
     let stdout = child.stdout.take().context("Failed to take stdout")?;
@@ -110,6 +113,10 @@ pub async fn execute_verify_task(
 
             // Wait for child to finish
             let status = wait_for_process(&mut child, cancel_token.as_deref()).await?;
+
+            // A test may spawn background children and then exit successfully.
+            // Stop those children before collecting artifacts or waiting for EOF.
+            kill_process_group(child_pid);
 
             // Collect output
             let stdout_text = stdout_reader.await.context("Stdout reader task failed")??;
@@ -287,14 +294,24 @@ async fn wait_for_process(
     }
 }
 
-/// Kill the entire process group for a given child PID.
-/// Kill the attached runtime client; Sandbox drop also removes the container.
+struct VerificationProcessGroup(u32);
+
+impl Drop for VerificationProcessGroup {
+    fn drop(&mut self) {
+        kill_process_group(self.0);
+    }
+}
+
+/// Kill the verification process group; the temporary checkout is removed on drop.
 fn kill_process_group(pid: u32) {
     if pid == 0 {
         return;
     }
     let pgid = Pid::from_raw(pid as i32);
     if let Err(e) = killpg(pgid, Signal::SIGKILL) {
+        if e == nix::errno::Errno::ESRCH {
+            return;
+        }
         warn!(pid, error = %e, "Failed to kill process group");
     }
 }
@@ -377,6 +394,22 @@ fn clean_head() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn process_group_guard_stops_command_on_drop() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        drop(VerificationProcessGroup(child.id()));
+        let status =
+            tokio::time::timeout(Duration::from_secs(2), wait_for_process(&mut child, None))
+                .await
+                .expect("guard must terminate verification")
+                .unwrap();
+        assert!(!status.success());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn process_wait_yields_so_timeout_and_cancellation_work() {

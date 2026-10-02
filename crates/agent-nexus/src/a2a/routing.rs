@@ -282,30 +282,16 @@ impl A2ARelay {
     ) -> Result<String> {
         let idempotency_key = req.idempotency_seed()?;
 
-        // Dedup in-flight work only. Terminal tasks must be retryable so an
-        // infrastructure fix can rerun the exact same verification request.
-        let existing_task_id = {
-            let idempotency = self.idempotency.lock().await;
-            idempotency.get(&idempotency_key).cloned()
-        };
-        if let Some(task_id) = existing_task_id {
-            let state = {
-                let tasks = self.tasks.lock().await;
-                tasks.get(&task_id).map(|task| task.state)
-            };
-            match state {
-                Some(TaskState::Pending | TaskState::Running) => {
-                    debug!(
-                        task_id = %task_id,
-                        pair_id = %req.pair_id,
-                        "Task already exists (dedup)"
-                    );
-                    return Ok(task_id);
-                }
-                Some(TaskState::Completed | TaskState::Cancelled) | None => {
-                    self.idempotency.lock().await.remove(&idempotency_key);
-                    self.idempotency_ts.lock().await.remove(&idempotency_key);
-                }
+        // Serialize lookup, terminal replacement, and insertion with task state.
+        // All multi-map operations acquire tasks before idempotency before ts.
+        let mut tasks = self.tasks.lock().await;
+        let mut idempotency = self.idempotency.lock().await;
+        if let Some(task_id) = idempotency.get(&idempotency_key) {
+            if tasks
+                .get(task_id)
+                .is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Running))
+            {
+                return Ok(task_id.clone());
             }
         }
 
@@ -321,16 +307,14 @@ impl A2ARelay {
             result: None,
         };
 
-        let mut tasks = self.tasks.lock().await;
         tasks.insert(task_id.clone(), entry);
-        self.idempotency
-            .lock()
-            .await
-            .insert(idempotency_key.clone(), task_id.clone());
+        idempotency.insert(idempotency_key.clone(), task_id.clone());
         self.idempotency_ts
             .lock()
             .await
             .insert(idempotency_key, std::time::Instant::now());
+
+        drop(idempotency);
 
         // Mirror the request to the audit trail so it can be replayed later
         let _ = self.mirror_request(&task_id, req).await;
@@ -456,43 +440,29 @@ impl A2ARelay {
         const IDEMPOTENCY_TTL_SECS: u64 = 3600; // 1 hour
         let now = std::time::Instant::now();
 
-        let stale_keys: Vec<String> = {
-            let ts = self.idempotency_ts.lock().await;
-            ts.iter()
-                .filter(|(_, instant)| {
-                    now.duration_since(**instant).as_secs() > IDEMPOTENCY_TTL_SECS
-                })
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
-
-        let to_evict: Vec<(String, String)> = {
-            let idempotency = self.idempotency.lock().await;
-            let tasks = self.tasks.lock().await;
-            stale_keys
-                .iter()
-                .filter_map(|key| {
-                    let task_id = idempotency.get(key)?;
-                    let should_evict = match tasks.get(task_id) {
-                        Some(t) => matches!(t.state, TaskState::Completed | TaskState::Cancelled),
-                        None => true,
-                    };
-                    if should_evict {
-                        Some((key.clone(), task_id.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
+        // Inspect and evict under the same locks as enqueue. A stale snapshot
+        // must never remove a replacement task's deduplication mapping.
+        let mut tasks = self.tasks.lock().await;
         let mut idempotency = self.idempotency.lock().await;
         let mut ts = self.idempotency_ts.lock().await;
-        let mut tasks = self.tasks.lock().await;
-        for (key, task_id) in to_evict {
-            idempotency.remove(&key);
+        let stale_keys: Vec<String> = ts
+            .iter()
+            .filter(|(_, inserted)| now.duration_since(**inserted).as_secs() > IDEMPOTENCY_TTL_SECS)
+            .filter(|(key, _)| {
+                idempotency
+                    .get(*key)
+                    .and_then(|id| tasks.get(id))
+                    .is_none_or(|task| {
+                        matches!(task.state, TaskState::Completed | TaskState::Cancelled)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            if let Some(task_id) = idempotency.remove(&key) {
+                tasks.remove(&task_id);
+            }
             ts.remove(&key);
-            tasks.remove(&task_id);
         }
     }
 

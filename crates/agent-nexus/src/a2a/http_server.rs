@@ -97,7 +97,7 @@ async fn handle_agent_card() -> Json<Value> {
         "description": "Central A2A relay for Sentinel↔Forge delegated verification (issue #143)",
         "capabilities": {
             "verify": {
-                "description": "Verify task execution with command allowlist and sandbox isolation",
+                "description": "Verify task execution in a temporary FORGE checkout with command policy checks",
                 "task_type": "verify",
                 "methods": [
                     "message/send",
@@ -272,8 +272,8 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
     }
 
     anyhow::ensure!(
-        params.get("sandbox_version").and_then(Value::as_u64) == Some(1),
-        "Executor upgrade required: isolated verification sandbox version 1 is mandatory"
+        params.get("checkout_version").and_then(Value::as_u64) == Some(1),
+        "Executor upgrade required: temporary verification checkout version 1 is mandatory"
     );
     match state.relay.claim_next_task(pair_id).await? {
         Some(entry) => Ok(json!({
@@ -530,7 +530,7 @@ mod regression_tests {
     }
 
     #[tokio::test]
-    async fn old_unsandboxed_executors_cannot_claim_tasks() {
+    async fn executors_without_temporary_checkout_cannot_claim_tasks() {
         let state = A2AServerState {
             relay: Arc::new(A2ARelay::new(Arc::new(
                 pocketflow_core::SharedStore::new_in_memory(),
@@ -544,6 +544,12 @@ mod regression_tests {
         assert!(handle_tasks_claim(
             &state,
             &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1})
+        )
+        .await
+        .is_err());
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":1})
         )
         .await
         .unwrap()

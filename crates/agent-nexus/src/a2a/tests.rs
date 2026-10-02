@@ -216,6 +216,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_terminal_retries_enqueue_one_replacement() {
+        use crate::a2a::routing::A2ARelay;
+        use crate::a2a::verify_handler::submit_verify_request;
+        let relay = Arc::new(A2ARelay::new(Arc::new(SharedStore::new_in_memory())));
+        let req = sample_request();
+        let original = submit_verify_request(&relay, &req, "T-048").await.unwrap();
+        relay.claim_next_task("T-048").await.unwrap().unwrap();
+        relay
+            .complete_task(&original, sample_result(&original))
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let relay = relay.clone();
+            let req = req.clone();
+            let barrier = barrier.clone();
+            workers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                relay.cleanup_idempotency().await;
+                submit_verify_request(&relay, &req, "T-048").await.unwrap()
+            }));
+        }
+        let ids = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut ids = std::collections::HashSet::new();
+            for worker in workers {
+                ids.insert(worker.await.unwrap());
+            }
+            ids
+        })
+        .await
+        .expect("enqueue and cleanup must not deadlock");
+        assert_eq!(ids.len(), 1);
+        assert!(!ids.contains(&original));
+        let claimed = relay.claim_next_task("T-048").await.unwrap().unwrap();
+        assert!(ids.contains(&claimed.task_id));
+        assert!(relay.claim_next_task("T-048").await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn test_relay_claim_rejects_non_forge_role_via_validation() {
         use crate::a2a::routing::A2ARelay;

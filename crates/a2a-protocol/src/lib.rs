@@ -23,7 +23,7 @@ pub use verify::{
 pub const TASK_TYPE_VERIFY: &str = "verify";
 
 /// Compatibility predicate: unknown tools are permitted; known dangerous operations are denied.
-/// This is a diagnostic guard, not a sandbox. All execution requires isolation.
+/// This is a diagnostic guard, not a sandbox. Verification runs with FORGE workspace permissions.
 pub fn is_allowlisted(argv: &[String]) -> bool {
     !argv.is_empty() && prohibited_operation(argv).is_none()
 }

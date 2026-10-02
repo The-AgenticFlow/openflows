@@ -1,4 +1,4 @@
-//! Docker-backed boundary tests. Run with --ignored; uses the local redis:7-alpine image.
+//! Verification checkout tests using the workspace's Git and shell; no Docker required.
 use openflows_harness::sandbox::Sandbox;
 use std::process::Command;
 
@@ -37,28 +37,25 @@ fn repository() -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "requires Docker and redis:7-alpine"]
-fn sandbox_protects_checkout_credentials_network_and_host_files() {
+fn checkout_runs_with_workspace_tools_and_collects_artifacts() {
     let repo = repository();
     let argv = [
-        "busybox",
         "sh",
         "-c",
         r#"
-        test -z "$REDIS_URL$CODER_AGENT_TOKEN$GITHUB_TOKEN" &&
-        test ! -e /var/run/docker.sock && test ! -e /home/coder &&
-        test ! -e /workspace/repo/.git && test ! -e private.env &&
-        test -z "$REDIS_VERSION$OPENFLOWS_SECRET_PROBE" &&
-        test "$(wc -l </proc/net/route)" -eq 1 &&
+        test -d .git && test ! -e private.env &&
+        test "$OPENFLOWS_TOOL_PROBE" = fixture-only &&
+        test -n "$HOME" && test "$CI" = true &&
+        git rev-parse HEAD &&
         echo build > generated.txt &&
         echo harmless-output
     "#,
     ]
     .map(str::to_owned);
-    let sandbox = Sandbox::create_with_image(repo.path(), &argv, "redis:7-alpine").unwrap();
+    let sandbox = Sandbox::create(repo.path(), &argv).unwrap();
     let output = sandbox
         .command()
-        .env("OPENFLOWS_SECRET_PROBE", "fixture-only")
+        .env("OPENFLOWS_TOOL_PROBE", "fixture-only")
         .output()
         .unwrap();
     assert!(
@@ -67,6 +64,7 @@ fn sandbox_protects_checkout_credentials_network_and_host_files() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("harmless-output"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&sandbox.head));
     assert!(sandbox.source_unchanged().unwrap());
     let artifacts = sandbox.artifacts(&["generated.txt".into()]).unwrap();
     assert_eq!(artifacts.len(), 1);
@@ -77,11 +75,10 @@ fn sandbox_protects_checkout_credentials_network_and_host_files() {
 }
 
 #[test]
-#[ignore = "requires Docker and redis:7-alpine"]
 fn sandbox_source_mutation_cannot_be_used_as_clean_head_evidence() {
     let repo = repository();
-    let argv = ["busybox", "sh", "-c", "echo changed > source.txt"].map(str::to_owned);
-    let sandbox = Sandbox::create_with_image(repo.path(), &argv, "redis:7-alpine").unwrap();
+    let argv = ["sh", "-c", "echo changed > source.txt"].map(str::to_owned);
+    let sandbox = Sandbox::create(repo.path(), &argv).unwrap();
     assert!(sandbox.command().status().unwrap().success());
     assert!(!sandbox.source_unchanged().unwrap());
     assert_eq!(
@@ -91,20 +88,72 @@ fn sandbox_source_mutation_cannot_be_used_as_clean_head_evidence() {
 }
 
 #[test]
-#[ignore = "requires Docker and redis:7-alpine"]
-fn sandbox_preserves_failure_exit_and_cleans_up_container() {
+fn checkout_preserves_failure_exit_and_cleans_up_directory() {
     let repo = repository();
-    let argv = ["busybox", "sh", "-c", "exit 7"].map(str::to_owned);
-    let sandbox = Sandbox::create_with_image(repo.path(), &argv, "redis:7-alpine").unwrap();
-    let command = sandbox.command();
-    let name = command.get_args().last().unwrap().to_owned();
+    let argv = ["sh", "-c", "exit 7"].map(str::to_owned);
+    let sandbox = Sandbox::create(repo.path(), &argv).unwrap();
+    let checkout = sandbox.checkout_path();
+    assert!(checkout.exists());
     assert_eq!(sandbox.command().status().unwrap().code(), Some(7));
     drop(sandbox);
-    assert!(!Command::new("docker")
-        .arg("inspect")
-        .arg(name)
+    assert!(!checkout.exists());
+    assert!(repo.path().join("source.txt").exists());
+}
+
+#[test]
+fn dirty_candidate_is_rejected() {
+    let repo = repository();
+    std::fs::write(repo.path().join("source.txt"), "uncommitted").unwrap();
+    let error = Sandbox::create(repo.path(), &["true".into()])
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("clean candidate"));
+}
+
+#[test]
+fn artifacts_cannot_follow_links_outside_checkout() {
+    let repo = repository();
+    let sandbox = Sandbox::create(repo.path(), &["true".into()]).unwrap();
+    std::os::unix::fs::symlink(repo.path(), sandbox.checkout_path().join("outside")).unwrap();
+    assert!(sandbox.artifacts(&["outside/source.txt".into()]).is_err());
+    std::os::unix::fs::symlink("source.txt", sandbox.checkout_path().join("link")).unwrap();
+    assert!(sandbox.artifacts(&["link".into()]).is_err());
+}
+
+#[test]
+fn checkout_git_changes_do_not_modify_forge_branch_or_index() {
+    let repo = repository();
+    let original = Command::new("git")
+        .current_dir(repo.path())
+        .args(["symbolic-ref", "HEAD"])
         .output()
         .unwrap()
-        .status
-        .success());
+        .stdout;
+    let sandbox = Sandbox::create(
+        repo.path(),
+        &[
+            "git".into(),
+            "checkout".into(),
+            "-b".into(),
+            "test-branch".into(),
+        ],
+    )
+    .unwrap();
+    assert!(sandbox.command().status().unwrap().success());
+    assert_eq!(
+        Command::new("git")
+            .current_dir(repo.path())
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        original
+    );
+    assert!(Command::new("git")
+        .current_dir(repo.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap()
+        .stdout
+        .is_empty());
 }

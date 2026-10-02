@@ -59,9 +59,9 @@ Do not quote the entire command: `--argv "cargo test"` is one token, not the
 executable `cargo` followed by `test`. The legacy token form remains supported:
 `--argv cargo --argv test --argv=--workspace --argv=--all-features`.
 Tokenization errors should be corrected and retried. Unfamiliar project tooling is
-allowed in the mandatory disposable verification sandbox; explicit destructive
-and control-plane operations are denied. See [verification sandbox](verification-sandbox.md)
-for isolation, provisioning requirements and executor-first rollout order.
+allowed in a temporary verification checkout; explicit destructive
+and control-plane operations are denied. See [verification checkout](verification-sandbox.md)
+for checkout preparation, artifact collection, and execution permissions.
 
 The executor reports a clean checkout head before and after execution. Missing,
 changed, dirty or timed-out evidence cannot satisfy the gate. SENTINEL must
@@ -149,3 +149,20 @@ Before rotating a PR reviewer, NEXUS interrupts any running old chat, confirms
 it is no longer running, and archives it before deleting bindings or freeing
 the slot. A still-running chat or Coder API failure retains the binding and
 slot for retry on the next controller poll.
+
+### Verification execution
+
+FORGE runs verification in a temporary detached checkout of the clean candidate
+commit, using its existing tools, environment, dependency caches, and network.
+No verification image or Docker engine is required. The checkout has an independent
+Git index and object database and is removed after execution. Generated artifacts
+are collected before cleanup. Edits to committed source invalidate commit evidence.
+This provides checkout separation, not a security boundary for untrusted processes.
+
+When a SENTINEL workspace is replaced, NEXUS interrupts an active old reviewer,
+confirms it has stopped, and archives that conversation before creating a review
+session in the new workspace. Interrupt, status, or archive failures preserve the
+binding for retry. The
+new review receives the current review request and uses durable lifecycle evidence.
+Verification enqueue and expiration share a lock order so concurrent retries of
+terminal tasks produce only one pending replacement.

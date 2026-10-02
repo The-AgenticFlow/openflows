@@ -26,27 +26,6 @@ variable "a2a_relay_addr" {
   description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Forge resolves the nexus container over the shared docker network by its service name to claim and execute verify tasks."
 }
 
-# Verification runs only in disposable containers on an operator-managed engine.
-# Do not expose a host Docker socket to the test container.
-variable "verify_image" {
-  type = string
-  default = ""
-  description = "Prebuilt verification image with project toolchain/dependencies; required for A2A execution."
-  validation {
-    condition = var.verify_image == "" || can(regex("^[A-Za-z0-9][A-Za-z0-9._/:@-]*$", var.verify_image))
-    error_message = "verify_image must be an image reference without shell metacharacters."
-  }
-}
-variable "verify_docker_host" {
-  type = string
-  default = ""
-  description = "Operator-managed Docker endpoint reachable by the executor (prefer TLS or SSH)."
-  validation {
-    condition = var.verify_docker_host == "" || can(regex("^(ssh|tcp|unix)://[A-Za-z0-9._/:@-]+$", var.verify_docker_host))
-    error_message = "verify_docker_host must be an ssh/tcp/unix endpoint without shell metacharacters."
-  }
-}
-
 # Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
 data "coder_parameter" "role" {
   name        = "role"
@@ -368,16 +347,8 @@ resource "coder_agent" "main" {
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
-    export OPENFLOWS_VERIFY_IMAGE="${var.verify_image}"
-    if [ -n "${var.verify_docker_host}" ]; then
-      export DOCKER_HOST="${var.verify_docker_host}"
-    fi
-    if [ -n "$OPENFLOWS_VERIFY_IMAGE" ] && ! command -v docker >/dev/null 2>&1; then
-      sudo apt-get update && sudo apt-get install -y docker.io
-    fi
-
     # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
-    # Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    # Executes tasks in temporary checkouts using this workspace's tools and environment.
     # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
     # Supervise startup failures (including Redis/relay races) outside the agent chat.
     # Keep diagnostics outside the checkout so candidate-head checks stay clean.

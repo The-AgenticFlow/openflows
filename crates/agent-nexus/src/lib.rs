@@ -2111,7 +2111,7 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = if testing {
-                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. For infrastructure failure or unavailable sandbox/toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the mandatory verification sandbox. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
+                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. For infrastructure failure or unavailable workspace toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
                     } else {
                         format!("Review plan revision {} for {}. Read `openflows-harness plan read`. Write review.md with actionable feedback. Run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict approve --report review.md` (or reject). Do not change source. A rejection is recorded and returned to FORGE.",lifecycle.revision,ticket.id,lifecycle.revision,lifecycle.review_round)
                     };
@@ -3477,8 +3477,28 @@ Use `openflows-harness` for all coordination:
         }
         if let Some(id) = session {
             if let Some(chat) = client.get_chat_opt(&id).await? {
-                anyhow::ensure!(chat.workspace_id == request.workspace_id,
-                    "Existing SENTINEL session belongs to another workspace; recover its workspace before reviewing");
+                if chat.workspace_id != request.workspace_id {
+                    // Quiesce the previous reviewer before replacing its session.
+                    // An uncertain interrupt/archive leaves the binding intact for retry.
+                    if matches!(
+                        chat.status(),
+                        ChatStatus::Running | ChatStatus::Pending | ChatStatus::RequiresAction
+                    ) {
+                        client.interrupt_chat(&id).await?;
+                        if let Some(current) = client.get_chat_opt(&id).await? {
+                            anyhow::ensure!(
+                                !matches!(current.status(), ChatStatus::Running | ChatStatus::Pending | ChatStatus::RequiresAction),
+                                "Waiting for the old SENTINEL reviewer to stop before workspace replacement"
+                            );
+                        }
+                    }
+                    client.archive_chat(&id).await?;
+                    store.del(&session_key).await;
+                    let replacement = client.create_chat(request).await?;
+                    store.set(&session_key, json!(replacement.id)).await;
+                    store.set(round_key, json!(replacement.id)).await;
+                    return Ok(replacement);
+                }
                 store.set(&session_key, json!(id)).await;
                 // Do not inject the next round while the previous review is
                 // still executing. Its stale verdict is independently rejected
@@ -5914,6 +5934,95 @@ mod tests {
             );
             create.assert_async().await;
             send.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_workspace_recovers_reviewer_only_after_quiescence() {
+        // A running reviewer is interrupted first. Failed archive or a reviewer
+        // still running after interrupt must preserve the old session binding.
+        for (old_status, after_interrupt, archive_status, succeeds) in [
+            ("waiting", "waiting", 200, true),
+            ("running", "waiting", 200, true),
+            ("running", "running", 200, false),
+            ("waiting", "waiting", 500, false),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _old = server
+                .mock("GET", "/api/v2/chats/old")
+                .with_body(
+                    json!({"id":"old", "workspace_id":"old-ws", "status":old_status}).to_string(),
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let _after = if old_status == "running" {
+                Some(
+                    server
+                        .mock("GET", "/api/v2/chats/old")
+                        .with_body(
+                            json!({"id":"old", "workspace_id":"old-ws", "status":after_interrupt})
+                                .to_string(),
+                        )
+                        .expect(1)
+                        .create_async()
+                        .await,
+                )
+            } else {
+                None
+            };
+            let interrupt = server
+                .mock("POST", "/api/v2/chats/old/interrupt")
+                .with_status(202)
+                .expect(usize::from(old_status == "running"))
+                .create_async()
+                .await;
+            let archive = server
+                .mock("PATCH", "/api/v2/chats/old")
+                .match_body(mockito::Matcher::Json(json!({"archived":true})))
+                .with_status(archive_status)
+                .expect(usize::from(after_interrupt != "running"))
+                .create_async()
+                .await;
+            let create = server
+                .mock("POST", "/api/v2/chats")
+                .with_status(201)
+                .with_body(r#"{"id":"new","workspace_id":"new-ws","status":"pending"}"#)
+                .expect(usize::from(succeeds))
+                .create_async()
+                .await;
+            let store = SharedStore::new_in_memory();
+            store.set("ticket:T-1:sentinel_session", json!("old")).await;
+            let request = coder_client::types::CreateChatRequest {
+                organization_id: Some("org".into()),
+                workspace_id: "new-ws".into(),
+                model_config_id: None,
+                content: vec![],
+                labels: None,
+            };
+            let result = NexusNode::continue_sentinel_review(
+                &store,
+                &CoderClient::new(&server.url(), "test"),
+                "T-1",
+                "round",
+                &request,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            assert_eq!(
+                store
+                    .get_typed::<String>("ticket:T-1:sentinel_session")
+                    .await
+                    .as_deref(),
+                Some(if succeeds { "new" } else { "old" })
+            );
+            assert_eq!(
+                store.get_typed::<String>("round").await.as_deref(),
+                if succeeds { Some("new") } else { None }
+            );
+            interrupt.assert_async().await;
+            archive.assert_async().await;
+            create.assert_async().await;
         }
     }
 

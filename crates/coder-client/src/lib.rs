@@ -666,13 +666,7 @@ impl CoderClient {
         // stores them and applies them when creating workspaces. Setting them
         // as env vars in the Rust process does NOT reach the server's Terraform
         // execution — the CLI only uploads the template files.
-        let mut template_variables = vec![("TF_VAR_dev_binary_host_path", "dev_binary_host_path")];
-        if name == "openflows-forge" {
-            template_variables.extend([
-                ("TF_VAR_verify_image", "verify_image"),
-                ("TF_VAR_verify_docker_host", "verify_docker_host"),
-            ]);
-        }
+        let template_variables = [("TF_VAR_dev_binary_host_path", "dev_binary_host_path")];
         for (env_name, variable_name) in template_variables {
             if let Ok(value) = std::env::var(env_name) {
                 if value.is_empty() {
