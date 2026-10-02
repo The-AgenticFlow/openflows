@@ -87,7 +87,6 @@ data "coder_parameter" "a2a_pair_token" {
   description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
   default     = ""
   type        = "string"
-  mutable     = false
   ephemeral   = true
 }
 
