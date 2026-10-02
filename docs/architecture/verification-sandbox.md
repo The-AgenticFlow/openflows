@@ -5,6 +5,15 @@ temporary detached checkout of the candidate commit, using the tools already
 installed in its workspace. No additional image, Docker engine, or image variable
 is needed.
 
+FORGE startup preserves a working Rust toolchain or installs stable with rustup,
+and installs the native build
+prerequisites (`build-essential`, `pkg-config`, `libssl-dev`) before starting the
+executor. It explicitly exports `$HOME/.cargo/bin` on PATH: a daemon does not read
+interactive shell profiles, and installing Cargo after it starts does not update
+its environment. Existing workspaces need the updated template and a restart, or
+the same toolchain installation followed by an executor restart. Startup needs
+access to Ubuntu package repositories, sh.rustup.rs, and static.rust-lang.org.
+
 Deploy the updated NEXUS relay and FORGE harness together. Executors advertise
 `checkout_version: 1` when claiming tasks; the relay rejects older executors so
 verification cannot silently fall back to the former execution mode.

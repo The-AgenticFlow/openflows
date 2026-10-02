@@ -356,6 +356,24 @@ resource "coder_agent" "main" {
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
+    # Provision the toolchain before the non-interactive executor inherits PATH.
+    # Shell profile changes made by rustup do not affect an already-running daemon.
+    export PATH="$HOME/.cargo/bin:$PATH"
+    log "Preparing FORGE Rust toolchain..."
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
+    if ! command -v rustup >/dev/null 2>&1; then
+      RUSTUP_INSTALLER=$(mktemp)
+      curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs -o "$RUSTUP_INSTALLER"
+      sh "$RUSTUP_INSTALLER" -y --profile minimal --default-toolchain stable --no-modify-path
+      rm -f "$RUSTUP_INSTALLER"
+    elif ! cargo --version >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
+      rustup toolchain install stable --profile minimal
+      rustup default stable
+    fi
+    cargo --version
+    rustc --version
+
     # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
     # Executes tasks in temporary checkouts using this workspace's tools and environment.
     # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
