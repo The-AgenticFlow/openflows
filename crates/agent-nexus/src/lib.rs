@@ -20,6 +20,7 @@ use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
 use provisioner::{transport::CoderTransport, Provisioner};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -266,6 +267,20 @@ impl NexusNode {
     pub fn with_a2a_relay(mut self, relay: std::sync::Arc<crate::a2a::A2ARelay>) -> Self {
         self.a2a_relay = Some(relay);
         self
+    }
+
+    fn a2a_pair_token(ticket_id: &str) -> Result<String> {
+        let secret = config::EnvConfig::from_env()
+            .ok()
+            .and_then(|env| env.hooks.chat_hook_secret)
+            .filter(|secret| !secret.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET is required to derive A2A pair tokens")?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"openflows-a2a-pair-token-v1\0");
+        hasher.update(secret.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(ticket_id.as_bytes());
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     fn resolve_github_token(&self) -> Result<String> {
@@ -937,6 +952,13 @@ Before significant work, read the relevant skill file to understand the workflow
             .await
             .unwrap_or_default();
         let branch = Self::resolve_workspace_branch(&pending_prs, worker_id, ticket_id);
+        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
+            )
+            .await;
 
         // Note: The openflows-forge template expects the dev binaries via the
         // Terraform variable `TF_VAR_dev_binary_host_path` (not workspace parameters). Providing it this
@@ -954,6 +976,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 "tenant": config::EnvConfig::from_env()
                     .map(|e| e.tenant.effective_tenant().to_string())
                     .unwrap_or_else(|_| "default".to_string()),
+                "a2a_pair_token": a2a_pair_token,
                 "coder_url": coder_url.unwrap_or_else(|| {
                     config::EnvConfig::from_env()
                         .map(|e| e.coder.url)

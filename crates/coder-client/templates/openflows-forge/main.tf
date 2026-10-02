@@ -82,6 +82,15 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "a2a_pair_token" {
+  name        = "a2a_pair_token"
+  description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
+  default     = ""
+  type        = "string"
+  mutable     = false
+  ephemeral   = true
+}
+
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
   description  = "Coder server URL for API calls"
@@ -343,6 +352,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
@@ -432,6 +442,7 @@ resource "docker_container" "workspace" {
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

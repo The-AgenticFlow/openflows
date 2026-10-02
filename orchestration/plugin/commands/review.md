@@ -19,7 +19,8 @@ or workspace toolchain blockers and stop.
 Project-specific verification commands are allowed in the temporary FORGE checkout. Known
 destructive/control-plane operations have explicit denials. `echo hello` checks
 transport only and never proves acceptance criteria. Missing toolchains or offline
-dependencies require the operator to update the verification image.
+dependencies require the operator to prepare the existing FORGE workspace/toolchain
+and retry verification.
 
 
 Read `openflows-harness status get` and `plan read`. Use the returned `revision`,

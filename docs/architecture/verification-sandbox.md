@@ -8,6 +8,10 @@ is needed.
 Deploy the updated NEXUS relay and FORGE harness together. Executors advertise
 `checkout_version: 1` when claiming tasks; the relay rejects older executors so
 verification cannot silently fall back to the former execution mode.
+Freshly provisioned SENTINEL and FORGE workspaces also receive `A2A_PAIR_TOKEN`.
+The relay requires that token for pair-scoped verification RPCs, so older
+workspaces without it must be reprovisioned before they can submit or claim
+verification tasks.
 
 The executor requires a clean working checkout and captures its HEAD. Independent
 local clones use separate Git objects and indexes, preventing ordinary test Git

@@ -57,6 +57,13 @@ impl IntoResponse for JsonRpcResponse {
     }
 }
 
+fn pair_token(params: &Value) -> anyhow::Result<&str> {
+    params
+        .get("pair_token")
+        .and_then(|v| v.as_str())
+        .context("A2A pair_token is required")
+}
+
 /// JSON-RPC error object.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
@@ -183,10 +190,10 @@ async fn handle_rpc(
 
 /// message/send: Submit a verify request (Sentinel → Nexus)
 ///
-/// `params` is the `verify` task payload: `{ "pair_id", "kind", "cwd",
-/// "argv", "timeout_secs", "env_allowlist", "expect" }`. The requester's
-/// identity is authenticated out-of-band (workspace token); the relay
-/// enforces that a Sentinel may only submit for its own `pair_id`.
+/// `params` wraps the `verify` task payload plus the pair token:
+/// `{ "message": { "task": { ... VerifyRequest ... } }, "pair_token": "..." }`.
+/// The relay accepts the caller's `pair_id` only when the token matches the
+/// hash Nexus stored while provisioning that Sentinel/FORGE pair.
 async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     // The message params nest the verify task under the otherMembers tasks.
     // Per the A2A wire shape used by the harness, params may be the
@@ -199,15 +206,10 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
     let req: VerifyRequest = serde_json::from_value(raw.clone())
         .map_err(|e| InvalidVerifyRequest(format!("Invalid VerifyRequest: {e}")))?;
 
-    // AuthZ (v1): the Docker network boundary is the trust model for this
-    // deployment.  pair_id is caller-supplied (self-declared) — a malicious
-    // workspace on the shared network could impersonate another pair.  The
-    // executor role check on claim (tasks/claim rejects non-Forge roles) and
-    // the unguessable UUIDv7 task IDs provide layers of defence, but these
-    // are NOT cryptographic guarantees.
-    //
-    // TODO(v2): bind pair-scope to a workspace identity token (plan task 2)
-    // so the relay can verify ownership without trusting self-declared values.
+    state
+        .relay
+        .verify_pair_token(&req.pair_id, pair_token(params)?)
+        .await?;
     let requester_pair_id = req.pair_id.clone();
 
     let task_id = submit_verify_request(&state.relay, &req, &requester_pair_id).await?;
@@ -217,19 +219,34 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
 
 /// tasks/get: Retrieve the state of a task (Sentinel polling, Forge status).
 ///
-/// `params: { "task_id": "..." }` → returns the current lifecycle state and,
+/// `params: { "task_id", "pair_id", "pair_token" }` → returns the current lifecycle state and,
 /// once completed, the terminal result the executor mirrored to Redis.
 async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let task_id = params
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/get requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/get requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
     let entry = state
         .relay
         .get_task(task_id)
         .await
         .context("task not found")?;
+    if entry.request.pair_id != pair_id {
+        return Err(anyhow::anyhow!(
+            "tasks/get pair_id mismatch: task belongs to {} but caller claims {}",
+            entry.request.pair_id,
+            pair_id
+        ));
+    }
 
     let state_str = match entry.state {
         TaskState::Pending => "pending",
@@ -251,7 +268,7 @@ async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Res
 
 /// tasks/claim: Forge executor claims the next pending task for its pair.
 ///
-/// `params: { "pair_id": "T-048", "role": "forge" }` → returns the task
+/// `params: { "pair_id", "role": "forge", "checkout_version": 1, "pair_token" }` → returns the task
 /// (request included) or null when no pending task exists for the pair.
 async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let pair_id = params
@@ -270,6 +287,10 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
             "tasks/claim is only available to the forge executor role"
         ));
     }
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
     anyhow::ensure!(
         params.get("checkout_version").and_then(Value::as_u64) == Some(1),
@@ -286,7 +307,7 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
 
 /// tasks/complete: Forge executor submits a terminal result for a task.
 ///
-/// `params: { "task_id", "pair_id", "result": { VerifyResult } }` → the relay
+/// `params: { "task_id", "pair_id", "pair_token", "result": { VerifyResult } }` → the relay
 /// marks the task completed and mirrors the result to Redis before returning.
 async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let task_id = params
@@ -297,6 +318,10 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
         .get("pair_id")
         .and_then(|p| p.as_str())
         .context("tasks/complete requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
     let result: VerifyResult = params
         .get("result")
@@ -316,8 +341,7 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
         ));
     }
 
-    // Guard (v1 best-effort): verify the caller's pair_id matches the owning
-    // task's pair_id so a workspace cannot complete another pair's task.
+    // Guard: verify the authenticated pair owns the task.
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.request.pair_id != pair_id {
             return Err(anyhow::anyhow!(
@@ -346,14 +370,12 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
         .get("pair_id")
         .and_then(|p| p.as_str())
         .context("tasks/cancel requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
-    // Guard (best-effort, v1): the pair_id here is self-declared by the
-    // caller — a workspace that knows another pair's task ID can supply
-    // the owning pair_id to bypass this check.  The real defence is the
-    // Docker network boundary + unguessable UUIDv7 task IDs.
-    //
-    // TODO(v2): replace with workspace-identity-backed ownership verification
-    // when the relay gains signed workspace credentials (plan task 2).
+    // Guard: verify the authenticated pair owns the task.
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.request.pair_id != pair_id {
             return Err(anyhow::anyhow!(
@@ -434,6 +456,23 @@ async fn handle_tasks_progress(state: &A2AServerState, params: &Value) -> anyhow
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/push_progress requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/push_progress requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
+    if let Some(entry) = state.relay.get_task(task_id).await {
+        if entry.request.pair_id != pair_id {
+            return Err(anyhow::anyhow!(
+                "tasks/push_progress pair_id mismatch: task belongs to {} but caller claims {}",
+                entry.request.pair_id,
+                pair_id
+            ));
+        }
+    }
 
     let event: VerifyProgressEvent = serde_json::from_value(params.clone())
         .context("tasks/push_progress requires valid VerifyProgressEvent params")?;
@@ -496,20 +535,27 @@ async fn handle_stream(
 mod regression_tests {
     use super::*;
 
+    const PAIR_TOKEN: &str = "test-pair-token";
+
     async fn submit(argv: Value) -> Value {
-        let state = A2AServerState {
-            relay: Arc::new(A2ARelay::new(Arc::new(
-                pocketflow_core::SharedStore::new_in_memory(),
-            ))),
-        };
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
         let response = handle_rpc(
             State(state),
             Json(JsonRpcRequest {
                 jsonrpc: "2.0".into(),
                 method: "message/send".into(),
                 id: json!(1),
-                params: json!({"pair_id":"T-066", "kind":"command", "cwd":"repo",
-                "argv":argv, "timeout_secs":30}),
+                params: json!({
+                    "message": {
+                        "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                        "argv":argv, "timeout_secs":30}
+                    },
+                    "pair_token": PAIR_TOKEN,
+                }),
             }),
         )
         .await;
@@ -531,29 +577,64 @@ mod regression_tests {
 
     #[tokio::test]
     async fn executors_without_temporary_checkout_cannot_claim_tasks() {
-        let state = A2AServerState {
-            relay: Arc::new(A2ARelay::new(Arc::new(
-                pocketflow_core::SharedStore::new_in_memory(),
-            ))),
-        };
-        assert!(
-            handle_tasks_claim(&state, &json!({"role":"forge", "pair_id":"T-066"}))
-                .await
-                .is_err()
-        );
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
         assert!(handle_tasks_claim(
             &state,
-            &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1})
+            &json!({"role":"forge", "pair_id":"T-066", "pair_token":PAIR_TOKEN})
         )
         .await
         .is_err());
         assert!(handle_tasks_claim(
             &state,
-            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":1})
+            &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1, "pair_token":PAIR_TOKEN})
+        )
+        .await
+        .is_err());
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":1, "pair_token":PAIR_TOKEN})
         )
         .await
         .unwrap()
         .is_null());
+    }
+
+    #[tokio::test]
+    async fn verify_requests_require_matching_pair_token() {
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
+
+        assert!(handle_message_send(
+            &state,
+            &json!({
+                "message": {
+                    "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                    "argv":["cargo","test"], "timeout_secs":30}
+                },
+                "pair_token": "wrong",
+            }),
+        )
+        .await
+        .is_err());
+
+        assert!(handle_message_send(
+            &state,
+            &json!({
+                "message": {
+                    "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                    "argv":["cargo","test"], "timeout_secs":30}
+                },
+            }),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

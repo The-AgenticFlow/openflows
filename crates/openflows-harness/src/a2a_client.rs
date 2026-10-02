@@ -18,6 +18,7 @@ pub struct A2AClient {
     relay_url: String,
     pair_id: String,
     role: String, // "sentinel" or "forge"
+    pair_token: String,
 }
 
 impl A2AClient {
@@ -47,12 +48,17 @@ impl A2AClient {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
+        let pair_token = std::env::var("A2A_PAIR_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .context("A2A_PAIR_TOKEN is not set; reprovision Sentinel/FORGE workspaces so the relay can authenticate pair-scoped verification")?;
 
         Ok(Self {
             http_client,
             relay_url,
             pair_id,
             role,
+            pair_token,
         })
     }
 
@@ -74,7 +80,12 @@ impl A2AClient {
         let rpc_request = json!({
             "jsonrpc": "2.0",
             "method": "message/send",
-            "params": req,
+            "params": {
+                "message": {
+                    "task": req,
+                },
+                "pair_token": self.pair_token,
+            },
             "id": uuid::Uuid::new_v4().to_string(),
         });
 
@@ -117,6 +128,8 @@ impl A2AClient {
             "method": "tasks/get",
             "params": {
                 "task_id": task_id,
+                "pair_id": self.pair_id,
+                "pair_token": self.pair_token,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });
@@ -146,6 +159,8 @@ impl A2AClient {
             "method": "tasks/get",
             "params": {
                 "task_id": task_id,
+                "pair_id": self.pair_id,
+                "pair_token": self.pair_token,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });
@@ -198,6 +213,7 @@ impl A2AClient {
                 "pair_id": self.pair_id,
                 "role": self.role,
                 "checkout_version": 1,
+                "pair_token": self.pair_token,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });
@@ -249,6 +265,7 @@ impl A2AClient {
             "params": {
                 "task_id": result.task_id,
                 "pair_id": self.pair_id,
+                "pair_token": self.pair_token,
                 "result": result,
             },
             "id": uuid::Uuid::new_v4().to_string(),
@@ -287,6 +304,7 @@ impl A2AClient {
             "params": {
                 "task_id": task_id,
                 "pair_id": self.pair_id,
+                "pair_token": self.pair_token,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });
@@ -312,6 +330,8 @@ impl A2AClient {
             "method": "tasks/push_progress",
             "params": {
                 "task_id": task_id,
+                "pair_id": self.pair_id,
+                "pair_token": self.pair_token,
                 "stream": "stdout",
                 "chunk": "",
             },

@@ -163,8 +163,8 @@ SENTINEL workspace      NEXUS A2A relay                FORGE workspace
 
 Walkthrough:
 
-1. **Submit** — SENTINEL calls `message/send` with a `VerifyRequest`. `submit_verify_request` (`verify_handler.rs:13`) validates against `validate_verify_request` (`routing.rs:224`):
-   - **Pair match** — `req.pair_id` must equal the requester's pair_id (currently self-declared; see §8).
+1. **Submit** — SENTINEL calls `message/send` with a `VerifyRequest` and its pair token. The relay first checks the token hash Nexus registered for that `pair_id`, then `submit_verify_request` (`verify_handler.rs:13`) validates against `validate_verify_request` (`routing.rs:224`):
+   - **Pair match** — `req.pair_id` must equal the authenticated requester pair.
    - **Allowlist** — `argv` must match `is_allowlisted`.
    - **cwd** — must deserialize to `Repo` or `Worktree` (serde rejects anything else).
    - **timeout** — must be `> 0` and `≤ 3600` seconds.
@@ -240,12 +240,12 @@ Standalone note: when `task_id` is `None` (self-test path), a fresh id is genera
 |----------|-----------|
 | **Review integrity** | SENTINEL never touches FORGE's filesystem; it only submits allowlisted commands and reads results. |
 | **Command control** | Static allowlist enforced by the relay before dispatch; no `sh -c`, no free-form shell, no `sudo`. |
-| **Pair isolation** | Routing and all guards are keyed on `pair_id`; claim is restricted to the `forge` role; complete/cancel verify the owning pair. |
+| **Pair isolation** | Routing and all guards are keyed on `pair_id`; claim is restricted to the `forge` role; submit/claim/get/complete/cancel/progress require the matching pair token. |
 | **Durability / audit** | Every request, result, and rejection is mirrored to tenant-namespaced Redis keys. |
 | **Single kill switch** | One relay server; `A2A_RELAY_ADDR` bind. |
 | **Unguessable IDs** | UUIDv4 task IDs add a layer against accidental cross-talk. |
 
-**Known v1 trust boundary (documented in-code):** `pair_id` is **self-declared** by the caller. The Docker network boundary is the v1 trust model — a malicious workspace on the shared network could in principle impersonate another pair's `pair_id`. The role gate on `claim` and the UUID task IDs are layers of defense, **not** cryptographic guarantees. The code marks a v2 TODO to bind pair-scope to a **workspace identity token** so the relay can verify ownership without trusting self-declared values (see `http_server.rs:196-202`, `routing.rs:230-244`). Until then, pair-scoped authorization should not be treated as hard isolation against an attacker already on the relay's network.
+**Known trust boundary:** Nexus derives a pair token from `CODER_CHAT_HOOK_SECRET` and the ticket id, injects it into the paired SENTINEL/FORGE workspaces as `A2A_PAIR_TOKEN`, and stores only its SHA-256 hash for relay validation. This prevents another reachable workspace from claiming a different `pair_id` by self-declaration alone. It does not make FORGE execution a process sandbox: once authenticated, verification still runs with FORGE's workspace permissions, environment, caches, and network access.
 
 The companion principle outside the relay: **SENTINEL must hard-fail — never approve — when a required artifact (PLAN.md, a diff, a persisted verify result) is missing or unreadable.** The relay exists to get evidence *into* SENTINEL's hands, not to excuse approving without it.
 
@@ -256,6 +256,7 @@ The companion principle outside the relay: **SENTINEL must hard-fail — never a
 | Setting | Env var | Default | Notes |
 |---------|---------|---------|-------|
 | Bind address | `A2A_RELAY_ADDR` | `127.0.0.1:3000` | In the Coder docker deployment, workspaces dial the relay at `openflows-nexus:3000` |
+| Pair token | `A2A_PAIR_TOKEN` | none | Injected into Sentinel/FORGE by Nexus; required for all pair-scoped verification RPCs |
 | Max task timeout | — | `3600` s (hard cap) | Enforced in `validate_verify_request` (`routing.rs:263`) |
 | Output tail | — | `10 KB` / stream | `truncate_to_tail` in the executor |
 | Event buffer | — | `1000` events **or** `1 MiB` | FIFO eviction in `EventBuffer` |
@@ -279,8 +280,7 @@ The harness client warns if `A2A_RELAY_ADDR` is unset — the loopback fallback 
 - **No dedicated `verifier` role** — FORGE is the v1 executor, but the schema is executor-agnostic (`executor.role` is a field), so a future dedicated verifier workspace is a routing change, not a protocol change.
 - **No arbitrary command execution** — the allowlist is static and small; widening it is a deliberate, reviewed change to the relay.
 - **No cross-pair verification** — the routing table is strictly keyed on `pair_id`, matching the isolation guarantee this whole design protects.
-- **No cryptographic pair authorization (v2)** — see §8; self-declared `pair_id` is the known v1 boundary.
+- **No process isolation** — FORGE still runs verification with its workspace permissions; the pair token only authenticates relay ownership.
 - **`ArtifactCheck` / artifact hashing** — reserved but not built; `VerifyResult.artifacts` is populated as `vec![]` (TODO in the executor).
 
 ---
-

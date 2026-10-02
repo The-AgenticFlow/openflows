@@ -9,6 +9,7 @@ use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::{anyhow, Result};
 use pocketflow_core::SharedStore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -213,6 +214,47 @@ impl A2ARelay {
         self.sessions.read().await.get(&key).cloned()
     }
 
+    pub fn pair_token_key(pair_id: &str) -> String {
+        format!("pair:{pair_id}:a2a_token_sha256")
+    }
+
+    pub fn hash_pair_token(token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub async fn record_pair_token(&self, pair_id: &str, token: &str) -> Result<()> {
+        anyhow::ensure!(!pair_id.trim().is_empty(), "pair_id must not be empty");
+        anyhow::ensure!(!token.trim().is_empty(), "pair token must not be empty");
+        self.store
+            .set(
+                &Self::pair_token_key(pair_id),
+                serde_json::json!(Self::hash_pair_token(token)),
+            )
+            .await;
+        Ok(())
+    }
+
+    pub async fn verify_pair_token(&self, pair_id: &str, token: &str) -> Result<()> {
+        anyhow::ensure!(!pair_id.trim().is_empty(), "pair_id must not be empty");
+        anyhow::ensure!(
+            !token.trim().is_empty(),
+            "A2A pair token is required; reprovision Sentinel/FORGE workspaces"
+        );
+        let expected: Option<String> = self.store.get_typed(&Self::pair_token_key(pair_id)).await;
+        let Some(expected) = expected else {
+            return Err(anyhow!(
+                "A2A pair token is not registered for {pair_id}; reprovision Sentinel/FORGE workspaces"
+            ));
+        };
+        anyhow::ensure!(
+            expected == Self::hash_pair_token(token),
+            "A2A pair token mismatch for {pair_id}"
+        );
+        Ok(())
+    }
+
     /// Validate a verify request: check allowlist, cwd, pair_id match.
     /// Returns error if validation fails (caller logs to audit:a2a:rejected).
     ///
@@ -226,16 +268,9 @@ impl A2ARelay {
         req: &VerifyRequest,
         requester_pair_id: &str,
     ) -> Result<()> {
-        // Rule 1: Requester and request must agree on pair_id. In v1 the
-        // requester is caller-supplied (self-declared) — this check prevents
-        // accidental mismatches between a misconfigured client's pair_id and
-        // the pair_id it writes into the request body.  It is NOT a
-        // cryptographic authorization: a workspace on the Docker network
-        // can supply any value here.
-        //
-        // TODO(v2): verify requester_pair_id against a workspace identity
-        // token (plan task 2) so the relay can enforce pair-scoped access
-        // without trusting self-declared values.
+        // Rule 1: Requester and request must agree on pair_id. HTTP callers
+        // are authenticated before this point with the pair token provisioned
+        // by Nexus; this sync check still catches accidental internal misuse.
         if req.pair_id != requester_pair_id {
             return Err(anyhow!(
                 "pair_id mismatch: request says {}, requester is {}",
@@ -286,6 +321,7 @@ impl A2ARelay {
         // All multi-map operations acquire tasks before idempotency before ts.
         let mut tasks = self.tasks.lock().await;
         let mut idempotency = self.idempotency.lock().await;
+        let mut idempotency_ts = self.idempotency_ts.lock().await;
         if let Some(task_id) = idempotency.get(&idempotency_key) {
             if tasks
                 .get(task_id)
@@ -309,12 +345,11 @@ impl A2ARelay {
 
         tasks.insert(task_id.clone(), entry);
         idempotency.insert(idempotency_key.clone(), task_id.clone());
-        self.idempotency_ts
-            .lock()
-            .await
-            .insert(idempotency_key, std::time::Instant::now());
+        idempotency_ts.insert(idempotency_key, std::time::Instant::now());
 
+        drop(idempotency_ts);
         drop(idempotency);
+        drop(tasks);
 
         // Mirror the request to the audit trail so it can be replayed later
         let _ = self.mirror_request(&task_id, req).await;
@@ -366,17 +401,23 @@ impl A2ARelay {
     /// to Redis per the plan (result must be durable before Sentinel sees
     /// it). Returns an error if the task is unknown.
     pub async fn complete_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        {
+            let tasks = self.tasks.lock().await;
+            if !tasks.contains_key(task_id) {
+                return Err(anyhow!("task not found: {}", task_id));
+            }
+        }
+
+        // Mirror the terminal result before publishing the Completed state so
+        // Sentinel never observes a completed task without a durable result.
+        self.mirror_result(&result).await?;
+
         let mut tasks = self.tasks.lock().await;
         let entry = tasks
             .get_mut(task_id)
             .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
         entry.state = TaskState::Completed;
-        entry.result = Some(result.clone());
-
-        // Mirror the terminal result to Redis before releasing the lock so a
-        // concurrent `tasks/get` from Sentinel never observes a completed task
-        // without a durable result.
-        self.mirror_result(&result).await?;
+        entry.result = Some(result);
 
         debug!(task_id, "Task completed and result mirrored");
         Ok(())
@@ -562,15 +603,14 @@ impl A2ARelay {
         }
         drop(tokens);
 
-        // Transition task state to Cancelled and store result
+        self.mirror_result(&result).await?;
+
+        // Publish the Cancelled state only after the result is durable.
         let mut tasks = self.tasks.lock().await;
         if let Some(entry) = tasks.get_mut(task_id) {
             entry.state = TaskState::Cancelled;
-            entry.result = Some(result.clone());
+            entry.result = Some(result);
         }
-        drop(tasks);
-
-        self.mirror_result(&result).await?;
         debug!(task_id, "Task cancelled and result mirrored");
         Ok(())
     }
