@@ -3,12 +3,12 @@
 // SharedStore — dual-backend (in-memory for dev, Redis for production).
 // Same interface regardless of backend. Swap via REDIS_URL env var.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
@@ -94,6 +94,30 @@ impl RedisBackend {
     }
 }
 
+fn redis_op_timeout() -> Duration {
+    let secs = std::env::var("OPENFLOWS_REDIS_OP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+async fn bounded_redis<T, F, E>(operation: &'static str, future: F) -> Result<T>
+where
+    F: Future<Output = core::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    match tokio::time::timeout(redis_op_timeout(), future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()).with_context(|| format!("Redis {operation} failed")),
+        Err(_) => anyhow::bail!(
+            "Redis {operation} timed out after {}s",
+            redis_op_timeout().as_secs()
+        ),
+    }
+}
+
 // ── Backend enum ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -108,7 +132,13 @@ impl Backend {
             Backend::InMemory(b) => b.map.read().await.get(key).cloned(),
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let raw: Option<String> = b.client.get(key).await.ok()?;
+                let raw: Option<String> = match bounded_redis("GET", b.client.get(key)).await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        warn!(key, %error, "Redis get failed");
+                        return None;
+                    }
+                };
                 raw.and_then(|s| serde_json::from_str(&s).ok())
             }
         }
@@ -122,8 +152,12 @@ impl Backend {
             Backend::Redis(b) => {
                 use fred::prelude::*;
                 if let Ok(s) = serde_json::to_string(&value) {
-                    let _: core::result::Result<(), _> =
-                        b.client.set::<(), _, _>(key, s, None, None, false).await;
+                    if let Err(error) =
+                        bounded_redis("SET", b.client.set::<(), _, _>(key, s, None, None, false))
+                            .await
+                    {
+                        warn!(key, %error, "Redis set failed");
+                    }
                 }
             }
         }
@@ -136,7 +170,9 @@ impl Backend {
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let _: core::result::Result<i64, _> = b.client.del(key).await;
+                if let Err(error) = bounded_redis::<i64, _, _>("DEL", b.client.del(key)).await {
+                    warn!(key, %error, "Redis del failed");
+                }
             }
         }
     }
@@ -144,14 +180,28 @@ impl Backend {
     async fn keys(&self, pattern: &str) -> Vec<String> {
         match self {
             Backend::InMemory(b) => b.keys(pattern).await,
-            Backend::Redis(b) => b.keys(pattern).await,
+            Backend::Redis(b) => {
+                match tokio::time::timeout(redis_op_timeout(), b.keys(pattern)).await {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        warn!(
+                            pattern,
+                            timeout_secs = redis_op_timeout().as_secs(),
+                            "Redis keys timed out"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
         }
     }
 
     async fn ping(&self) -> Result<()> {
         match self {
             Backend::InMemory(_) => Ok(()),
-            Backend::Redis(b) => b.ping().await,
+            Backend::Redis(b) => tokio::time::timeout(redis_op_timeout(), b.ping())
+                .await
+                .context("Redis PING timed out")?,
         }
     }
 }
@@ -262,10 +312,13 @@ impl SharedStore {
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let claimed: i64 = b.client.eval(
-                    "if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 else return 0 end",
-                    vec![key],
-                    vec![token.to_string(), ttl_secs.to_string()],
+                let claimed: i64 = bounded_redis(
+                    "lease acquire",
+                    b.client.eval(
+                        "if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 else return 0 end",
+                        vec![key],
+                        vec![token.to_string(), ttl_secs.to_string()],
+                    ),
                 ).await?;
                 Ok(claimed == 1)
             }
@@ -289,10 +342,13 @@ impl SharedStore {
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let _: i64 = b.client.eval(
-                    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
-                    vec![key],
-                    vec![token.to_string()],
+                let _: i64 = bounded_redis(
+                    "lease release",
+                    b.client.eval(
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+                        vec![key],
+                        vec![token.to_string()],
+                    ),
                 ).await?;
             }
         }
@@ -346,7 +402,8 @@ impl SharedStore {
             Backend::InMemory(b) => b.map.read().await.get(&key).cloned(),
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let raw: Option<String> = b.client.get(&key).await?;
+                let raw: Option<String> =
+                    bounded_redis("lifecycle GET", b.client.get(&key)).await?;
                 raw.map(|s| serde_json::from_str(&s)).transpose()?
             }
         };
@@ -381,7 +438,8 @@ impl SharedStore {
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let raw: Option<String> = b.client.get(&key).await?;
+                let raw: Option<String> =
+                    bounded_redis("transition GET", b.client.get(&key)).await?;
                 let current =
                     Lifecycle::decode(raw.as_deref().map(serde_json::from_str).transpose()?)?;
                 anyhow::ensure!(
@@ -390,14 +448,15 @@ impl SharedStore {
                 );
                 let next = current.apply(actor, event, ts)?;
                 let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); return 1";
-                let changed: i64 = b
-                    .client
-                    .eval(
+                let changed: i64 = bounded_redis(
+                    "transition CAS",
+                    b.client.eval(
                         script,
                         vec![key],
                         vec![raw.unwrap_or_default(), serde_json::to_string(&next)?],
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 anyhow::ensure!(changed == 1, "Lifecycle changed; refresh before retrying");
                 Ok(next)
             }

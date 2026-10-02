@@ -1130,10 +1130,37 @@ Before significant work, read the relevant skill file to understand the workflow
         })?;
         let registry = self.load_registry()?;
         let transport = CoderTransport::new(client.clone(), workspace_id);
-        Provisioner::new(artifacts)
-            .provision_role(&transport, Self::worker_role(worker_id), &registry)
-            .await?;
+        let role = Self::worker_role(worker_id);
+        let timeout_secs = std::env::var("OPENFLOWS_WORKSPACE_PROVISION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(300);
+        info!(
+            worker_id,
+            role, workspace_id, timeout_secs, "Provisioning workspace instructions"
+        );
+        let provisioner = Provisioner::new(artifacts);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            provisioner.provision_role(&transport, role, &registry),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                anyhow::bail!(
+                    "Workspace instruction provisioning timed out after {}s for {}",
+                    timeout_secs,
+                    workspace_id
+                );
+            }
+        }
         store.del(&key).await;
+        info!(
+            worker_id,
+            role, workspace_id, "Workspace instructions provisioned"
+        );
         Ok(())
     }
 

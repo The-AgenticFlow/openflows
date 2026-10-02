@@ -27,6 +27,7 @@ pub use types::*;
 use anyhow::{bail, Context, Result};
 use config::{GithubConfig, TenantConfig};
 use envconfig::Envconfig;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -47,6 +48,47 @@ fn check_template_push_output(name: &str, output: &std::process::Output) -> Resu
         info!(name, stderr = %stderr, "coder templates push succeeded");
     }
     Ok(())
+}
+
+fn resolve_coder_cli() -> PathBuf {
+    if let Some(path) = std::env::var_os("CODER_CLI_PATH").map(PathBuf::from) {
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("coder");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(bin_dir) = std::env::var_os("CODER_SCRIPT_BIN_DIR").map(PathBuf::from) {
+        let candidate = bin_dir.join("coder");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    // Coder workspace startup places its helper CLI under /tmp/coder.*/coder
+    // without always adding it to PATH. The controller runs inside that same
+    // workspace, so discover it before falling back to a plain PATH lookup.
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path().join("coder"))
+            .filter(|path| path.is_file())
+            .collect();
+        candidates.sort();
+        if let Some(candidate) = candidates.into_iter().next() {
+            return candidate;
+        }
+    }
+
+    PathBuf::from("coder")
 }
 
 /// Client for the Coder OSS REST API.
@@ -648,7 +690,7 @@ impl CoderClient {
 
         // Push the template via coder CLI
         // The CLI reads the directory and pushes it to the Coder server
-        let mut cmd = tokio::process::Command::new("coder");
+        let mut cmd = tokio::process::Command::new(resolve_coder_cli());
         cmd.args([
             "templates",
             "push",
@@ -1109,7 +1151,7 @@ impl CoderClient {
         let ssh_token = self.session_token();
         let output = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("coder")
+            tokio::process::Command::new(resolve_coder_cli())
                 .args(["ssh", ws_target, "--", &wrapped])
                 .env("CODER_URL", &self.base_url)
                 .env("CODER_SESSION_TOKEN", ssh_token)
@@ -1999,6 +2041,23 @@ mod http_mock {
 #[cfg(test)]
 mod tests {
     use super::parse_chat_models_body;
+
+    #[test]
+    fn coder_cli_path_override_takes_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let coder = dir.path().join("coder");
+        std::fs::write(&coder, "#!/bin/sh\n").unwrap();
+
+        let previous = std::env::var_os("CODER_CLI_PATH");
+        std::env::set_var("CODER_CLI_PATH", &coder);
+        let resolved = super::resolve_coder_cli();
+        match previous {
+            Some(value) => std::env::set_var("CODER_CLI_PATH", value),
+            None => std::env::remove_var("CODER_CLI_PATH"),
+        }
+
+        assert_eq!(resolved, coder);
+    }
 
     #[tokio::test]
     async fn send_chat_message_accepts_queued_and_immediate_envelopes() {
