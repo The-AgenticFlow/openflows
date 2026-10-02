@@ -49,8 +49,9 @@ pub async fn classify_stop(store: &SharedStore, chat_id: &str) -> (StopClassific
     let phase = st.phase.clone().unwrap_or_else(|| "unset".to_string());
 
     let classification = match phase.as_str() {
-        "planning" if !st.gate_approved => StopClassification::PlannedHandoff,
-        "review_ready" if st.pr_recorded => StopClassification::PlannedHandoff,
+        "plan_ready" if !st.gate_approved => StopClassification::PlannedHandoff,
+        "submit" if st.pr_recorded => StopClassification::PlannedHandoff,
+        "testing" | "plan_rejected" | "done" => StopClassification::PlannedHandoff,
         "blocked" => StopClassification::PlannedHandoff,
         "fuel_exhausted" => StopClassification::PlannedHandoff,
         _ => StopClassification::Premature,

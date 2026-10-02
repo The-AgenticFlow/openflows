@@ -87,7 +87,7 @@ ensure_fresh_binary() {
         return
     fi
     echo "  → Ensuring openflows binary is built from current source..."
-    if ! (cd "$PROJECT_ROOT" && cargo build --release -p openflows) ; then
+    if ! (cd "$PROJECT_ROOT" && cargo build --release --target-dir "${PROJECT_ROOT}/target" -p openflows) ; then
         echo "❌ Failed to build openflows from source" >&2
         exit 1
     fi
@@ -98,8 +98,8 @@ ensure_fresh_binary() {
 find_binary() {
     if [ -x "$OPENFLOWS_BIN" ]; then
         echo "$OPENFLOWS_BIN"
-    elif [ -x "./target/release/openflows" ]; then
-        echo "./target/release/openflows"
+    elif [ -x "${PROJECT_ROOT}/target/release/openflows" ]; then
+        echo "${PROJECT_ROOT}/target/release/openflows"
     elif command -v openflows >/dev/null 2>&1; then
         echo "openflows"
     else
@@ -251,7 +251,11 @@ case "$CMD" in
         echo "  Tenant Name: $NAME"
         echo "  Fleet: $FLEET (FORGE-SENTINEL pair(s))"
         echo ""
-        run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET" "${REST[@]}"
+        if [ "${#REST[@]}" -gt 0 ]; then
+            run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET" "${REST[@]}"
+        else
+            run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET"
+        fi
         ;;
 
     doctor)

@@ -54,6 +54,25 @@ All config is read from environment at startup — no code change needed to enab
 
 ---
 
+### Consumer timeout containment
+
+After JWT verification, the consumer limits event processing to half of
+`CODER_CHAT_HOOK_TIMEOUT` (milliseconds, default 1500), leaving the remaining
+budget for transport. Configure this value to match the Coder dispatch deadline.
+Audit writes run separately with the same bounded lifetime and log failures.
+Slow observation hooks return HTTP 200 with an empty decision. Slow mutable hooks
+return HTTP 200 with a policy denial that asks the agent to retry; they never
+implicitly authorize a tool because a dependency is unavailable. Authentication
+and payload errors still fail closed.
+
+Timed-out work is cancelled, so advisory feedback, audit entries, or reactive kicks
+may be lost; durable lifecycle state and controller polling remain authoritative.
+This contains dependency stalls inside a reachable consumer. Consumer outages,
+network failures, and runtime starvation can still produce a Coder dispatch error;
+the controller's existing same-chat recovery must resume those sessions. A command
+timeout is separate from the hook deadline and is never successful test evidence.
+
+
 ## 3. Discrepancies found (feedback to Coder / internal decisions)
 
 ### D1 — Role/ticket context is missing from hook events

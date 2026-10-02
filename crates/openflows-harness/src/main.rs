@@ -141,6 +141,12 @@ enum ReviewAction {
         report: PathBuf,
         #[arg(long)]
         pr: Option<u64>,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: String,
     },
 }
 
@@ -165,6 +171,21 @@ enum HeartbeatAction {
 
 #[derive(Subcommand)]
 enum GateAction {
+    /// Decide a review of an exact plan revision and (for testing/submit) head.
+    Decide {
+        #[arg(long)]
+        phase: String,
+        #[arg(long, value_parser=["approve", "reject"])]
+        verdict: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        report: PathBuf,
+    },
     /// Approve a gated phase transition (SENTINEL → FORGE)
     Approve {
         /// Phase to approve (e.g., "planning")
@@ -186,7 +207,7 @@ enum GateAction {
 enum PlanAction {
     /// Write a plan to SharedStore (FORGE)
     Write {
-        /// Path to the PLAN.md file to upload
+        /// Path to the plan file to upload (including Coder chat-specific plan paths)
         #[arg(long)]
         file: PathBuf,
     },
@@ -198,9 +219,12 @@ enum PlanAction {
 enum VerifyAction {
     /// Submit a verify request (SENTINEL-side, task 3 of issue #143)
     Request {
-        /// Command argv to execute (must be allowlisted)
-        #[arg(long)]
+        /// One command token per flag; use --argv=--flag for option tokens
+        #[arg(long, conflicts_with = "command_argv")]
         argv: Vec<String>,
+        /// Command and arguments after -- (recommended); never interpreted by a shell
+        #[arg(last = true, required_unless_present = "argv")]
+        command_argv: Vec<String>,
         /// Command execution timeout in seconds
         #[arg(long, default_value = "600")]
         timeout_secs: u64,
@@ -231,6 +255,18 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Commands::Verify {
+        action: VerifyAction::Request {
+            argv, command_argv, ..
+        },
+    } = &cli.command
+    {
+        a2a_protocol::validate_command_argv(if command_argv.is_empty() {
+            argv
+        } else {
+            command_argv
+        })?;
+    }
 
     let env = config::EnvConfig::from_env().context("failed to load environment configuration")?;
     let redis_url = env
@@ -254,6 +290,36 @@ async fn main() -> Result<()> {
     let store = store::HarnessStore::new(&redis_url, &tenant).await?;
 
     match cli.command {
+        Commands::Gate {
+            action:
+                GateAction::Decide {
+                    phase,
+                    verdict,
+                    revision,
+                    round,
+                    head,
+                    report,
+                },
+        } => {
+            anyhow::ensure!(
+                role.eq_ignore_ascii_case("sentinel"),
+                "Worker gate decisions require SENTINEL; human decisions use the operator CLI"
+            );
+            store
+                .gate_decide(
+                    &ticket,
+                    &role,
+                    &phase,
+                    verdict == "approve",
+                    &std::fs::read_to_string(report)?,
+                    store::ReviewTarget {
+                        revision,
+                        round,
+                        head,
+                    },
+                )
+                .await?;
+        }
         Commands::Dispatch {
             action: DispatchAction::Read,
         } => {
@@ -292,10 +358,24 @@ async fn main() -> Result<()> {
                     verdict,
                     report,
                     pr,
+                    revision,
+                    round,
+                    head,
                 },
         } => {
             store
-                .review_submit(&ticket, &role, &verdict, &report, pr)
+                .review_submit(
+                    &ticket,
+                    &role,
+                    &verdict,
+                    &report,
+                    pr,
+                    store::ReviewTarget {
+                        revision,
+                        round,
+                        head: Some(head),
+                    },
+                )
                 .await?;
         }
         Commands::Merge {
@@ -339,6 +419,7 @@ async fn main() -> Result<()> {
             action:
                 VerifyAction::Request {
                     argv,
+                    command_argv,
                     timeout_secs,
                     expect_exit,
                     artifacts,
@@ -347,7 +428,11 @@ async fn main() -> Result<()> {
             store
                 .verify_request(
                     &ticket,
-                    argv,
+                    if command_argv.is_empty() {
+                        argv
+                    } else {
+                        command_argv
+                    },
                     timeout_secs,
                     expect_exit,
                     artifacts.as_deref(),
@@ -367,4 +452,118 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod verify_cli_tests {
+    use super::*;
+
+    #[test]
+    fn verification_accepts_command_after_separator() {
+        let result = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--expect-exit",
+            "0",
+            "--",
+            "cargo",
+            "test",
+            "--workspace",
+            "--all-features",
+            "--",
+            "--nocapture",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("{error}"));
+        let Commands::Verify {
+            action: VerifyAction::Request {
+                command_argv, argv, ..
+            },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(argv.is_empty());
+        assert_eq!(
+            command_argv,
+            [
+                "cargo",
+                "test",
+                "--workspace",
+                "--all-features",
+                "--",
+                "--nocapture"
+            ]
+        );
+        a2a_protocol::validate_command_argv(&command_argv).unwrap();
+    }
+    #[test]
+    fn legacy_argv_preserves_tokens_and_flags() {
+        let cli = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--expect-exit",
+            "0",
+            "--argv",
+            "cargo",
+            "--argv",
+            "test",
+            "--argv=--workspace",
+        ])
+        .unwrap();
+        let Commands::Verify {
+            action: VerifyAction::Request {
+                argv, command_argv, ..
+            },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert!(command_argv.is_empty());
+        assert_eq!(argv, ["cargo", "test", "--workspace"]);
+        a2a_protocol::validate_command_argv(&argv).unwrap();
+    }
+
+    #[test]
+    fn quoted_command_is_an_actionable_error_not_an_allowlist_blocker() {
+        let cli = Cli::try_parse_from([
+            "openflows-harness",
+            "verify",
+            "request",
+            "--argv",
+            "cargo test",
+        ])
+        .unwrap();
+        let Commands::Verify {
+            action: VerifyAction::Request { argv, .. },
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        let error = a2a_protocol::validate_command_argv(&argv)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single argument"));
+        assert!(error.contains("-- cargo test"));
+    }
+
+    #[test]
+    fn missing_or_ambiguous_command_is_rejected() {
+        for args in [
+            vec!["openflows-harness", "verify", "request"],
+            vec![
+                "openflows-harness",
+                "verify",
+                "request",
+                "--argv",
+                "cargo",
+                "--",
+                "npm",
+                "test",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 }

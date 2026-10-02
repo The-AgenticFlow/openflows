@@ -210,7 +210,7 @@ pub fn build_directive(state: PrMonitorState, pr_number: u64, reason: Option<&st
     }
     out.push_str(
         "\nFetch the full review context (inline comments / conflicted files) \
-         for this PR and address them, then re-run: openflows-harness status set review_ready",
+         for this PR and address them, then re-run: openflows-harness status set testing",
     );
     out
 }
@@ -363,7 +363,7 @@ mod tests {
         assert!(d.contains("reason: missing pagination per spec"));
         // Pointer, not a dump: no inline comments are embedded.
         assert!(!d.contains("comments:"));
-        assert!(d.contains("openflows-harness status set review_ready"));
+        assert!(d.contains("openflows-harness status set testing"));
         assert!(d.contains("Fetch the full review context"));
     }
 

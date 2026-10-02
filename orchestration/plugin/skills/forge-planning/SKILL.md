@@ -1,157 +1,80 @@
 ---
 name: forge-planning
-description: Planning skill for the FORGE builder agent
+description: Use when FORGE prepares or revises a ticket implementation plan before SENTINEL approval.
 ---
 
 # FORGE Planning Skill
 
-## Writing PLAN.md
+## Ground the plan before writing it
 
-Before any implementation, write a plan.
-Use the `/plan` command to structure it correctly.
+Read `openflows-harness status get` and `openflows-harness dispatch read` for the
+current phase, assignment, and requirements. On resume, also read
+`openflows-harness plan read`. Harness state is authoritative.
 
-## What a good plan contains
+Before writing the plan, inspect relevant source files, repository structure,
+existing tests, architecture guidance, and deployment configuration. Read-only
+source inspection is allowed before plan approval. Use targeted searches and
+reads to identify the actual implementation and existing patterns; do not write
+a speculative plan that merely promises to inspect the repository later.
 
-1. **Your understanding of the ticket** - in your own words
-2. **Technical approach** - follows `orchestration/agent/arch/patterns.md` (if it exists)
-3. **Explicit segment breakdown** - each segment is independently testable
-4. **Definition of done per segment** - specific and verifiable
-5. **List of files you will create or modify**
-6. **Risk areas** - things you are uncertain about
-7. **Questions for SENTINEL** - clarifications needed before starting
+Check `git status --short` and `git branch --show-current`. Use the assigned
+checkout and branch. If it is the protected base branch or conflicts with the
+assignment, report the mismatch before implementation; do not edit source on
+main or invent another branch from legacy environment variables. A base branch
+in dispatch is not evidence that main is the assigned working branch.
 
-## Segment sizing
+For deployment tickets, inspect existing compose files, Dockerfiles, deployment
+documentation, and available runtime capabilities read-only. Identify the
+service, deployment target, container runtime, and public exposure mechanism.
+If an essential prerequisite is unavailable or unspecified, report exactly
+what is missing and the evidence. Do not invent infrastructure, provision
+resources during planning, or keep exploring unrelated alternatives. Avoid
+printing credentials, environment dumps, or rendered configuration secrets.
 
-A good segment:
-- Touches 1-3 files
-- Has a single clear purpose
-- Can be tested in isolation
-- Takes roughly 20-40 minutes to implement
+Planning permits the standard current-chat plan and coordination artifacts. Source edits, dependency
+installation, builds, container startup, and deployment wait for approval.
+If policy denies a read-only probe, record the exact command and denial for
+NEXUS; do not delegate or disguise the operation to bypass the hook.
 
-A segment that is too large:
-- Touches more than 5 files
-- Has multiple unrelated concerns
-- Cannot be independently verified
+## Plan structure
 
-**Split it.**
+1. **Understanding:** requested outcome and acceptance criteria from dispatch.
+2. **Repository findings:** relevant source/configuration paths and what already exists.
+3. **Technical approach:** concrete changes following existing architecture.
+4. **Segments:** focused, testable steps with files and measurable exit conditions.
+5. **Verification:** commands and evidence needed to establish the requested outcome.
+6. **Risks and prerequisites:** known limitations, missing capabilities, and precise questions.
+7. **Out of scope:** boundaries that prevent unrelated changes.
 
-## Example PLAN.md structure
+Keep segment sizes proportionate to the task. Reuse existing deployment and
+coding patterns. Distinguish observed facts from assumptions.
 
-```markdown
-# PLAN: [Ticket Title]
+## Plan file path
 
-## Understanding
+Use the exact path supplied by Coder or the startup hook:
+`/home/coder/.coder/plans/PLAN-<chat-id>.md`. The ID belongs to the current chat;
+do not invent it, reuse another chat's file, or write `/home/coder/PLAN.md`.
+Legacy `PLAN.md` and `plan` aliases are not accepted for planning or upload.
+Replace `<absolute-plan-path>` in commands with that same absolute path.
+The harness accepts this file directly; no copy into the repository is needed.
 
-[Brief summary of what we're building and why]
-
-## Technical Approach
-
-[How we'll implement it, referencing existing patterns]
-
-## Segments
-
-### Segment 1: [Name]
-
-**Purpose:** [Single sentence]
-
-**Files:**
-- `src/path/file1.ts` (new)
-- `src/path/file2.ts` (modify)
-
-**Definition of Done:**
-- [ ] [Specific criterion 1]
-- [ ] [Specific criterion 2]
-- [ ] Tests pass
-
-### Segment 2: [Name]
-...
-
-## Files Changed
-
-- `src/auth/login.ts` (new)
-- `src/middleware/auth.ts` (modify)
-- `tests/auth/login.test.ts` (new)
-
-## Out of Scope
-
-- [Explicitly list what we're NOT building]
-- [This prevents scope creep]
-
-## Risks
-
-- [Risk 1]: [Mitigation strategy]
-- [Risk 2]: [Mitigation strategy]
-
-## Questions for SENTINEL
-
-- [Question 1]
-- [Question 2]
-```
-
-## Planning Gate Protocol (MANDATORY)
-
-After writing PLAN.md, you MUST wait for SENTINEL to approve the planning
-gate before writing any code.  Do NOT skip this step — the controller
-will not spawn SENTINEL until you signal that planning is complete.
-
-### 1. Upload the plan to SharedStore
+## Submit and resume
 
 ```bash
-openflows-harness plan write --file PLAN.md
+openflows-harness plan write --file <absolute-plan-path>
+openflows-harness status set plan_ready
 ```
 
-This persists your plan to Redis at `pair:{id}:plan` so SENTINEL (and
-NEXUS) can access it without relying on the Coder API filesystem bridge.
-The plan is automatically cleaned up when the workspace is destroyed.
+Upload through the harness so SENTINEL reads the exact stored revision. Wait
+for its decision; do not poll in a loop or start implementation while waiting.
 
-### 2. Signal planning complete
+SENTINEL approval atomically transitions shared state to `building`. FORGE
+must not perform a separate transition to building to activate an approval.
+On notification, read `openflows-harness status get` and start only if the
+current phase is `building`. An old approval notification does not override
+`blocked` or another newer phase.
 
-```bash
-openflows-harness status set planning
-```
-
-This tells the controller you have finished planning and SENTINEL should
-spawn to review your plan.
-
-### 3. Check gate status (ONE SHOT — do NOT poll)
-
-```bash
-# Check if SENTINEL has approved the planning gate yet
-openflows-harness gate status --phase planning
-```
-
-- If it prints `✓ Gate 'planning' approved`: you may proceed to
-  implementation (step 4 below).
-- If it prints `✗ Gate 'planning' not yet approved`: **HALT. Do NOT
-  poll in a loop.** Stop all work. NEXUS will resume this chat with a
-  notification when SENTINEL completes the review.
-
-**Never proceed without gate approval.** The gate is your authorisation
-to write code. NEXUS owns the notification — your job is to check once,
-then stop and wait for the orchestrator to wake you up.
-
-### 4. After gate approval (or after NEXUS resumes with approval notification)
-
-```bash
-openflows-harness status set building
-```
-
-Then begin implementation with Segment 1.
-
-## Contract negotiation
-
-SENTINEL may write CONTRACT.md after reviewing your plan.
-
-If SENTINEL objects:
-1. Read the objection carefully in `CONTRACT.md`
-2. Update `PLAN.md` addressing each specific objection
-3. Do not argue - either accept the feedback or ask a clarifying question
-
-Maximum 3 rounds of negotiation.
-After 3 rounds without agreement, the ticket is BLOCKED.
-
-## After CONTRACT is AGREED
-
-1. Read `CONTRACT.md` - these are your binding terms
-2. Begin implementation with Segment 1
-3. Do not deviate from the plan without updating `PLAN.md` and getting SENTINEL approval
+If rejected, read the harness review feedback, return from `plan_rejected` to
+`planning`, address the findings in the current-chat plan, upload, and set `plan_ready` again.
+Use the current revision and review round; do not wait for local contract or
+per-segment review files. Follow `shared-harness-protocol` for later gates.

@@ -1,57 +1,46 @@
 ---
 name: review
-description: Submit a SENTINEL review verdict to the controller
+description: Record a SENTINEL decision for a specific lifecycle review round
 ---
 
-# /review Command
+# /review
 
-Submit a review verdict for the current ticket. Run via the CLI:
+Send project verification commands to FORGE with `verify request`. Each runs in a
+temporary checkout using FORGE's current login-shell environment. The response
+includes argv, candidate HEAD, exit code, stdout and stderr. Correct malformed
+arguments first. For failing commands, timeouts, missing dependencies or executor
+setup failures, record those details in `review.md` and reject the current testing
+round with actionable feedback. This returns FORGE to building under the existing
+approved plan. Distinguish a failed test from a command that could not start.
+Transport errors mean evidence is missing, not that tests failed; report the exact
+error and return actionable executor repair to FORGE. Reserve blocked for external
+prerequisites FORGE cannot resolve. Never approve smoke tests as acceptance evidence.
 
+
+Read `openflows-harness status get` and `plan read`. Use the returned `revision`,
+`review_round` and `head` from the artifact you actually review, not from a later
+snapshot obtained merely to make an outdated command succeed. Write a report.
+
+For a submitted plan:
 ```bash
-openflows-harness review submit --verdict <approve|reject> --report <path-to-eval.md> [--pr <N>]
+openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md
 ```
-
-## Arguments
-
-| Arg | Required | Description |
-|---|---|---|
-| `--verdict` | Yes | `approve` or `reject` |
-| `--report` | Yes | Path to the evaluation markdown written during review (`segment-N-eval.md` / `final-review.md`) |
-| `--pr` | No | PR number, if the verdict targets a specific PR |
-
-## When to Use
-
-After SENTINEL finishes reviewing a PR (or completed work):
-
-- **`approve`** — the work earns its merge; the controller routes the ticket onward.
-- **`reject`** — the work needs changes; the controller routes back to FORGE to rework
-  in **its existing chat session**.
-
-## What it does
-
-Writes `ticket:{id}:review:sentinel:pr_review` (a `ReviewPayload` `{verdict, report, pr_number}`)
-to SharedStore. This is the **PR/final review** verdict — it is namespaced by review type
-(`pr_review`) so it never collides with the planning-gate review state
-(`ticket:{id}:gate:planning`). The controller (SENTINEL node) reads this key to route the
-ticket. This is the **machine-readable handshake** — the controller does **not** read
-`STATUS.json` or the report file directly.
-
-## Examples
-
-### Approve a PR
-
+For testing, verify implementation against the approved plan and run tests through
+A2A in FORGE's clean checkout (FORGE runs `verify serve`):
 ```bash
-openflows-harness review submit --verdict approve --report final-review.md --pr 42
+openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features
+openflows-harness gate decide --phase testing --revision <N> --round <R> --head <SHA> --verdict approve --report review.md
 ```
-
-### Reject with rework guidance
-
+For a recorded PR in submit:
 ```bash
-openflows-harness review submit --verdict reject --report segment-N-eval.md --pr 42
+openflows-harness review submit --revision <N> --round <R> --head <SHA> --verdict approve --report final-review.md
 ```
+Use `--verdict reject` with actionable feedback for any failed review. Rejected
+plans return to plan_rejected; testing/PR rejection returns to building. The
+controller retries delivery of PR decisions to GitHub from a persisted queue.
+Do not substitute a GitHub-only review for the lifecycle command.
 
-## Notes
-
-- Keep inline `file:line` guidance in the report — FORGE reads it to address blockers.
-- A `reject` loops back to FORGE in the same session; FORGE re-signals
-  `openflows-harness status set review_ready` after addressing the report.
+Read `.agents/skills/sentinel-review/SKILL.md` and
+`.agents/skills/shared-harness-protocol/SKILL.md` before reviewing.
+Human testing review is TODO; A2A verification and SENTINEL approval gate testing.
+Human PR approval remains required in submit; CI must succeed for the submitted head.

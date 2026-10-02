@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod env;
 pub mod identity;
+pub mod lifecycle;
 pub mod project;
 pub mod registry;
 pub mod state;

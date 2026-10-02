@@ -57,7 +57,7 @@ data "coder_parameter" "repo_url" {
 
 data "coder_parameter" "branch" {
   name        = "branch"
-  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = default branch."
+  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = create or resume the worker/ticket branch."
   default     = ""
   type        = "string"
 }
@@ -80,6 +80,14 @@ data "coder_parameter" "tenant" {
   description  = "OpenFlows tenant identifier"
   default     = ""
   type        = "string"
+}
+
+data "coder_parameter" "a2a_pair_token" {
+  name        = "a2a_pair_token"
+  description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
+  default     = ""
+  type        = "string"
+  mutable     = false
 }
 
 data "coder_parameter" "coder_url" {
@@ -230,8 +238,9 @@ resource "coder_agent" "main" {
     GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
     # The target branch: when the controller passes a PR `branch` (rework of an
     # existing PR), check that out so already-done work is NOT redone. When
-    # empty, fall back to the default branch (fresh work).
+    # empty, create or resume the worker/ticket branch (fresh work).
     TARGET_BRANCH="${local.safe_branch}"
+    TICKET_ID="${data.coder_parameter.ticket_id.value}"
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
@@ -285,8 +294,8 @@ resource "coder_agent" "main" {
     }
 
     # Checkout the target branch. For rework of an existing PR, this resumes the
-    # branch where the work was already done (never redo completed work). Fall
-    # back to the default branch head when no branch was requested.
+    # branch where the work was already done (never redo completed work).
+    # Fresh assignments get a worker/ticket branch seeded from the default head.
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace
       if [ -n "$TARGET_BRANCH" ]; then
@@ -316,8 +325,20 @@ resource "coder_agent" "main" {
           warn_branch_mismatch "$TARGET_BRANCH"
         fi
       else
-        # Checkout the default branch head so work never begins on a stale tree.
-        git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+        # Fresh assignments own a named branch. Reuse local work on restart.
+        WORK_BRANCH="$ROLE/$TICKET_ID"
+        if [ -z "$TICKET_ID" ] || ! git check-ref-format --branch "$WORK_BRANCH" >/dev/null 2>&1; then
+          log "ERROR: cannot derive worker/ticket branch"
+          exit 1
+        fi
+        if git show-ref --verify --quiet "refs/heads/$WORK_BRANCH"; then
+          git checkout "$WORK_BRANCH" || { warn_branch_mismatch "$WORK_BRANCH"; exit 1; }
+        elif git show-ref --verify --quiet "refs/remotes/origin/$WORK_BRANCH"; then
+          git checkout --track -b "$WORK_BRANCH" "origin/$WORK_BRANCH"
+        else
+          git checkout --no-track -b "$WORK_BRANCH" origin/HEAD || git checkout --no-track -b "$WORK_BRANCH"
+        fi
+        log "Assignment branch ready: $WORK_BRANCH"
       fi
     fi
 
@@ -330,15 +351,19 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
     # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
-    # Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    # Executes tasks in temporary checkouts using this workspace's tools and environment.
     # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
-    # This is a long-running process that polls for task assignments via SSE.
-    nohup openflows-harness verify serve >/dev/null 2>&1 &
+    # Supervise startup failures (including Redis/relay races) outside the agent chat.
+    # Keep diagnostics outside the checkout so candidate-head checks stay clean.
+    mkdir -p /home/coder/.local/state/openflows
+    nohup bash -c 'while true; do openflows-harness verify serve; sleep 5; done' \
+      >>/home/coder/.local/state/openflows/verify.log 2>&1 &
     log "Verify executor started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET) — issue #143 task 5"
 
     # ── Start coding agent ──────────────────────────────────────────────
@@ -383,6 +408,8 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -414,6 +441,7 @@ resource "docker_container" "workspace" {
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

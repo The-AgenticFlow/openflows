@@ -207,7 +207,7 @@ impl IdentityManager {
             github_token,
             routing_key: entry.routing_key.clone(),
             cli: entry.cli.clone(),
-            active: entry.active,
+            active: entry.enabled,
         })
     }
 
@@ -353,8 +353,8 @@ impl IdentityManager {
         drop(reg);
 
         if role == AgentRole::Forge {
-            let mut identities = Vec::with_capacity(entry.instances as usize);
-            for i in 1..=entry.instances {
+            let mut identities = Vec::with_capacity(entry.max_instances as usize);
+            for i in 1..=entry.max_instances {
                 let id = format!("forge-{}", i);
                 let github_token = self.resolve_token_for_entry(&entry)?;
                 identities.push(AgentIdentity {
@@ -365,7 +365,7 @@ impl IdentityManager {
                     github_token,
                     routing_key: entry.routing_key.clone(),
                     cli: entry.cli.clone(),
-                    active: entry.active,
+                    active: entry.enabled,
                 });
             }
             return Ok(identities);
@@ -380,7 +380,7 @@ impl IdentityManager {
             github_token,
             routing_key: entry.routing_key.clone(),
             cli: entry.cli.clone(),
-            active: entry.active,
+            active: entry.enabled,
         }])
     }
 
@@ -549,7 +549,10 @@ mod tests {
     #[test]
     fn test_get_identities_for_role_forge() {
         let _token_guard = setup_test_token();
-        let f = write_temp(sample_registry_json());
+        let canonical = sample_registry_json()
+            .replace("\"active\"", "\"enabled\"")
+            .replace("\"instances\"", "\"max_instances\"");
+        let f = write_temp(&canonical);
         let manager = IdentityManager::load(f.path()).unwrap();
 
         let forge_identities = manager.get_identities_for_role(AgentRole::Forge).unwrap();

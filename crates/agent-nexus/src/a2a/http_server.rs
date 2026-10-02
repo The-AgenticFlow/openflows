@@ -7,7 +7,7 @@
 //! - tasks/resubscribe (resume after disconnect)
 
 use super::routing::{A2ARelay, TaskState};
-use super::verify_handler::submit_verify_request;
+use super::verify_handler::{submit_verify_request, InvalidVerifyRequest};
 use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::Context;
 use axum::{
@@ -57,6 +57,13 @@ impl IntoResponse for JsonRpcResponse {
     }
 }
 
+fn pair_token(params: &Value) -> anyhow::Result<&str> {
+    params
+        .get("pair_token")
+        .and_then(|v| v.as_str())
+        .context("A2A pair_token is required")
+}
+
 /// JSON-RPC error object.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
@@ -97,7 +104,7 @@ async fn handle_agent_card() -> Json<Value> {
         "description": "Central A2A relay for Sentinel↔Forge delegated verification (issue #143)",
         "capabilities": {
             "verify": {
-                "description": "Verify task execution with command allowlist and sandbox isolation",
+                "description": "Verify task execution in a temporary FORGE checkout with command policy checks",
                 "task_type": "verify",
                 "methods": [
                     "message/send",
@@ -157,13 +164,21 @@ async fn handle_rpc(
         }
         .into_response(),
         Err(e) => {
-            warn!(error = %e, "RPC handler error");
+            warn!(error = %e, method = %req.method, request_id = %req.id, "RPC handler error");
             JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32603,
-                    message: "Internal error".into(),
+                    code: if e.is::<InvalidVerifyRequest>() {
+                        -32602
+                    } else {
+                        -32603
+                    },
+                    message: if let Some(invalid) = e.downcast_ref::<InvalidVerifyRequest>() {
+                        invalid.to_string()
+                    } else {
+                        "Internal error; inspect NEXUS relay logs for this request".into()
+                    },
                     data: None,
                 }),
                 id: req.id,
@@ -175,10 +190,10 @@ async fn handle_rpc(
 
 /// message/send: Submit a verify request (Sentinel → Nexus)
 ///
-/// `params` is the `verify` task payload: `{ "pair_id", "kind", "cwd",
-/// "argv", "timeout_secs", "env_allowlist", "expect" }`. The requester's
-/// identity is authenticated out-of-band (workspace token); the relay
-/// enforces that a Sentinel may only submit for its own `pair_id`.
+/// `params` wraps the `verify` task payload plus the pair token:
+/// `{ "message": { "task": { ... VerifyRequest ... } }, "pair_token": "..." }`.
+/// The relay accepts the caller's `pair_id` only when the token matches the
+/// hash Nexus stored while provisioning that Sentinel/FORGE pair.
 async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     // The message params nest the verify task under the otherMembers tasks.
     // Per the A2A wire shape used by the harness, params may be the
@@ -188,18 +203,13 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
         .and_then(|m| m.get("task"))
         .unwrap_or(params);
 
-    let req: VerifyRequest =
-        serde_json::from_value(raw.clone()).context("params are not a valid VerifyRequest")?;
+    let req: VerifyRequest = serde_json::from_value(raw.clone())
+        .map_err(|e| InvalidVerifyRequest(format!("Invalid VerifyRequest: {e}")))?;
 
-    // AuthZ (v1): the Docker network boundary is the trust model for this
-    // deployment.  pair_id is caller-supplied (self-declared) — a malicious
-    // workspace on the shared network could impersonate another pair.  The
-    // executor role check on claim (tasks/claim rejects non-Forge roles) and
-    // the unguessable UUIDv7 task IDs provide layers of defence, but these
-    // are NOT cryptographic guarantees.
-    //
-    // TODO(v2): bind pair-scope to a workspace identity token (plan task 2)
-    // so the relay can verify ownership without trusting self-declared values.
+    state
+        .relay
+        .verify_pair_token(&req.pair_id, pair_token(params)?)
+        .await?;
     let requester_pair_id = req.pair_id.clone();
 
     let task_id = submit_verify_request(&state.relay, &req, &requester_pair_id).await?;
@@ -209,19 +219,34 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
 
 /// tasks/get: Retrieve the state of a task (Sentinel polling, Forge status).
 ///
-/// `params: { "task_id": "..." }` → returns the current lifecycle state and,
+/// `params: { "task_id", "pair_id", "pair_token" }` → returns the current lifecycle state and,
 /// once completed, the terminal result the executor mirrored to Redis.
 async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let task_id = params
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/get requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/get requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
     let entry = state
         .relay
         .get_task(task_id)
         .await
         .context("task not found")?;
+    if entry.request.pair_id != pair_id {
+        return Err(anyhow::anyhow!(
+            "tasks/get pair_id mismatch: task belongs to {} but caller claims {}",
+            entry.request.pair_id,
+            pair_id
+        ));
+    }
 
     let state_str = match entry.state {
         TaskState::Pending => "pending",
@@ -243,7 +268,7 @@ async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Res
 
 /// tasks/claim: Forge executor claims the next pending task for its pair.
 ///
-/// `params: { "pair_id": "T-048", "role": "forge" }` → returns the task
+/// `params: { "pair_id", "role": "forge", "checkout_version": 3, "pair_token" }` → returns the task
 /// (request included) or null when no pending task exists for the pair.
 async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let pair_id = params
@@ -262,7 +287,15 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
             "tasks/claim is only available to the forge executor role"
         ));
     }
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
+    anyhow::ensure!(
+        params.get("checkout_version").and_then(Value::as_u64) == Some(3),
+        "Executor upgrade required: verification checkout with workspace login environment (version 3) is mandatory"
+    );
     match state.relay.claim_next_task(pair_id).await? {
         Some(entry) => Ok(json!({
             "task_id": entry.task_id,
@@ -274,7 +307,7 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
 
 /// tasks/complete: Forge executor submits a terminal result for a task.
 ///
-/// `params: { "task_id", "pair_id", "result": { VerifyResult } }` → the relay
+/// `params: { "task_id", "pair_id", "pair_token", "result": { VerifyResult } }` → the relay
 /// marks the task completed and mirrors the result to Redis before returning.
 async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let task_id = params
@@ -285,6 +318,10 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
         .get("pair_id")
         .and_then(|p| p.as_str())
         .context("tasks/complete requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
     let result: VerifyResult = params
         .get("result")
@@ -304,8 +341,7 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
         ));
     }
 
-    // Guard (v1 best-effort): verify the caller's pair_id matches the owning
-    // task's pair_id so a workspace cannot complete another pair's task.
+    // Guard: verify the authenticated pair owns the task.
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.request.pair_id != pair_id {
             return Err(anyhow::anyhow!(
@@ -334,14 +370,12 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
         .get("pair_id")
         .and_then(|p| p.as_str())
         .context("tasks/cancel requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
 
-    // Guard (best-effort, v1): the pair_id here is self-declared by the
-    // caller — a workspace that knows another pair's task ID can supply
-    // the owning pair_id to bypass this check.  The real defence is the
-    // Docker network boundary + unguessable UUIDv7 task IDs.
-    //
-    // TODO(v2): replace with workspace-identity-backed ownership verification
-    // when the relay gains signed workspace credentials (plan task 2).
+    // Guard: verify the authenticated pair owns the task.
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.request.pair_id != pair_id {
             return Err(anyhow::anyhow!(
@@ -360,6 +394,7 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.state == TaskState::Running || entry.state == TaskState::Pending {
             let cancelled_result = a2a_protocol::VerifyResult {
+                head_sha: None,
                 task_id: task_id.to_string(),
                 exit_code: None,
                 timed_out: false,
@@ -421,6 +456,23 @@ async fn handle_tasks_progress(state: &A2AServerState, params: &Value) -> anyhow
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/push_progress requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/push_progress requires string pair_id")?;
+    state
+        .relay
+        .verify_pair_token(pair_id, pair_token(params)?)
+        .await?;
+    if let Some(entry) = state.relay.get_task(task_id).await {
+        if entry.request.pair_id != pair_id {
+            return Err(anyhow::anyhow!(
+                "tasks/push_progress pair_id mismatch: task belongs to {} but caller claims {}",
+                entry.request.pair_id,
+                pair_id
+            ));
+        }
+    }
 
     let event: VerifyProgressEvent = serde_json::from_value(params.clone())
         .context("tasks/push_progress requires valid VerifyProgressEvent params")?;
@@ -477,4 +529,136 @@ async fn handle_stream(
     });
 
     Sse::new(sse_stream).into_response()
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    const PAIR_TOKEN: &str = "test-pair-token";
+
+    async fn submit(argv: Value) -> Value {
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
+        let response = handle_rpc(
+            State(state),
+            Json(JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                method: "message/send".into(),
+                id: json!(1),
+                params: json!({
+                    "message": {
+                        "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                        "argv":argv, "timeout_secs":30}
+                    },
+                    "pair_token": PAIR_TOKEN,
+                }),
+            }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_command_explains_policy_instead_of_internal_error() {
+        let body = submit(json!(["rm", "-rf", "/"])).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("policy denied"));
+    }
+
+    #[tokio::test]
+    async fn executors_without_current_workspace_environment_cannot_claim_tasks() {
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "pair_token":PAIR_TOKEN})
+        )
+        .await
+        .is_err());
+        for version in [1, 2] {
+            assert!(handle_tasks_claim(&state, &json!({"role":"forge", "pair_id":"T-066", "checkout_version":version, "pair_token":PAIR_TOKEN})).await.is_err());
+        }
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "sandbox_version":1, "pair_token":PAIR_TOKEN})
+        )
+        .await
+        .is_err());
+        assert!(handle_tasks_claim(
+            &state,
+            &json!({"role":"forge", "pair_id":"T-066", "checkout_version":3, "pair_token":PAIR_TOKEN})
+        )
+        .await
+        .unwrap()
+        .is_null());
+    }
+
+    #[tokio::test]
+    async fn verify_requests_require_matching_pair_token() {
+        let relay = Arc::new(A2ARelay::new(Arc::new(
+            pocketflow_core::SharedStore::new_in_memory(),
+        )));
+        relay.record_pair_token("T-066", PAIR_TOKEN).await.unwrap();
+        let state = A2AServerState { relay };
+
+        assert!(handle_message_send(
+            &state,
+            &json!({
+                "message": {
+                    "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                    "argv":["cargo","test"], "timeout_secs":30}
+                },
+                "pair_token": "wrong",
+            }),
+        )
+        .await
+        .is_err());
+
+        assert!(handle_message_send(
+            &state,
+            &json!({
+                "message": {
+                    "task": {"pair_id":"T-066", "kind":"command", "cwd":"repo",
+                    "argv":["cargo","test"], "timeout_secs":30}
+                },
+            }),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn quoted_command_reports_tokenization_error() {
+        let body = submit(json!(["cargo test --workspace --all-features"])).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("single argument"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("-- cargo test"));
+    }
+
+    #[tokio::test]
+    async fn allowed_request_is_queued_without_registered_executor() {
+        let body = submit(json!(["cargo", "test"])).await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert_eq!(body["result"]["status"], "pending");
+        assert!(body["result"]["task_id"].is_string());
+    }
 }

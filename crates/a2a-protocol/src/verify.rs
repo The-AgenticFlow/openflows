@@ -85,6 +85,9 @@ pub struct ExecutorInfo {
 /// `pair:{id}:verification` in Redis before the A2A task is acked complete.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResult {
+    /// Clean checkout commit before and after execution; absent results cannot authorize lifecycle gates.
+    #[serde(default)]
+    pub head_sha: Option<String>,
     pub task_id: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -171,6 +174,7 @@ mod tests {
             artifacts: vec![],
         };
         let ok = VerifyResult {
+            head_sha: None,
             task_id: "t1".into(),
             exit_code: Some(0),
             timed_out: false,

@@ -5,33 +5,16 @@
 
 use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
-use config::state::{
-    full_ticket_key, full_ticket_key_flat, heartbeat_key, review_verdict_key, HeartbeatRecord,
-    REVIEW_TYPE_PR,
-};
+use config::lifecycle::{Event, Phase};
+use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
+use pocketflow_core::SharedStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-
-/// Valid phases for the `status set` command.
-const VALID_PHASES: &[&str] = &["planning", "building", "testing", "review_ready", "blocked"];
-
-/// Phases that require SENTINEL approval before transitioning FROM them.
-/// FORGE cannot move past these phases until SENTINEL writes a gate approval.
-const GATED_PHASES: &[&str] = &["planning"];
-
-/// Phases a brand-new ticket (no recorded status yet) may enter directly.
-/// FORGE must first sit in `planning` and earn a SENTINEL gate approval before
-/// it is allowed into any downstream phase; `blocked` is permitted as a failure
-/// escape hatch so a freshly-provisioned workspace can report an immediate
-/// blocker without first pretending to plan. Anything else is rejected to
-/// prevent FORGE from short-circuiting straight to `building`/`testing`/
-/// `review_ready` and bypassing the planning-gate review entirely.
-const ENTRY_PHASES: &[&str] = &["planning", "blocked"];
 
 /// Gate approval payload written by SENTINEL to allow FORGE to proceed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +59,9 @@ pub struct ReviewPayload {
     pub verdict: String,
     pub report: String,
     pub pr_number: Option<u64>,
+    pub revision: u64,
+    pub round: u64,
+    pub head: String,
 }
 
 /// Merge payload written by vessel.
@@ -86,9 +72,17 @@ pub struct MergePayload {
     pub merged: bool,
 }
 
+/// Exact artifact identity supplied by a reviewer, never inferred at submission time.
+pub struct ReviewTarget {
+    pub revision: u64,
+    pub round: u64,
+    pub head: Option<String>,
+}
+
 pub struct HarnessStore {
     client: fred::clients::Client,
     tenant: String,
+    lifecycle: SharedStore,
 }
 
 /// Authorize an approver role for a gated phase transition. Only SENTINEL may
@@ -108,32 +102,6 @@ pub fn authorize_gate_approver(role: &str) -> Result<()> {
     Ok(())
 }
 
-/// True iff `phase` may be set as a ticket's FIRST recorded status (i.e. the
-/// ticket has no prior status in Redis). FORGE must enter through `planning`
-/// (or `blocked`, the failure escape hatch) so a fresh ticket cannot jump
-/// straight to `building`/`testing`/`review_ready` and thereby skip the
-/// SENTINEL-reviewed planning gate.
-pub fn is_allowed_first_phase(phase: &str) -> bool {
-    ENTRY_PHASES.contains(&phase)
-}
-
-/// If transitioning `current_phase -> target` requires crossing a SENTINEL
-/// gate, return the gated phase being LEFT (the phase whose gate approval
-/// must be consulted and consumed); otherwise return `None`.
-///
-/// A gate is crossed when the current phase is itself gated (e.g. `planning`)
-/// and the target differs from it. Transitions among downstream phases (e.g.
-/// `building -> testing`) do not require a fresh approval, and returning TO
-/// a gated phase (`building -> planning`) is free — the next outbound
-/// transition will be gated, which is where the approval is enforced.
-pub fn gate_source_for_transition(current_phase: &str, target: &str) -> Option<&'static str> {
-    if GATED_PHASES.contains(&current_phase) && current_phase != target {
-        GATED_PHASES.iter().find(|&&p| p == current_phase).copied()
-    } else {
-        None
-    }
-}
-
 impl HarnessStore {
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
@@ -142,6 +110,8 @@ impl HarnessStore {
         Ok(Self {
             client,
             tenant: tenant.to_string(),
+            lifecycle: SharedStore::new_redis_with_tenant(redis_url, Some(tenant.to_owned()))
+                .await?,
         })
     }
 
@@ -174,221 +144,93 @@ impl HarnessStore {
         Ok(())
     }
 
-    /// Set the current phase for this ticket.
-    ///
-    /// Enforces gated phase transitions: FORGE cannot move past `planning`
-    /// until SENTINEL approves via `gate approve`, and the approval is
-    /// consumed on the outbound transition so a later return to `planning`
-    /// (e.g. for a revised plan) requires a fresh SENTINEL review. A brand-new
-    /// ticket with no prior status must enter via `planning` (or `blocked`),
-    /// so it cannot short-circuit straight to `building` and skip the gate.
+    /// Advance through the authoritative graph with one atomic lifecycle write.
+    /// Testing captures a clean checkout head; later stages require its evidence.
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
-        if !VALID_PHASES.contains(&phase) {
-            bail!(
-                "Invalid phase '{}'. Valid phases: {}",
-                phase,
-                VALID_PHASES.join(", ")
-            );
-        }
-
-        // Read current phase (if any) and enforce gating.
-        let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
-        let current_status: Option<String> = self
-            .client
-            .get(&status_key)
-            .await
-            .context("Redis GET failed")?;
-
-        let current_phase: Option<String> = current_status
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(String::from));
-
-        // Fresh ticket (no recorded status): must enter through the planning
-        // gate. FORGE cannot bypass the SENTINEL-reviewed plan by writing
-        // `building`/`testing`/`review_ready` as its first status.
-        if current_phase.is_none() && !is_allowed_first_phase(phase) {
-            bail!(
-                "Cannot set first status to '{}' for ticket {}. FORGE must enter through \
-                 'planning' and obtain SENTINEL gate approval before any downstream phase. \
-                 (Set status to 'planning', or 'blocked' to report an immediate blocker.)",
-                phase,
-                ticket
-            );
-        }
-
-        // For transitions that leave a gated phase, require a SENTINEL approval
-        // and consume it atomically so the approval is single-use per planning
-        // cycle even under concurrent transitions.
-        if let Some(source_phase) = current_phase
-            .as_deref()
-            .and_then(|cur| gate_source_for_transition(cur, phase))
-        {
-            let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, source_phase));
-
-            // Atomically GET-and-DELETE the approval in a single Redis
-            // command. Using separate GET then DEL would let two concurrent
-            // `status set building` calls both observe the approval before
-            // either delete lands, so a single SENTINEL approval would
-            // authorize multiple transitions. GETDEL returns the value it
-            // removed (None if the key was already gone), and the key is gone
-            // by the time the command returns — the loser of the race gets
-            // None and is rejected below. We must propagate the error (no
-            // longer ignore a failed DEL): if the consume silently failed the
-            // approval would survive and the single-use guarantee would be
-            // voided.
-            let consumed_approval: Option<String> = self
-                .client
-                .getdel(&gate_key)
-                .await
-                .context("Redis GETDEL failed while consuming gate approval")?;
-
-            if consumed_approval.is_none() {
-                bail!(
-                    "Cannot transition from '{}' to '{}' without SENTINEL approval.\n\
-                     SENTINEL must run: openflows-harness gate approve --phase {}\n\
-                     This ensures your plan is reviewed before implementation begins.",
-                    source_phase,
-                    phase,
-                    source_phase
-                );
-            }
-
-            info!(
-                ticket,
-                from = source_phase,
-                to = phase,
-                "Gate approval verified and consumed (GETDEL), allowing transition"
-            );
-        }
-
-        let val = serde_json::json!({
-            "phase": phase,
-            "role": role,
-            "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        });
-        let _: Result<(), _> = self
-            .client
-            .set::<(), _, _>(&status_key, val.to_string(), None, None, false)
-            .await;
-        println!("Wrote: {}", status_key);
-        info!(key = %status_key, phase, "status set");
+        let phase = Phase::parse(phase)?;
+        let head = if phase == Phase::Testing {
+            Some(Self::checkout_head()?)
+        } else {
+            None
+        };
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        self.lifecycle
+            .transition(ticket, state.version, role, Event::Move { phase, head })
+            .await?;
         Ok(())
     }
 
-    /// Approve a gated phase transition (SENTINEL only).
-    ///
-    /// This allows FORGE to proceed past a gated phase (e.g., `planning` → `building`).
-    ///
-    /// Only the SENTINEL role may approve a gate. FORGE cannot approve its own
-    /// plan — if it could, the mandatory review checkpoint would be bypassable by
-    /// the very agent it is meant to supervise. The worker CLI (`openflows-harness
-    /// gate approve`) derives `role` from `OPENFLOWS_ROLE`, so only a SENTINEL
-    /// workspace can satisfy this; the admin `openflows gate approve` CLI passes
-    /// `--approver` (defaulting to SENTINEL). Any other role is rejected.
-    pub async fn gate_approve(
+    fn checkout_head() -> Result<String> {
+        let dirty = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()?;
+        anyhow::ensure!(
+            dirty.status.success() && dirty.stdout.is_empty(),
+            "Commit all work before testing; checkout must be clean"
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        anyhow::ensure!(head.status.success(), "Cannot identify checkout HEAD");
+        Ok(String::from_utf8(head.stdout)?.trim().to_string())
+    }
+
+    pub async fn gate_decide(
         &self,
         ticket: &str,
         role: &str,
         phase: &str,
-        notes: Option<&str>,
+        approved: bool,
+        report: &str,
+        target: ReviewTarget,
     ) -> Result<()> {
-        authorize_gate_approver(role)?;
-        if !GATED_PHASES.contains(&phase) {
-            bail!(
-                "Phase '{}' is not a gated phase. Gated phases: {}",
-                phase,
-                GATED_PHASES.join(", ")
-            );
-        }
-
-        // Verify current phase matches
-        let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
-        let current_status: Option<String> = self
-            .client
-            .get(&status_key)
-            .await
-            .context("Redis GET failed")?;
-
-        if let Some(ref status_json) = current_status {
-            if let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) {
-                if let Some(current_phase) = status.get("phase").and_then(|p| p.as_str()) {
-                    if current_phase != phase {
-                        bail!(
-                            "Cannot approve '{}' gate — current phase is '{}'. \
-                             FORGE must be in the '{}' phase to receive approval.",
-                            phase,
-                            current_phase,
-                            phase
-                        );
-                    }
-                }
-            }
-        } else {
-            bail!(
-                "No status found for ticket {}. FORGE must set status to '{}' first.",
+        let ReviewTarget {
+            revision,
+            round,
+            head,
+        } = target;
+        let phase = Phase::parse(phase)?;
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        self.lifecycle
+            .transition(
                 ticket,
-                phase
-            );
-        }
-
-        let approval = GateApproval {
-            phase: phase.to_string(),
-            approved_by: role.to_string(),
-            ts: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            notes: notes.map(|s| s.to_string()),
-        };
-
-        let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
-        let json = serde_json::to_string(&approval)?;
-        let _: Result<(), _> = self
-            .client
-            .set::<(), _, _>(&gate_key, json, None, None, false)
-            .await;
-
-        println!("Gate approved: {} phase '{}' by {}", ticket, phase, role);
-        info!(key = %gate_key, phase, role, "gate approved");
+                state.version,
+                role,
+                Event::Decide {
+                    round,
+                    phase,
+                    approved,
+                    report: report.into(),
+                    revision,
+                    head,
+                },
+            )
+            .await?;
         Ok(())
     }
 
-    /// Check if a gated phase has been approved.
-    pub async fn gate_status(&self, ticket: &str, phase: &str) -> Result<()> {
-        let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
-        let approval: Option<String> = self
-            .client
-            .get(&gate_key)
-            .await
-            .context("Redis GET failed")?;
+    /// Legacy API intentionally refuses unversioned approval. Use gate_decide.
+    pub async fn gate_approve(
+        &self,
+        _ticket: &str,
+        _role: &str,
+        _phase: &str,
+        _notes: Option<&str>,
+    ) -> Result<()> {
+        bail!("Approval requires an explicit plan revision and tested head. Use gate decide --revision <N> --round <R> --phase <plan_ready|testing|submit> --verdict approve --report <file>.")
+    }
 
-        match approval {
-            Some(json) => {
-                let approval: GateApproval =
-                    serde_json::from_str(&json).context("Failed to parse gate approval")?;
-                println!(
-                    "✓ Gate '{}' approved by {} at {}",
-                    approval.phase, approval.approved_by, approval.ts
-                );
-                if let Some(notes) = approval.notes {
-                    println!("  Notes: {}", notes);
-                }
-            }
-            None => {
-                println!("✗ Gate '{}' not yet approved", phase);
-            }
-        }
-        Ok(())
+    pub async fn gate_status(&self, ticket: &str, _phase: &str) -> Result<()> {
+        self.status_get(ticket).await
     }
 
     /// Read the current status JSON for this ticket. Prints `{}` when unset
     /// so hook scripts can always parse the output.
     pub async fn status_get(&self, ticket: &str) -> Result<()> {
-        let key = self.key(&full_ticket_key_flat(ticket, "status"));
-        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
-        println!("{}", val.unwrap_or_else(|| "{}".to_string()));
-        debug!(key = %key, "status read");
+        println!(
+            "{}",
+            serde_json::to_string(&self.lifecycle.lifecycle(ticket).await?)?
+        );
         Ok(())
     }
 
@@ -418,10 +260,10 @@ impl HarnessStore {
         };
         let key = self.key(&full_ticket_key_flat(ticket, "handoff"));
         let json = serde_json::to_string(&payload)?;
-        let _: Result<(), _> = self
-            .client
+        self.client
             .set::<(), _, _>(&key, json, None, None, false)
-            .await;
+            .await
+            .context("Redis write failed")?;
         println!("Wrote: {}", key);
         info!(key = %key, "handoff written");
         Ok(())
@@ -429,6 +271,10 @@ impl HarnessStore {
 
     /// Record that a PR was opened.
     pub async fn pr_opened(&self, ticket: &str, pr: &u64, branch: &str, title: &str) -> Result<()> {
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        self.lifecycle
+            .transition(ticket, state.version, "forge", Event::Pr { number: *pr })
+            .await?;
         let payload = PrInfo {
             pr_number: *pr,
             branch: branch.to_string(),
@@ -436,10 +282,10 @@ impl HarnessStore {
         };
         let key = self.key(&full_ticket_key_flat(ticket, "pr"));
         let json = serde_json::to_string(&payload)?;
-        let _: Result<(), _> = self
-            .client
+        self.client
             .set::<(), _, _>(&key, json, None, None, false)
-            .await;
+            .await
+            .context("Redis write failed")?;
         println!("Wrote: {} (pr #{})", key, pr);
         info!(key = %key, pr, "pr opened");
         Ok(())
@@ -458,7 +304,14 @@ impl HarnessStore {
         verdict: &str,
         report_path: &Path,
         pr: Option<u64>,
+        target: ReviewTarget,
     ) -> Result<()> {
+        let ReviewTarget {
+            revision,
+            round,
+            head,
+        } = target;
+        let head = head.context("PR review requires a commit SHA")?;
         if !role.eq_ignore_ascii_case("sentinel") {
             bail!(
                 "Review submit rejected: role '{}' is not SENTINEL. \
@@ -478,41 +331,40 @@ impl HarnessStore {
             "Failed to read report file: {}",
             report_path.display()
         ))?;
-        let payload = ReviewPayload {
-            verdict: verdict.to_string(),
-            report,
-            pr_number: pr,
-        };
-        // `review submit` records the SENTINEL PR/final review verdict. It is
-        // namespaced by review type (`pr_review`) so it never collides with the
-        // planning-gate review state (`ticket:{id}:gate:planning`).
-        let key = self.key(&review_verdict_key(ticket, REVIEW_TYPE_PR));
-        let json = serde_json::to_string(&payload)?;
-        let _: Result<(), _> = self
-            .client
-            .set::<(), _, _>(&key, json, None, None, false)
-            .await;
-        println!("Wrote: {} (verdict: {})", key, verdict);
-        info!(key = %key, verdict, "review submitted");
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        anyhow::ensure!(
+            state.phase == Phase::Submit
+                && state.review_round == round
+                && state.revision == revision
+                && state.head.as_ref() == Some(&head),
+            "Stale PR review"
+        );
+        anyhow::ensure!(
+            pr.is_none() || pr == state.pr_number,
+            "Review PR does not match lifecycle candidate"
+        );
+        self.lifecycle
+            .transition(
+                ticket,
+                state.version,
+                role,
+                Event::Decide {
+                    phase: Phase::Submit,
+                    approved: verdict == "approve",
+                    report,
+                    revision,
+                    round,
+                    head: Some(head),
+                },
+            )
+            .await?;
+
         Ok(())
     }
 
     /// Record that a merge completed (vessel).
-    pub async fn merge_done(&self, ticket: &str, pr: &u64, sha: &str) -> Result<()> {
-        let payload = MergePayload {
-            pr_number: *pr,
-            sha: sha.to_string(),
-            merged: true,
-        };
-        let key = self.key(&full_ticket_key_flat(ticket, "deployment"));
-        let json = serde_json::to_string(&payload)?;
-        let _: Result<(), _> = self
-            .client
-            .set::<(), _, _>(&key, json, None, None, false)
-            .await;
-        println!("Wrote: {} (pr #{}, merged)", key, pr);
-        info!(key = %key, pr, "merge done");
-        Ok(())
+    pub async fn merge_done(&self, _ticket: &str, _pr: &u64, _sha: &str) -> Result<()> {
+        bail!("Only the controller records confirmed GitHub merges")
     }
 
     /// Start daemonized heartbeat writing (every 30s).
@@ -530,8 +382,7 @@ impl HarnessStore {
                 status: "running".to_string(),
             };
             let json = serde_json::to_string(&record)?;
-            let _: Result<(), _> = self
-                .client
+            self.client
                 .set::<(), _, _>(
                     &key,
                     &json,
@@ -539,7 +390,8 @@ impl HarnessStore {
                     None,
                     false,
                 )
-                .await;
+                .await
+                .context("Redis write failed")?;
             debug!(key = %key, "heartbeat written");
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
@@ -564,6 +416,16 @@ impl HarnessStore {
         expect_exit: Option<i32>,
         artifacts: Option<&str>,
     ) -> Result<()> {
+        a2a_protocol::validate_command_argv(&argv)?;
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        anyhow::ensure!(
+            state.phase == Phase::Testing && state.head.is_some(),
+            "A2A verification requires testing"
+        );
+        anyhow::ensure!(
+            expect_exit == Some(0),
+            "Gate evidence requires --expect-exit 0"
+        );
         // Create A2A client for this pair (ticket == pair_id in current design)
         let client = crate::a2a_client::A2AClient::new(ticket.to_string(), "sentinel".to_string())?;
 
@@ -606,9 +468,29 @@ impl HarnessStore {
             if let Some(result) = client.get_task_status(&task_id).await? {
                 // The result is durable (mirrored by the relay before ack);
                 // surface it as JSON for the caller.
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                let stdout: Option<String> = self
+                    .client
+                    .get(self.key(&format!("audit:a2a:{task_id}:stdout")))
+                    .await?;
+                let stderr: Option<String> = self
+                    .client
+                    .get(self.key(&format!("audit:a2a:{task_id}:stderr")))
+                    .await?;
+                let mut output = serde_json::to_value(&result)?;
+                output["argv"] = serde_json::json!(&request.argv);
+                output["stdout"] = serde_json::json!(stdout.unwrap_or_default());
+                output["stderr"] = serde_json::json!(stderr.as_deref().unwrap_or_default());
+                println!("{}", serde_json::to_string_pretty(&output)?);
                 if result.timed_out {
                     bail!("verification timed out");
+                }
+                if result.exit_code.is_none() {
+                    bail!(
+                        "Verification executor failed: {}",
+                        stderr
+                            .as_deref()
+                            .unwrap_or("inspect FORGE verify.log for runtime failure")
+                    );
                 }
                 match request.expect.exit_code {
                     Some(expected) if result.exit_code != Some(expected) => {
@@ -620,6 +502,21 @@ impl HarnessStore {
                     }
                     _ => {}
                 }
+                anyhow::ensure!(
+                    result.head_sha == state.head,
+                    "Verification did not run on the clean candidate head"
+                );
+                self.lifecycle
+                    .transition(
+                        ticket,
+                        state.version,
+                        "sentinel",
+                        Event::Verified {
+                            head: state.head.clone().unwrap(),
+                            task: task_id.clone(),
+                        },
+                    )
+                    .await?;
                 return Ok(());
             }
 
@@ -757,6 +654,7 @@ impl HarnessStore {
                 &tenant,
                 &request.pair_id,
                 &request.argv,
+                &request.expect.artifacts,
                 request.timeout_secs,
                 &workspace_id,
                 Some(&task_id),
@@ -776,13 +674,24 @@ impl HarnessStore {
                     // synthetic failure so the task does not hang pending
                     // forever on the Sentinel side.
                     eprintln!("  [TASK FAILED] {}: {}", task_id, e);
+                    let stderr_key = self.key(&format!("audit:a2a:{}:stderr", task_id));
+                    self.client
+                        .set::<(), _, _>(
+                            &stderr_key,
+                            format!("[EXECUTOR_SETUP] {e:#}"),
+                            None,
+                            None,
+                            false,
+                        )
+                        .await?;
                     let fail = a2a_protocol::VerifyResult {
+                        head_sha: None,
                         task_id: task_id.clone(),
                         exit_code: None,
                         timed_out: false,
                         duration_ms: 0,
                         stdout_ref: format!("audit:a2a:{}:stdout", task_id),
-                        stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                        stderr_ref: stderr_key,
                         artifacts: vec![],
                         executor: a2a_protocol::ExecutorInfo {
                             role: "forge".to_string(),
@@ -810,21 +719,32 @@ impl HarnessStore {
 
     /// Write a plan artifact (FORGE → Redis at `pair:{id}:plan`).
     ///
-    /// FORGE writes PLAN.md as a local file in its workspace, then calls this
+    /// FORGE writes its plan at the current chat-specific path, then calls this
     /// to persist it directly to Redis SharedStore so SENTINEL (and NEXUS)
     /// can read it without relying on Coder API filesystem access.
     pub async fn plan_write(&self, ticket: &str, file_path: &Path) -> Result<()> {
-        let content = std::fs::read_to_string(file_path)
-            .context(format!("Failed to read plan file: {}", file_path.display()))?;
-
-        let key = self.key(&format!("pair:{}:plan", ticket));
-        let _: Result<(), _> = self
-            .client
-            .set::<(), _, _>(&key, content, None, None, false)
-            .await;
-
-        println!("Wrote: {}", key);
-        info!(key = %key, "plan written to SharedStore");
+        let content = std::fs::read_to_string(file_path)?;
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        self.lifecycle
+            .transition(
+                ticket,
+                state.version,
+                "forge",
+                Event::Plan {
+                    content: content.clone(),
+                },
+            )
+            .await?;
+        // Compatibility projection; the lifecycle record is authoritative.
+        self.client
+            .set::<(), _, _>(
+                self.key(&format!("pair:{ticket}:plan")),
+                serde_json::to_string(&content)?,
+                None,
+                None,
+                false,
+            )
+            .await?;
         Ok(())
     }
 
@@ -833,21 +753,18 @@ impl HarnessStore {
     /// SENTINEL uses this to retrieve the FORGE plan during planning gate review.
     /// Prints the plan content as raw markdown; prints nothing if unset.
     pub async fn plan_read(&self, ticket: &str) -> Result<()> {
-        let key = self.key(&format!("pair:{}:plan", ticket));
-        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
-        match val {
-            Some(content) => {
-                print!("{}", content);
-            }
-            None => {
-                bail!(
-                    "No plan found for ticket {}. FORGE must write a plan via \
-                     `openflows-harness plan write --file PLAN.md` first.",
-                    ticket
-                );
-            }
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        if !state.plan.is_empty() {
+            println!("{}", state.plan);
+            return Ok(());
         }
-        debug!(key = %key, "plan read");
+        let raw: Option<String> = self
+            .client
+            .get(self.key(&format!("pair:{ticket}:plan")))
+            .await?;
+        if let Some(raw) = raw {
+            println!("{}", serde_json::from_str::<String>(&raw).unwrap_or(raw));
+        }
         Ok(())
     }
 
@@ -891,13 +808,6 @@ impl HarnessStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_valid_phases() {
-        assert!(VALID_PHASES.contains(&"planning"));
-        assert!(VALID_PHASES.contains(&"building"));
-        assert!(!VALID_PHASES.contains(&"invalid_phase"));
-    }
 
     #[test]
     fn test_valid_verdicts() {
@@ -949,49 +859,5 @@ mod tests {
         assert!(authorize_gate_approver("lore").is_err());
         assert!(authorize_gate_approver("").is_err());
         assert!(authorize_gate_approver("admin").is_err());
-    }
-
-    #[test]
-    fn test_first_status_must_enter_via_planning_or_blocked() {
-        // A brand-new ticket must enter through the planning gate (or report
-        // an immediate blocker via `blocked`). It cannot short-circuit
-        // straight to building/testing/review_ready and skip the SENTINEL plan
-        // review.
-        assert!(is_allowed_first_phase("planning"));
-        assert!(is_allowed_first_phase("blocked"));
-        assert!(!is_allowed_first_phase("building"));
-        assert!(!is_allowed_first_phase("testing"));
-        assert!(!is_allowed_first_phase("review_ready"));
-    }
-
-    #[test]
-    fn test_gate_source_only_for_leaving_planning() {
-        // Leaving planning -> any other phase requires (and consumes) an
-        // approval sourced from the planning gate.
-        assert_eq!(
-            gate_source_for_transition("planning", "building"),
-            Some("planning")
-        );
-        assert_eq!(
-            gate_source_for_transition("planning", "testing"),
-            Some("planning")
-        );
-        assert_eq!(
-            gate_source_for_transition("planning", "review_ready"),
-            Some("planning")
-        );
-
-        // Staying in planning is a no-op, not a gated transition.
-        assert_eq!(gate_source_for_transition("planning", "planning"), None);
-
-        // Transitions among downstream phases do not require re-approval.
-        assert_eq!(gate_source_for_transition("building", "testing"), None);
-        assert_eq!(gate_source_for_transition("testing", "review_ready"), None);
-
-        // Returning TO planning is free; the next outbound transition is
-        // gated, and because the previous approval was consumed on the way
-        // out, the revised plan forces a fresh SENTINEL approval.
-        assert_eq!(gate_source_for_transition("building", "planning"), None);
-        assert_eq!(gate_source_for_transition("blocked", "planning"), None);
     }
 }

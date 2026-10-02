@@ -31,7 +31,9 @@ impl Provisioner {
         registry: &config::Registry,
     ) -> anyhow::Result<()> {
         let entry = registry
-            .get(role)
+            .team
+            .iter()
+            .find(|entry| entry.id == role)
             .ok_or_else(|| anyhow::anyhow!("Role '{}' not found in registry", role))?;
 
         if !entry.enabled {
@@ -39,39 +41,34 @@ impl Provisioner {
             return Ok(());
         }
 
-        // 1. Provision skills
-        // Try to create .agents/skills directory first, proceed without skills if permission denied.
-        // This allows role provisioning to continue even if workspace lacks home directory write access.
-        let skills_dir = ".agents/skills";
+        // Required skills must be available before an agent can start.
+        transport
+            .create_dir_all(".agents/skills")
+            .await
+            .context("Failed to create required skills directory")?;
+        for skill_name in &entry.skills {
+            let source = self
+                .orchestrator_dir
+                .join("orchestration/plugin/skills")
+                .join(skill_name)
+                .join("SKILL.md");
+            transport
+                .copy_file(&source, &format!(".agents/skills/{skill_name}/SKILL.md"))
+                .await
+                .with_context(|| format!("Failed to provision required skill {skill_name}"))?;
+        }
 
-        if let Err(e) = transport.create_dir_all(skills_dir).await {
-            // Permission denied is common in sandboxed workspaces - log and continue without skills
-            if e.to_string().contains("Permission denied") || e.to_string().contains("mkdir") {
-                warn!(role, skills_dir, error = %e, "Cannot create .agents/skills directory - skills will not be provisioned. Ensure workspace has write access to home directory.");
-            } else {
-                warn!(role, skills_dir, error = %e, "Failed to create skills directory - continuing without skills");
-            }
-        } else {
-            // Successfully created directory, now provision each skill
-            for skill_name in &entry.skills {
-                let skill_dir = self
-                    .orchestrator_dir
-                    .join("orchestration")
-                    .join("plugin")
-                    .join("skills")
-                    .join(skill_name);
-
-                let skill_md = skill_dir.join("SKILL.md");
-                if skill_md.exists() {
-                    let target = format!("{}/{}/SKILL.md", skills_dir, skill_name);
-                    match transport.copy_file(&skill_md, &target).await {
-                        Ok(_) => info!(skill = skill_name, role, "Provisioned skill"),
-                        Err(e) => {
-                            warn!(skill = skill_name, role, error = %e, "Failed to copy skill file - continuing");
-                        }
-                    }
-                } else {
-                    warn!(skill = skill_name, "Skill directory not found — skipping");
+        // Keep complete command documents accessible beyond startup excerpts.
+        let commands = self.orchestrator_dir.join("orchestration/plugin/commands");
+        if commands.is_dir() {
+            for entry in std::fs::read_dir(&commands)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    transport
+                        .copy_file(&path, &format!(".agents/commands/{name}"))
+                        .await
+                        .context("Failed to provision command instructions")?;
                 }
             }
         }
@@ -112,7 +109,12 @@ impl Provisioner {
             .join("agents")
             .join(format!("{}.agent.md", role));
 
-        if persona_path.exists() {
+        anyhow::ensure!(
+            persona_path.is_file(),
+            "Required persona missing: {}",
+            persona_path.display()
+        );
+        {
             transport
                 .copy_file(&persona_path, &format!("{}.agent.md", role))
                 .await
@@ -456,44 +458,56 @@ mod tests {
                 RegistryEntry {
                     id: "forge".to_string(),
                     enabled: true,
-                    plan_mode: false,
                     max_instances: 1,
                     skills: vec![],
                     mcp: serde_json::Value::Null,
                     cli: String::new(),
-                    active: true,
-                    instances: 1,
                     model_backend: None,
                     routing_key: None,
                     github_token_env: None,
                     allowed_domains: None,
                     coder_module: None,
-                    model: None,
                 },
                 RegistryEntry {
                     id: "lore".to_string(),
                     enabled: false,
-                    plan_mode: false,
                     max_instances: 1,
                     skills: vec![],
                     mcp: serde_json::Value::Null,
                     cli: String::new(),
-                    active: true,
-                    instances: 1,
                     model_backend: None,
                     routing_key: None,
                     github_token_env: None,
                     allowed_domains: None,
                     coder_module: None,
-                    model: None,
                 },
             ],
         }
     }
 
     #[tokio::test]
+    async fn required_instruction_files_cannot_be_missing() {
+        let orch = tempfile::tempdir().unwrap();
+        let transport = MemTransport::default();
+        assert!(Provisioner::new(orch.path())
+            .provision_role(&transport, "forge", &registry())
+            .await
+            .is_err());
+        let orch = persona_dir();
+        let mut reg = registry();
+        reg.team[0].skills.push("missing-skill".into());
+        assert!(Provisioner::new(orch.path())
+            .provision_role(&transport, "forge", &reg)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn provisions_agents_md_persona_for_enabled_role() {
         let orch = persona_dir();
+        let commands = orch.path().join("orchestration/plugin/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("plan.md"), "Read the full planning skill").unwrap();
         let transport = MemTransport::default();
         let provisioner = Provisioner::new(orch.path());
         provisioner
@@ -507,6 +521,10 @@ mod tests {
             .written("forge.agent.md")
             .expect("forge.agent.md written");
         assert!(persona.contains("Forge persona"));
+        assert_eq!(
+            transport.written(".agents/commands/plan.md").as_deref(),
+            Some("Read the full planning skill")
+        );
     }
 
     #[tokio::test]

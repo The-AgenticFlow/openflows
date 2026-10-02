@@ -21,6 +21,7 @@ use serde_json::Value;
 const MUTATING_HINTS: &[(&str, &str)] = &[
     ("status set", "phase_changed"),
     ("review submit", "verdict_written"),
+    ("gate decide", "gate_decided"),
     ("gate approve", "gate_approved"),
     ("pr opened", "pr_submitted"),
     ("handoff write", "handoff_written"),

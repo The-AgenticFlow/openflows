@@ -102,21 +102,31 @@ resource "coder_agent" "main" {
     # TEMPORARY: Use mounted dev binary for local testing
     # (In production, download from GitHub releases instead)
     if [ -f /opt/openflows-dev/openflows ]; then
-      echo "Using mounted dev binary..."
-      sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
-      sudo chmod +x /usr/local/bin/openflows
+      # Guard against a non-ELF binary being mounted (e.g. a macOS Mach-O
+      # accidentally synced from a macOS dev host). Copying it over
+      # /usr/local/bin/openflows would brick the controller with cryptic
+      # `__PAGEZERO__: not found` errors when sh falls back to parsing the
+      # binary as a script after the kernel returns ENOEXEC.
+      if head -c 4 /opt/openflows-dev/openflows | grep -q $'\x7fELF'; then
+        echo "Using mounted dev binary..."
+        sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
+        sudo chmod +x /usr/local/bin/openflows
 
-      # Self-healing: if the workspace has a git checkout, warn when the
-      # mounted binary is older than the latest source commit.  This catches
-      # the case where someone forgot to run 'make dev-sync' before starting
-      # the workspace.
-      if [ -d /home/coder/workspace/.git ]; then
-        BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
-        LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
-        if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
-          echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
-          echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
+        # Self-healing: if the workspace has a git checkout, warn when the
+        # mounted binary is older than the latest source commit.  This catches
+        # the case where someone forgot to run 'make dev-sync' before starting
+        # the workspace.
+        if [ -d /home/coder/workspace/.git ]; then
+          BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
+          LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
+          if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
+            echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
+            echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
+          fi
         fi
+      else
+        echo "WARNING: Mounted dev binary is not a Linux ELF; keeping the image's built-in binary." >&2
+        echo "         Run 'make dev-sync' on the host to rebuild for $${LINUX_TARGET:-x86_64-unknown-linux-musl}." >&2
       fi
     else
       echo "WARNING: Dev binary not found at /opt/openflows-dev/openflows"
@@ -215,6 +225,8 @@ resource "docker_volume" "artifacts" {
 resource "docker_container" "workspace" {
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"

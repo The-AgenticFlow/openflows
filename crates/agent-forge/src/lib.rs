@@ -314,7 +314,7 @@ impl BatchNode for ForgePairNode {
                 );
 
                 match harness_status.phase.as_str() {
-                    "review_ready" => {
+                    "submit" => {
                         info!(
                             ticket_id,
                             worker_id, "Harness reports review_ready — checking for PR info"
@@ -362,7 +362,7 @@ impl BatchNode for ForgePairNode {
                         warn!(ticket_id, worker_id, "Harness reports blocked status");
                         has_failed = true;
                     }
-                    "planning" => {
+                    "plan_ready" => {
                         // FORGE is in the planning gate — waiting for SENTINEL to
                         // review the plan and approve the gate. Route to NEXUS so
                         // it can spawn a SENTINEL chat for plan review.
@@ -373,7 +373,7 @@ impl BatchNode for ForgePairNode {
                         );
                         has_planning_gate = true;
                     }
-                    "building" | "testing" => {
+                    "planning" | "plan_rejected" | "building" | "testing" => {
                         debug!(
                             ticket_id,
                             worker_id,

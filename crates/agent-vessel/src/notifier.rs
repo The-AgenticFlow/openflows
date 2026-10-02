@@ -5,7 +5,7 @@
 
 use pocketflow_core::SharedStore;
 use serde_json::json;
-use tracing::info;
+use tracing::{debug, info};
 
 /// VESSEL Notifier — emits events to SharedStore for dependency resolution.
 pub struct VesselNotifier;
@@ -145,8 +145,9 @@ impl VesselNotifier {
     /// Key format: ticket:{ticket_id}:status
     pub async fn set_ticket_status_merged(store: &SharedStore, ticket_id: &str) {
         let key = format!("ticket:{}:status", ticket_id);
-        store.set(&key, json!("Merged")).await;
-        info!(ticket_id, "Set ticket status to Merged");
+        // Lifecycle completion is written atomically with merge evidence by VESSEL.
+        let _ = (store, key);
+        debug!(ticket_id, "Merge notification preserves lifecycle record");
     }
 }
 
@@ -218,6 +219,9 @@ mod tests {
         VesselNotifier::set_ticket_status_merged(&store, "T-42").await;
 
         let status = store.get("ticket:T-42:status").await;
-        assert_eq!(status, Some(json!("Merged")));
+        assert_eq!(
+            status, None,
+            "notification must not manufacture merge evidence"
+        );
     }
 }

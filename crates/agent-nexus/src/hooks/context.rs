@@ -146,21 +146,14 @@ fn role_from_key(un_ns: &str) -> Option<String> {
 
 /// Read the durable per-ticket state used by the hook slices.
 pub async fn read_ticket_state(store: &SharedStore, ticket_id: &str) -> TicketState {
-    let status_key = format!("ticket:{ticket_id}:status");
-    let phase = store
-        .get(&status_key)
-        .await
-        .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(str::to_string));
-
+    let lifecycle = store.lifecycle(ticket_id).await.ok();
+    let phase = lifecycle.as_ref().map(|s| s.phase.as_str().to_owned());
     let plan_key = format!("pair:{ticket_id}:plan");
-    // `openflows-harness plan write` stores the plan as raw markdown, not JSON.
-    // SharedStore::get() parses Redis values as JSON, so a real raw plan can
-    // look "missing" if we deserialize it here. Key presence is the contract.
-    let plan_exists = !store.keys(&plan_key).await.is_empty();
-
-    let gate_key = format!("ticket:{ticket_id}:gate:planning");
-    let gate_approved = store.get(&gate_key).await.is_some();
-
+    let plan_exists = lifecycle.as_ref().is_some_and(|s| !s.plan.is_empty())
+        || !store.keys(&plan_key).await.is_empty();
+    let gate_approved = lifecycle
+        .as_ref()
+        .is_some_and(|s| s.plan_decision.as_ref().is_some_and(|d| d.approved));
     let pr_key = format!("ticket:{ticket_id}:pr");
     let pr_recorded = store.get(&pr_key).await.is_some();
 

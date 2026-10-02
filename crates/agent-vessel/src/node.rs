@@ -3,7 +3,7 @@
 // VesselNode — orchestrates CI polling, merging, and notification.
 // Implements the Node trait for integration with the Flow.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use coder_client::CoderClient;
 use config::{
@@ -36,6 +36,7 @@ use crate::{CiPoller, PrMerger, VesselNotifier};
 /// 2. exec: Poll CI, detect conflicts, resolve if possible, merge if green, return outcomes
 /// 3. post: Emit events, update tickets, return routing action
 pub struct VesselNode {
+    lifecycle_store: std::sync::Mutex<Option<SharedStore>>,
     config: VesselConfig,
     client: github::GithubRestClient,
     poller: CiPoller,
@@ -65,6 +66,7 @@ impl VesselNode {
         let client = github::GithubRestClient::new(&config.github_token);
 
         Self {
+            lifecycle_store: std::sync::Mutex::new(None),
             poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
             merger: PrMerger::new(client.clone(), config.merge_method),
             client,
@@ -578,6 +580,7 @@ impl Node for VesselNode {
 
     /// Phase 1: Read pending PRs and CI readiness from SharedStore.
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
+        *self.lifecycle_store.lock().unwrap() = Some(store.clone());
         debug!("VESSEL prep: reading pending PRs and CI readiness");
 
         let repository: Option<String> = store.get_typed("repository").await;
@@ -644,7 +647,7 @@ impl Node for VesselNode {
 
             debug!(pr_number, "Fetching PR details");
 
-            let pr_info = match self.client.get_pull_request(owner, repo, pr_number).await {
+            let mut pr_info = match self.client.get_pull_request(owner, repo, pr_number).await {
                 Ok(info) => info,
                 Err(e) => {
                     warn!(pr_number, error = %e, "Failed to fetch PR details, skipping");
@@ -652,43 +655,102 @@ impl Node for VesselNode {
                 }
             };
 
-            // Check if PR has active check runs, even if ci_readiness says Missing.
-            // PR #19 (CI setup) adds CI that runs on itself, so we must check.
-            // If check_suites returns anything other than Success, checks exist.
-            let pr_has_ci = if !has_ci_workflows {
-                match self
-                    .client
-                    .get_check_suites_status(owner, repo, &pr_info.head_sha)
-                    .await
-                {
-                    Ok(CiStatus::Success) => {
-                        // Might be truly no checks, or all passed - verify
-                        self.has_any_check_runs(owner, repo, &pr_info.head_sha)
-                            .await
-                            .unwrap_or(false)
-                    }
-                    Ok(_) => {
-                        info!(
-                            pr_number,
-                            "PR has check runs despite ci_readiness=Missing — processing with CI"
-                        );
-                        true
-                    }
-                    Err(_) => false,
-                }
-            } else {
-                has_ci_workflows
-            };
-
-            let outcome = if !pr_has_ci {
-                warn!(
+            let store = self
+                .lifecycle_store
+                .lock()
+                .unwrap()
+                .clone()
+                .context("VESSEL lifecycle store not initialized")?;
+            let ticket = pr["ticket_id"].as_str().or(pr_info.ticket_id.as_deref());
+            let Some(ticket) = ticket
+                .filter(|ticket| !ticket.trim().is_empty())
+                .map(str::to_owned)
+            else {
+                outcomes.push(VesselOutcome::Unmanaged {
                     pr_number,
-                    "No CI workflows configured — treating as success and alerting NEXUS"
-                );
-                self.merge_without_ci(owner, repo, pr_info).await?
-            } else {
-                self.process_single_pr(owner, repo, pr_info).await?
+                    reason: "PR has no lifecycle ticket; manual review and merge required".into(),
+                });
+                continue;
             };
+            pr_info.ticket_id = Some(ticket.clone());
+            let ticket = ticket.as_str();
+            let state = store.lifecycle(ticket).await?;
+            if let Some(sha) = self
+                .client
+                .confirmed_merge_sha(owner, repo, pr_number)
+                .await?
+            {
+                if state.phase != config::lifecycle::Phase::Done {
+                    store
+                        .transition(
+                            ticket,
+                            state.version,
+                            "vessel",
+                            config::lifecycle::Event::ReconcileMerged {
+                                number: pr_number,
+                                sha: sha.clone(),
+                            },
+                        )
+                        .await?;
+                }
+                outcomes.push(VesselOutcome::Merged {
+                    ticket_id: ticket.to_owned(),
+                    pr_number,
+                    sha,
+                    pr_title: pr_info.title.clone(),
+                    pr_body: pr_info.body.clone(),
+                });
+                continue;
+            }
+            // An unmerged snapshot cannot prove that an earlier timed-out request
+            // has stopped executing. Only confirmed completion clears an unknown outcome.
+            if state.merge_pending {
+                warn!(
+                    ticket,
+                    "Merge outcome uncertain; waiting for reconciliation"
+                );
+                continue;
+            }
+            if state.phase != config::lifecycle::Phase::Submit {
+                info!(
+                    pr_number,
+                    ticket,
+                    phase = state.phase.as_str(),
+                    "Deferring PR: lifecycle is not in submit phase"
+                );
+                continue;
+            }
+            if state.head.as_deref() != Some(&pr_info.head_sha) {
+                info!(pr_number, ticket, expected_head = ?state.head, actual_head = %pr_info.head_sha,
+                    "Deferring PR: head changed; returning ticket to building");
+                if !state.merge_pending {
+                    store
+                        .transition(
+                            ticket,
+                            state.version,
+                            "vessel",
+                            config::lifecycle::Event::Move {
+                                phase: config::lifecycle::Phase::Building,
+                                head: None,
+                            },
+                        )
+                        .await?;
+                }
+                continue;
+            }
+            if !state.merge_ready(&pr_info.head_sha) {
+                info!(
+                    pr_number,
+                    ticket,
+                    review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
+                    human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
+                    delivery_pending = state.pr_delivery.is_some(),
+                    "Deferring PR: waiting for lifecycle approvals or review delivery"
+                );
+                continue;
+            }
+
+            let outcome = self.process_single_pr(owner, repo, pr_info).await?;
             outcomes.push(outcome);
         }
 
@@ -704,12 +766,20 @@ impl Node for VesselNode {
             serde_json::from_value(exec_result["outcomes"].clone()).unwrap_or_default();
         let has_work = exec_result["has_work"].as_bool().unwrap_or(false);
 
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
         if !has_work {
+            if !pending_prs.is_empty() {
+                // Returning no_work routes immediately back to Nexus, which
+                // would send the unchanged queue straight back to Vessel.
+                info!(
+                    pending_count = pending_prs.len(),
+                    "Pending PRs deferred; pausing until the next controller poll"
+                );
+                return Ok(Action::new(PAUSE_SIGNAL));
+            }
             debug!("No PRs were processed");
             return Ok(Action::new("no_work"));
         }
-
-        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
 
         let mut any_success = false;
         let mut any_failure = false;
@@ -722,6 +792,30 @@ impl Node for VesselNode {
         let mut failed_ticket_ids: Vec<String> = Vec::new();
 
         for outcome in outcomes {
+            let rework = matches!(
+                &outcome,
+                VesselOutcome::CiFailed { .. }
+                    | VesselOutcome::CiTimeout { .. }
+                    | VesselOutcome::Conflicts { .. }
+            ) || matches!(&outcome,VesselOutcome::Reviews{state,..} if state!="needs_review");
+            if rework {
+                if let Some(ticket) = outcome.ticket_id() {
+                    let current = store.lifecycle(ticket).await?;
+                    if current.phase == config::lifecycle::Phase::Submit && !current.merge_pending {
+                        store
+                            .transition(
+                                ticket,
+                                current.version,
+                                "vessel",
+                                config::lifecycle::Event::Move {
+                                    phase: config::lifecycle::Phase::Building,
+                                    head: None,
+                                },
+                            )
+                            .await?;
+                    }
+                }
+            }
             match &outcome {
                 VesselOutcome::Merged {
                     ticket_id,
@@ -1436,6 +1530,17 @@ impl Node for VesselNode {
 
                     self.remove_from_pending_prs(store, *pr_number).await;
                 }
+                VesselOutcome::Unmanaged { pr_number, reason } => {
+                    warn!(pr_number, reason, "PR requires manual handling");
+                    store
+                        .set(
+                            &format!("pr:{pr_number}:unmanaged"),
+                            json!({"reason": reason}),
+                        )
+                        .await;
+                    self.remove_from_pending_prs(store, *pr_number).await;
+                    any_awaiting_human = true;
+                }
                 VesselOutcome::DocsPrClosed { pr_number, reason } => {
                     info!(
                         pr_number,
@@ -1478,38 +1583,6 @@ impl Node for VesselNode {
 impl VesselNode {
     /// Check if any check runs exist for a commit by querying check-runs API.
     /// Returns true if total_count > 0.
-    async fn has_any_check_runs(&self, owner: &str, repo: &str, sha: &str) -> Result<bool> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/commits/{}/check-runs?per_page=1",
-            owner, repo, sha
-        );
-
-        let client = reqwest::Client::builder()
-            .user_agent("AgentFlow-VESSEL/0.1")
-            .build()?;
-
-        let resp = client
-            .get(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.config.github_token),
-            )
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Ok(false);
-        }
-
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let total = body["total_count"].as_u64().unwrap_or(0);
-        Ok(total > 0)
-    }
-
-    /// Process a single PR: poll CI → detect conflicts → resolve if possible → merge if green → return outcome.
-    /// For Docs PRs: short-circuit CI polling if conflicts detected to save time.
     async fn process_single_pr(
         &self,
         owner: &str,
@@ -1568,7 +1641,7 @@ impl VesselNode {
                 let monitor_state =
                     classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
                         .await
-                        .unwrap_or(PrMonitorState::ReadyForMerge);
+                        .unwrap_or(PrMonitorState::NeedsReview);
 
                 // SENTINEL has not yet approved the PR on GitHub. Do not merge
                 // and do not ask FORGE to rework — keep the PR pending so the
@@ -1603,7 +1676,7 @@ impl VesselNode {
                     });
                 }
 
-                match self.merger.merge(owner, repo, &pr_info).await {
+                match self.merge_reviewed(owner, repo, &pr_info).await {
                     Ok(result) if result.merged => Ok(VesselOutcome::Merged {
                         ticket_id: ticket_id.unwrap_or_else(|| format!("T-{}", pr_number)),
                         pr_number,
@@ -1683,76 +1756,10 @@ impl VesselNode {
                 );
                 self.handle_conflicts(owner, repo, pr_info).await
             }
-            CiPollResult::Timeout => {
-                warn!(
-                    pr_number,
-                    "CI timed out — checking for conflicts as likely cause"
-                );
-                let fresh_pr = self.client.get_pull_request(owner, repo, pr_number).await;
-                if let Ok(ref info) = fresh_pr {
-                    if info.has_conflicts() {
-                        warn!(
-                            pr_number,
-                            "Conflicts found after timeout — treating as conflict case"
-                        );
-                        return self.handle_conflicts(owner, repo, fresh_pr.unwrap()).await;
-                    }
-                }
-
-                // Even when CI times out, never merge a PR that has not received
-                // SENTINEL's GitHub approve review. This mirrors the
-                // CI-Success path so a timeout cannot bypass the review gate.
-                let monitor_state =
-                    classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
-                        .await
-                        .unwrap_or(PrMonitorState::ReadyForMerge);
-                if monitor_state == PrMonitorState::NeedsReview {
-                    debug!(
-                        pr_number,
-                        "CI timed out and PR not yet approved by SENTINEL — keeping pending for final review"
-                    );
-                    return Ok(VesselOutcome::Reviews {
-                        ticket_id,
-                        pr_number,
-                        state: PrMonitorState::NeedsReview.as_str().to_string(),
-                    });
-                }
-
-                // A timeout must not bypass outstanding review feedback. If the
-                // PR is in a review-rework state (changes requested or open
-                // comments), route it back to FORGE via /address_review instead
-                // of merging — mirroring the CI-Success path.
-                if matches!(
-                    monitor_state,
-                    PrMonitorState::ChangesRequested | PrMonitorState::Comments
-                ) {
-                    warn!(
-                        pr_number,
-                        state = monitor_state.as_str(),
-                        "CI timed out with outstanding review feedback — routing to /address_review"
-                    );
-                    return Ok(VesselOutcome::Reviews {
-                        ticket_id,
-                        pr_number,
-                        state: monitor_state.as_str().to_string(),
-                    });
-                }
-
-                match self.merger.merge(owner, repo, &pr_info).await {
-                    Ok(result) if result.merged => Ok(VesselOutcome::CiMissing {
-                        ticket_id,
-                        pr_number,
-                    }),
-                    Ok(_result) => Ok(VesselOutcome::CiTimeout {
-                        ticket_id,
-                        pr_number,
-                    }),
-                    Err(_) => Ok(VesselOutcome::CiTimeout {
-                        ticket_id,
-                        pr_number,
-                    }),
-                }
-            }
+            CiPollResult::Timeout => Ok(VesselOutcome::CiTimeout {
+                ticket_id,
+                pr_number,
+            }),
         }
     }
 
@@ -1776,6 +1783,32 @@ impl VesselNode {
         }
 
         let ticket_id = pr_info.ticket_id.clone();
+        // Release the frozen candidate before touching its worktree. A merge with
+        // an unknown outcome must remain reserved until GitHub confirms it.
+        let store = self
+            .lifecycle_store
+            .lock()
+            .unwrap()
+            .clone()
+            .context("Missing lifecycle store for conflict rework")?;
+        let ticket = ticket_id.as_deref().context("Conflict PR has no ticket")?;
+        let current = store.lifecycle(ticket).await?;
+        anyhow::ensure!(!current.merge_pending, "Merge outcome is still unresolved");
+        anyhow::ensure!(
+            current.phase == config::lifecycle::Phase::Submit,
+            "Conflict rework requires a submitted candidate"
+        );
+        store
+            .transition(
+                ticket,
+                current.version,
+                "vessel",
+                config::lifecycle::Event::Move {
+                    phase: config::lifecycle::Phase::Building,
+                    head: None,
+                },
+            )
+            .await?;
         let worktree_path = self.resolve_worktree_path(&pr_info);
 
         let conflicted_files = match &worktree_path {
@@ -2109,56 +2142,74 @@ impl VesselNode {
         }
     }
 
-    /// Merge a PR without CI validation (no CI workflows configured).
-    /// Still attempts the merge but emits a ci_missing event to alert NEXUS.
-    async fn merge_without_ci(
+    /// Reserve and merge only the reviewed candidate with successful current-head CI.
+    async fn merge_reviewed(
         &self,
         owner: &str,
         repo: &str,
-        pr_info: PrInfo,
-    ) -> Result<VesselOutcome> {
-        let pr_number = pr_info.number;
-
-        let ticket_id = if Self::is_docs_pr(&pr_info) {
-            Some("T-DOCS".to_string())
+        pr: &pocketflow_core::PrInfo,
+    ) -> Result<pocketflow_core::MergeResult> {
+        let store = self
+            .lifecycle_store
+            .lock()
+            .unwrap()
+            .clone()
+            .context("Missing lifecycle store")?;
+        let ticket = pr.ticket_id.as_deref().context("PR has no ticket")?;
+        let state = store.lifecycle(ticket).await?;
+        anyhow::ensure!(
+            state.merge_ready(&pr.head_sha) && state.pr_number == Some(pr.number),
+            "Current head lacks lifecycle approval"
+        );
+        // Empty check sets and timeouts are never proof of success.
+        anyhow::ensure!(
+            self.client.get_ci_status(owner, repo, &pr.head_sha).await?
+                == pocketflow_core::CiStatus::Success,
+            "CI must succeed for the candidate head"
+        );
+        let state = if state.merge_pending {
+            state
         } else {
-            pr_info.ticket_id.clone()
+            store
+                .transition(
+                    ticket,
+                    state.version,
+                    "vessel",
+                    config::lifecycle::Event::BeginMerge {
+                        head: pr.head_sha.clone(),
+                    },
+                )
+                .await?
         };
-
-        info!(pr_number, ticket_id = ?ticket_id, "Merging PR without CI — no workflows configured");
-
-        match self.merger.merge(owner, repo, &pr_info).await {
-            Ok(result) if result.merged => Ok(VesselOutcome::CiMissing {
-                ticket_id,
-                pr_number,
-            }),
-            Ok(result) if is_merge_conflict_message(&result.message) => {
-                warn!(
-                    pr_number,
-                    message = %result.message,
-                    "Merge blocked by conflicts (no CI) — routing to conflict handler"
-                );
-                self.handle_conflicts(owner, repo, pr_info).await
+        let result = self.merger.merge(owner, repo, pr).await;
+        match &result {
+            Ok(result) if result.merged => {
+                store
+                    .transition(
+                        ticket,
+                        state.version,
+                        "vessel",
+                        config::lifecycle::Event::Merged {
+                            number: pr.number,
+                            head: pr.head_sha.clone(),
+                            sha: result.sha.clone().context("Merge response missing SHA")?,
+                        },
+                    )
+                    .await?;
             }
-            Ok(result) => Ok(VesselOutcome::MergeBlocked {
-                ticket_id,
-                pr_number,
-                reason: result.message,
-            }),
-            Err(e) if is_merge_conflict_message(&e.to_string()) => {
-                warn!(
-                    pr_number,
-                    error = %e,
-                    "Merge API error indicates conflicts (no CI) — routing to conflict handler"
-                );
-                self.handle_conflicts(owner, repo, pr_info).await
+            Ok(_) => {
+                store
+                    .transition(
+                        ticket,
+                        state.version,
+                        "vessel",
+                        config::lifecycle::Event::CancelMerge,
+                    )
+                    .await?;
             }
-            Err(e) => Ok(VesselOutcome::MergeBlocked {
-                ticket_id,
-                pr_number,
-                reason: e.to_string(),
-            }),
+            Err(_) => { /* Outcome may be unknown: preserve reservation for reconciliation. */ }
         }
+        result
     }
 
     /// Update ticket status in SharedStore.
@@ -2167,7 +2218,12 @@ impl VesselNode {
 
         for ticket in tickets.iter_mut() {
             if ticket["id"].as_str() == Some(ticket_id) {
-                ticket["status"] = json!({ "type": status });
+                let worker = ticket["status"]["worker_id"]
+                    .as_str()
+                    .unwrap_or("vessel")
+                    .to_owned();
+                let lifecycle = store.lifecycle(ticket_id).await.ok();
+                ticket["status"] = json!({ "type": if status=="merged_no_ci" {"merged"} else {status}, "worker_id":worker, "pr_number":lifecycle.and_then(|s|s.pr_number).unwrap_or(0) });
                 break;
             }
         }
@@ -3036,7 +3092,11 @@ impl VesselNode {
                 continue;
             }
 
-            if self.client.is_pr_merged(owner, repo, pr_number).await? {
+            if let Some(merge_sha) = self
+                .client
+                .confirmed_merge_sha(owner, repo, pr_number)
+                .await?
+            {
                 warn!(pr_number, "Found already-merged PR during reconciliation");
 
                 let ticket_id = pr["ticket_id"].as_str().map(String::from);
@@ -3055,7 +3115,21 @@ impl VesselNode {
                         None,
                     )
                     .await;
-                    VesselNotifier::set_ticket_status_merged(store, &tid).await;
+                    let state = store.lifecycle(&tid).await?;
+                    if state.phase != config::lifecycle::Phase::Done {
+                        store
+                            .transition(
+                                &tid,
+                                state.version,
+                                "vessel",
+                                config::lifecycle::Event::ReconcileMerged {
+                                    number: pr_number,
+                                    sha: merge_sha,
+                                },
+                            )
+                            .await?;
+                    }
+
                     self.remove_from_pending_prs(store, pr_number).await;
                 }
             }
@@ -3119,7 +3193,7 @@ fn build_ci_fix_directive(
     out.push_str(
         "\nReuse your existing workspace and branch (you already have this PR checked \
          out). Match the failed checks to .github/workflows/, reproduce and fix ALL \
-         errors locally, push, then re-run: openflows-harness status set review_ready",
+         errors locally, push, then re-run: openflows-harness status set testing",
     );
     out
 }
@@ -3141,6 +3215,110 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn merge_reservation_clears_only_for_definitive_rejection() {
+        for (status, pending) in [
+            (405, false),
+            (409, false),
+            (422, false),
+            (408, true),
+            (500, true),
+            (0, true), // Transport failure after the merge request is accepted.
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _status = server
+                .mock("GET", "/repos/org/repo/commits/head/status")
+                .with_status(200)
+                .with_body(r#"{"state":"success","total_count":1}"#)
+                .create_async()
+                .await;
+            let _checks = server
+                .mock(
+                    "GET",
+                    "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+                )
+                .with_status(200)
+                .with_body(r#"{"check_suites":[]}"#)
+                .create_async()
+                .await;
+            let merge = server
+                .mock("PUT", "/repos/org/repo/pulls/42/merge")
+                .with_status(if status == 0 { 500 } else { status })
+                .with_body(r#"{"message":"rejected"}"#)
+                .expect(if status == 0 { 0 } else { 1 })
+                .create_async()
+                .await;
+            let client = github::GithubRestClient::with_api_base("test", server.url());
+            let mut node = VesselNode::new(VesselConfig::default());
+            node.client = client.clone();
+            let merge_client = if status == 0 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request).await;
+                    // Drop the connection without reporting whether the merge happened.
+                });
+                github::GithubRestClient::with_api_base("test", endpoint)
+            } else {
+                client
+            };
+            node.merger = PrMerger::new(merge_client, pocketflow_core::MergeMethod::Squash);
+            let store = SharedStore::new_in_memory();
+            let decision = json!({"round":0,"pr_number":42,"actor":"human","approved":true,"report":"approved","revision":1,"head":"head"});
+            store.set("ticket:T-42:status", json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":decision,"pr_human":decision})).await;
+            *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+            let pr = PrInfo {
+                number: 42,
+                head_sha: "head".into(),
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                ticket_id: Some("T-42".into()),
+                title: "Feature".into(),
+                body: None,
+                state: pocketflow_core::PrState::Open,
+                mergeable: Some(true),
+            };
+            let result = node.merge_reviewed("org", "repo", &pr).await;
+            assert_eq!(
+                store.lifecycle("T-42").await.unwrap().merge_pending,
+                pending,
+                "HTTP {status}: {result:?}"
+            );
+            assert_eq!(result.is_err(), pending);
+            merge.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ticketless_pr_is_reported_for_manual_handling_and_dequeued() {
+        let mut server = mockito::Server::new_async().await;
+        let _pr = server.mock("GET", "/repos/org/repo/pulls/42")
+            .with_status(200).with_body(r#"{"number":42,"title":"Dependency update","body":null,"head":{"sha":"head","ref":"dependabot/update"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true}"#)
+            .create_async().await;
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = client;
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        store.set(KEY_PENDING_PRS, json!([{"number":42}])).await;
+        let result = node
+            .exec(json!({"owner":"org","repo":"repo","pending_prs":[{"number":42}]}))
+            .await
+            .unwrap();
+        assert_eq!(result["outcomes"][0]["type"], "unmanaged");
+        let action = node.post(&store, result).await.unwrap();
+        assert_eq!(action.as_str(), Action::AWAITING_HUMAN);
+        assert!(store
+            .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.get("pr:42:unmanaged").await.is_some());
+    }
 
     #[test]
     fn test_parse_repository() {
@@ -3219,7 +3397,7 @@ mod tests {
         assert!(events.iter().any(|e| e.event_type == "ticket_merged"));
 
         let status = store.get("ticket:T-42:status").await;
-        assert_eq!(status, Some(json!("Merged")));
+        assert_eq!(status, None, "post cannot manufacture merge evidence");
 
         let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
         assert!(pending.is_empty());
@@ -3273,6 +3451,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_lifecycle_prs_pause_without_dropping_or_merging() {
+        for state in [
+            json!({"phase":"planning"}),
+            json!({"phase":"submit", "head":"head", "merge_pending":true}),
+            json!({"phase":"submit", "head":"old-head"}),
+            json!({"phase":"submit", "head":"head"}),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let pr = server.mock("GET", "/repos/org/repo/pulls/42")
+                .with_status(200)
+                .with_body(r#"{"number":42,"title":"Feature","body":null,"head":{"sha":"head","ref":"feature"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true,"merged":false}"#)
+                .expect(2).create_async().await;
+            let merge = server
+                .mock("PUT", "/repos/org/repo/pulls/42/merge")
+                .expect(0)
+                .create_async()
+                .await;
+            let mut node = VesselNode::new(VesselConfig::default());
+            node.client = github::GithubRestClient::with_api_base("test", server.url());
+            let store = SharedStore::new_in_memory();
+            *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+            let pending = json!([{"number":42,"ticket_id":"T-42"}]);
+            store.set(KEY_PENDING_PRS, pending.clone()).await;
+            store.set("ticket:T-42:status", state.clone()).await;
+            let result = node
+                .exec(json!({"owner":"org","repo":"repo","pending_prs":pending}))
+                .await
+                .unwrap();
+            let action = node.post(&store, result).await.unwrap();
+            assert_eq!(action.as_str(), PAUSE_SIGNAL, "state: {state}");
+            assert_eq!(store.get(KEY_PENDING_PRS).await.unwrap(), pending);
+            pr.assert_async().await;
+            merge.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_post_handles_no_work() {
         let store = SharedStore::new_in_memory();
 
@@ -3309,6 +3524,10 @@ mod tests {
         let tickets: Vec<Value> = store.get_typed("tickets").await.unwrap();
         let ticket = tickets.iter().find(|t| t["id"] == "T-42").unwrap();
         assert_eq!(ticket["status"]["type"], "merged");
+        assert!(
+            serde_json::from_value::<TicketStatus>(ticket["status"].clone()).is_ok(),
+            "merged ticket projection must remain typed"
+        );
     }
 
     #[tokio::test]
@@ -3517,7 +3736,7 @@ mod tests {
         assert!(d.contains("src/api.rs"));
         // FORGE is told to reuse its existing workspace and re-arm the PR.
         assert!(d.contains("Reuse your existing workspace"));
-        assert!(d.contains("openflows-harness status set review_ready"));
+        assert!(d.contains("openflows-harness status set testing"));
     }
 
     #[test]

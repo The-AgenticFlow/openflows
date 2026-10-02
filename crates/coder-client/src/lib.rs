@@ -27,10 +27,69 @@ pub use types::*;
 use anyhow::{bail, Context, Result};
 use config::{GithubConfig, TenantConfig};
 use envconfig::Envconfig;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+fn check_template_push_output(name: &str, output: &std::process::Output) -> Result<()> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!(
+            "coder templates push failed for '{}' ({}):\n{}\n{}",
+            name,
+            output.status,
+            stderr,
+            stdout
+        );
+    } else {
+        info!(name, stderr = %stderr, "coder templates push succeeded");
+    }
+    Ok(())
+}
+
+fn resolve_coder_cli() -> PathBuf {
+    if let Some(path) = std::env::var_os("CODER_CLI_PATH").map(PathBuf::from) {
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("coder");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(bin_dir) = std::env::var_os("CODER_SCRIPT_BIN_DIR").map(PathBuf::from) {
+        let candidate = bin_dir.join("coder");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    // Coder workspace startup places its helper CLI under /tmp/coder.*/coder
+    // without always adding it to PATH. The controller runs inside that same
+    // workspace, so discover it before falling back to a plain PATH lookup.
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path().join("coder"))
+            .filter(|path| path.is_file())
+            .collect();
+        candidates.sort();
+        if let Some(candidate) = candidates.into_iter().next() {
+            return candidate;
+        }
+    }
+
+    PathBuf::from("coder")
+}
 
 /// Client for the Coder OSS REST API.
 ///
@@ -631,7 +690,7 @@ impl CoderClient {
 
         // Push the template via coder CLI
         // The CLI reads the directory and pushes it to the Coder server
-        let mut cmd = tokio::process::Command::new("coder");
+        let mut cmd = tokio::process::Command::new(resolve_coder_cli());
         cmd.args([
             "templates",
             "push",
@@ -645,14 +704,18 @@ impl CoderClient {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-        // Pass TF_VAR_dev_binary_host_path as a --variable flag so the Coder
-        // server stores it and applies it when creating workspaces. Setting it
-        // as an env var in the Rust process does NOT reach the server's
-        // Terraform execution — the CLI only uploads the template files.
-        if let Ok(path) = std::env::var("TF_VAR_dev_binary_host_path") {
-            if !path.is_empty() {
+        // Pass selected TF_VAR_* values as --variable flags so the Coder server
+        // stores them and applies them when creating workspaces. Setting them
+        // as env vars in the Rust process does NOT reach the server's Terraform
+        // execution — the CLI only uploads the template files.
+        let template_variables = [("TF_VAR_dev_binary_host_path", "dev_binary_host_path")];
+        for (env_name, variable_name) in template_variables {
+            if let Ok(value) = std::env::var(env_name) {
+                if value.is_empty() {
+                    continue;
+                }
                 cmd.arg("--variable")
-                    .arg(format!("dev_binary_host_path={}", path));
+                    .arg(format!("{}={}", variable_name, value));
             }
         }
 
@@ -661,22 +724,9 @@ impl CoderClient {
             .await
             .context("Failed to run coder templates push")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if !output.status.success() {
-            warn!(
-                name,
-                stderr = %stderr,
-                stdout = %stdout,
-                "coder templates push returned non-zero exit code"
-            );
-        } else {
-            info!(name, stderr = %stderr, "coder templates push succeeded");
-        }
-
-        // Clean up temp directory
+        // Clean up even when the CLI rejects the template.
         let _ = std::fs::remove_dir_all(&temp_dir);
+        check_template_push_output(name, &output)?;
 
         // Return the template info by listing again
         let templates = self.list_templates().await?;
@@ -1101,7 +1151,7 @@ impl CoderClient {
         let ssh_token = self.session_token();
         let output = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("coder")
+            tokio::process::Command::new(resolve_coder_cli())
                 .args(["ssh", ws_target, "--", &wrapped])
                 .env("CODER_URL", &self.base_url)
                 .env("CODER_SESSION_TOKEN", ssh_token)
@@ -1407,6 +1457,8 @@ impl CoderClient {
     }
 
     /// Send a message to an existing Chat.
+    /// A running chat may accept the message into its queue. In that case the
+    /// returned message contains the queue entry ID, not a conversation message ID.
     /// POST /api/v2/chats/{chat_id}/messages
     pub async fn send_chat_message(
         &self,
@@ -1425,9 +1477,24 @@ impl CoderClient {
             .await
             .context("Failed to send chat message")?;
 
-        if resp.status().is_success() || resp.status().as_u16() == 201 {
-            let msg: crate::types::ChatMessage = resp.json().await?;
-            info!(chat_id, message_id = %msg.id, "Sent chat message");
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let queued = body.get("queued").and_then(|value| value.as_bool()) == Some(true);
+            // Coder v2.37 returns an envelope for both immediate and queued sends.
+            // Prefer the queue entry when present: an envelope can also include
+            // older messages that were promoted from the queue during this send.
+            let payload = if queued {
+                body.get("queued_message")
+                    .context("Accepted queued chat message response is missing queued_message")?
+            } else {
+                body.get("message").unwrap_or(&body)
+            };
+            let mut msg: crate::types::ChatMessage = serde_json::from_value(payload.clone())
+                .context("Invalid accepted chat message response")?;
+            if queued {
+                msg.role = "user".to_string();
+            }
+            info!(chat_id, message_id = %msg.id, queued, "Sent chat message");
             Ok(msg)
         } else {
             let status = resp.status();
@@ -1948,6 +2015,24 @@ mod http_mock {
                 "201 Created",
                 r#"{"id":"chat-1","organization_id":"org-abc"}"#.to_string(),
             ),
+            ("POST", "/api/v2/chats/queued/messages") => (
+                "200 OK",
+                r#"{"queued":true,"message":{"id":41,"chat_id":"queued","role":"user","content":[{"type":"text","text":"previous message"}]},"queued_message":{"id":42,"chat_id":"queued","content":[{"type":"text","text":"approval"}],"created_at":"2026-09-30T00:00:00Z"}}"#.to_string(),
+            ),
+            ("POST", "/api/v2/chats/immediate/messages") => (
+                "200 OK",
+                r#"{"queued":false,"message":{"id":43,"chat_id":"immediate","role":"user","content":[{"type":"text","text":"approval"}],"created_at":"2026-09-30T00:00:00Z"}}"#.to_string(),
+            ),
+            ("POST", "/api/v2/chats/legacy/messages") => (
+                "201 Created",
+                r#"{"id":"legacy-id","chat_id":"legacy","role":"user","content":[]}"#.to_string(),
+            ),
+            ("POST", "/api/v2/chats/malformed/messages") => (
+                "200 OK", r#"{"queued":true}"#.to_string(),
+            ),
+            ("POST", "/api/v2/chats/rejected/messages") => (
+                "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
+            ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
         }
     }
@@ -1956,6 +2041,83 @@ mod http_mock {
 #[cfg(test)]
 mod tests {
     use super::parse_chat_models_body;
+
+    #[test]
+    fn coder_cli_path_override_takes_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let coder = dir.path().join("coder");
+        std::fs::write(&coder, "#!/bin/sh\n").unwrap();
+
+        let previous = std::env::var_os("CODER_CLI_PATH");
+        std::env::set_var("CODER_CLI_PATH", &coder);
+        let resolved = super::resolve_coder_cli();
+        match previous {
+            Some(value) => std::env::set_var("CODER_CLI_PATH", value),
+            None => std::env::remove_var("CODER_CLI_PATH"),
+        }
+
+        assert_eq!(resolved, coder);
+    }
+
+    #[tokio::test]
+    async fn send_chat_message_accepts_queued_and_immediate_envelopes() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        for (chat_id, expected_id) in [
+            ("queued", "42"),
+            ("immediate", "43"),
+            ("legacy", "legacy-id"),
+        ] {
+            let message = client
+                .send_chat_message(chat_id, vec![crate::types::ChatInputPart::text("approval")])
+                .await
+                .expect("accepted messages must not be reported as failures and retried");
+            assert_eq!(message.id, expected_id);
+            assert_eq!(message.chat_id, chat_id);
+            assert_eq!(message.role, "user");
+            if chat_id != "legacy" {
+                assert_eq!(message.content_raw[0]["text"], "approval");
+            }
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_chat_message_retains_http_and_malformed_response_errors() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        assert!(client.send_chat_message("malformed", vec![]).await.is_err());
+        let error = client
+            .send_chat_message("rejected", vec![])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("403"));
+        assert!(error.contains("chat access denied"));
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn template_push_failure_preserves_terraform_diagnostics() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'Extra characters after interpolation expression'; echo 'template import init error' >&2; exit 1"])
+            .output().unwrap();
+        let error = super::check_template_push_output("openflows-nexus", &output)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("openflows-nexus"));
+        assert!(error.contains("Extra characters after interpolation expression"));
+        assert!(error.contains("template import init error"));
+    }
+
+    #[test]
+    fn template_push_success_allows_warnings() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'No lockfile found' >&2"])
+            .output()
+            .unwrap();
+        assert!(super::check_template_push_output("openflows-nexus", &output).is_ok());
+    }
 
     #[test]
     fn flattens_provider_nested_models_and_normalizes_id() {

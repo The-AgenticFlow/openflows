@@ -3,12 +3,12 @@
 // SharedStore — dual-backend (in-memory for dev, Redis for production).
 // Same interface regardless of backend. Swap via REDIS_URL env var.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
@@ -94,6 +94,30 @@ impl RedisBackend {
     }
 }
 
+fn redis_op_timeout() -> Duration {
+    let secs = std::env::var("OPENFLOWS_REDIS_OP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+async fn bounded_redis<T, F, E>(operation: &'static str, future: F) -> Result<T>
+where
+    F: Future<Output = core::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    match tokio::time::timeout(redis_op_timeout(), future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()).with_context(|| format!("Redis {operation} failed")),
+        Err(_) => anyhow::bail!(
+            "Redis {operation} timed out after {}s",
+            redis_op_timeout().as_secs()
+        ),
+    }
+}
+
 // ── Backend enum ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -108,7 +132,13 @@ impl Backend {
             Backend::InMemory(b) => b.map.read().await.get(key).cloned(),
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let raw: Option<String> = b.client.get(key).await.ok()?;
+                let raw: Option<String> = match bounded_redis("GET", b.client.get(key)).await {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        warn!(key, %error, "Redis get failed");
+                        return None;
+                    }
+                };
                 raw.and_then(|s| serde_json::from_str(&s).ok())
             }
         }
@@ -122,8 +152,12 @@ impl Backend {
             Backend::Redis(b) => {
                 use fred::prelude::*;
                 if let Ok(s) = serde_json::to_string(&value) {
-                    let _: core::result::Result<(), _> =
-                        b.client.set::<(), _, _>(key, s, None, None, false).await;
+                    if let Err(error) =
+                        bounded_redis("SET", b.client.set::<(), _, _>(key, s, None, None, false))
+                            .await
+                    {
+                        warn!(key, %error, "Redis set failed");
+                    }
                 }
             }
         }
@@ -136,7 +170,9 @@ impl Backend {
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let _: core::result::Result<i64, _> = b.client.del(key).await;
+                if let Err(error) = bounded_redis::<i64, _, _>("DEL", b.client.del(key)).await {
+                    warn!(key, %error, "Redis del failed");
+                }
             }
         }
     }
@@ -144,14 +180,28 @@ impl Backend {
     async fn keys(&self, pattern: &str) -> Vec<String> {
         match self {
             Backend::InMemory(b) => b.keys(pattern).await,
-            Backend::Redis(b) => b.keys(pattern).await,
+            Backend::Redis(b) => {
+                match tokio::time::timeout(redis_op_timeout(), b.keys(pattern)).await {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        warn!(
+                            pattern,
+                            timeout_secs = redis_op_timeout().as_secs(),
+                            "Redis keys timed out"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
         }
     }
 
     async fn ping(&self) -> Result<()> {
         match self {
             Backend::InMemory(_) => Ok(()),
-            Backend::Redis(b) => b.ping().await,
+            Backend::Redis(b) => tokio::time::timeout(redis_op_timeout(), b.ping())
+                .await
+                .context("Redis PING timed out")?,
         }
     }
 }
@@ -231,6 +281,80 @@ impl SharedStore {
         self.backend.del(&ns_key).await;
     }
 
+    /// Atomically acquire a tenant-scoped lease. Use a unique token per attempt.
+    /// Returns false while another lease is live; backend errors are propagated.
+    pub async fn try_claim(&self, key: &str, token: &str, ttl_secs: u64) -> Result<bool> {
+        anyhow::ensure!(ttl_secs > 0, "Lease TTL must be positive");
+        let key = self.ns_key(key);
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis();
+                let expires_at = now + u128::from(ttl_secs) * 1000;
+                let expires_at = u64::try_from(expires_at)?;
+                if let Some(existing) = map.get(&key) {
+                    // Unknown values also occupy the key; never overwrite them.
+                    if existing
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|expiry| u128::from(expiry) > now)
+                    {
+                        return Ok(false);
+                    }
+                }
+                map.insert(
+                    key,
+                    serde_json::json!({"token": token, "expires_at": expires_at}),
+                );
+                Ok(true)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let claimed: i64 = bounded_redis(
+                    "lease acquire",
+                    b.client.eval(
+                        "if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then return 1 else return 0 end",
+                        vec![key],
+                        vec![token.to_string(), ttl_secs.to_string()],
+                    ),
+                ).await?;
+                Ok(claimed == 1)
+            }
+        }
+    }
+
+    /// Release a lease only if its current token matches. Missing leases are harmless.
+    pub async fn release_claim(&self, key: &str, token: &str) -> Result<()> {
+        let key = self.ns_key(key);
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                if map
+                    .get(&key)
+                    .and_then(|value| value.get("token"))
+                    .and_then(Value::as_str)
+                    == Some(token)
+                {
+                    map.remove(&key);
+                }
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let _: i64 = bounded_redis(
+                    "lease release",
+                    b.client.eval(
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+                        vec![key],
+                        vec![token.to_string()],
+                    ),
+                ).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn keys(&self, pattern: &str) -> Vec<String> {
         // For pattern matching, we need to handle both the namespace prefix
         // and the fact that SCAN returns full keys. The pattern should match
@@ -271,6 +395,74 @@ impl SharedStore {
         Ok(())
     }
 
+    /// Strict lifecycle reads distinguish an absent ticket from a store outage.
+    pub async fn lifecycle(&self, ticket: &str) -> Result<config::lifecycle::Lifecycle> {
+        let key = self.ns_key(&format!("ticket:{ticket}:status"));
+        let value = match &self.backend {
+            Backend::InMemory(b) => b.map.read().await.get(&key).cloned(),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> =
+                    bounded_redis("lifecycle GET", b.client.get(&key)).await?;
+                raw.map(|s| serde_json::from_str(&s)).transpose()?
+            }
+        };
+        config::lifecycle::Lifecycle::decode(value)
+    }
+
+    /// Compare-and-set the entire lifecycle, including approvals and evidence.
+    /// A conflict is returned to the caller; stale requests are never replayed.
+    pub async fn transition(
+        &self,
+        ticket: &str,
+        version: u64,
+        actor: &str,
+        event: config::lifecycle::Event,
+    ) -> Result<config::lifecycle::Lifecycle> {
+        use config::lifecycle::Lifecycle;
+        let key = self.ns_key(&format!("ticket:{ticket}:status"));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let current = Lifecycle::decode(map.get(&key).cloned())?;
+                anyhow::ensure!(
+                    current.version == version,
+                    "Lifecycle changed; refresh before retrying"
+                );
+                let next = current.apply(actor, event, ts)?;
+                map.insert(key, serde_json::to_value(&next)?);
+                Ok(next)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> =
+                    bounded_redis("transition GET", b.client.get(&key)).await?;
+                let current =
+                    Lifecycle::decode(raw.as_deref().map(serde_json::from_str).transpose()?)?;
+                anyhow::ensure!(
+                    current.version == version,
+                    "Lifecycle changed; refresh before retrying"
+                );
+                let next = current.apply(actor, event, ts)?;
+                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); return 1";
+                let changed: i64 = bounded_redis(
+                    "transition CAS",
+                    b.client.eval(
+                        script,
+                        vec![key],
+                        vec![raw.unwrap_or_default(), serde_json::to_string(&next)?],
+                    ),
+                )
+                .await?;
+                anyhow::ensure!(changed == 1, "Lifecycle changed; refresh before retrying");
+                Ok(next)
+            }
+        }
+    }
+
     // ── Event ring buffer ─────────────────────────────────────────────
 
     /// Emit a structured event. Every node lifecycle phase should call this.
@@ -306,5 +498,108 @@ impl SharedStore {
     /// Number of events in the ring buffer (for initial TUI render).
     pub async fn event_count(&self) -> usize {
         self.ring_buffer.read().await.len()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use config::lifecycle::{Event, Phase};
+    #[tokio::test]
+    async fn competing_updates_cannot_both_commit() {
+        let store = SharedStore::new_in_memory();
+        let event = Event::Plan {
+            content: "plan".into(),
+        };
+        let (a, b) = tokio::join!(
+            store.transition("T-1", 0, "forge", event.clone()),
+            store.transition("T-1", 0, "forge", event)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(store.lifecycle("T-1").await.unwrap().version, 1);
+    }
+    #[tokio::test]
+    async fn legacy_approval_is_not_authority_and_merged_stays_terminal() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set("ticket:T-1:status", serde_json::json!("approved"))
+            .await;
+        assert_eq!(store.lifecycle("T-1").await.unwrap().phase, Phase::Planning);
+        store
+            .set("ticket:T-1:status", serde_json::json!("Merged"))
+            .await;
+        assert!(store
+            .transition(
+                "T-1",
+                0,
+                "forge",
+                Event::Move {
+                    phase: Phase::Planning,
+                    head: None
+                }
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn concurrent_claims_have_one_winner() {
+        let store = SharedStore::new_in_memory();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                store
+                    .try_claim("review:T-1", &i.to_string(), 120)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            winners += usize::from(result.unwrap());
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn release_requires_current_owner() {
+        let store = SharedStore::new_in_memory();
+        assert!(store.try_claim("review:T-1", "owner", 120).await.unwrap());
+        store.release_claim("review:T-1", "other").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "other", 120).await.unwrap());
+        store.release_claim("review:T-1", "owner").await.unwrap();
+        assert!(store.try_claim("review:T-1", "other", 120).await.unwrap());
+        store.release_claim("review:T-1", "owner").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "third", 120).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn expired_claim_can_be_replaced_and_old_owner_cannot_release_it() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                "review:T-1",
+                serde_json::json!({"token": "old", "expires_at": 0}),
+            )
+            .await;
+        assert!(store.try_claim("review:T-1", "new", 120).await.unwrap());
+        store.release_claim("review:T-1", "old").await.unwrap();
+        assert!(!store.try_claim("review:T-1", "third", 120).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn claims_are_namespaced_and_reject_zero_ttl() {
+        let store = SharedStore::new_in_memory_with_tenant("one");
+        let mut other = store.clone();
+        other.tenant = "two".into();
+        assert!(store.try_claim("review:T-1", "owner", 0).await.is_err());
+        assert!(store.try_claim("review:T-1", "owner", 120).await.unwrap());
+        assert!(other.try_claim("review:T-1", "owner", 120).await.unwrap());
     }
 }

@@ -101,6 +101,14 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "a2a_pair_token" {
+  name        = "a2a_pair_token"
+  description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
   description = "Coder server URL for API calls"
@@ -230,6 +238,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="sentinel"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
@@ -242,6 +251,8 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -275,6 +286,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     "OPENFLOWS_ROLE=sentinel",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

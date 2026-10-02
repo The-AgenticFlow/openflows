@@ -118,3 +118,6 @@ worktrees/
 
 # Dev binary mount for Coder workspace templates (built artifacts)
 .dev-binaries/
+
+# Linux cross-build dependency cache (separate from host Cargo cache)
+.docker-cargo/

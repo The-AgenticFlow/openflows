@@ -5,7 +5,7 @@
 //! the shared ticket's durable state (what FORGE is doing). Two review jobs:
 //!   - `plan_gate` — FORGE is `planning` and the gate is not approved yet →
 //!     review `PLAN.md`, then `gate approve`.
-//!   - `pr_review` — FORGE is `review_ready` with a PR → review the diff, write
+//!   - `pr_review` — FORGE is `submit` with a PR → review the diff, write
 //!     the evaluation report, then `review submit`.
 //!   - `idle` — nothing pending; no review action should be taken.
 //!
@@ -25,6 +25,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SentinelJob {
     PlanGateReview,
+    TestingReview,
     PrReview,
     Idle,
 }
@@ -32,8 +33,9 @@ pub enum SentinelJob {
 /// Derive what review job Sentinel should be doing from the ticket state.
 pub fn sentinel_job(st: &TicketState) -> SentinelJob {
     match st.phase.as_deref() {
-        Some("planning") if !st.gate_approved => SentinelJob::PlanGateReview,
-        Some("review_ready") => SentinelJob::PrReview,
+        Some("plan_ready") if !st.gate_approved => SentinelJob::PlanGateReview,
+        Some("testing") => SentinelJob::TestingReview,
+        Some("submit") if st.pr_recorded => SentinelJob::PrReview,
         _ => SentinelJob::Idle,
     }
 }
@@ -317,18 +319,19 @@ pub fn sentinel_guidance(st: &TicketState) -> String {
         SentinelJob::PlanGateReview => {
             "SENTINEL plan-gate review: FORGE is in `planning` and awaits approval. \
              Read PLAN.md, evaluate it against the ticket, then run \
-             `openflows-harness gate approve --phase planning`."
+             `openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`."
                 .to_string()
         }
+        SentinelJob::TestingReview => "Review implementation against the approved plan; run A2A verification and gate decide --phase testing with exact revision/head and a report. Map the approved plan criteria to commands and observed results in the report. For infrastructure failure or unavailable workspace toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Human testing review is TODO; successful A2A verification and SENTINEL approval permit submit.".to_string(),
         SentinelJob::PrReview => {
-            "SENTINEL PR review: FORGE is `review_ready` with a PR to review. Read the \
+            "SENTINEL PR review: FORGE is `submit` with a PR to review. Read the \
              ticket + diff, write your evaluation report (*-eval.md / final-review.md), \
              then `openflows-harness review submit --verdict approve|reject`."
                 .to_string()
         }
         SentinelJob::Idle => {
             "SENTINEL: no review is pending right now. Do not submit a gate approval or \
-             review verdict until FORGE signals `planning` or `review_ready`."
+             review verdict until FORGE signals `planning` or `submit`."
                 .to_string()
         }
     }
@@ -363,6 +366,15 @@ pub async fn sentinel_phase_guard(
              (only *-eval.md / final-review.md review reports may be written)",
         )
         .with_model_context(guidance);
+    }
+
+    if matches!(lower.as_str(), "bash" | "sh" | "shell" | "exec" | "execute")
+        && super::guard::is_verification_request(&command_text(input))
+    {
+        if sentinel_job(st) != SentinelJob::TestingReview {
+            return HookDecision::deny("A2A verification requires the testing phase");
+        }
+        return base.with_model_context(guidance);
     }
 
     if matches!(lower.as_str(), "bash" | "sh" | "shell" | "exec")

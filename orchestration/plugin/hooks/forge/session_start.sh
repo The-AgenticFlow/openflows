@@ -91,39 +91,29 @@ echo ""
 
 echo -e "${BOLD}Workflow:${NC}"
 cat <<'EOF'
-  1. planning  → Review the task, write PLAN.md, set planning, then wait for SENTINEL
-  2. building  → After SENTINEL approval, implement the solution
-  3. testing   → Run tests and verify the solution works
-  4. review_ready → PR is open and ready for review
-  5. blocked   → Stuck? Use this to pause and explain
+  planning -> plan_ready -> building -> testing -> submit -> done
+  Plan rejection: plan_rejected -> planning -> revised plan -> plan_ready
+  Test/PR/CI rejection: building -> testing -> submit
 
-Run at each phase:
-  openflows-harness status set <phase>
+  1. Read dispatch and status get. Use absolute file paths under /home/coder/workspace.
+     Verify the worker/ticket branch (e.g. forge-2/T-066), or the dispatched PR branch.
+     Start/revise in planning.
+  2. Write the plan at the current chat-specific path; run plan write --file <absolute-plan-path>; set plan_ready.
+  3. Wait for SENTINEL approval, then set building and implement.
+  4. Commit ALL work, set testing, and check the template-managed verify executor.
+     Inspect /home/coder/.local/state/openflows/verify.log for infrastructure failures.
+     Persist project tool activation in the user's login-shell config or a project script.
+     SENTINEL returns failing commands/setup diagnostics to building; repair and retest.
+     Reserve blocked for external prerequisites you cannot resolve.
+  5. Wait for successful A2A verification and SENTINEL testing approval, then set submit.
+  6. Open/update PR; run pr opened --pr <N> --branch <branch> --title <title>.
+  7. Wait for SENTINEL and HUMAN PR approval and CI success.
 
-Example flow:
-  $ # Read the dispatch to understand the task
-  $ openflows-harness dispatch read
+  Source is frozen during plan_ready, testing and submit. For corrections,
+  return to building and repeat testing. For plan changes, return to planning.
+  Use blocked only for external prerequisites you cannot resolve; recover through planning.
+  Read revision/review_round/head from status get for every review decision.
 
-  $ # Write the implementation plan, then request SENTINEL planning review
-  $ $EDITOR PLAN.md
-  $ openflows-harness status set planning
-
-  $ # After SENTINEL approves the planning gate, start building
-  $ openflows-harness status set building
-  $ # ...implement...
-
-  $ # Open a PR when ready
-  $ git push origin <branch>
-  $ # Create PR on GitHub, get the PR number
-  
-  $ # Record the PR
-  $ openflows-harness pr opened --pr <number> --branch <branch> --title "<title>"
-
-  $ # Move to review phase
-  $ openflows-harness status set review_ready
-
-  $ # Prepare handoff contract (markdown summary of changes)
-  $ openflows-harness handoff write --contract changes.md --notes "Ready for sentinel review"
 EOF
 echo ""
 

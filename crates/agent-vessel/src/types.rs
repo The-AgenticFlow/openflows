@@ -106,6 +106,11 @@ pub enum VesselOutcome {
         pr_number: u64,
         state: String,
     },
+    /// No lifecycle ticket owns this PR; a human must handle it.
+    Unmanaged {
+        pr_number: u64,
+        reason: String,
+    },
     DocsPrClosed {
         pr_number: u64,
         reason: String,
@@ -122,7 +127,7 @@ impl VesselOutcome {
             VesselOutcome::CiMissing { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::Conflicts { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::Reviews { ticket_id, .. } => ticket_id.as_deref(),
-            VesselOutcome::DocsPrClosed { .. } => None,
+            VesselOutcome::Unmanaged { .. } | VesselOutcome::DocsPrClosed { .. } => None,
         }
     }
 
@@ -135,7 +140,8 @@ impl VesselOutcome {
             VesselOutcome::CiMissing { pr_number, .. } => *pr_number,
             VesselOutcome::Conflicts { pr_number, .. } => *pr_number,
             VesselOutcome::Reviews { pr_number, .. } => *pr_number,
-            VesselOutcome::DocsPrClosed { pr_number, .. } => *pr_number,
+            VesselOutcome::Unmanaged { pr_number, .. }
+            | VesselOutcome::DocsPrClosed { pr_number, .. } => *pr_number,
         }
     }
 }

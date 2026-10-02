@@ -15,21 +15,16 @@ if ! command -v openflows-harness >/dev/null 2>&1; then
   exit 0
 fi
 
-pr=$(openflows-harness pr get 2>/dev/null || echo '{}')
-case "$pr" in
-  *'"pr_number"'*) exit 0 ;;
-esac
-
 status=$(openflows-harness status get 2>/dev/null || echo '{}')
 phase=$(printf '%s' "$status" | sed -n 's/.*"phase"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
 case "$phase" in
-  planning)
+  plan_ready|testing|plan_rejected)
     # Planning is an intentional gate: FORGE should stop after writing PLAN.md
     # and let SENTINEL review/approve before implementation begins.
     exit 0
     ;;
-  review_ready|blocked)
+  submit|blocked|done)
     # Terminal-enough states: sentinel/human takes over from here.
     exit 0
     ;;
@@ -40,7 +35,7 @@ case "$phase" in
       echo "  1. Finish implementation and tests, updating 'openflows-harness status set building|testing'."
       echo "  2. Open the PR and record it: openflows-harness pr opened --pr <n> --branch <branch> --title <title>."
       echo "  3. Write the handoff: openflows-harness handoff write --contract <file>."
-      echo "  4. Mark review readiness: openflows-harness status set review_ready."
+      echo "  4. Mark review readiness: openflows-harness status set submit."
       echo "If you are genuinely stuck, run: openflows-harness status set blocked (and explain why)."
     } >&2
     exit 2

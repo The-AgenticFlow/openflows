@@ -35,3 +35,6 @@ futures = { workspace = true }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 sha2 = "0.10"
 reqwest = { workspace = true }
+
+[dev-dependencies]
+mockito = "1"

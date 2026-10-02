@@ -1,58 +1,26 @@
 ---
 name: status
-description: Signal the current harness phase for the ticket
+description: Read or advance the authoritative ticket lifecycle
 ---
 
-# /status Command
+# /status
 
-Signal your current progress phase to the harness. Run via the CLI:
+Read `openflows-harness status get` before acting. It returns the phase, version,
+plan revision, review round, candidate head, decisions, feedback and history.
 
-```bash
-openflows-harness status set <phase>
-```
-
-## Authoritative Phases
-
-| Phase | When to use |
+| Phase | Entry / exit |
 |---|---|
-| `planning` | Analyzing the ticket and writing `PLAN.md`; wait for SENTINEL gate approval |
-| `building` | Implementing after SENTINEL approves the plan |
-| `testing` | Running the test suite and verifying behavior |
-| `review_ready` | PR is open and SENTINEL is reviewing the completed work |
-| `blocked` | Cannot proceed — include an exact, answerable question |
+| planning | Write the plan at the current chat-specific path; upload with `plan write --file <absolute-plan-path>` |
+| plan_ready | Submit the uploaded plan; wait for SENTINEL approval |
+| plan_rejected | Read feedback, set planning, revise/upload and resubmit |
+| building | Implement the approved plan, commit changes |
+| testing | Set with a clean checkout; run verify serve, await SENTINEL + human approval |
+| submit | Set after testing approval; open/record PR, await SENTINEL + human approval + CI |
+| done | Controller-only, confirmed merge; terminal |
+| blocked | Record blocker; recover through planning |
 
-Do NOT invent other phase values (e.g. `AWAITING_REVIEW`, `COMPLETE`, `PR_OPENED`,
-`PENDING_REVIEW`). The harness rejects unknown phases.
-
-## What it does
-
-Writes `ticket:{id}:status` (`{"phase","role","ts"}`) to SharedStore. The controller
-(NEXUS) reads this key to route the ticket — it does **not** read a `STATUS.json` file.
-
-## Examples
-
-### Enter planning
-
-```bash
-openflows-harness status set planning
-```
-
-### Signal work is ready for PR review
-
-```bash
-openflows-harness status set review_ready
-```
-
-### Blocked
-
-```bash
-openflows-harness status set blocked
-```
-
-## After setting a phase
-
-- `planning` → NEXUS spawns SENTINEL to review the plan (planning gate).
-- `building` → implementation proceeds after SENTINEL gate approval.
-- `review_ready` → NEXUS spawns SENTINEL to review the PR; SENTINEL's verdict is
-  submitted via `openflows-harness review submit`.
-- `blocked` → surfaced to NEXUS / human for intervention.
+Use `openflows-harness status set <phase>` for permitted worker transitions.
+A draft plan is not permission to edit source. Testing and submit freeze source;
+return to building for fixes, then repeat testing and review. A plan change
+requires returning to planning and getting a new approval. Skipped stages and
+stale decisions are rejected. `review_ready` is no longer a phase.

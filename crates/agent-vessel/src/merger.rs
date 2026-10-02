@@ -41,6 +41,7 @@ impl PrMerger {
                 pr_info.number,
                 &commit_title,
                 self.default_method,
+                &pr_info.head_sha,
             )
             .await?;
 

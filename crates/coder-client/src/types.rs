@@ -414,6 +414,7 @@ impl Chat {
 /// A message in a Chat conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(deserialize_with = "deserialize_chat_message_id")]
     pub id: String,
     #[serde(default)]
     pub chat_id: String,
@@ -423,6 +424,24 @@ pub struct ChatMessage {
     pub content_raw: serde_json::Value,
     #[serde(default, rename = "created_at")]
     pub created_at_raw: String,
+}
+
+// Coder uses int64 message IDs; retain string IDs for older API responses
+// and for callers that already treat message IDs as opaque strings.
+fn deserialize_chat_message_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MessageId {
+        String(String),
+        Integer(i64),
+    }
+    Ok(match MessageId::deserialize(deserializer)? {
+        MessageId::String(id) => id,
+        MessageId::Integer(id) => id.to_string(),
+    })
 }
 
 /// A model returned from `GET /api/v2/organizations/{org}/chats/models`.
