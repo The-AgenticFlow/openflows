@@ -27,6 +27,7 @@ These specifications supersede ambiguous details in the [initial deployment plan
 - Extend the existing Axum `openflows-manager` as the product API, credential broker, and durable provisioning coordinator. Do not build a second competing control plane.
 - Use PostgreSQL with SQLx migrations for product metadata and operation records. Use a separate database and credentials from Coder's database; never modify Coder tables directly.
 - Use GitHub App user authorization for human sign-in in v1. This does not require an App installation and does not grant Openflows membership. Keep provider identity behind an interface for later OIDC.
+- The legacy orchestration `registry.json` is not part of hosted provisioning or template releases. Replace it with typed Manager-owned release and role configuration; remove its hosted parameter, persistence, and runtime dependency during migration.
 - Membership roles are `admin`, `developer`, `viewer`. Ownership is a separate `organizations.owner_user_id`, not a fourth exclusive role. The creator becomes owner AND admin atomically. Ownership alone never bypasses the admin-only GitHub rule.
 - Human Coder accounts are out of scope for v1. Tenant machine identities own workspaces. No customer receives platform Coder credentials.
 - CLI requests use Openflows credentials. Hosted CLI commands never receive Redis or operator Coder credentials.
@@ -39,7 +40,7 @@ These specifications supersede ambiguous details in the [initial deployment plan
 |---|---|---|
 | `crates/openflows-manager/src/server.rs` | Axum state holds one tenant-scoped Redis store | Add database and services; resolve tenant scope after authorization per request |
 | `crates/openflows-manager/src/routes/mod.rs` | Health/readiness and API index only | Add versioned identity, organization, installation, tenant, runtime, operation routes |
-| `binary/src/bin/agentflow.rs` | CLI root; `run_tenant` bootstraps Coder directly | Add hosted API client and preserve explicit local path |
+| `binary/src/bin/agentflow.rs` | CLI root; `run_tenant` bootstraps Coder directly and persists the legacy agent `registry.json` | Add hosted API client; preserve explicit local path only during migration; hosted provisioning must remove this file and parameter dependency |
 | `crates/coder-client/src/bootstrap.rs` | Publishes bundled templates; uses session owner and passes session token to Nexus | Separate platform bootstrap from customer onboarding; remove global credentials from hosted templates |
 | `crates/coder-client/src/lib.rs` | Template lookup by name, default-org cache, workspace creation | Explicit organization, template/version, owner IDs; validate returned resource ownership |
 | `crates/agent-nexus/src/lib.rs` | Creates workers directly; default-org model/chat calls | Hosted provisioning through manager; explicit organization for every remaining Coder operation |

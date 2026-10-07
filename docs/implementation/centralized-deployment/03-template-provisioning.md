@@ -59,7 +59,7 @@ Keep source under `crates/coder-client/templates/`. A CI release contains all fi
 }
 ```
 
-The abbreviated example must be expanded to all five roles in a real release. Lore remains published but disabled by the default registry. Package sorted paths, normalized timestamps, stable ownership, and gzip metadata; the current tar byte comparison alone does not guarantee reproducibility. Validate manifests and checksums before unpacking, reject archive path traversal, and use an operator-configured artifact origin. The manifest digest is the release identity, never a mutable `latest` URL.
+The manifest is the release contract; it is not the old agent `registry.json`. Do not ship, upload, or pass `registry.json` as a template parameter. Package sorted paths, normalized timestamps, stable ownership, and gzip metadata; the current tar byte comparison alone does not guarantee reproducibility. Validate manifests and checksums before unpacking, reject archive path traversal, and use an operator-configured artifact origin. The manifest digest is the release identity, never a mutable `latest` URL.
 
 Publish separately into each Coder org: upload archive, create template version, await successful import, create/bind template if absent, then persist exact IDs. The adapter must support explicit version selection in workspace creation/builds. Current comments asserting template-version APIs are unavailable must be checked against the pinned version, not treated as authoritative.
 
@@ -80,7 +80,7 @@ Platform startup resumes unfinished operations and reconciles configured release
 
 ## 5. Tenant and worker provisioning
 
-`POST /organizations/{org}/tenants` body: `{ "repository_id": 123, "name": "backend", "fleet": 2 }`. Admin/developer permitted. Resolve connection and repository server-side. Enforce one live tenant per repo, fleet >=1, configured per-org quota, and approved pinned release. Customer cannot submit registry JSON, arbitrary images, model credentials, or Terraform values. Generate registry from approved configuration and requested fleet.
+`POST /organizations/{org}/tenants` body: `{ "repository_id": 123, "name": "backend", "fleet": 2 }`. Admin/developer permitted. Resolve connection and repository server-side. Enforce one live tenant per repo, fleet >=1, configured per-org quota, and approved pinned release. Customer cannot submit agent registry JSON, arbitrary images, model credentials, or Terraform values. The Manager generates a typed, versioned runtime configuration from the approved release, organization policy, and requested fleet; it passes only validated role and slot configuration to Nexus.
 
 Tenant operation steps:
 
