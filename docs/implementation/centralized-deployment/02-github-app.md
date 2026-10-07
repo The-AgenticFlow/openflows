@@ -25,6 +25,34 @@ Role token profiles are explicit allowlists inside that envelope: Nexus uses con
 
 ## 3. Persistence
 
+These records are persisted in the **Openflows control-plane PostgreSQL database**. This is a new application database owned and migrated by the Openflows Manager; it is not Coder's PostgreSQL database and it is not Redis.
+
+The deployment should run three logically separate data stores:
+
+| Store | Owner | Data | Access rule |
+|---|---|---|---|
+| Openflows PostgreSQL | Openflows Manager | Users, organizations, memberships, GitHub bindings, repository inventory, tenants, operations, audit, encrypted secret references | Only Manager services and migrations |
+| Coder PostgreSQL | Coder | Coder users/service accounts, organizations, templates, provisioners, workspaces, builds | Only Coder and its supported API/CLI; Openflows never writes its tables |
+| Redis | Openflows runtime | Tenant execution state, queues, heartbeats, flow data | Tenant-scoped runtime access; not the source of truth for identity or authorization |
+
+For the first deployment, provision Openflows PostgreSQL as a dedicated PostgreSQL 16 database or schema with a dedicated database role, for example:
+
+```text
+Database: openflows_control_plane
+Role:     openflows_manager
+Schema:   public (or an explicitly configured openflows schema)
+Migrations: crates/openflows-manager/migrations/
+Connection: OPENFLOWS_DATABASE_URL
+```
+
+The exact host, TLS settings, backup policy, and managed-Postgres provider are deployment choices. They must be supplied through `OPENFLOWS_DATABASE_URL` and secret management; they must not be inferred from `CODER_PG_CONNECTION_URL`. Local development may add an `openflows-db` PostgreSQL service to Compose. Production should use a separately backed-up, encrypted PostgreSQL instance with restricted network access.
+
+The Manager runs migrations before reporting product readiness. Migrations must be forward-only, numbered, transactional where PostgreSQL permits, and tested against an empty database and a prior version. A failed migration keeps the Manager unready; it must not silently use Redis or Coder as a fallback database.
+
+GitHub access tokens themselves are not stored as ordinary table values. The `credential_leases` row stores a token fingerprint, expiry, connection generation, and an encrypted secret-manager reference. If the selected secret provider supports short-lived secret storage, store the installation token there; otherwise encrypt the ciphertext with an envelope key held outside PostgreSQL. Never log or return stored tokens from administrative APIs. The App private key, OAuth client secret, and webhook secret are secret-manager entries referenced by configuration, not database rows.
+
+Back up Openflows PostgreSQL independently from Coder PostgreSQL. Restore it before starting the Manager, then run GitHub and Coder reconciliation before issuing credentials. A restored database must increment or reconcile connection generations so tokens issued before the restore are not trusted blindly.
+
 | Table | Fields and constraints |
 |---|---|
 | `github_connections` | `id`, `organization_id`, `app_id`, `installation_id`, `github_account_id`, account type/login snapshot, `status(pending,active,suspended,disconnected,deleted)`, `access_generation`, `connected_by`, `verified_at`, `last_reconciled_at`; UNIQUE(app_id, installation_id), composite UNIQUE(org,id) |
