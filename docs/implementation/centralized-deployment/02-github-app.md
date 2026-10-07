@@ -175,6 +175,30 @@ Runtime request: `{ "purpose": "git" }` or `{ "purpose": "api" }`. Reject caller
 7. Recheck connection generation and runtime authorization after the network call, before storing/delivering the token. If access changed, revoke/discard it.
 8. Record the encrypted credential lease and audit metadata; return credential only to the authorized runtime. Installation tokens have no refresh token: renewal is another JWT exchange.
 
+### Renewal behavior
+
+GitHub installation tokens expire after one hour. The broker re-requests one; it does not refresh the old token:
+
+```text
+Workspace asks for a credential
+        │
+        ├─ cached token has more than 5 minutes remaining
+        │       └─ return it
+        │
+        └─ missing, near expiry, or invalidated
+                ├─ acquire single-flight lock for the installation/repository/profile
+                ├─ sign a fresh App JWT with the App private key
+                ├─ POST /app/installations/{installation_id}/access_tokens
+                │    with the same repository_ids and permission profile
+                ├─ validate expiry, repository scope, permissions, and connection generation
+                ├─ replace the cached lease
+                └─ return the new installation token
+```
+
+The normal path renews proactively when fewer than five minutes remain. If GitHub returns `401` during a request, invalidate the cached lease and retry the operation once after obtaining a new token. Do not retry a write automatically after an ambiguous network failure; first reconcile whether GitHub accepted the write. If re-issuance returns `401` or `404`, the App JWT, installation, or connection is invalid and issuance fails closed. If it returns `403`, preserve the existing permission scope and report the missing permission or suspended installation; never request broader permissions automatically.
+
+The single-flight lock prevents many workers sharing a tenant from all exchanging tokens at once. A distributed lock is required when the Manager has multiple replicas. The cache is an optimization only: the database connection generation and current GitHub reconciliation remain authoritative. A webhook that removes a repository or suspends an installation increments the generation, invalidating cached leases immediately. A token already delivered to a workspace can remain usable until GitHub rejects it or it expires, so revocation also stops affected workspaces and denies future issuance.
+
 Reference: [installation token generation](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).
 
 ## 8. Git and Rust client integration
