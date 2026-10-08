@@ -738,23 +738,49 @@ ensure_github_link() {
     ok "GitHub linked"
 }
 
-# check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a tenant name already bound
-# to a different repo would keep running against the old one. Stop with the fix instead of reporting success.
+# check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a workspace built for another
+# repo, another fleet size, or without the controller would keep its old settings. Stop with the fix instead of
+# reporting success.
 check_existing_tenant() {
-    local ws build existing
+    local ws build params existing_repo existing_fleet existing_ctl
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
     ws="$(api GET "/api/v2/users/me/workspace/openflows-nexus-${NAME}" 2>/dev/null || true)"
     build="$(printf '%s' "$ws" | json latest_build.id)"
     [ -n "$build" ] || return 0   # no workspace yet: nothing to reuse
-    existing="$(api GET "/api/v2/workspacebuilds/${build}/parameters" 2>/dev/null | python3 -c '
+    params="$(api GET "/api/v2/workspacebuilds/${build}/parameters" 2>/dev/null || true)"
+    { read -r existing_repo; read -r existing_fleet; read -r existing_ctl; } < <(printf '%s' "$params" | python3 -c '
 import sys, json
-for p in json.load(sys.stdin):
-    if p.get("name") == "github_repository": print(p.get("value", ""))' 2>/dev/null || true)"
-    if [ -n "$existing" ] && [ "$existing" != "$REPO" ]; then
-        die "Tenant '${NAME}' already exists for ${existing}" \
-            "An existing tenant workspace is reused unchanged, so it would keep working on ${existing}." \
+try:
+    p = {x.get("name"): x.get("value", "") for x in json.load(sys.stdin)}
+except Exception:
+    p = {}
+fleet = ""
+try:
+    for e in json.loads(p.get("registry_json") or "{}").get("team", []):
+        if e.get("id") == "forge":
+            fleet = str(e.get("max_instances", e.get("instances", "")))
+except Exception:
+    pass
+print(p.get("github_repository", ""))
+print(fleet)
+print(p.get("start_controller", ""))' 2>/dev/null)
+    local recreate="delete the old workspace and re-run:  coder delete openflows-nexus-${NAME} --yes"
+    if [ -n "$existing_repo" ] && [ "$existing_repo" != "$REPO" ]; then
+        die "Tenant '${NAME}' already exists for ${existing_repo}" \
+            "An existing tenant workspace is reused unchanged, so it would keep working on ${existing_repo}." \
             "Either pick another name:  ./scripts/setup.sh ${REPO} --name <other-name>" \
-            "or delete the old workspace and re-run:  coder delete openflows-nexus-${NAME} --yes"
+            "or ${recreate}"
+    fi
+    if [ -n "$existing_fleet" ] && [ "$existing_fleet" != "$FLEET" ]; then
+        die "Tenant '${NAME}' already runs a fleet of ${existing_fleet}, not ${FLEET}" \
+            "An existing tenant workspace is reused unchanged, so the fleet size would not change." \
+            "Keep the current size:  ./scripts/setup.sh ${REPO} --fleet ${existing_fleet}" \
+            "or ${recreate}"
+    fi
+    if [ "$existing_ctl" = "false" ]; then
+        die "Tenant '${NAME}' was created without the in-workspace controller" \
+            "It was built by an older version and would never start picking up issues." \
+            "${recreate}"
     fi
 }
 
