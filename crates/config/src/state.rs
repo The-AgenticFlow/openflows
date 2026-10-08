@@ -58,6 +58,20 @@ pub enum TicketStatus {
     },
 }
 
+impl TicketStatus {
+    /// Return whether this ticket status represents a terminal state
+    /// (e.g. Merged, Exhausted, Failed with attempts >= MAX_ATTEMPTS,
+    /// or Completed with an outcome other than "pr_opened").
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Merged { .. } | Self::Exhausted { .. } => true,
+            Self::Failed { attempts, .. } => *attempts >= Ticket::MAX_ATTEMPTS,
+            Self::Completed { outcome, .. } => outcome != "pr_opened",
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerSlot {
     pub id: String,
@@ -87,6 +101,19 @@ pub enum WorkerStatus {
         reason: String,
         issue_url: Option<String>,
     },
+}
+
+impl WorkerStatus {
+    /// Return the ticket ID associated with this worker status, if any.
+    pub fn ticket_id(&self) -> Option<&str> {
+        match self {
+            Self::Assigned { ticket_id, .. }
+            | Self::Working { ticket_id, .. }
+            | Self::Done { ticket_id, .. }
+            | Self::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
+            Self::Idle => None,
+        }
+    }
 }
 
 pub const KEY_TICKETS: &str = "tickets";

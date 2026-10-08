@@ -64,6 +64,7 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         -w /src
         -e CARGO_HOME=/src/.docker-cargo
         -e CARGO_TARGET_DIR=/src/target
+        -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
         "messense/rust-musl-cross:x86_64-musl" cargo build)
     mkdir -p "${DOCKER_CARGO_HOME}"
 else

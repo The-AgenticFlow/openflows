@@ -45,11 +45,11 @@ services:
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
-      # repos via OIDC. Values come from .env (see quick_start.md Step 2).
+      # repos via OIDC. Values come from .env (see docs/setup-reference.md Step 2).
       # IMPORTANT: `coder server` fails to start if client_id/client_secret are
       # EMPTY, so these MUST be populated in .env BEFORE `docker compose up -d`.
       # A fresh setup is covered by `.env.example` (which ships these populated
-      # with placeholders) + quick_start Step 2. If your existing `.env` predates
+      # with placeholders) + setup-reference Step 2. If your existing `.env` predates
       # this block, add the CODER_EXTERNAL_AUTH_0_* vars (or start from
       # `.env.example`) or Coder will not come up.
       # Callback URL: ${CODER_ACCESS_URL}/external-auth/primary-github/callback
@@ -59,6 +59,11 @@ services:
       CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
       CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
+      # The CODER_SESSION_TOKEN is copied into each tenant's nexus workspace, where the
+      # controller uses it for the Coder API. Coder's 7-day default cap would cut the
+      # controller off after a week, so allow 90 days.
+      CODER_MAX_TOKEN_LIFETIME: ${CODER_MAX_TOKEN_LIFETIME:-2160h}
+      CODER_DEFAULT_TOKEN_LIFETIME: ${CODER_DEFAULT_TOKEN_LIFETIME:-2160h}
       # Agent lifecycle hooks are wired by OpenFlows. Operators do not need to
       # configure Coder's raw hook URL/experiment flags for the bundled stack.
       # OPENFLOWS_HOOK_URL is the single source of truth for the hook endpoint:

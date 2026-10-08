@@ -969,23 +969,124 @@ impl CoderClient {
         }
     }
 
-    /// Delete a workspace.
+    /// Delete a workspace by triggering a delete build and waiting for deletion to complete.
     pub async fn delete_workspace(&self, id: &str) -> Result<()> {
         let resp = self
             .authenticated_request(
-                reqwest::Method::DELETE,
-                &format!("/api/v2/workspaces/{}", id),
+                reqwest::Method::POST,
+                &format!("/api/v2/workspaces/{}/builds", id),
             )
+            .json(&serde_json::json!({
+                "transition": "delete"
+            }))
             .send()
             .await
             .context("Failed to delete workspace")?;
 
-        if resp.status().is_success() {
-            info!(workspace_id = id, "Deleted workspace");
-            Ok(())
-        } else {
-            bail!("Failed to delete workspace: {}", resp.status())
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            info!(
+                workspace_id = id,
+                "Workspace already deleted (404 Not Found)"
+            );
+            return Ok(());
         }
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete workspace: {}", body)
+        }
+
+        self.wait_for_workspace_deleted(id, Duration::from_secs(60))
+            .await
+    }
+
+    /// Wait until a workspace is confirmed deleted (returns 404 or reports status "deleted").
+    /// If the delete build fails or cancels, this method returns an error.
+    pub async fn wait_for_workspace_deleted(&self, id: &str, timeout: Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+        info!(
+            workspace_id = id,
+            "Waiting for workspace deletion to complete"
+        );
+        while start.elapsed() < timeout {
+            let resp = self
+                .authenticated_request(reqwest::Method::GET, &format!("/api/v2/workspaces/{}", id))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    info!(
+                        workspace_id = id,
+                        "Workspace confirmed deleted (404 Not Found)"
+                    );
+                    return Ok(());
+                }
+                Ok(r) if r.status().is_success() => match r.json::<CoderWorkspace>().await {
+                    Ok(ws) => {
+                        let status = ws.workspace_status();
+                        let build_status = ws.latest_build.as_ref().map(|b| b.status.as_str());
+                        let is_delete_build = ws
+                            .latest_build
+                            .as_ref()
+                            .and_then(|b| b.transition.as_deref())
+                            == Some("delete");
+
+                        if status == WorkspaceStatus::Deleted
+                            || ws.status == "deleted"
+                            || (is_delete_build && build_status == Some("succeeded"))
+                        {
+                            info!(workspace_id = id, "Workspace confirmed deleted");
+                            return Ok(());
+                        }
+
+                        if status == WorkspaceStatus::Failed
+                            || (is_delete_build
+                                && matches!(build_status, Some("failed" | "canceled")))
+                        {
+                            bail!(
+                                    "Delete build failed for workspace {}: workspace status is {:?}, build status is {:?}",
+                                    id,
+                                    status,
+                                    build_status
+                                );
+                        }
+
+                        debug!(
+                            workspace_id = id,
+                            status = ?status,
+                            build_status = ?build_status,
+                            "Workspace deletion in progress, waiting..."
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            error = %e,
+                            "Failed to parse workspace status while waiting for deletion"
+                        );
+                    }
+                },
+                Ok(r) => {
+                    debug!(
+                        workspace_id = id,
+                        status = %r.status(),
+                        "Unexpected status code checking workspace deletion, retrying..."
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "Error checking workspace deletion status, retrying..."
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        bail!(
+            "Workspace {} deletion did not complete within {:?}",
+            id,
+            timeout
+        )
     }
 
     /// Create a role-specific worker workspace for a ticket.
@@ -2041,6 +2142,26 @@ mod http_mock {
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
             ),
+            ("POST", "/api/v2/workspaces/ws-delete-me/builds") => (
+                "201 Created",
+                r#"{"id":"build-1","transition":"delete"}"#.to_string(),
+            ),
+            ("POST", "/api/v2/workspaces/ws-delete-fail/builds") => (
+                "201 Created",
+                r#"{"id":"build-fail","transition":"delete"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-delete-fail") => (
+                "200 OK",
+                r#"{"id":"ws-delete-fail","name":"ws-delete-fail","status":"failed","latest_build":{"status":"failed","transition":"delete"}}"#.to_string(),
+            ),
+            ("POST", "/api/v2/workspaces/ws-deleted/builds") => (
+                "201 Created",
+                r#"{"id":"build-2","transition":"delete"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-deleted") => (
+                "200 OK",
+                r#"{"id":"ws-deleted","name":"ws-deleted","status":"deleted","latest_build":{"status":"succeeded","transition":"delete"}}"#.to_string(),
+            ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
         }
     }
@@ -2271,6 +2392,63 @@ mod tests {
             .expect("organization_id must be present and a string");
         assert!(!org_id.is_empty(), "organization_id must not be empty");
         assert_eq!(org_id, "org-abc");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_sends_delete_build_transition() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+
+        client
+            .delete_workspace("ws-delete-me")
+            .await
+            .expect("delete_workspace should succeed against mock");
+
+        let requests = server.requests().await;
+        let delete_req = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-me/builds")
+            .expect("expected a POST to workspace builds");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&delete_req.body).expect("recorded body should be valid JSON");
+        assert_eq!(
+            body.get("transition").and_then(|v| v.as_str()),
+            Some("delete")
+        );
+
+        // 404 should also be treated as success (already deleted)
+        client
+            .delete_workspace("ws-not-found")
+            .await
+            .expect("404 should succeed");
+
+        // Workspace reporting status 'deleted' should succeed
+        client
+            .delete_workspace("ws-deleted")
+            .await
+            .expect("workspace with deleted status should succeed");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_fails_when_delete_build_fails() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+
+        let err = client
+            .delete_workspace("ws-delete-fail")
+            .await
+            .expect_err("delete_workspace must fail when the delete build fails");
+
+        assert!(
+            err.to_string().contains("Delete build failed"),
+            "Error message should explain delete build failed: {}",
+            err
+        );
+
         server.shutdown().await;
     }
 }
