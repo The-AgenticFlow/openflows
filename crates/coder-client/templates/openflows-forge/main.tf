@@ -1,8 +1,25 @@
 terraform {
   required_providers {
-    coder = { source = "coder/coder", version = "~> 2.18.0" }
+    coder  = { source = "coder/coder", version = "~> 2.18.0" }
     docker = { source = "kreuzwerker/docker", version = "4.5.0" }
   }
+}
+
+# Container-backed testing is opt-in and requires Sysbox on the Docker host.
+variable "worker_runtime" {
+  type        = string
+  default     = "standard"
+  description = "standard preserves the existing workspace; sysbox enables an isolated Docker daemon."
+  validation {
+    condition     = contains(["standard", "sysbox"], var.worker_runtime)
+    error_message = "worker_runtime must be standard or sysbox."
+  }
+}
+
+variable "worker_image" {
+  type        = string
+  default     = ""
+  description = "Image built from docker/worker/Dockerfile; required for sysbox. Prefer an immutable digest."
 }
 
 # TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
@@ -29,35 +46,35 @@ variable "a2a_relay_addr" {
 # Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
 data "coder_parameter" "role" {
   name        = "role"
-  description  = "Agent role name"
+  description = "Agent role name"
   default     = "forge"
   type        = "string"
 }
 
 data "coder_parameter" "ticket_id" {
   name        = "ticket_id"
-  description  = "Ticket identifier"
+  description = "Ticket identifier"
   default     = ""
   type        = "string"
 }
 
 data "coder_parameter" "redis_url" {
   name        = "redis_url"
-  description  = "Redis SharedStore URL"
+  description = "Redis SharedStore URL"
   default     = "redis://redis:6379"
   type        = "string"
 }
 
 data "coder_parameter" "repo_url" {
   name        = "repo_url"
-  description  = "Git repository URL to clone into the workspace"
+  description = "Git repository URL to clone into the workspace"
   default     = ""
   type        = "string"
 }
 
 data "coder_parameter" "branch" {
   name        = "branch"
-  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = create or resume the worker/ticket branch."
+  description = "Remote branch to check out (the PR branch for an existing PR). Empty = create or resume the worker/ticket branch."
   default     = ""
   type        = "string"
 }
@@ -77,7 +94,7 @@ locals {
 
 data "coder_parameter" "tenant" {
   name        = "tenant"
-  description  = "OpenFlows tenant identifier"
+  description = "OpenFlows tenant identifier"
   default     = ""
   type        = "string"
 }
@@ -92,7 +109,7 @@ data "coder_parameter" "a2a_pair_token" {
 
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
-  description  = "Coder server URL for API calls"
+  description = "Coder server URL for API calls"
   default     = ""
   type        = "string"
 }
@@ -483,9 +500,33 @@ resource "docker_volume" "workspace" {
   name = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
 }
 
+# Private engine storage survives workspace restarts; deletion removes it.
+resource "docker_volume" "engine" {
+  count = var.worker_runtime == "sysbox" ? 1 : 0
+  name  = "openflows-engine-${data.coder_workspace.me.id}"
+}
+
 resource "docker_container" "workspace" {
-  name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
-  image = "codercom/enterprise-base:ubuntu"
+  name       = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
+  image      = var.worker_runtime == "sysbox" ? var.worker_image : "codercom/enterprise-base:ubuntu"
+  runtime    = var.worker_runtime == "sysbox" ? "sysbox-runc" : null
+  privileged = false
+  user       = var.worker_runtime == "sysbox" ? "root" : null
+
+  lifecycle {
+    precondition {
+      condition     = var.worker_runtime != "sysbox" || trimspace(var.worker_image) != ""
+      error_message = "Sysbox requires worker_image built from docker/worker/Dockerfile."
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.worker_runtime == "sysbox" ? [1] : []
+    content {
+      container_path = "/var/lib/docker"
+      volume_name    = docker_volume.engine[0].name
+    }
+  }
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -512,7 +553,10 @@ resource "docker_container" "workspace" {
     }
   }
 
-  env = [
+  env = concat(var.worker_runtime == "sysbox" ? [
+    "DOCKER_HOST=unix:///var/run/docker.sock",
+    "TESTCONTAINERS_HOST_OVERRIDE=localhost",
+    ] : [], [
     "REDIS_URL=${data.coder_parameter.redis_url.value}",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
@@ -522,16 +566,16 @@ resource "docker_container" "workspace" {
     "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-  ]
+  ])
 
-  # egress allowlist: Coder control plane + github.com + Redis only
-  # (enforced at network level; Redis is a documented exception per docs/governance.md)
+  # Shared coordination network. An egress allowlist requires host-side policy;
+  # selecting Sysbox isolates the engine, not access to services on this network.
 
   networks_advanced {
     name = "openflows_default"
   }
 
-  entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]
+  entrypoint = concat(var.worker_runtime == "sysbox" ? ["/usr/local/bin/openflows-worker-entrypoint"] : [], ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")])
 }
 
 data "coder_workspace" "me" {}

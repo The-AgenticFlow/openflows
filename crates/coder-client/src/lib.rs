@@ -33,6 +33,27 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Values sent to Coder and included in the template cache fingerprint.
+fn template_variables(name: &str) -> Vec<(String, String)> {
+    let mut values = Vec::new();
+    if let Ok(path) = std::env::var("TF_VAR_dev_binary_host_path") {
+        if !path.is_empty() {
+            values.push(("dev_binary_host_path".into(), path));
+        }
+    }
+    if matches!(name, "openflows-forge" | "openflows-sentinel") {
+        // Send defaults explicitly so removing an override resets a previous
+        // deployment's Sysbox settings instead of retaining server-side values.
+        for (key, default) in [("worker_runtime", "standard"), ("worker_image", "")] {
+            values.push((
+                key.into(),
+                std::env::var(format!("TF_VAR_{key}")).unwrap_or_else(|_| default.into()),
+            ));
+        }
+    }
+    values
+}
+
 fn check_template_push_output(name: &str, output: &std::process::Output) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -708,15 +729,10 @@ impl CoderClient {
         // stores them and applies them when creating workspaces. Setting them
         // as env vars in the Rust process does NOT reach the server's Terraform
         // execution — the CLI only uploads the template files.
-        let template_variables = [("TF_VAR_dev_binary_host_path", "dev_binary_host_path")];
-        for (env_name, variable_name) in template_variables {
-            if let Ok(value) = std::env::var(env_name) {
-                if value.is_empty() {
-                    continue;
-                }
-                cmd.arg("--variable")
-                    .arg(format!("{}={}", variable_name, value));
-            }
+        let template_variables = template_variables(name);
+        for (variable_name, value) in template_variables {
+            cmd.arg("--variable")
+                .arg(format!("{}={}", variable_name, value));
         }
 
         let output = match cmd.output().await {

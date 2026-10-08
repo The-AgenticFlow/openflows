@@ -524,10 +524,12 @@ impl CoderBootstrapper {
 }
 
 /// Compute a hex SHA-256 fingerprint of the template archive bytes.
-fn template_hash(data: &[u8]) -> String {
+fn template_hash(data: &[u8], variables: &[(String, String)]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
+    // Length-delimited serialization prevents ambiguous key/value boundaries.
+    hasher.update(serde_json::to_vec(variables).expect("string pairs serialize"));
     hex_encode(&hasher.finalize())
 }
 
@@ -577,7 +579,7 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 /// if the push attempt failed. Callers use `None` to determine whether bootstrap
 /// should fail due to a template management error.
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
-    let current_hash = template_hash(data);
+    let current_hash = template_hash(data, &crate::template_variables(name));
 
     let before_templates = client.list_templates().await.ok();
     let before_template = before_templates
@@ -643,5 +645,34 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             warn!("  ⚠ Template '{}' push failed: {}", name, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod template_fingerprint_tests {
+    use super::template_hash;
+
+    #[test]
+    fn runtime_and_image_changes_invalidate_template_cache() {
+        let standard = vec![("worker_runtime".into(), "standard".into())];
+        let sysbox = vec![("worker_runtime".into(), "sysbox".into())];
+        assert_ne!(
+            template_hash(b"archive", &standard),
+            template_hash(b"archive", &sysbox)
+        );
+        let image = vec![("worker_image".into(), "worker:v1".into())];
+        let next_image = vec![("worker_image".into(), "worker:v2".into())];
+        assert_ne!(
+            template_hash(b"archive", &image),
+            template_hash(b"archive", &next_image)
+        );
+        assert_eq!(
+            template_hash(b"archive", &image),
+            template_hash(b"archive", &image)
+        );
+        assert_ne!(
+            template_hash(b"archive", &image),
+            template_hash(b"changed", &image)
+        );
     }
 }

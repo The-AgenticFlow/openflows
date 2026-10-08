@@ -397,3 +397,9 @@ Verify inside a workspace **without printing the token**: `test -s ~/.git-creden
 - **Testing & debugging:** [testing_quick_start.md](testing_quick_start.md)
 - **Token acquisition:** [token_guide.md](token_guide.md)
 - **Lifecycle hooks (design):** [docs/experiments/hook-driven-state-derivation.md](docs/experiments/hook-driven-state-derivation.md) and [docs/experiments/coder-lifecycle-hooks-feedback.md](docs/experiments/coder-lifecycle-hooks-feedback.md)
+
+## Container-backed worker tests
+
+To enable Docker/Testcontainers in FORGE and SENTINEL on a supported Linux
+host, follow [the Sysbox worker setup](docs/worker-container-tests.md). This is
+an opt-in runtime; standard workspaces do not expose the host Docker daemon.

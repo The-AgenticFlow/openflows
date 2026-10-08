@@ -13,6 +13,20 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  worker-supervisor:
+    name: Worker Docker supervisor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check supervisor and integration script
+        run: |
+          bash -n docker/worker/entrypoint.sh scripts/test-worker-sysbox.sh scripts/test-worker-templates.sh
+          python3 -m unittest discover -s tests/worker -p test_entrypoint.py -v
+
   zizmor:
     name: Zizmor
     runs-on: ubuntu-latest
