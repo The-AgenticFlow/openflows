@@ -3,6 +3,300 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.7.0] - 2026-10-08
+
+### Features
+
+- *(setup)* Ask for the fleet size during setup
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Add one-command setup script and slim the quick start
+
+
+
+
+
+
+
+  by @arielpetit
+
+### Bug Fixes
+
+- *(github)* Include startup_failure in failure detail paths and diagnostics
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(github)* Scope ghost check suite filter to known non-ci apps
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(github)* Ignore ghost check suites with zero runs in ci status
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(github)* Do not let non-verdict reviews supersede approvals or change requests
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(merge)* Reconcile GitHub approval into lifecycle so approved PRs merge
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(scripts)* Restore the installer hint in prod.sh
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(scripts)* Use the musl image's linker in dev-sync Docker build
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Show progress while installing the coder CLI
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Check GitHub sign-in is offered and refuse to reuse a tenant for another repo
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Keep the workspace token alive and make re-runs safe
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Address review feedback on the setup script
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(vessel)* Retain workspace references when deletion fails
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Move test_decision guard before pr_human for side-effect-free rejection
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Satisfy pr_decision during GitHub approval reconciliation
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Only reconcile authorized current-head GitHub approvals
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel, docs)* Require sentinel test approval before reconciliation and set checks to read-only
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel, nexus)* Guard workspace lifecycle and worker release
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel, nexus)* Recycle forge and sentinel pairs to idle on merge and terminal state
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel,coder-client)* Trigger delete build and isolate worker slot workspace
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel,coder-client,nexus)* Confirm workspace deletion and retry failed cleanups
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel,nexus,config)* Safe concurrent cleanup, preserve retryable tickets, archive chats
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+### Documentation
+
+- *(quickstart)* Add Checks and Issues to GitHub App permissions
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+### Styling
+
+- *(uncategorized)* Apply cargo fmt formatting
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(uncategorized)* Fix formatting in agent-vessel
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+### Miscellaneous Tasks
+
+- *(agent-sentinel)* Drop unused github and regex dependencies
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+
+
+
+### Contributors
+
+- @NkwaTambe
+- @arielpetit
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.6.0...openflows-1.7.0
+
+
+
 ## [1.6.0] - 2026-10-06
 
 ### Features
@@ -460,15 +754,6 @@ All notable changes to this project will be documented in this file.
   by @Christian Yemele
 
 
-
-
-### Contributors
-
-- @Christian
-- @Christiantyemele
-- @Chrstian
-- @NkwaTambe
-- @ndefokou
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.8...openflows-1.6.0
 
