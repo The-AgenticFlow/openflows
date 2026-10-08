@@ -3,6 +3,23 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.7.0] - 2026-10-08
+
+### Features
+
+- *(setup)* Add one-command setup script and slim the quick start
+
+
+
+
+
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.6.0...openflows-1.7.0
+
+
+
 ## [1.6.0] - 2026-10-06
 
 ### Features
