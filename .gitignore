@@ -11,6 +11,10 @@ out/
 *.pyc
 __pycache__/
 
+# Presentation build artifacts (generated slides/pptx, not source)
+.presentation-build/
+output/
+
 # Environment files
 .env
 .env.local

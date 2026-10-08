@@ -107,14 +107,14 @@ Live checks are `NOT_VERIFIED` because **no licensed Coder deployment was config
 | C1 | Verify server version | `GET /api/v2/buildinfo` (unauthenticated) | none | resp `version` | non-200 | **NOT_VERIFIED** (live); harness `ro_buildinfo_matches_pinned_version` | Compose `healthcheck` hits this path (`docker-compose.yml:86`); harness |
 | C2 | List organizations | `GET /api/v2/organizations` | member | `[{id,name,is_default}]` | 401/403 | **NOT_VERIFIED** (live); source confirmed | `CoderClient::list_organizations` `lib.rs:500` |
 | C3 | Create organization | `coder organizations create <name>` | **Owner** role; **Premium** license | name; returns org | 403 if not Owner | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | [docs/admin/users/organizations](https://coder.com/docs/admin/users/organizations) "requires a Premium license"; "User with Owner role"; harness `cap_create_organization` |
-| C4 | Register org-scoped provisioner | `coder provisioner keys create <key> --org <org>`; `coder provisionerd start --org <org>` | org admin | one-time key | 403 without org perms | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | docs organizations "Deploy a provisioner"; built-in provisioners are default-org only; harness `cap_register_org_scoped_provisioner` |
+| C4 | Register org-scoped provisioner | `POST /api/v2/organizations/{org}/provisionerkeys` → `{"key":"<43-char secret>"}`; `coder provisionerd start --org <org>`; readiness at `GET /organizations/{org}/provisionerdaemons` | org admin; Enterprise (key API) | create returns raw 43-char secret (no `coder_` prefix); daemon listing reports `key_name` + `status` | 403 without org perms | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | `provisionerkey.New` (`apikey.GenerateSecret(43)`); `provisionerdaemons` route in `coderd.go`; AGPL CLI exposes no `provisioner keys create`; harness `create_provisioner_key_api`/`wait_for_provisioner_ready` |
 | C5 | Create machine identity (service account) | `coder users create --service-account --org <org>` | **Premium** | username/email; returns user | 403 without license | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | [docs/reference/cli/users/create](https://coder.com/docs/reference/cli/users/create) `--service-account` (Premium); harness `cap_create_machine_identity_and_assign_permissions` |
 | C6 | Assign permissions to identity | `coder organizations members edit-roles <u> <roles...>` (org-scoped via `CODER_ORGANIZATION`); `default_org_member_roles` | org admin; Premium | role names | rejected invalid role | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | `coder organizations members edit-roles` (v2.37.3); docs "Service accounts don't inherit `agents-access`… assign the role directly"; harness `cap_create_machine_identity_and_assign_permissions` |
 | C7 | Publish template + observe import | `coder templates push --org <org> --name <version> -d <dir>` | org template admin | version name; import job | import failure | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | [docs/reference/cli/templates/push](https://coder.com/docs/reference/cli/templates/push) `--name`, `--org`; harness `cap_publish_template_version_and_observe_import` |
 | C8 | Create workspace with explicit org/owner/version | `coder create <owner>/<ws> --org <org> --template <t> --template-version <v>` | owner permission; member | org, template, version | 403 wrong org | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | [docs/reference/cli/create](https://coder.com/docs/reference/cli/create) `--org`, `--template-version`, `<username>/<name>`; harness `cap_create_workspace_explicit_org_owner_version` |
 | C9 | Agents/chat: list models org-scoped | `GET /api/v2/organizations/{org}/chats/models` | member with `agents-access` | `{providers:[{models:[{id}]}]}` | 403 without agents-access | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | `lib.rs:1603/1645`; migration doc §1.2 (default-org routes removed in v2.37); harness `ro_list_chat_models_org_scoped` |
 | C10 | Agents/chat: create/get/send | `POST/GET /api/v2/chats…` | member of chat org | `organization_id` required | 403/404 | **VERIFIED_SOURCE**; **NOT_VERIFIED** live | `lib.rs:1365-1589`; migration doc §1.3 |
-| C11 | Cross-tenant isolation | token of org A accesses org B resources (both directions: models, workspaces, chats) | scoped machine identity | — | authenticated denial (`403`/`404`, not `401`) both ways | **NOT_VERIFIED** — must be demonstrated with two live machine identities; positive controls (each identity reads its own explicit org) + both-direction negatives required; **never inferred from names** | harness `mut_isolation_cross_tenant` |
+| C11 | Cross-tenant isolation | token of org A accesses org B resources (both directions: models, workspaces, chats) | scoped machine identity | — | authenticated denial (`403`/`404`, not `401`) both ways; cross-org workspace invisible (empty 200 is correct isolation) | **NOT_VERIFIED** — must be demonstrated with two live machine identities; positive controls (each identity reads its own explicit org + its own workspace fixture + creates a chat in its own org) + both-direction negatives required; **never inferred from names** | harness `iso_cross_tenant` (fixtures from `mut_scenario_provision_tenant` via `--isolation`) |
 
 **Unsupported / gated findings:**
 
@@ -157,16 +157,18 @@ These are the **expected contracts** the harness asserts. Credentials are redact
 
 Delivered in this PR:
 
-- `crates/coder-client/tests/compatibility.rs` — Rust integration harness (read-only `ro_*`, ordered mutating scenario `mut_*` incl. isolation, explicit cleanup `cleanup_*`).
-- `tests/integration/coder_compatibility.sh` — reproducible shell wrapper (mirrors `tests/integration/gated_workflow_test.sh`), bash-3.2 safe, with explicit `--mutating` and `--cleanup` modes.
+- `crates/coder-client/tests/compatibility.rs` — Rust integration harness (read-only `ro_*`, ordered mutating scenario `mut_*`, isolation `iso_*`, explicit cleanup `cleanup_*`, plus non-`#[ignore]`d offline regression tests for the parsing/validation helpers).
+- `tests/integration/coder_compatibility.sh` — reproducible shell wrapper (mirrors `tests/integration/gated_workflow_test.sh`), bash-3.2 safe, with explicit `--mutating`, `--isolation`, and `--cleanup` modes.
 
 Safety/design notes:
-- **Group selection:** tests are named with stable prefixes so the wrapper selects exactly one group (`ro_`, `mut_`, or `cleanup_`). Destructive cleanup **never** runs during a read-only or mutating verification; it runs only via `--cleanup`.
-- **Single ordered mutating scenario:** `mut_scenario_provision_tenant` creates org → provisioner key + running daemon → machine identity + roles → template version → workspace, so every step's prerequisites exist before the next (no cross-test ordering assumptions). Provisioner readiness and all subprocesses are bounded by timeouts.
-- **Persistent, atomic ledger:** every created resource (org, template, user, workspace, provisioner key) is recorded **immediately** in `OPENFLOWS_CODER_LEDGER_FILE` (default `<tmp>/ofci-ledger.json`) together with the **deployment URL and organization**, written atomically under a process lock.
-- **Org-scoped, validated cleanup:** `--cleanup` only deletes entries whose recorded deployment URL matches `CODER_URL` and whose org matches the test prefix; it deletes children before parents, org-scopes every delete via `CODER_ORGANIZATION`, and **retains** entries whose deletion failed.
-- **Credentials never printed:** command output is redacted; provisioner-key and session tokens are consumed programmatically and never echoed.
-- **Isolation is never inferred:** `mut_isolation_cross_tenant` uses explicit fixture orgs (resolved by the owning token), requires authenticated denials (`403`/`404`, not `401`) in **both** directions, and probes models, workspaces, and chats.
+- **Group selection:** tests are named with stable prefixes so the wrapper selects exactly one group (`ro_`, `mut_`, `iso_`, or `cleanup_`). Destructive cleanup **never** runs during a read-only or mutating verification; it runs only via `--cleanup`.
+- **Single ordered mutating scenario:** `mut_scenario_provision_tenant` provisions **two** isolated orgs (A and B), each: org → provisioner key (structured API) + running daemon → machine identity + roles → template version → workspace → build waited to completion → token minted. Each workspace is **recorded in the ledger immediately after creation** (before polling), so a failed or timed-out build still leaves the resource tracked for cleanup. Provisioner readiness (identity + `status`) and all subprocesses are bounded by timeouts; `kill_on_drop` prevents orphaned children.
+- **Workspace build semantics:** per the pinned API, `latest_build.status` is a `WorkspaceStatus` (a successful *start* reports `running`, never `succeeded`) while `latest_build.job.status` is a `ProvisionerJobStatus` (`succeeded` when the provisioning job finishes). Polling and identity validation accept the job reaching `succeeded` and/or the workspace reaching `running`.
+- **Provisioner key parsing:** the pinned server returns a **raw 43-char alphanumeric secret** (`{"key":"…"}`), not a `coder_`-prefixed string; the harness creates keys via the REST API and parses/validates the secret offline.
+- **Persistent, atomic ledger:** every created resource (org, template, user, workspace, provisioner key) is recorded **immediately** in `OPENFLOWS_CODER_LEDGER_FILE` (default `<tmp>/ofci-ledger.json`) together with the **deployment URL, organization, and immutable resource ID**, under a cross-process file lock.
+- **Org-scoped, validated cleanup:** `--cleanup` only deletes entries whose recorded deployment URL matches `CODER_URL` and whose org matches the test prefix; it deletes children before parents, org-scopes every delete, spins a provisioner daemon back up (from a stored 0600 secret) so Terraform deletion jobs can run, and **retains** entries whose deletion failed. If a child (workspace/template) deletion fails for an org, its **dependencies (template, user, provisioner key, org) are preserved** for retry, and cleanup **fails with a non-zero status** whenever resources remain.
+- **Credentials never printed:** command output is redacted; provisioner-key and session tokens are written to 0600 temp files and consumed programmatically, never echoed.
+- **Isolation is never inferred:** `iso_cross_tenant` uses explicit fixture orgs and workspace fixtures created by `--mutating`, requires positive controls (each identity reads its own org models, sees its own workspace, creates a chat in its own org) plus authenticated denials (`403`/`404`, not `401`) in **both** directions for models, workspaces, and chats. Only a valid response (empty 200 or explicit 403/404) establishes isolation — a request failure, 5xx, or 401 is an error, never a pass. **Missing mandatory fixtures is a hard failure**, not a silent green.
 
 Read-only:
 ```sh
@@ -175,13 +177,17 @@ export CODER_SESSION_TOKEN=<operator token>   # or CODER_SESSION_TOKEN_FILE=/pat
 ./tests/integration/coder_compatibility.sh
 ```
 
-Mutating + isolation (explicit opt-in, isolated org prefix):
+Mutating scenario (creates the two isolation orgs + workspace fixtures; explicit opt-in, isolated org prefix):
 ```sh
 export OPENFLOWS_CODER_MUTATE=1
 export OPENFLOWS_CODER_TEST_ORG_PREFIX=ofci-$(whoami)-
-export OPENFLOWS_CODER_TOKEN_A_FILE=/path/to/org-a/token   # for C11
-export OPENFLOWS_CODER_TOKEN_B_FILE=/path/to/org-b/token
 ./tests/integration/coder_compatibility.sh --mutating
+```
+
+Isolation (MUST run after `--mutating` populated the fixtures; the wrapper sources the fixture manifest and mints/uses the org A/B identity tokens):
+```sh
+export OPENFLOWS_CODER_MUTATE=1
+./tests/integration/coder_compatibility.sh --isolation
 ```
 
 Cleanup (deletes only resources recorded in the ledger):
@@ -196,9 +202,11 @@ export OPENFLOWS_CODER_MUTATE=1
 |---|---|
 | `cargo test -p coder-client --lib` | **PASS** (18 tests) — existing checks unchanged |
 | `cargo test -p coder-client --test compatibility --no-run` (default + `chats-api`) | **PASS** (compiles both) |
-| Wrapper read-only mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only the `ro_` group (6 tests); no bash/cargo-flag errors. This is NOT a successful verification run: a live deployment is still required for the `ro_*` assertions. |
-| Wrapper mutating mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only the `mut_` group (2 tests) with `--features coder-client/chats-api` placed before `--`; no `Unrecognized option`. NOT a successful verification run. |
-| Wrapper cleanup mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only `cleanup_created_resources`; cleanup is never selected by read-only or mutating modes. |
+| `cargo test -p coder-client --test compatibility offline` (default + `chats-api`) | **PASS** (20 offline regression tests) — key parsing, workspace/build-response validation, ledger identity, daemon status, isolation decision logic (errors never prove invisibility), incomplete-result handling; no deployment needed |
+| Wrapper read-only mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only the `ro_` group; no bash/cargo-flag errors. This is NOT a successful verification run: a live deployment is still required for the `ro_*` assertions. |
+| Wrapper mutating mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only `mut_scenario_provision_tenant` with `--features coder-client/chats-api` placed before `--`; no `Unrecognized option`. NOT a successful verification run. |
+| Wrapper isolation mode (bash 3.2) | **PASS (argument parsing/group selection)** — sources the fixture manifest and runs only `iso_cross_tenant`; fails loudly (exit 1) if the `--mutating` manifest is absent. |
+| Wrapper cleanup mode (bash 3.2) | **PASS (argument parsing/group selection)** — runs only `cleanup_created_resources`; cleanup is never selected by read-only, mutating, or isolation modes. |
 | Harness `env_summary` | **PASS** (reports `token_set=false`) |
 | Harness read-only (no live env) | **NOT_VERIFIED** — fails with explicit NOT_VERIFIED message, never fabricated evidence |
 | Live C1–C11 against a deployment | **NOT_VERIFIED** — no licensed Coder deployment configured for this PR |
