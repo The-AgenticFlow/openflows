@@ -258,8 +258,9 @@ A healthy consumer responds `200`. If you see `InvalidAudience`, see [Troublesho
    (If you changed `OPENFLOWS_HOOK_URL` at the same time, do the same — the hook URL is also immutable.)
 4. Recreate the workspace through the tenant flow, which rebuilds it with the new secret and restarts its controller:
    ```bash
-   ./scripts/prod.sh tenant <owner/repo> --name <tenant>
+   ./scripts/prod.sh tenant <owner/repo> --name <tenant> --fleet <N>
    ```
+   (`--fleet N` is **mandatory** — re-specify the same fleet as the original tenant so the rebuilt workspace keeps its FORGE-SENTINEL pair capacity.)
 
 Coder and the consumer must always share the same secret, and both Coder and the Controller must be restarted after rotation.
 
@@ -359,7 +360,7 @@ Grant the GitHub App **Pull requests → Read and write**, then **approve/update
 
 ### Controller not picking up issues
 
-1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
+1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team> --fleet <N>`).
 2. Watch the controller's foreground terminal for errors.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
@@ -377,7 +378,7 @@ If the controller logs `Hook consumer: JWT verification failed ... InvalidAudien
 
 ### `403 External authentication is required to create a workspace with this template`
 
-Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link as the **tenant user** (see [Link the GitHub App](#link-the-github-app-required-for-private-repos)) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, recreate the tenant workspace via `./scripts/prod.sh tenant <owner/repo> --name <tenant>`.
+Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link as the **tenant user** (see [Link the GitHub App](#link-the-github-app-required-for-private-repos)) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, recreate the tenant workspace via `./scripts/prod.sh tenant <owner/repo> --name <tenant> --fleet <N>` (`--fleet` is mandatory).
 
 ### Agents can't clone/push the private repo
 

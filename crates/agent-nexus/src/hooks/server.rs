@@ -741,40 +741,127 @@ fn invokes_coder_lifecycle(cmd: &str) -> bool {
 /// Split a shell command into tokens, stripping shell quotes and tracking
 /// whether each token starts a fresh command. Handles quotes and separators
 /// that fall inside a quoted argument (e.g. `sh -c 'coder start ws'`).
+///
+/// Every shell separator (`; && || | ( ) { } \``) introduces a fresh command
+/// boundary — including one **embedded inside a whitespace-delimited token**
+/// with no surrounding whitespace. This closes the P1 "Separator Attached to
+/// Previous Token" hole: `echo ok; coder start ws`, `cd /tmp;coder start ws`,
+/// `true&&coder stop ws`, and `echo hi|coder delete ws` all surface a `coder`
+/// token at a real command boundary instead of slipping past the guard.
 fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
+    const SEPARATORS: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
     let mut tokens: Vec<(String, bool)> = Vec::new();
     let mut at_start = true;
     for part in cmd.split(char::is_whitespace) {
         if part.is_empty() {
             continue;
         }
-        let lead = part.trim_start_matches(&[';', '&', '|', '(', ')', '{', '}', '`'][..]);
-        let sep_before = lead.len() != part.len();
-        let body = lead.trim_end_matches(&[';', '&', '|', '(', ')', '{', '}', '`'][..]);
-        if body.is_empty() {
-            at_start = true;
-            continue;
+        // Walk `part`, splitting it into segments at each separator character.
+        // A segment preceded by a separator (or by the start of a fresh
+        // command) is pushed with `boundary = true`.
+        let mut rest = part;
+        let mut boundary = at_start;
+        loop {
+            let split_at = rest.find(|c: char| SEPARATORS.contains(&c));
+            let (segment, sep_after) = match split_at {
+                Some(idx) => (&rest[..idx], true),
+                None => (rest, false),
+            };
+            let segment = segment.trim_matches(&['\'', '"', '`'][..]);
+            if !segment.is_empty() {
+                tokens.push((segment.to_string(), boundary));
+                boundary = false;
+            }
+            if !sep_after {
+                break;
+            }
+            // Consume the separator run; the following segment starts a fresh
+            // command.
+            let sep_start = split_at.unwrap();
+            let sep_end = rest[sep_start..]
+                .find(|c: char| !SEPARATORS.contains(&c))
+                .map(|i| sep_start + i)
+                .unwrap_or(rest.len());
+            rest = &rest[sep_end..];
+            boundary = true;
+            if rest.is_empty() {
+                break;
+            }
         }
-        let tok = body.trim_matches(&['\'', '"', '`'][..]);
-        if tok.is_empty() {
-            at_start = true;
-            continue;
-        }
-        tokens.push((tok.to_string(), at_start || sep_before));
-        at_start = false;
+        // The next whitespace-delimited part starts a fresh command only if
+        // this part ended with a separator.
+        at_start = boundary;
     }
     tokens
 }
 
 /// True when `tokens[i]` begins a command: it is the first token, it followed
-/// a separator, or it followed a `sudo` prefix or a shell-wrapper `-c`.
+/// a separator, or it followed a `sudo` prefix, a shell-wrapper `-c`, or a
+/// standard forwarding wrapper (`command`, `env`, `exec`, ...). Treating
+/// wrappers as boundary introducers closes the hole where `command coder
+/// delete ws` / `env coder stop ws` / `exec coder delete ws` bypassed the
+/// lifecycle guard (P1: "Wrapper-Wrapped Invocations").
+///
+/// A wrapper may carry its own arguments before the wrapped command
+/// (`env KEY=value coder …`, `command -p coder …`, `exec -a name coder …`), so
+/// the look-back walks backward over argument-like tokens (flags, `VAR=value`
+/// assignments, and a flag's value) to reach the wrapper. `command -v/-V coder`
+/// is a *lookup* (prints the binary path), not an invocation, and is never a
+/// boundary.
+const FORWARDING_BOUNDARY_WRAPPERS: &[&str] = &["command", "env", "exec", "sudo", "su"];
+
 fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool) -> bool {
     if at_start {
         return true;
     }
-    if i > 0 {
-        let prev = tokens[i - 1].0.as_str();
-        if prev == "-c" || prev == "sudo" || prev == "su" {
+    if i == 0 {
+        return false;
+    }
+    // Walk backward from `coder` over argument-like tokens to find a
+    // forwarding wrapper or `-c`. The look-back is bounded so we never walk
+    // across an entire unrelated command.
+    let mut j = i - 1;
+    let mut looked = 0usize;
+    let mut saw_lookup_flag = false; // `command -v/-V` → lookup, not invocation
+    while j > 0 && looked < 4 {
+        let prev = tokens[j].0.as_str();
+        // `-c` is the shell-wrapper boundary (`sh -c 'coder …'`): the command
+        // that follows it is at a real command boundary, never consumed as a
+        // generic flag.
+        if prev == "-c" {
+            return true;
+        }
+        if prev.starts_with('-') {
+            if prev == "-v" || prev == "-V" {
+                saw_lookup_flag = true;
+            }
+            j -= 1;
+            looked += 1;
+            continue;
+        }
+        if prev.contains('=') {
+            j -= 1;
+            looked += 1;
+            continue;
+        }
+        // A bare value may be the argument consumed by a preceding flag
+        // (e.g. `exec -a name coder`). Skip it only if the token before it is
+        // a flag, so an ordinary command word is not mistaken for a wrapper arg.
+        if j > 0 && tokens[j - 1].0.starts_with('-') {
+            j -= 1;
+            looked += 1;
+            continue;
+        }
+        break;
+    }
+    if let Some(prev) = tokens.get(j) {
+        let name = prev.0.as_str();
+        if name == "-c" || FORWARDING_BOUNDARY_WRAPPERS.contains(&name) {
+            // `command -v/-V coder` resolves the binary path; it does not
+            // invoke a lifecycle subcommand.
+            if name == "command" && saw_lookup_flag {
+                return false;
+            }
             return true;
         }
     }
@@ -1102,6 +1189,27 @@ mod tests {
             "sh -c \"coder delete ws\"",
             "nohup openflows run & coder start x",
             "cd /tmp && coder workspace y",
+            // P1: separator attached to the previous token must still be caught.
+            "echo ok; coder start ws",
+            "true && coder stop my-ws",
+            "echo hi | coder delete ws",
+            // P1: separator embedded with NO surrounding whitespace must be caught.
+            "echo ok;coder start ws",
+            "cd /tmp;coder delete ws",
+            "true&&coder stop my-ws",
+            "echo hi|coder delete ws",
+            "cd /tmp && ls;coder start ws",
+            // P1: standard forwarding wrappers must still be caught.
+            "command coder delete ws",
+            "env coder stop my-ws",
+            "exec coder delete ws",
+            "command env coder delete ws",
+            // P1: wrapper-argument variants must be caught too (env assignment,
+            // command flag, exec flag+value).
+            "env GITHUB_TOKEN=x coder delete ws",
+            "command -p coder delete ws",
+            "exec -a myname coder delete ws",
+            "sudo -u admin coder stop my-ws",
         ] {
             assert!(
                 invokes_coder_lifecycle(cmd),
@@ -1119,6 +1227,15 @@ mod tests {
             "cat guide.txt # how to coder start",
             "openflows-harness coder start", // a different binary, not the CLI
             "echo \"see coder templates for the API\"",
+            // Wrappers used as commands themselves must not create false positives.
+            "command -v coder",
+            "command -V coder",
+            "env | grep CODER",
+            "exec echo done",
+            // A flag/arg before a coder mention on an unrelated command must not
+            // create a boundary.
+            "git commit -m \"coder start ws\"",
+            "some-tool --help coder",
         ] {
             assert!(
                 !invokes_coder_lifecycle(cmd),

@@ -267,6 +267,13 @@ impl CoderClient {
     }
 
     /// Create a client with a different token (e.g., after bootstrap).
+    ///
+    /// The identity caches (`cached_username`, `cached_org_id`) are **not**
+    /// carried over: a new token may belong to a different principal (e.g. a
+    /// tenant user minted from an admin client), so reusing the source client's
+    /// cached identity would silently attribute the new client's actions to the
+    /// old user. `cached_models` is a deployment-global model catalog and is
+    /// safe to share.
     pub fn with_token(&self, token: String) -> Self {
         Self {
             base_url: self.base_url.clone(),
@@ -276,8 +283,8 @@ impl CoderClient {
             session_token: self.session_token.clone(),
             #[cfg(feature = "chats-api")]
             cached_models: self.cached_models.clone(),
-            cached_org_id: self.cached_org_id.clone(),
-            cached_username: self.cached_username.clone(),
+            cached_org_id: Arc::new(RwLock::new(None)),
+            cached_username: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -458,6 +465,115 @@ impl CoderClient {
         }
     }
 
+    /// Generate a strong, unique password that satisfies Coder's minimum
+    /// password requirements (uppercase, lowercase, digit, special, >= 8 chars).
+    ///
+    /// Used only as a `login_type: "password"` placeholder when creating a
+    /// non-interactive tenant user; the tenant authenticates via a minted API
+    /// token, never this password. Entropy comes from `/dev/urandom` (base64 of
+    /// 24 random bytes); a deterministic time-based fallback is used only if
+    /// `/dev/urandom` is unavailable. A fixed `Aa1!` suffix guarantees every
+    /// required character class.
+    fn generate_tenant_password() -> String {
+        let mut entropy = [0u8; 24];
+        let have_urandom = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| {
+                use std::io::Read;
+                f.read_exact(&mut entropy)
+            })
+            .is_ok();
+        let mut base = if have_urandom {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(entropy)
+        } else {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{nanos:032x}")
+        };
+        // Guarantee uppercase, lowercase, digit, and a special character.
+        base.push_str("Aa1!");
+        base
+    }
+
+    /// Create a new Coder user (admin-only) and return it.
+    ///
+    /// Idempotent: if a user with the same email already exists, the existing
+    /// user is returned instead of failing on a conflict, so re-running tenant
+    /// onboarding is safe. `GET /api/v2/users` lists deployment users; a match
+    /// on email (or username) short-circuits the creation.
+    ///
+    /// `POST /api/v2/users` (admin) takes `{ email, username, user_status,
+    /// login_type, organization_ids }` and returns the created `CoderUser`.
+    ///
+    /// Coder v2.37+ requires at least one `organization_ids` entry (an empty
+    /// list returns 400). A truly non-interactive `login_type: "none"` user is
+    /// rejected for non-service accounts ("Login type 'none' requires a service
+    /// account."), and service accounts (which *do* allow `login_type: "none"`)
+    /// require the premium Service Accounts entitlement and cannot complete
+    /// interactive flows. To keep this entitlement-independent and compatible
+    /// with the tenant GitHub link flow, we create a `login_type: "password"`
+    /// user with a strong random password that is never shared. The caller mints
+    /// a tenant-scoped API token via `create_api_token`, so the tenant
+    /// authenticates through that token rather than the generated password.
+    pub async fn create_user(&self, email: &str, username: &str) -> Result<CoderUser> {
+        // Reuse an existing user with the same identity when present.
+        if let Ok(users) = self.list_users().await {
+            if let Some(existing) = users
+                .iter()
+                .find(|u| u.email.eq_ignore_ascii_case(email) || u.username == username)
+            {
+                info!(
+                    user_id = %existing.id,
+                    username = %existing.username,
+                    "Reusing existing Coder user"
+                );
+                return Ok(existing.clone());
+            }
+        }
+
+        let organization_id = self.get_default_organization_id().await?;
+        let password = Self::generate_tenant_password();
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/users")
+            .json(&serde_json::json!({
+                "email": email,
+                "username": username,
+                "user_status": "active",
+                "login_type": "password",
+                "password": password,
+                "organization_ids": [organization_id],
+            }))
+            .send()
+            .await
+            .context("Failed to create Coder user")?;
+
+        if resp.status().is_success() {
+            let user: CoderUser = resp.json().await?;
+            info!(
+                user_id = %user.id,
+                username = %user.username,
+                "Created Coder user"
+            );
+            Ok(user)
+        } else if resp.status().as_u16() == 409 {
+            // A concurrent create won the race; fall back to a lookup.
+            let users = self.list_users().await?;
+            users
+                .into_iter()
+                .find(|u| u.email.eq_ignore_ascii_case(email) || u.username == username)
+                .context(format!(
+                    "Coder user '{}' already exists but not found in listing",
+                    username
+                ))
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create Coder user ({}): {}", status, body)
+        }
+    }
+
     /// List all users visible to the authenticated user.
     /// GET /api/v2/users
     pub async fn list_users(&self) -> Result<Vec<CoderUser>> {
@@ -563,83 +679,123 @@ impl CoderClient {
         Ok(org_id)
     }
 
-    /// Create an API token for a user. Attempts to reuse an existing token
-    /// with the same name first for idempotency.
-    pub async fn create_api_token(&self, user_id: &str, name: &str) -> Result<CoderApiKey> {
-        // Try to find an existing token with the same name first
-        let list_resp = self
+    /// List the API tokens (metadata only) for a user.
+    ///
+    /// `GET /api/v2/users/{user}/keys/tokens` returns token *metadata* — the
+    /// raw `key` secret is never included and is exposed only at creation time.
+    /// Each item carries `id` and `token_name`.
+    pub async fn list_api_tokens(&self, user_id: &str) -> Result<Vec<CoderApiKey>> {
+        let resp = self
             .authenticated_request(
                 reqwest::Method::GET,
                 &format!("/api/v2/users/{}/keys/tokens", user_id),
             )
             .send()
-            .await;
+            .await
+            .context("Failed to list API tokens")?;
 
-        if let Ok(resp) = list_resp {
-            if resp.status().is_success() {
-                let list_body: serde_json::Value = resp.json().await.unwrap_or_default();
-                if let Some(items) = list_body.as_array() {
-                    for item in items {
-                        if let Some(item_name) = item.get("name").and_then(|v| v.as_str()) {
-                            if item_name == name {
-                                if let Some(item_key) = item.get("key").and_then(|v| v.as_str()) {
-                                    let api_key = CoderApiKey {
-                                        id: item
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        name: item_name.to_string(),
-                                        key: item_key.to_string(),
-                                    };
-                                    info!(key_name = %api_key.name, "Reusing existing API token");
-                                    return Ok(api_key);
-                                }
-                            }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list API tokens ({}): {}", status, body)
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let items = body.as_array().cloned().unwrap_or_default();
+        Ok(items
+            .into_iter()
+            .filter_map(|item| {
+                let id = item.get("id")?.as_str()?.to_string();
+                let name = item
+                    .get("token_name")
+                    .or_else(|| item.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Some(CoderApiKey {
+                    id,
+                    name,
+                    key: String::new(),
+                })
+            })
+            .collect())
+    }
+
+    /// Revoke a user's API token by id.
+    ///
+    /// Coder exposes token deletion at `DELETE /api/v2/users/{user}/keys/{id}`
+    /// (a token is an API key carrying a `token_name`); the
+    /// `/api/v2/users/{user}/keys/tokens/{id}` path is **not** a route and
+    /// returns 405. Verified against Coder v2.37.
+    pub async fn delete_api_token(&self, user_id: &str, token_id: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::DELETE,
+                &format!("/api/v2/users/{}/keys/{}", user_id, token_id),
+            )
+            .send()
+            .await
+            .context("Failed to delete API token")?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete API token ({}): {}", status, body)
+        }
+    }
+
+    /// Create an API token for a user with the given `name` (a tenant-attributable
+    /// prefix). Coder exposes the raw token `key` only in the creation response,
+    /// so an existing token cannot be read back for reuse.
+    ///
+    /// To keep onboarding idempotent **and** convergent — instead of relying on
+    /// a duplicate-name 409 that may not be returned by every Coder version, and
+    /// instead of accumulating an unrecycled token per run — any previously
+    /// created token with this name (or the legacy `name-*` suffix naming from
+    /// earlier versions) is revoked before a fresh token is minted. Repeated runs
+    /// therefore converge on exactly one active token per `name` instead of
+    /// leaking standing tenant-scoped credentials.
+    pub async fn create_api_token(&self, user_id: &str, name: &str) -> Result<CoderApiKey> {
+        // Revoke stale tokens from prior runs (exact name match, plus the
+        // `name-<suffix>` legacy naming) so onboarding converges to one token.
+        if let Ok(tokens) = self.list_api_tokens(user_id).await {
+            for token in tokens {
+                let stale = token.name == name
+                    || token
+                        .name
+                        .strip_prefix(name)
+                        .map(|rest| rest.starts_with('-'))
+                        .unwrap_or(false);
+                if stale {
+                    match self.delete_api_token(user_id, &token.id).await {
+                        Ok(_) => {
+                            info!(key_name = %token.name, "Revoked stale API token before recreating")
+                        }
+                        Err(e) => {
+                            warn!(key_name = %token.name, error = %e, "Failed to revoke stale API token")
                         }
                     }
                 }
             }
         }
 
-        // No existing token found — create a new one
+        let lifetime_ns = 168 * 3600 * 1_000_000_000_i64;
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
                 &format!("/api/v2/users/{}/keys/tokens", user_id),
             )
             .json(&serde_json::json!({
-                "name": name,
-                "lifetime": 168 * 3600 * 1_000_000_000_i64,
+                "token_name": name,
+                "lifetime": lifetime_ns,
             }))
             .send()
             .await
             .context("Failed to create API token")?;
 
         if resp.status().is_success() {
-            let body: serde_json::Value = resp.json().await?;
-            let key_value = body
-                .get("key")
-                .and_then(|v| v.as_str())
-                .context("No 'key' field in API token response")?
-                .to_string();
-            let key_id = body
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let name_value = body
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(name)
-                .to_string();
-            let api_key = CoderApiKey {
-                id: key_id,
-                name: name_value,
-                key: key_value,
-            };
-            info!(key_name = %api_key.name, "Created API token");
-            Ok(api_key)
+            parse_api_token_response(resp, name).await
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -1239,6 +1395,36 @@ impl CoderClient {
         }
         Ok(())
     }
+}
+
+/// Parse a `POST /api/v2/users/{user}/keys/tokens` (201) response into a
+/// [`CoderApiKey`]. The raw `key` is present only in this creation response.
+async fn parse_api_token_response(
+    resp: reqwest::Response,
+    fallback_name: &str,
+) -> Result<CoderApiKey> {
+    let body: serde_json::Value = resp.json().await?;
+    let key_value = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .context("No 'key' field in API token response")?
+        .to_string();
+    let key_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let name_value = body
+        .get("token_name")
+        .or_else(|| body.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_name)
+        .to_string();
+    Ok(CoderApiKey {
+        id: key_id,
+        name: name_value,
+        key: key_value,
+    })
 }
 
 // External-auth (GitHub link) API
@@ -2041,7 +2227,45 @@ mod http_mock {
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
             ),
-            _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+            ("GET", "/api/v2/users/me") => (
+                "200 OK",
+                r#"{"id":"admin-1","username":"admin","email":"admin@openflows.local"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/users") => ("200 OK", r#"[]"#.to_string()),
+            ("POST", "/api/v2/users") => (
+                "201 Created",
+                r#"{"id":"tenant-1","username":"tenant-acme","email":"tenant-acme@openflows.local"}"#.to_string(),
+            ),
+            _ => {
+                // Dynamic token routes under `/api/v2/users/{user}/keys/tokens`.
+                if path.starts_with("/api/v2/users/") && path.ends_with("/keys/tokens") {
+                    return match method {
+                        "GET" => (
+                            "200 OK",
+                            r#"[{"id":"tok-1","token_name":"openflows-tenant"},{"id":"tok-2","token_name":"openflows-tenant-deadbeef"}]"#
+                                .to_string(),
+                        ),
+                        "POST" => (
+                            "201 Created",
+                            r#"{"id":"tok-new","key":"sekret-token","token_name":"openflows-tenant"}"#
+                                .to_string(),
+                        ),
+                        _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+                    };
+                }
+                // Token deletion lives at `/api/v2/users/{user}/keys/{id}`
+                // (a token is an API key), not `/keys/tokens/{id}`.
+                if path.starts_with("/api/v2/users/")
+                    && path.contains("/keys/")
+                    && !path.contains("/keys/tokens/")
+                {
+                    return match method {
+                        "DELETE" => ("204 No Content", String::new()),
+                        _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+                    };
+                }
+                ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+            }
         }
     }
 }
@@ -2271,6 +2495,130 @@ mod tests {
             .expect("organization_id must be present and a string");
         assert!(!org_id.is_empty(), "organization_id must not be empty");
         assert_eq!(org_id, "org-abc");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_api_token_revokes_stale_tokens_and_converges() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // The mock lists two stale tokens (one exact-name, one legacy
+        // `name-<suffix>`), both of which must be revoked before a fresh
+        // token is minted, so repeated runs converge on a single active token
+        // instead of accumulating standing tenant-scoped credentials.
+        let key = client
+            .create_api_token("tenant-1", "openflows-tenant")
+            .await
+            .expect("create_api_token should converge against mock");
+        assert_eq!(key.key, "sekret-token");
+        assert_eq!(key.name, "openflows-tenant");
+
+        let requests = server.requests().await;
+        let deletes = requests
+            .iter()
+            .filter(|r| {
+                r.method == "DELETE"
+                    && r.path.contains("/keys/")
+                    && !r.path.contains("/keys/tokens/")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 2, "both stale tokens must be revoked");
+
+        let creates = requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/keys/tokens"))
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 1, "exactly one fresh token must be minted");
+        let body: serde_json::Value =
+            serde_json::from_str(&creates[0].body).expect("create body valid JSON");
+        assert_eq!(
+            body.get("token_name").and_then(|v| v.as_str()),
+            Some("openflows-tenant")
+        );
+        assert!(body.get("lifetime").is_some(), "lifetime must be present");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_user_posts_tenant_identity() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // The mock GET /users returns an empty list, so create_user falls
+        // through to POST /users with a `login_type: password` tenant identity
+        // (Coder v2.37 rejects `login_type: none` for non-service accounts).
+        let user = client
+            .create_user("tenant-acme@openflows.local", "tenant-acme")
+            .await
+            .expect("create_user should succeed against mock");
+        assert_eq!(user.id, "tenant-1");
+        assert_eq!(user.username, "tenant-acme");
+
+        let requests = server.requests().await;
+        let create = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v2/users")
+            .expect("expected a POST /api/v2/users request");
+        let body: serde_json::Value =
+            serde_json::from_str(&create.body).expect("create body valid JSON");
+        assert_eq!(
+            body.get("login_type").and_then(|v| v.as_str()),
+            Some("password")
+        );
+        let password = body
+            .get("password")
+            .and_then(|v| v.as_str())
+            .expect("a password must be provided for login_type password");
+        assert!(
+            password.len() >= 8
+                && password.chars().any(|c| c.is_uppercase())
+                && password.chars().any(|c| c.is_lowercase())
+                && password.chars().any(|c| c.is_ascii_digit())
+                && password.chars().any(|c| !c.is_alphanumeric()),
+            "generated tenant password must meet Coder's requirements"
+        );
+        assert_eq!(
+            body.get("user_status").and_then(|v| v.as_str()),
+            Some("active")
+        );
+        assert_eq!(
+            body.get("organization_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "at least one organization is required (Coder v2.37+)"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_token_clears_identity_caches() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // Populate the admin client's username cache, then derive a new client
+        // with a different token and confirm the cached identity is not carried
+        // over — a tenant client must not inherit the admin's cached identity.
+        client.resolve_current_user().await.expect("resolve me");
+        {
+            let guard = client.cached_username.read().await;
+            assert_eq!(guard.as_deref(), Some("admin"));
+        }
+
+        let tenant_client = client.with_token("tenant-token".to_string());
+        {
+            let guard = tenant_client.cached_username.read().await;
+            assert!(guard.is_none(), "with_token must clear the cached username");
+        }
+        {
+            let guard = tenant_client.cached_org_id.read().await;
+            assert!(guard.is_none(), "with_token must clear the cached org id");
+        }
+        assert_eq!(tenant_client.session_token(), "tenant-token");
+
         server.shutdown().await;
     }
 }

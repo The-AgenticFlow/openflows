@@ -982,6 +982,14 @@ Before significant work, read the relevant skill file to understand the workflow
                         .map(|e| e.coder.url)
                         .unwrap_or_default()
                 }),
+                // The configured Coder external-auth provider id drives the
+                // injected CODER_EXTERNAL_AUTH_<ID>_ACCESS_TOKEN env var and the
+                // `coder_external_auth` data source id in the worker templates.
+                "external_auth_id": config::EnvConfig::from_env()
+                    .ok()
+                    .and_then(|e| e.coder.external_auth_id)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "primary-github".to_string()),
             }),
         };
         // Inject the Terraform variable the template reads.

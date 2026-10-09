@@ -6,7 +6,7 @@ All production operations use `./scripts/prod.sh`:
 
 ```bash
 ./scripts/prod.sh bootstrap                      # One-time: Setup Coder + push templates
-./scripts/prod.sh tenant owner/repo --name team  # Add a tenant (runs its own in-workspace controller)
+./scripts/prod.sh tenant owner/repo --name team --fleet N  # Add a tenant (runs its own in-workspace controller)
 ```
 
 ### `bootstrap` — One-time Setup
@@ -22,10 +22,10 @@ All production operations use `./scripts/prod.sh`:
 ### `tenant` — Add a Team
 
 ```bash
-./scripts/prod.sh tenant owner/repo --name my-team
+./scripts/prod.sh tenant owner/repo --name my-team --fleet N
 ```
 
-Binds a GitHub repo to a tenant. Each tenant is scoped to one `owner/repo` and gets its own nexus workspace; that workspace's controller auto-starts with `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` injected from this command.
+Binds a GitHub repo to a tenant. Each tenant is scoped to one `owner/repo` and gets its own nexus workspace; that workspace's controller auto-starts with `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` injected from this command. `--fleet N` is **mandatory** and sets N FORGE-SENTINEL pairs.
 
 ### `doctor` — Health Check
 
@@ -138,6 +138,6 @@ Controller starts inside workspace
 |---------|-------------|
 | `./scripts/dev-sync.sh` | Build and mount dev binary to Coder |
 | `./scripts/prod.sh bootstrap` | One-time: Setup Coder + templates (includes dev-sync) |
-| `./scripts/prod.sh tenant owner/repo --name team` | Add tenant (auto-starts its in-workspace controller) |
+| `./scripts/prod.sh tenant owner/repo --name team --fleet N` | Add tenant (auto-starts its in-workspace controller) |
 | `./scripts/prod.sh doctor` | Health check |
 | `./scripts/reset-controller-state.sh --confirm` | Clean Redis state |

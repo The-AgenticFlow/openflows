@@ -337,8 +337,20 @@ impl CoderBootstrapper {
         Ok(())
     }
 
-    /// Provision a tenant's nexus workspace using the current session user
-    /// (admin) identity. Returns the workspace ID.
+    /// Provision a tenant's nexus workspace under the **tenant's own Coder
+    /// identity** with a tenant-scoped token, so the tenant does not share the
+    /// administrator's Coder account or GitHub identity.
+    ///
+    /// Creates (or reuses) a per-tenant Coder user, mints a tenant-scoped API
+    /// token, waits for the tenant's own GitHub external-auth link, and creates
+    /// the `openflows-nexus-<tenant>` workspace owned by that tenant user with
+    /// the tenant token baked in as `coder_session_token`. Returns the workspace ID.
+    ///
+    /// Re-running for an existing tenant-owned workspace returns that workspace
+    /// immediately (without rotating its token — rotation would revoke the token
+    /// baked into the live controller while the workspace is not rebuilt). To
+    /// apply new build parameters (e.g. `--fleet`) or rotate the token, delete
+    /// the workspace and re-run.
     pub async fn ensure_tenant(
         &self,
         client: &CoderClient,
@@ -348,14 +360,68 @@ impl CoderBootstrapper {
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
 
-        // Use the current session user (admin) as the tenant owner.
-        let admin = client.get_me().await?;
+        let tenant_username = format!("tenant-{}", tenant_name.to_lowercase().replace('.', "-"));
+        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+
+        // Check up front whether the tenant-owned workspace already exists. The
+        // listing is deployment-wide, so we match on both name and owner.
+        let workspaces = match client.list_workspaces(&tenant_username).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(error = %e, "Could not list workspaces to detect an existing tenant workspace");
+                Vec::new()
+            }
+        };
+
+        // If the tenant-owned workspace already exists, reuse it **without**
+        // rotating its token. Rotating would revoke the token currently baked
+        // into the live workspace's controller (`create_api_token` revokes
+        // stale tokens before minting a fresh one) while the workspace is not
+        // rebuilt, breaking that controller. The operator recreates the
+        // workspace (delete + re-run) to pick up new build parameters / token.
+        if let Some(existing) = workspaces
+            .iter()
+            .find(|w| w.name == nexus_workspace_name && w.owner_name == tenant_username)
+        {
+            println!(
+                "  ⚠ Tenant workspace '{}' already exists (owner: '{}') — its build parameters (including fleet) are unchanged. \
+                 Recreate it once to apply `--fleet` / enable the in-workspace controller \
+                 (`start_controller=true`); new tenants get these automatically.",
+                nexus_workspace_name, existing.owner_name
+            );
+            return Ok(existing.id.clone());
+        }
+
+        // 0. Resolve (or create) the tenant's own Coder user. The admin client
+        //    can create users and mint tokens for any user, so each tenant gets
+        //    an isolated Coder identity instead of reusing the admin's.
+        let tenant_email = format!("{tenant_username}@openflows.local");
+        let tenant_user = client
+            .create_user(&tenant_email, &tenant_username)
+            .await
+            .with_context(|| {
+                format!("Failed to resolve/create tenant Coder user for '{tenant_name}'")
+            })?;
         info!(
-            "  ✓ Using session user '{}' as tenant owner",
-            admin.username
+            "  ✓ Tenant Coder user '{}' (id: {}) resolved",
+            tenant_user.username, tenant_user.id
         );
 
-        // 1. Check the session user's GitHub external-auth grant until linked.
+        // 1. Mint a tenant-scoped API token for that user. The nexus controller
+        //    and worker workspaces run under this token (CODER_SESSION_TOKEN),
+        //    so their Coder + GitHub identity is the tenant's, not the admin's.
+        let tenant_api_key = client
+            .create_api_token(&tenant_user.id, "openflows-tenant")
+            .await
+            .context("Failed to mint tenant-scoped Coder token")?;
+        let tenant_token = tenant_api_key.key.clone();
+        let tenant_client = client
+            .with_token(tenant_token.clone())
+            .with_session_token(&tenant_token);
+
+        // 2. Check the tenant user's GitHub external-auth grant until linked.
+        //    The device flow / status query runs as the tenant user, so each
+        //    tenant links its own GitHub account independently of the admin.
         let coder_url = client.base_url();
         let external_auth_id = self
             .env
@@ -370,7 +436,7 @@ impl CoderBootstrapper {
         let timeout = Duration::from_secs(300);
         let mut link_shown = false;
         loop {
-            match client.get_external_auth(&external_auth_id).await {
+            match tenant_client.get_external_auth(&external_auth_id).await {
                 Ok(auth) if auth.authenticated => {
                     let linked_user = auth
                         .user
@@ -392,8 +458,15 @@ impl CoderBootstrapper {
                                 auth.app_install_url
                             );
                         }
-                        // Kick off a device flow for self-serve linking.
-                        match client.get_external_auth_device(&external_auth_id).await {
+                        // Kick off a device flow for self-serve linking. This
+                        // must run as the *tenant* user so the resulting GitHub
+                        // external-auth grant binds to the tenant's Coder user,
+                        // not the administrator's (the tenant independently
+                        // links its own account).
+                        match tenant_client
+                            .get_external_auth_device(&external_auth_id)
+                            .await
+                        {
                             Ok(device) => {
                                 let target = if !device.verification_uri_complete.is_empty() {
                                     device.verification_uri_complete.clone()
@@ -440,29 +513,46 @@ impl CoderBootstrapper {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
-        // 2. Create the nexus workspace under the session user (admin).
+        // 2. Create the nexus workspace under the tenant user.
         let redis_url = "redis://redis:6379".to_string();
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
         let repo_url = format!("https://github.com/{}.git", github_repo);
 
-        // Re-running `tenant add` for an existing tenant returns the existing
-        // workspace without changing its build parameters (see
-        // create_workspace_for_user 409 handling). Existing workspaces keep
-        // their original `start_controller` value and must be recreated once
-        // to pick up `start_controller=true` (new tenants get it automatically).
-        if let Ok(workspaces) = client.list_workspaces(&admin.id).await {
-            // The listing is deployment-wide, so match both owner and name.
-            if workspaces
-                .iter()
-                .any(|w| w.name == nexus_workspace_name && w.owner_name == admin.username)
-            {
-                println!(
-                    "  ⚠ Tenant workspace '{}' already exists — its build parameters (including fleet) are unchanged. \
-                     Recreate it once to apply `--fleet` / enable the in-workspace controller \
-                     (`start_controller=true`); new tenants get these automatically.",
-                    nexus_workspace_name
-                );
-            }
+        // Resolve the administrator's username so the legacy-workspace migration
+        // only ever deletes workspaces owned by the admin (the pre-tenant-scoped
+        // owner), never a colliding workspace owned by an unrelated user.
+        let admin_username = client
+            .get_me()
+            .await
+            .map(|me| me.username)
+            .unwrap_or_default();
+
+        // Migration: a workspace with this name that predates tenant-scoped
+        // provisioning is owned by the *administrator* and has the admin's
+        // session token + GitHub identity baked into its controller. It must
+        // not be left running (it re-exposes the exact admin-identity
+        // vulnerability this change removes) and must not silently coexist
+        // with a duplicate tenant-owned workspace. Delete it so the tenant-owned
+        // workspace below becomes the single source of truth. Deletion uses the
+        // admin client because the tenant client cannot delete another user's
+        // workspace. Only the administrator's own legacy workspace is deleted —
+        // a colliding workspace owned by an unrelated user is never touched.
+        if let Some(legacy) = workspaces.iter().find(|w| {
+            w.name == nexus_workspace_name
+                && w.owner_name != tenant_user.username
+                && w.owner_name == admin_username
+        }) {
+            println!(
+                "  ⚠ Found a pre-existing '{}' workspace owned by '{}' (not the tenant '{}'). \
+                 This legacy workspace runs under the administrator's identity/session token. \
+                 Deleting it before recreating under the tenant's own identity.",
+                nexus_workspace_name, legacy.owner_name, tenant_user.username
+            );
+            client.delete_workspace(&legacy.id).await.with_context(|| {
+                format!(
+                    "Failed to delete legacy admin-owned workspace '{}' for tenant '{}'",
+                    legacy.id, tenant_name
+                )
+            })?;
         }
 
         let hook_secret = self
@@ -486,9 +576,9 @@ impl CoderBootstrapper {
                     .and_then(|c| c.hooks.chat_hook_url_effective())
             })
             .unwrap_or_default();
-        let workspace = client
+        let workspace = tenant_client
             .create_workspace_for_user(
-                &admin.id,
+                &tenant_user.id,
                 &CreateWorkspaceRequest {
                     template_name: "openflows-nexus".to_string(),
                     name: nexus_workspace_name.clone(),
@@ -496,19 +586,20 @@ impl CoderBootstrapper {
                         "repo_url": repo_url,
                         "redis_url": redis_url,
                         "coder_url": coder_url,
-                        "coder_session_token": client.session_token(),
+                        "coder_session_token": tenant_client.session_token(),
                         "tenant": tenant_name,
                         "github_repository": github_repo,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
                         "registry_json": registry_json,
+                        "external_auth_id": external_auth_id,
                         "start_controller": true,
                     }),
                 },
             )
             .await?;
 
-        client
+        tenant_client
             .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
             .await?;
 
@@ -516,6 +607,7 @@ impl CoderBootstrapper {
             workspace_id = %workspace.id,
             workspace_name = %workspace.name,
             tenant = tenant_name,
+            owner = %tenant_user.username,
             "  ✓ Tenant nexus workspace created"
         );
 

@@ -46,6 +46,12 @@ variable "harness_version" {
   description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
 }
 
+variable "external_auth_id" {
+  type        = string
+  default     = "primary-github"
+  description = "Coder external-auth provider id (CODER_EXTERNAL_AUTH_0_ID) that the tenant linked for GitHub; drives the injected CODER_EXTERNAL_AUTH_<ID>_ACCESS_TOKEN env var"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -187,7 +193,10 @@ resource "docker_container" "workspace" {
     # Lore resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the tenant
     # owner's linked GitHub App token). Export it here — Coder only injects the
     # provider token into `git` via GIT_ASKPASS, not as a general env var.
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
+    # The env var name is derived from the configured external-auth id
+    # (CODER_EXTERNAL_AUTH_0_ID) so a custom provider id works at runtime.
+    "CODER_EXTERNAL_AUTH_0_ID=${var.external_auth_id}",
+    "CODER_EXTERNAL_AUTH_${replace(replace(upper(var.external_auth_id), "-", "_"), ".", "_")}_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
   ]
 
   # egress allowlist: Coder control plane + github.com + Redis only
@@ -203,5 +212,5 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = "primary-github"
+  id = var.external_auth_id
 }
