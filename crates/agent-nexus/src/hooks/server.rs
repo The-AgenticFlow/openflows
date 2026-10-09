@@ -742,73 +742,99 @@ fn invokes_coder_lifecycle(cmd: &str) -> bool {
 /// whether each token starts a fresh command. Handles quotes and separators
 /// that fall inside a quoted argument (e.g. `sh -c 'coder start ws'`).
 ///
-/// Every shell separator (`; && || | ( ) { } \``) introduces a fresh command
-/// boundary — including one **embedded inside a whitespace-delimited token**
-/// with no surrounding whitespace. This closes the P1 "Separator Attached to
-/// Previous Token" hole: `echo ok; coder start ws`, `cd /tmp;coder start ws`,
-/// `true&&coder stop ws`, and `echo hi|coder delete ws` all surface a `coder`
-/// token at a real command boundary instead of slipping past the guard.
+/// Outside quotes, every shell control operator (`; && || | ( ) { } \``)
+/// introduces a fresh command boundary — including one **embedded inside a
+/// whitespace-delimited token** with no surrounding whitespace. This closes the
+/// P1 "Separator Attached to Previous Token" hole: `echo ok; coder start ws`,
+/// `cd /tmp;coder start ws`, `true&&coder stop ws`, and `echo hi|coder delete ws`
+/// all surface a `coder` token at a real command boundary instead of slipping
+/// past the guard.
+///
+/// Control operators **inside a quoted argument are literal** (P2 "Quoted
+/// examples get blocked"): `echo 'example;coder delete ws'` keeps `example;coder`
+/// as a single token rather than fabricating a `coder` command boundary, so
+/// harmless examples and commit messages are not denied. Whitespace still splits
+/// words inside quotes so `sh -c 'coder start ws'` exposes `coder` as a token
+/// that the boundary logic below can recognise.
 fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
-    const SEPARATORS: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
+    const CONTROL: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
     let mut tokens: Vec<(String, bool)> = Vec::new();
     let mut at_start = true;
-    for part in cmd.split(char::is_whitespace) {
-        if part.is_empty() {
+    let mut cur = String::new();
+    let mut has_cur = false;
+    let mut quote: Option<char> = None;
+
+    for c in cmd.chars() {
+        if let Some(q) = quote {
+            // Inside a quote: control operators are literal, whitespace still
+            // splits words, and the closing quote returns to normal parsing.
+            if c == q {
+                quote = None;
+                continue;
+            }
+            if c.is_whitespace() {
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                    at_start = false;
+                }
+            } else {
+                cur.push(c);
+                has_cur = true;
+            }
             continue;
         }
-        // Walk `part`, splitting it into segments at each separator character.
-        // A segment preceded by a separator (or by the start of a fresh
-        // command) is pushed with `boundary = true`.
-        let mut rest = part;
-        let mut boundary = at_start;
-        loop {
-            let split_at = rest.find(|c: char| SEPARATORS.contains(&c));
-            let (segment, sep_after) = match split_at {
-                Some(idx) => (&rest[..idx], true),
-                None => (rest, false),
-            };
-            let segment = segment.trim_matches(&['\'', '"', '`'][..]);
-            if !segment.is_empty() {
-                tokens.push((segment.to_string(), boundary));
-                boundary = false;
+        match c {
+            '\'' | '"' => quote = Some(c),
+            c if c.is_whitespace() => {
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                    at_start = false;
+                }
             }
-            if !sep_after {
-                break;
+            c if CONTROL.contains(&c) => {
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                }
+                at_start = true;
             }
-            // Consume the separator run; the following segment starts a fresh
-            // command.
-            let sep_start = split_at.unwrap();
-            let sep_end = rest[sep_start..]
-                .find(|c: char| !SEPARATORS.contains(&c))
-                .map(|i| sep_start + i)
-                .unwrap_or(rest.len());
-            rest = &rest[sep_end..];
-            boundary = true;
-            if rest.is_empty() {
-                break;
+            _ => {
+                cur.push(c);
+                has_cur = true;
             }
         }
-        // The next whitespace-delimited part starts a fresh command only if
-        // this part ended with a separator.
-        at_start = boundary;
+    }
+    if has_cur {
+        tokens.push((cur, at_start));
     }
     tokens
 }
 
 /// True when `tokens[i]` begins a command: it is the first token, it followed
-/// a separator, or it followed a `sudo` prefix, a shell-wrapper `-c`, or a
-/// standard forwarding wrapper (`command`, `env`, `exec`, ...). Treating
-/// wrappers as boundary introducers closes the hole where `command coder
-/// delete ws` / `env coder stop ws` / `exec coder delete ws` bypassed the
-/// lifecycle guard (P1: "Wrapper-Wrapped Invocations").
+/// a control operator, or it is the command word reached through a `sudo`
+/// prefix, a shell-wrapper `-c`, or a standard forwarding wrapper (`command`,
+/// `env`, `exec`, ...). Treating wrappers as boundary introducers closes the
+/// hole where `command coder delete ws` / `env coder stop ws` / `exec coder
+/// delete ws` bypassed the lifecycle guard (P1: "Wrapper-Wrapped Invocations").
 ///
-/// A wrapper may carry its own arguments before the wrapped command
-/// (`env KEY=value coder …`, `command -p coder …`, `exec -a name coder …`), so
-/// the look-back walks backward over argument-like tokens (flags, `VAR=value`
-/// assignments, and a flag's value) to reach the wrapper. `command -v/-V coder`
-/// is a *lookup* (prints the binary path), not an invocation, and is never a
-/// boundary.
+/// A wrapper may carry any number of its own arguments before the wrapped
+/// command (`env A=1 B=2 C=3 D=4 E=5 coder …`, `command -p coder …`, `exec -a
+/// name coder …`), so the look-back walks backward over argument-like tokens
+/// (flags, `VAR=value` assignments, and a flag's value) **until the actual
+/// command word is reached** rather than stopping after a fixed token count
+/// (P1 "Wrapper arguments bypass the guard").
+///
+/// The wrapper word must itself sit at a real command boundary; otherwise it is
+/// merely text passed to an earlier command and must not create a boundary (P2
+/// "Harmless wrapper examples get blocked"): `echo "command coder delete ws"`
+/// only prints an example and is allowed. `command -v/-V coder` is a *lookup*
+/// (prints the binary path), not an invocation, and is never a boundary.
 const FORWARDING_BOUNDARY_WRAPPERS: &[&str] = &["command", "env", "exec", "sudo", "su"];
+
+/// Shells whose `-c` treats the next word as the command string.
+const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool) -> bool {
     if at_start {
@@ -817,55 +843,54 @@ fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool
     if i == 0 {
         return false;
     }
-    // Walk backward from `coder` over argument-like tokens to find a
-    // forwarding wrapper or `-c`. The look-back is bounded so we never walk
-    // across an entire unrelated command.
+    // Walk backward from `coder` over argument-like tokens (flags, `VAR=value`
+    // assignments, and a flag's value) to reach the wrapper or shell word. The
+    // walk stops at the actual command word, so there is no fixed look-back
+    // bound that a long argument list could exhaust.
     let mut j = i - 1;
-    let mut looked = 0usize;
     let mut saw_lookup_flag = false; // `command -v/-V` → lookup, not invocation
-    while j > 0 && looked < 4 {
-        let prev = tokens[j].0.as_str();
-        // `-c` is the shell-wrapper boundary (`sh -c 'coder …'`): the command
-        // that follows it is at a real command boundary, never consumed as a
-        // generic flag.
-        if prev == "-c" {
-            return true;
+    while j > 0 && is_wrapper_argument(tokens, j) {
+        if tokens[j].0 == "-v" || tokens[j].0 == "-V" {
+            saw_lookup_flag = true;
         }
-        if prev.starts_with('-') {
-            if prev == "-v" || prev == "-V" {
-                saw_lookup_flag = true;
-            }
-            j -= 1;
-            looked += 1;
-            continue;
-        }
-        if prev.contains('=') {
-            j -= 1;
-            looked += 1;
-            continue;
-        }
-        // A bare value may be the argument consumed by a preceding flag
-        // (e.g. `exec -a name coder`). Skip it only if the token before it is
-        // a flag, so an ordinary command word is not mistaken for a wrapper arg.
-        if j > 0 && tokens[j - 1].0.starts_with('-') {
-            j -= 1;
-            looked += 1;
-            continue;
-        }
-        break;
+        j -= 1;
     }
-    if let Some(prev) = tokens.get(j) {
-        let name = prev.0.as_str();
-        if name == "-c" || FORWARDING_BOUNDARY_WRAPPERS.contains(&name) {
-            // `command -v/-V coder` resolves the binary path; it does not
-            // invoke a lifecycle subcommand.
-            if name == "command" && saw_lookup_flag {
-                return false;
-            }
-            return true;
+    let word = &tokens[j].0;
+    if word == "-c" {
+        // `sh -c '<cmd>'` / `bash -c '<cmd>'`: the command after `-c` is at a
+        // real boundary, provided the `-c` belongs to a shell.
+        return j > 0 && SHELL_WRAPPERS.contains(&tokens[j - 1].0.as_str());
+    }
+    if FORWARDING_BOUNDARY_WRAPPERS.contains(&word.as_str()) {
+        // `command -v/-V coder` resolves the binary path; it does not invoke a
+        // lifecycle subcommand.
+        if word == "command" && saw_lookup_flag {
+            return false;
         }
+        // Only a genuine wrapper when it is itself at a real command boundary —
+        // otherwise it is text passed to an earlier command (`echo "command
+        // coder …"`). The wrapper's own boundary is its tokenization flag.
+        return token_at_command_boundary(tokens, j, tokens[j].1);
     }
     false
+}
+
+/// True when `tokens[j]` is an argument consumed by the wrapper/shell that
+/// precedes it (a `VAR=value` assignment, a flag, or a bare value taken by a
+/// preceding flag), so the backward boundary walk can skip over it. `-c` is
+/// special and is never skipped: the boundary logic treats it as a real
+/// command introducer.
+fn is_wrapper_argument(tokens: &[(String, bool)], j: usize) -> bool {
+    let w = &tokens[j].0;
+    if w == "-c" {
+        return false;
+    }
+    if w.contains('=') || w.starts_with('-') {
+        return true;
+    }
+    // A bare value may be the argument consumed by a preceding flag
+    // (e.g. `exec -a name coder`, `sudo -u admin coder`).
+    j > 0 && tokens[j - 1].0.starts_with('-')
 }
 
 /// True when `tok` names the `coder` CLI binary (`coder`, `sudo coder`,
@@ -1210,6 +1235,11 @@ mod tests {
             "command -p coder delete ws",
             "exec -a myname coder delete ws",
             "sudo -u admin coder stop my-ws",
+            // P1: wrapper arguments beyond the old four-token look-back must
+            // still be caught (Review "Wrapper arguments bypass the guard").
+            "env A=1 B=2 C=3 D=4 E=5 coder delete ws",
+            "env A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 I=9 J=10 coder stop my-ws",
+            "sudo -u alice -g sudo -H env K=V L=W coder delete ws",
         ] {
             assert!(
                 invokes_coder_lifecycle(cmd),
@@ -1236,6 +1266,19 @@ mod tests {
             // create a boundary.
             "git commit -m \"coder start ws\"",
             "some-tool --help coder",
+            // P2: control operators inside a quoted argument are literal and
+            // must not fabricate a coder command (Review "Quoted examples get
+            // blocked").
+            "echo 'example;coder delete ws'",
+            "git commit -m 'fix: example;coder delete ws'",
+            "echo \"result;coder start ws\" > notes.txt",
+            // P2: a wrapper word that is itself just text passed to another
+            // command must not create a boundary (Review "Harmless wrapper
+            // examples get blocked").
+            "echo \"command coder delete ws\"",
+            "echo 'env coder stop my-ws'",
+            "printf '%s\\n' \"exec coder delete ws\"",
+            "grep -r 'command coder stop' docs/",
         ] {
             assert!(
                 !invokes_coder_lifecycle(cmd),

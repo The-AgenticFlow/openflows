@@ -40,10 +40,12 @@ variable "harness_version" {
   description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
 }
 
-variable "external_auth_id" {
-  type        = string
-  default     = "primary-github"
+data "coder_parameter" "external_auth_id" {
+  name        = "external_auth_id"
   description = "Coder external-auth provider id (CODER_EXTERNAL_AUTH_0_ID) that the tenant linked for GitHub; drives the injected CODER_EXTERNAL_AUTH_<ID>_ACCESS_TOKEN env var"
+  default     = "primary-github"
+  type        = "string"
+  mutable     = false
 }
 
 resource "coder_agent" "main" {
@@ -188,8 +190,8 @@ resource "docker_container" "workspace" {
     # provider token into `git` via GIT_ASKPASS, not as a general env var.
     # The env var name is derived from the configured external-auth id
     # (CODER_EXTERNAL_AUTH_0_ID) so a custom provider id works at runtime.
-    "CODER_EXTERNAL_AUTH_0_ID=${var.external_auth_id}",
-    "CODER_EXTERNAL_AUTH_${replace(replace(upper(var.external_auth_id), "-", "_"), ".", "_")}_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
+    "CODER_EXTERNAL_AUTH_0_ID=${data.coder_parameter.external_auth_id.value}",
+    "CODER_EXTERNAL_AUTH_${replace(replace(upper(data.coder_parameter.external_auth_id.value), "-", "_"), ".", "_")}_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
   ]
 
   # egress allowlist: Coder control plane + github.com + Redis only
@@ -205,5 +207,5 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = var.external_auth_id
+  id = data.coder_parameter.external_auth_id.value
 }

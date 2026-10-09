@@ -297,6 +297,11 @@ pub struct CoderApiKey {
     pub name: String,
     #[serde(default)]
     pub key: String,
+    /// RFC3339 expiry of the token, when the server reports one. Used to detect
+    /// when a tenant's baked-in controller token is nearing its 7-day expiry so
+    /// it can be renewed before the running controller loses Coder access.
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 // ── Chats API types (Phase 3) ─────────────────────────────────────────────

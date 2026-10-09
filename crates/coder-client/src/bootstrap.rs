@@ -41,6 +41,123 @@ fn password_meets_coder_requirements(password: &str) -> bool {
     has_uppercase && has_lowercase && has_digit && has_special
 }
 
+/// Build a collision-free, deterministic Coder username for a tenant.
+///
+/// Lowercasing and `-`/`.` normalization alone is not injective: `Acme` and
+/// `acme` (or `my.tenant` and `my-tenant`) would collide on the same account,
+/// letting one tenant's `create_user` reuse the other's Coder identity and
+/// revoke its live API token (P1 "Tenant names share credentials"). Appending a
+/// short SHA-256 prefix of the raw tenant name keeps the name deterministic for
+/// a given tenant while guaranteeing two distinct tenant names never map to the
+/// same account.
+fn tenant_username(tenant_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tenant_name.as_bytes());
+    let digest = hex_encode(&hasher.finalize());
+    let slug = tenant_name.to_lowercase().replace('.', "-");
+    format!("tenant-{slug}-{}", &digest[..8])
+}
+
+/// Resolve the Coder username for a tenant, preferring the legacy
+/// `tenant-<slug>` account created before collision-free naming, and falling
+/// back to the collision-free `tenant-<slug>-<hash>` form for new tenants.
+///
+/// This keeps already-provisioned tenants on their existing account (so an
+/// upgrade does not silently orphan or recreate their workspace) while still
+/// preventing two distinct tenant names from ever sharing an account.
+async fn resolve_tenant_username(client: &CoderClient, tenant_name: &str) -> String {
+    let legacy = format!("tenant-{}", tenant_name.to_lowercase().replace('.', "-"));
+    if let Ok(users) = client.list_users().await {
+        if users.iter().any(|u| u.username == legacy) {
+            return legacy;
+        }
+    }
+    tenant_username(tenant_name)
+}
+
+/// Parse an RFC3339 timestamp into Unix seconds without pulling in a time
+/// crate (coder-client keeps its dependency surface small). Returns `None` for
+/// unparseable input.
+fn rfc3339_unix(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let date_part = s.get(..10)?;
+    let time_part = s.get(11..19)?;
+    let year: i64 = date_part.get(0..4)?.parse().ok()?;
+    let month: i64 = date_part.get(5..7)?.parse().ok()?;
+    let day: i64 = date_part.get(8..10)?.parse().ok()?;
+    let hour: i64 = time_part.get(0..2)?.parse().ok()?;
+    let minute: i64 = time_part.get(3..5)?.parse().ok()?;
+    let sec: i64 = time_part.get(6..8)?.parse().ok()?;
+
+    let is_leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mut days = 0i64;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 0..(month - 1) {
+        let mut dm = month_days[m as usize];
+        if m == 1 && is_leap(year) {
+            dm += 1;
+        }
+        days += dm;
+    }
+    days += day - 1;
+
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + sec;
+
+    // Timezone offset: `Z`/empty means UTC, otherwise ±HH:MM.
+    let rest = s.get(19..).unwrap_or("");
+    let offset_secs = if rest.starts_with('Z') || rest.is_empty() {
+        0
+    } else if let Some(sign) = rest.chars().next().and_then(|c| match c {
+        '+' => Some(1i64),
+        '-' => Some(-1i64),
+        _ => None,
+    }) {
+        let oh: i64 = rest.get(1..3)?.parse().ok()?;
+        let om: i64 = rest.get(4..6)?.parse().ok()?;
+        sign * (oh * 3_600 + om * 60)
+    } else {
+        0
+    };
+
+    Some(secs - offset_secs)
+}
+
+/// True when the tenant's current `openflows-tenant` API token is near expiry
+/// and its workspace should be rebuilt so the baked-in controller token is
+/// refreshed before the old one lapses (P1 "Controllers lose access weekly").
+async fn token_expiring_soon(client: &CoderClient, user_id: &str, name: &str) -> bool {
+    let Ok(tokens) = client.list_api_tokens(user_id).await else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for token in tokens {
+        let is_tenant_token = token.name == name
+            || token
+                .name
+                .strip_prefix(name)
+                .map(|r| r.starts_with('-'))
+                .unwrap_or(false);
+        if !is_tenant_token {
+            continue;
+        }
+        let Some(expires) = token.expires_at.as_deref().and_then(rfc3339_unix) else {
+            continue;
+        };
+        // Renew when the token lapses within the next 48 hours of its 7-day life.
+        if expires.saturating_sub(now) < 48 * 3_600 {
+            return true;
+        }
+    }
+    false
+}
+
 impl CoderBootstrapper {
     /// Create a bootstrapper from environment variables.
     ///
@@ -348,9 +465,18 @@ impl CoderBootstrapper {
     ///
     /// Re-running for an existing tenant-owned workspace returns that workspace
     /// immediately (without rotating its token — rotation would revoke the token
-    /// baked into the live controller while the workspace is not rebuilt). To
-    /// apply new build parameters (e.g. `--fleet`) or rotate the token, delete
-    /// the workspace and re-run.
+    /// baked into the live controller while the workspace is not rebuilt), unless
+    /// the tenant's controller token is near its 7-day expiry, in which case the
+    /// workspace is rebuilt so the running controller receives a fresh token. To
+    /// apply new build parameters (e.g. `--fleet`) or force a token rotation,
+    /// delete the workspace and re-run.
+    ///
+    /// Tenant usernames are collision-free (a SHA-256 suffix disambiguates names
+    /// that normalize identically, e.g. `Acme` vs `acme`), and a workspace-name
+    /// collision owned by another tenant is rejected before any credential is
+    /// minted, so two tenant names never share a Coder account, GitHub grant, or
+    /// workspace. A failure to list workspaces aborts provisioning instead of
+    /// being treated as an empty deployment.
     pub async fn ensure_tenant(
         &self,
         client: &CoderClient,
@@ -360,29 +486,125 @@ impl CoderBootstrapper {
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
 
-        let tenant_username = format!("tenant-{}", tenant_name.to_lowercase().replace('.', "-"));
+        let tenant_username = resolve_tenant_username(client, tenant_name).await;
         let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+
+        // Resolve the administrator's username up front so the legacy-workspace
+        // migration can be evaluated regardless of which owner we find below.
+        let admin_username = client
+            .get_me()
+            .await
+            .map(|me| me.username)
+            .unwrap_or_default();
 
         // Check up front whether the tenant-owned workspace already exists. The
         // listing is deployment-wide, so we match on both name and owner.
-        let workspaces = match client.list_workspaces(&tenant_username).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                warn!(error = %e, "Could not list workspaces to detect an existing tenant workspace");
-                Vec::new()
-            }
-        };
+        //
+        // A failed listing is treated as a **hard error**, not an empty
+        // deployment: a transient API error must never skip the reuse guard and
+        // rotate the token of a live workspace (P1 "Reruns revoke live tokens").
+        let workspaces = client
+            .list_workspaces(&tenant_username)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to list workspaces to detect an existing tenant workspace for '{tenant_name}'"
+                )
+            })?;
 
-        // If the tenant-owned workspace already exists, reuse it **without**
-        // rotating its token. Rotating would revoke the token currently baked
-        // into the live workspace's controller (`create_api_token` revokes
-        // stale tokens before minting a fresh one) while the workspace is not
-        // rebuilt, breaking that controller. The operator recreates the
-        // workspace (delete + re-run) to pick up new build parameters / token.
+        // Migration: a workspace with this name that predates tenant-scoped
+        // provisioning is owned by the *administrator* and has the admin's
+        // session token + GitHub identity baked into its controller. It must
+        // not be left running (it re-exposes the exact admin-identity
+        // vulnerability this change removes) and must not silently coexist
+        // with a duplicate tenant-owned workspace. Delete it **before** the
+        // tenant reuse return so a tenant-owned workspace can never shadow a
+        // leftover admin-owned controller (P1 "Legacy controllers escape
+        // cleanup"). Deletion uses the admin client because the tenant client
+        // cannot delete another user's workspace. Only the administrator's own
+        // legacy workspace is deleted — a colliding workspace owned by an
+        // unrelated user is rejected below, never touched.
+        if let Some(legacy) = workspaces.iter().find(|w| {
+            w.name == nexus_workspace_name
+                && w.owner_name != tenant_username
+                && w.owner_name == admin_username
+        }) {
+            println!(
+                "  ⚠ Found a pre-existing '{}' workspace owned by '{}' (not the tenant '{}'). \
+                 This legacy workspace runs under the administrator's identity/session token. \
+                 Deleting it before recreating under the tenant's own identity.",
+                nexus_workspace_name, legacy.owner_name, tenant_username
+            );
+            client.delete_workspace(&legacy.id).await.with_context(|| {
+                format!(
+                    "Failed to delete legacy admin-owned workspace '{}' for tenant '{}'",
+                    legacy.id, tenant_name
+                )
+            })?;
+        }
+
+        // Reject a workspace-name collision owned by a *different* tenant. Two
+        // distinct tenant names (e.g. `Acme` and `acme`) can normalize to the
+        // same `openflows-nexus-<slug>` workspace name; matching on owner means
+        // neither would match the other, but creating the same name would then
+        // return the other tenant's workspace via the 409 lookup. Fail loudly
+        // **before minting credentials** so tenant identities and GitHub grants
+        // are never shared (P1 "Tenant names share credentials").
+        if let Some(other) = workspaces.iter().find(|w| {
+            w.name == nexus_workspace_name
+                && w.owner_name != tenant_username
+                && w.owner_name != admin_username
+        }) {
+            anyhow::bail!(
+                "Tenant workspace name '{}' is already owned by another tenant ('{}'). \
+                 Choose a distinct tenant name; the normalized workspace name must be unique.",
+                nexus_workspace_name, other.owner_name
+            );
+        }
+
+        // If the tenant-owned workspace already exists, reuse it — but renew its
+        // controller token when it is near expiry so the running controller does
+        // not lose Coder access (P1 "Controllers lose access weekly"). Reuse
+        // otherwise leaves the token untouched (rotation would revoke the token
+        // currently baked into the live controller while it is not rebuilt).
         if let Some(existing) = workspaces
             .iter()
             .find(|w| w.name == nexus_workspace_name && w.owner_name == tenant_username)
         {
+            // Resolve the tenant user (idempotent) to inspect its token.
+            let tenant_email = format!("{tenant_username}@openflows.local");
+            let tenant_user = client
+                .create_user(&tenant_email, &tenant_username)
+                .await
+                .with_context(|| {
+                    format!("Failed to resolve tenant Coder user for '{tenant_name}'")
+                })?
+                .0;
+
+            if token_expiring_soon(client, &tenant_user.id, "openflows-tenant").await {
+                println!(
+                    "  ⚠ Tenant '{}' controller token is near expiry — rebuilding the workspace to bake in a fresh token",
+                    tenant_name
+                );
+                client.delete_workspace(&existing.id).await.with_context(|| {
+                    format!(
+                        "Failed to delete expiring-token workspace '{}' for tenant '{}'",
+                        existing.id, tenant_name
+                    )
+                })?;
+                // Fall through to the fresh-provision path below with the
+                // already-resolved tenant user.
+                return self
+                    .provision_nexus_workspace(
+                        client,
+                        tenant_name,
+                        &tenant_user,
+                        github_repo,
+                        registry_json,
+                    )
+                    .await;
+            }
+
             println!(
                 "  ⚠ Tenant workspace '{}' already exists (owner: '{}') — its build parameters (including fleet) are unchanged. \
                  Recreate it once to apply `--fleet` / enable the in-workspace controller \
@@ -396,7 +618,7 @@ impl CoderBootstrapper {
         //    can create users and mint tokens for any user, so each tenant gets
         //    an isolated Coder identity instead of reusing the admin's.
         let tenant_email = format!("{tenant_username}@openflows.local");
-        let tenant_user = client
+        let (tenant_user, tenant_password) = client
             .create_user(&tenant_email, &tenant_username)
             .await
             .with_context(|| {
@@ -406,6 +628,42 @@ impl CoderBootstrapper {
             "  ✓ Tenant Coder user '{}' (id: {}) resolved",
             tenant_user.username, tenant_user.id
         );
+
+        // Present the tenant's own sign-in credentials so they can complete
+        // their GitHub external-auth link as themselves, not as the operator.
+        // Without this, a password-only account with no sign-in path leaves the
+        // tenant unable to link, and the dashboard fallback would open under the
+        // operator's account (P1 "New tenants cannot sign in").
+        if !tenant_password.is_empty() {
+            eprintln!();
+            eprintln!("  ─── New tenant Coder account ───");
+            eprintln!("  Username: {}", tenant_user.username);
+            eprintln!("  Email:    {}", tenant_email);
+            eprintln!("  Password: {}", tenant_password);
+            eprintln!(
+                "  Sign in at {} as this tenant to link GitHub. The password is shown only now; \
+                 hand it to the tenant operator and have them rotate it after linking.",
+                client.base_url()
+            );
+            eprintln!();
+        }
+
+        self.provision_nexus_workspace(client, tenant_name, &tenant_user, github_repo, registry_json)
+            .await
+    }
+
+    /// Mint the tenant-scoped token, wait for the tenant's own GitHub
+    /// external-auth grant, and create the tenant's Nexus workspace. Shared by
+    /// the fresh-tenant path and the near-expiry renewal path.
+    async fn provision_nexus_workspace(
+        &self,
+        client: &CoderClient,
+        tenant_name: &str,
+        tenant_user: &crate::CoderUser,
+        github_repo: &str,
+        registry_json: &str,
+    ) -> Result<String> {
+        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
 
         // 1. Mint a tenant-scoped API token for that user. The nexus controller
         //    and worker workspaces run under this token (CODER_SESSION_TOKEN),
@@ -482,7 +740,8 @@ impl CoderBootstrapper {
                             }
                             Err(_) => {
                                 eprintln!(
-                                    "    2. Complete the link in the dashboard: {}/external-auth/{}",
+                                    "    2. Sign in as the tenant at {}/login and complete the link in the dashboard: {}/external-auth/{}",
+                                    coder_url.trim_end_matches('/'),
                                     coder_url.trim_end_matches('/'),
                                     external_auth_id
                                 );
@@ -513,47 +772,9 @@ impl CoderBootstrapper {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
-        // 2. Create the nexus workspace under the tenant user.
+        // 3. Create the nexus workspace under the tenant user.
         let redis_url = "redis://redis:6379".to_string();
         let repo_url = format!("https://github.com/{}.git", github_repo);
-
-        // Resolve the administrator's username so the legacy-workspace migration
-        // only ever deletes workspaces owned by the admin (the pre-tenant-scoped
-        // owner), never a colliding workspace owned by an unrelated user.
-        let admin_username = client
-            .get_me()
-            .await
-            .map(|me| me.username)
-            .unwrap_or_default();
-
-        // Migration: a workspace with this name that predates tenant-scoped
-        // provisioning is owned by the *administrator* and has the admin's
-        // session token + GitHub identity baked into its controller. It must
-        // not be left running (it re-exposes the exact admin-identity
-        // vulnerability this change removes) and must not silently coexist
-        // with a duplicate tenant-owned workspace. Delete it so the tenant-owned
-        // workspace below becomes the single source of truth. Deletion uses the
-        // admin client because the tenant client cannot delete another user's
-        // workspace. Only the administrator's own legacy workspace is deleted —
-        // a colliding workspace owned by an unrelated user is never touched.
-        if let Some(legacy) = workspaces.iter().find(|w| {
-            w.name == nexus_workspace_name
-                && w.owner_name != tenant_user.username
-                && w.owner_name == admin_username
-        }) {
-            println!(
-                "  ⚠ Found a pre-existing '{}' workspace owned by '{}' (not the tenant '{}'). \
-                 This legacy workspace runs under the administrator's identity/session token. \
-                 Deleting it before recreating under the tenant's own identity.",
-                nexus_workspace_name, legacy.owner_name, tenant_user.username
-            );
-            client.delete_workspace(&legacy.id).await.with_context(|| {
-                format!(
-                    "Failed to delete legacy admin-owned workspace '{}' for tenant '{}'",
-                    legacy.id, tenant_name
-                )
-            })?;
-        }
 
         let hook_secret = self
             .env
@@ -735,5 +956,35 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             warn!("  ⚠ Template '{}' push failed: {}", name, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_parser_handles_utc_and_offsets() {
+        assert_eq!(rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_unix("1970-01-02T00:00:00Z"), Some(86_400));
+        // Fractional seconds are tolerated.
+        assert_eq!(rfc3339_unix("1970-01-01T00:00:00.123Z"), Some(0));
+        // A +02:00 offset is 2h behind UTC.
+        assert_eq!(rfc3339_unix("1970-01-01T02:00:00+02:00"), Some(0));
+        // A -05:00 offset is 5h ahead of UTC.
+        assert_eq!(rfc3339_unix("1970-01-01T00:00:00-05:00"), Some(5 * 3_600));
+        // Unparseable input yields None rather than panicking.
+        assert_eq!(rfc3339_unix("not-a-date"), None);
+    }
+
+    #[test]
+    fn tenant_usernames_are_collision_free() {
+        // Distinct tenant names that normalize identically must map to distinct
+        // accounts so they never share a Coder identity or GitHub grant.
+        assert_ne!(tenant_username("Acme"), tenant_username("acme"));
+        assert_ne!(tenant_username("my.tenant"), tenant_username("my-tenant"));
+        assert_ne!(tenant_username("Alpha"), tenant_username("alpha"));
+        // A given tenant name maps deterministically.
+        assert_eq!(tenant_username("acme"), tenant_username("acme"));
     }
 }
