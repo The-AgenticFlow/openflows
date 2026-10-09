@@ -78,7 +78,7 @@ async fn resolve_tenant_username(client: &CoderClient, tenant_name: &str) -> Str
 
 /// Parse an RFC3339 timestamp into Unix seconds without pulling in a time
 /// crate (coder-client keeps its dependency surface small). Returns `None` for
-/// unparseable input.
+/// unparsable input.
 fn rfc3339_unix(s: &str) -> Option<i64> {
     let s = s.trim();
     let date_part = s.get(..10)?;
@@ -558,7 +558,8 @@ impl CoderBootstrapper {
             anyhow::bail!(
                 "Tenant workspace name '{}' is already owned by another tenant ('{}'). \
                  Choose a distinct tenant name; the normalized workspace name must be unique.",
-                nexus_workspace_name, other.owner_name
+                nexus_workspace_name,
+                other.owner_name
             );
         }
 
@@ -586,12 +587,15 @@ impl CoderBootstrapper {
                     "  ⚠ Tenant '{}' controller token is near expiry — rebuilding the workspace to bake in a fresh token",
                     tenant_name
                 );
-                client.delete_workspace(&existing.id).await.with_context(|| {
-                    format!(
-                        "Failed to delete expiring-token workspace '{}' for tenant '{}'",
-                        existing.id, tenant_name
-                    )
-                })?;
+                client
+                    .delete_workspace(&existing.id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to delete expiring-token workspace '{}' for tenant '{}'",
+                            existing.id, tenant_name
+                        )
+                    })?;
                 // Fall through to the fresh-provision path below with the
                 // already-resolved tenant user.
                 return self
@@ -648,8 +652,14 @@ impl CoderBootstrapper {
             eprintln!();
         }
 
-        self.provision_nexus_workspace(client, tenant_name, &tenant_user, github_repo, registry_json)
-            .await
+        self.provision_nexus_workspace(
+            client,
+            tenant_name,
+            &tenant_user,
+            github_repo,
+            registry_json,
+        )
+        .await
     }
 
     /// Mint the tenant-scoped token, wait for the tenant's own GitHub
@@ -973,7 +983,7 @@ mod tests {
         assert_eq!(rfc3339_unix("1970-01-01T02:00:00+02:00"), Some(0));
         // A -05:00 offset is 5h ahead of UTC.
         assert_eq!(rfc3339_unix("1970-01-01T00:00:00-05:00"), Some(5 * 3_600));
-        // Unparseable input yields None rather than panicking.
+        // Unparsable input yields None rather than panicking.
         assert_eq!(rfc3339_unix("not-a-date"), None);
     }
 
