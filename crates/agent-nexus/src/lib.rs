@@ -7,6 +7,7 @@ use coder_client::{
 };
 use config::{
     state::{
+        address_review_attempts_key, address_review_dispatched_at_key,
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
@@ -502,20 +503,80 @@ Before significant work, read the relevant skill file to understand the workflow
                     }
 
                     // A PR whose ticket has been escalated to a human must not be
-                    // re-added to automatic processing, even if a stale
-                    // /address_review dispatch marker is still present. VESSEL
-                    // leaves the marker set after exhausting its review attempts,
-                    // so without this guard the next discovery pass would put the
-                    // PR back into the polling loop.
+                    // re-added to automatic processing unless human intervention
+                    // has occurred on GitHub (an approved review or a new commit).
                     let ticket = tickets.iter().find(|t| t.id == *tid);
                     if let Some(ticket) = ticket {
                         if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
+                            // Check if an authorized human has intervened on GitHub:
+                            // 1. An authorized approval on the candidate head commit was submitted on GitHub, OR
+                            // 2. A new commit was pushed to the PR branch.
+                            let reviews = client
+                                .list_pr_reviews(owner, repo_name, pr.number)
+                                .await
+                                .unwrap_or_default();
+                            let is_authorized_head_approval =
+                                github::effective_review_state(&reviews)
+                                    == github::PrReviewState::Approved
+                                    && github::latest_review_per_user(&reviews).into_iter().any(
+                                        |r| {
+                                            r.state_enum() == github::PrReviewState::Approved
+                                                && r.is_authorized_reviewer()
+                                                && (r.commit_id.as_deref() == Some(&pr.head_sha)
+                                                    || r.commit_id.is_none())
+                                        },
+                                    );
+                            let last_sha = store
+                                .get_typed::<String>(&address_review_dispatched_key(pr.number))
+                                .await;
+                            let head_changed =
+                                last_sha.as_deref().is_some_and(|sha| sha != pr.head_sha);
+
+                            if !is_authorized_head_approval && !head_changed {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Skipping re-add of PR for ticket awaiting human intervention"
+                                );
+                                continue;
+                            }
+
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                "Skipping re-add of PR for ticket awaiting human intervention"
+                                is_authorized_head_approval,
+                                head_changed,
+                                "Human intervention detected on PR for ticket previously awaiting human — resuming PR"
                             );
-                            continue;
+
+                            // Reset the /address_review attempts counter now that a human has intervened
+                            store
+                                .set(&address_review_attempts_key(pr.number), json!(0))
+                                .await;
+                            if is_authorized_head_approval {
+                                store.del(&address_review_dispatched_key(pr.number)).await;
+                                store
+                                    .del(&address_review_dispatched_at_key(pr.number))
+                                    .await;
+                            }
+
+                            // Unblock ticket status in KEY_TICKETS so NEXUS active ticket polling and SENTINEL resume
+                            let mut tickets_copy: Vec<Ticket> =
+                                store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                            let mut updated = false;
+                            for t in tickets_copy.iter_mut() {
+                                if t.id == *tid
+                                    && matches!(t.status, TicketStatus::AwaitingHuman { .. })
+                                {
+                                    t.status = TicketStatus::InProgress {
+                                        worker_id: "vessel".to_string(),
+                                    };
+                                    updated = true;
+                                }
+                            }
+                            if updated {
+                                store.set(KEY_TICKETS, json!(tickets_copy)).await;
+                            }
                         }
                     }
 
@@ -1852,15 +1913,16 @@ Use `openflows-harness` for all coordination:
         };
 
         let ticket_count = tickets.len();
-        let active_count = tickets
-            .iter()
-            .filter(|t| {
-                matches!(
-                    &t.status,
-                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
-                )
-            })
-            .count();
+        let is_ticket_active = |t: &Ticket| {
+            matches!(
+                &t.status,
+                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+            ) || matches!(
+                &t.status,
+                TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+            )
+        };
+        let active_count = tickets.iter().filter(|t| is_ticket_active(t)).count();
         info!(
             total = ticket_count,
             active = active_count,
@@ -1871,11 +1933,9 @@ Use `openflows-harness` for all coordination:
             // Check tickets that are currently being worked on.
             // Both Assigned (chat just created) and InProgress (actively working)
             // are active states where FORGE may have set a harness phase.
-            let is_active = matches!(
-                &ticket.status,
-                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
-            );
-            if !is_active {
+            // Tickets with an open PR (Completed { outcome: "pr_opened" }) may also
+            // re-enter testing/plan_ready during PR review rework or CI fix.
+            if !is_ticket_active(ticket) {
                 continue;
             }
 
@@ -2045,8 +2105,25 @@ Use `openflows-harness` for all coordination:
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
                         TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
+                        | TicketStatus::InProgress { worker_id }
+                        | TicketStatus::Completed { worker_id, .. }
+                            if worker_id != "nexus-reconciliation" =>
+                        {
+                            worker_id.clone()
+                        }
+                        _ => live_slots
+                            .iter()
+                            .find(|(id, slot)| {
+                                Self::worker_role(id) == "forge"
+                                    && matches!(
+                                        &slot.status,
+                                        WorkerStatus::Assigned { ticket_id: tid, .. }
+                                            | WorkerStatus::Working { ticket_id: tid, .. }
+                                            if tid == &ticket.id
+                                    )
+                            })
+                            .map(|(id, _)| id.clone())
+                            .unwrap_or_default(),
                     };
                     let sentinel_slot =
                         Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
@@ -2363,8 +2440,25 @@ Use `openflows-harness` for all coordination:
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
                         TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
+                        | TicketStatus::InProgress { worker_id }
+                        | TicketStatus::Completed { worker_id, .. }
+                            if worker_id != "nexus-reconciliation" =>
+                        {
+                            worker_id.clone()
+                        }
+                        _ => live_slots
+                            .iter()
+                            .find(|(id, slot)| {
+                                Self::worker_role(id) == "forge"
+                                    && matches!(
+                                        &slot.status,
+                                        WorkerStatus::Assigned { ticket_id: tid, .. }
+                                            | WorkerStatus::Working { ticket_id: tid, .. }
+                                            if tid == &ticket.id
+                                    )
+                            })
+                            .map(|(id, _)| id.clone())
+                            .unwrap_or_default(),
                     };
                     let sentinel_slot =
                         Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
@@ -6327,6 +6421,75 @@ mod tests {
             create.assert_async().await;
             send.assert_async().await;
         }
+    }
+
+    #[tokio::test]
+    async fn poll_harness_status_scans_reworking_ticket_with_pr_opened_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = server
+            .mock("GET", "/api/v2/organizations")
+            .with_status(200)
+            .with_body(r#"[{"id":"org","name":"default","is_default":true}]"#)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .match_body(mockito::Matcher::Regex("Testing review for T-1".into()))
+            .with_status(201)
+            .with_body(r#"{"id":"review-chat","workspace_id":"ws"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Docs", "body":"Improve README", "priority":0,
+            "status":{"type":"completed","outcome":"pr_opened","worker_id":"nexus-reconciliation"}
+        }))
+        .unwrap();
+        let mut forge_slot = slot(
+            "forge-1",
+            WorkerStatus::Assigned {
+                ticket_id: "T-1".into(),
+                issue_url: None,
+            },
+        );
+        forge_slot.workspace_id = Some("ws-forge".into());
+        let mut reviewer = slot("sentinel-1", WorkerStatus::Idle);
+        reviewer.workspace_id = Some("ws".into());
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({"forge-1": forge_slot, "sentinel-1": reviewer}),
+            )
+            .await;
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Testing,
+            revision: 1,
+            head: Some("head-sha".into()),
+            review_round: 2,
+            version: 3,
+            plan: "# Plan".into(),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        let node = NexusNode::new("missing", "missing");
+        node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+            .await;
+        create.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_chat_key("T-1", "testing:1:head-sha:2"))
+                .await
+                .as_deref(),
+            Some("review-chat")
+        );
     }
 
     #[tokio::test]

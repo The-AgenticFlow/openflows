@@ -277,3 +277,15 @@ pub fn address_review_dispatched_key(pr_number: u64) -> String {
 pub fn address_review_rearmed_key(pr_number: u64) -> String {
     format!("_address_review_rearmed_{}", pr_number)
 }
+
+/// Flat key for the ISO 8601 / RFC 3339 timestamp when VESSEL last dispatched `/address_review`.
+/// Full key: `_address_review_dispatched_at_{pr_number}`
+pub fn address_review_dispatched_at_key(pr_number: u64) -> String {
+    format!("_address_review_dispatched_at_{}", pr_number)
+}
+
+/// Flat key for the number of `/address_review` attempts dispatched for a PR.
+/// Full key: `_address_review_attempts_{pr_number}`
+pub fn address_review_attempts_key(pr_number: u64) -> String {
+    format!("_address_review_attempts_{}", pr_number)
+}

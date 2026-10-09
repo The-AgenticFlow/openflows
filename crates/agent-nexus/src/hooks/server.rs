@@ -771,12 +771,16 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
     // True while the current quote is a shell `-c` command string, so
     // separators inside it are real command boundaries.
     let mut command_string = false;
+    // Track nested quotes inside a command_string (e.g. bash -c 'echo "foo;bar"').
+    // While nested_quote is Some, control operators are literal, not boundaries.
+    let mut nested_quote: Option<char> = None;
 
     for c in cmd.chars() {
         if let Some(q) = quote {
             if c == q {
                 quote = None;
                 command_string = false;
+                nested_quote = None;
                 continue;
             }
             if c.is_whitespace() {
@@ -785,12 +789,20 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
                     has_cur = false;
                     at_start = false;
                 }
-            } else if command_string && CONTROL.contains(&c) {
+            } else if command_string && nested_quote.is_none() && CONTROL.contains(&c) {
                 if has_cur {
                     tokens.push((std::mem::take(&mut cur), at_start));
                     has_cur = false;
                 }
                 at_start = true;
+            } else if c == '\'' || c == '"' {
+                if nested_quote.is_none() {
+                    nested_quote = Some(c);
+                } else if nested_quote == Some(c) {
+                    nested_quote = None;
+                }
+                // Don't push quote chars into cur - shell strips them
+                has_cur = true;
             } else {
                 cur.push(c);
                 has_cur = true;
@@ -799,8 +811,12 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
         }
         match c {
             '\'' | '"' => {
-                // Flush any pending word so the shell-`-c` test sees it.
-                if has_cur {
+                // Preserve adjacent quoted/unquoted parts as one word: the shell
+                // joins `co"der"` into `coder` and `d"elete"` into `delete`, so
+                // splitting them here would hide the real executable/subcommand
+                // (P1 "Quoted words bypass the guard"). Only a pending `-c` is
+                // flushed so the shell-`-c` command-string test can see it.
+                if has_cur && cur == "-c" {
                     tokens.push((std::mem::take(&mut cur), at_start));
                     has_cur = false;
                     at_start = false;
@@ -838,6 +854,11 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
 /// a following quoted argument is that shell's command string. The shell may be
 /// a bare name or a path (`/bin/sh`), optionally carrying shell options between
 /// it and `-c` (`bash -l -c …`).
+///
+/// The shell word must itself start a command; otherwise `-c` is just text
+/// passed to an earlier command (e.g. `echo bash -c 'echo ok;coder delete ws'`
+/// only prints an example) and its argument is a literal, not a command string
+/// (P2 "Printed shell examples get blocked").
 fn quote_follows_shell_c(tokens: &[(String, bool)]) -> bool {
     let n = tokens.len();
     if n < 2 || tokens[n - 1].0 != "-c" {
@@ -848,7 +869,7 @@ fn quote_follows_shell_c(tokens: &[(String, bool)]) -> bool {
     while k > 0 && tokens[k].0.starts_with('-') {
         k -= 1;
     }
-    is_shell_word(&tokens[k].0)
+    is_shell_word(&tokens[k].0) && token_at_command_boundary(tokens, k, tokens[k].1)
 }
 
 /// True when `word` names a shell, either as a bare name or as a path whose
@@ -1353,5 +1374,70 @@ mod tests {
                 "expected benign text NOT to be blocked: {cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_nested_quotes_in_command_string() {
+        // Nested double quotes inside single-quoted command string
+        assert!(!invokes_coder_lifecycle(
+            r#"bash -c 'echo "example;coder delete ws"'"#
+        ));
+        assert!(!invokes_coder_lifecycle(
+            r#"sh -c 'echo "foo;coder stop bar"'"#
+        ));
+
+        // Nested single quotes inside double-quoted command string
+        assert!(!invokes_coder_lifecycle(
+            r#"bash -c "echo 'example;coder delete ws'"#
+        ));
+        assert!(!invokes_coder_lifecycle(
+            r#"sh -c "echo 'foo;coder stop bar'"#
+        ));
+
+        // Multiple nested quotes
+        assert!(!invokes_coder_lifecycle(
+            r#"bash -c 'echo "a;b" && echo "c;coder delete ws"'"#
+        ));
+
+        // Real command boundaries still work inside command_string (not nested)
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo ok; coder delete ws'"#
+        ));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'true && coder stop ws'"#
+        ));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo hi | coder delete ws'"#
+        ));
+
+        // Mixed: nested quotes with real boundaries
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo "safe"; coder delete ws'"#
+        ));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo "safe" && coder stop ws'"#
+        ));
+    }
+
+    #[test]
+    fn test_p1_quoted_word_joining() {
+        // Shell joins adjacent quoted and unquoted parts
+        assert!(invokes_coder_lifecycle(r#"coder d"elete" ws"#));
+        assert!(invokes_coder_lifecycle(r#"coder 'delete' ws"#));
+        assert!(invokes_coder_lifecycle(r#"c"o"d"e"r delete ws"#));
+        assert!(invokes_coder_lifecycle(r#""coder" delete ws"#));
+        assert!(invokes_coder_lifecycle(r#"'coder' delete ws"#));
+
+        // With shell -c
+        assert!(invokes_coder_lifecycle(r#"bash -c 'coder d"elete" ws'"#));
+        assert!(invokes_coder_lifecycle(r#"bash -c 'c"o"d"e"r delete ws'"#));
+        assert!(invokes_coder_lifecycle(r#"sh -c '"coder" delete ws'"#));
+
+        // Benign mentions should not be blocked
+        assert!(!invokes_coder_lifecycle(r#"echo 'coder d"elete" ws'"#));
+        assert!(!invokes_coder_lifecycle(r#"echo "coder d'ete'le ws""#));
+        assert!(!invokes_coder_lifecycle(
+            r#"grep 'coder d"elete" ws' file.txt"#
+        ));
     }
 }
