@@ -9,8 +9,8 @@ use coder_client::CoderClient;
 use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
-        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
-        KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
+        full_ticket_key_flat, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
@@ -41,6 +41,7 @@ pub struct VesselNode {
     client: github::GithubRestClient,
     poller: CiPoller,
     merger: PrMerger,
+    slots_lock: tokio::sync::Mutex<()>,
 }
 
 /// Maximum number of conflict resolution attempts before giving up.
@@ -71,6 +72,7 @@ impl VesselNode {
             merger: PrMerger::new(client.clone(), config.merge_method),
             client,
             config,
+            slots_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -232,72 +234,110 @@ impl VesselNode {
             }
         }
 
+        self.clear_slot_workspace(store, worker_id, workspace_id)
+            .await;
+    }
+
+    /// Atomically clears the workspace ID from worker slots in SharedStore.
+    /// Serialized via `slots_lock` so that concurrent cleanup tasks cannot race on
+    /// reading/modifying/writing `worker_slots` and inadvertently restore stale workspace references.
+    async fn clear_slot_workspace(&self, store: &SharedStore, worker_id: &str, workspace_id: &str) {
+        let _guard = self.slots_lock.lock().await;
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut changed = false;
         if let Some(slot) = slots.get_mut(worker_id) {
             if slot.workspace_id.as_deref() == Some(workspace_id) {
                 slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                changed = true;
             }
+        }
+        for slot in slots.values_mut() {
+            if slot.workspace_id.as_deref() == Some(workspace_id) {
+                slot.workspace_id = None;
+                changed = true;
+            }
+        }
+        if changed {
+            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
     }
 
     /// Destroy a Coder workspace and archive all associated chats.
     /// Called during merge/cleanup to tear down ephemeral workspaces.
+    /// Returns `true` if the workspace was successfully deleted.
     async fn destroy_coder_workspace(
         &self,
         store: &SharedStore,
         worker_id: &str,
         workspace_id: &str,
-    ) {
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            // Archive all chats associated with this workspace
-            let chats = client.list_chats().await.unwrap_or_default();
-            let ws_chats: Vec<_> = chats
-                .iter()
-                .filter(|c| c.workspace_id == workspace_id)
-                .collect();
-
-            let mut archived = 0;
-            for chat in &ws_chats {
-                if client.archive_chat(&chat.id).await.is_ok() {
-                    archived += 1;
-                }
-            }
-
-            if !ws_chats.is_empty() {
-                info!(
+    ) -> bool {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(c) => c,
+            None => {
+                warn!(
+                    worker_id,
                     workspace_id,
-                    archived,
-                    total = ws_chats.len(),
-                    "Archived chats before workspace destruction"
+                    "Coder client unavailable — retaining workspace reference for later cleanup"
                 );
+                return false;
             }
+        };
 
-            // Delete the workspace
-            if let Err(e) = client.delete_workspace(workspace_id).await {
+        // Archive all chats associated with this workspace
+        let chats = client.list_chats().await.unwrap_or_default();
+        let ws_chats: Vec<_> = chats
+            .iter()
+            .filter(|c| c.workspace_id == workspace_id)
+            .collect();
+
+        let mut archived = 0;
+        for chat in &ws_chats {
+            if client.archive_chat(&chat.id).await.is_ok() {
+                archived += 1;
+            }
+        }
+
+        if !ws_chats.is_empty() {
+            info!(
+                workspace_id,
+                archived,
+                total = ws_chats.len(),
+                "Archived chats before workspace destruction"
+            );
+        }
+
+        // Delete the workspace
+        match client.delete_workspace(workspace_id).await {
+            Ok(_) => {
+                info!(worker_id, workspace_id, "Destroyed Coder workspace");
+                self.clear_slot_workspace(store, worker_id, workspace_id)
+                    .await;
+                true
+            }
+            Err(e) => {
                 warn!(
                     worker_id,
                     workspace_id,
                     error = %e,
-                    "Failed to delete Coder workspace"
+                    "Failed to delete Coder workspace — retaining workspace reference for later cleanup"
                 );
-            } else {
-                info!(worker_id, workspace_id, "Destroyed Coder workspace");
-            }
-        }
-
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get_mut(worker_id) {
-            if slot.workspace_id.as_deref() == Some(workspace_id) {
-                slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                false
             }
         }
     }
 
-    /// Stop a Coder workspace for the worker associated with a merged PR.
+    fn resolve_worker_id_from_pr(pr_entry: &Value) -> Option<String> {
+        pr_entry["worker_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                Self::derive_worker_id_from_branch(pr_entry["head_branch"].as_str().unwrap_or(""))
+            })
+    }
+
+    /// Stop Coder workspace(s) for the workers associated with a merged PR.
     async fn stop_coder_workspace_for_pr(
         &self,
         store: &SharedStore,
@@ -311,21 +351,51 @@ impl VesselNode {
             Some(e) => e,
             None => return,
         };
-        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
-        }
+        let target_ticket = pr_entry["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr_entry);
+
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
+        let mut to_stop: Vec<(String, String)> = Vec::new();
+        for (worker_id, slot) in &slots {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
             }
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
+                if let Some(ref ws_id) = slot.workspace_id {
+                    if !to_stop.iter().any(|(_, w)| w == ws_id) {
+                        to_stop.push((worker_id.clone(), ws_id.clone()));
+                    }
+                }
+            }
+        }
+
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    if !to_stop.iter().any(|(_, w)| w == &ws_id) {
+                        let w_id = if role == "sentinel" {
+                            "sentinel".to_string()
+                        } else {
+                            target_worker.as_deref().unwrap_or(role).to_string()
+                        };
+                        to_stop.push((w_id, ws_id));
+                    }
+                }
+            }
+        }
+
+        for (worker_id, ws_id) in to_stop {
+            self.stop_coder_workspace_for_worker(store, &worker_id, &ws_id)
+                .await;
         }
     }
 
-    /// Destroy a Coder workspace for the worker associated with a merged PR.
+    /// Destroy Coder workspace(s) for the workers associated with a merged PR.
     /// Archives all chats and deletes the workspace.
     async fn destroy_coder_workspace_for_pr(
         &self,
@@ -340,17 +410,144 @@ impl VesselNode {
             Some(e) => e,
             None => return,
         };
-        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
-        }
+        let target_ticket = pr_entry["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr_entry);
+
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.destroy_coder_workspace(store, worker_id, ws_id).await;
+        let mut to_destroy: Vec<(String, String, String)> = Vec::new(); // (worker_id, ws_id, role)
+        for (worker_id, slot) in &slots {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
+            }
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
+                if let Some(ref ws_id) = slot.workspace_id {
+                    if !to_destroy.iter().any(|(_, w, _)| w == ws_id) {
+                        let role = Self::worker_role(worker_id).to_string();
+                        to_destroy.push((worker_id.clone(), ws_id.clone(), role));
+                    }
+                }
             }
         }
+
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    if !to_destroy.iter().any(|(_, w, _)| w == &ws_id) {
+                        let w_id = if role == "sentinel" {
+                            "sentinel".to_string()
+                        } else {
+                            target_worker.as_deref().unwrap_or(role).to_string()
+                        };
+                        to_destroy.push((w_id, ws_id, role.to_string()));
+                    }
+                }
+            }
+        }
+
+        for (worker_id, ws_id, role) in to_destroy {
+            if self
+                .destroy_coder_workspace(store, &worker_id, &ws_id)
+                .await
+            {
+                if let Some(tid) = target_ticket {
+                    let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, &role);
+                    if store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id) {
+                        store.del(&ws_key).await;
+                    }
+                }
+            } else if let Some(tid) = target_ticket {
+                // Deletion failed: ensure the workspace ID is preserved in the ticket key
+                // so the undeleted workspace can be cleaned up later by recovery
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, &role);
+                if store.get_typed::<String>(&ws_key).await.is_none() {
+                    store.set(&ws_key, json!(ws_id)).await;
+                }
+            }
+        }
+    }
+
+    /// Scan terminal tickets (Merged, Exhausted, or Completed) and retry deletion for any
+    /// workspaces whose previous deletion attempt failed and whose ID is still
+    /// retained in `full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role)`.
+    /// Runs all candidate deletions concurrently so slow Coder builds do not stack latency.
+    pub async fn cleanup_terminal_ticket_workspaces(&self, store: &SharedStore) {
+        let raw_tickets: Vec<Value> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+
+        let mut to_cleanup = Vec::new();
+
+        for raw_ticket in &raw_tickets {
+            let ticket_id = match raw_ticket["id"].as_str() {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let status_type = raw_ticket["status"]["type"].as_str().unwrap_or("");
+            let is_terminal =
+                match serde_json::from_value::<TicketStatus>(raw_ticket["status"].clone()) {
+                    Ok(status) => status.is_terminal(),
+                    Err(_) => matches!(status_type, "merged" | "exhausted" | "completed"),
+                } || store
+                    .lifecycle(ticket_id)
+                    .await
+                    .ok()
+                    .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
+
+            if !is_terminal {
+                continue;
+            }
+
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    let target_worker = slots
+                        .iter()
+                        .find(|(_, s)| s.workspace_id.as_deref() == Some(&ws_id))
+                        .map(|(w, _)| w.as_str())
+                        .unwrap_or(role);
+
+                    to_cleanup.push((
+                        ticket_id.to_string(),
+                        role.to_string(),
+                        target_worker.to_string(),
+                        ws_id,
+                        ws_key,
+                    ));
+                }
+            }
+        }
+
+        if to_cleanup.is_empty() {
+            return;
+        }
+
+        let cleanup_futures = to_cleanup.into_iter().map(
+            |(ticket_id, role, target_worker, ws_id, ws_key)| async move {
+                info!(
+                    ticket_id = %ticket_id,
+                    role = %role,
+                    worker_id = %target_worker,
+                    workspace_id = %ws_id,
+                    "Retrying deletion of retained workspace for terminal ticket"
+                );
+
+                if self
+                    .destroy_coder_workspace(store, &target_worker, &ws_id)
+                    .await
+                    && store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id)
+                {
+                    store.del(&ws_key).await;
+                }
+            },
+        );
+
+        futures::future::join_all(cleanup_futures).await;
     }
 
     #[allow(dead_code)]
@@ -584,7 +781,8 @@ impl Node for VesselNode {
         debug!("VESSEL prep: reading pending PRs and CI readiness");
 
         let repository: Option<String> = store.get_typed("repository").await;
-        let pending_prs: Option<Vec<Value>> = store.get_typed("pending_prs").await;
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        let merge_ready_prs: Option<Vec<Value>> = store.get_typed(KEY_MERGE_READY_PRS).await;
         let ci_readiness: Option<crate::types::CiReadiness> = store.get_typed("ci_readiness").await;
 
         let (owner, repo) = parse_repository(repository.as_deref());
@@ -593,6 +791,39 @@ impl Node for VesselNode {
         // addresses a `/address_review` and re-arms the PR. Re-add those PRs so we
         // resume polling them without depending on NEXUS re-discovery.
         self.rearm_review_prs(store, owner, repo).await;
+
+        // The NEXUS merge-ready handoff is a snapshot from the last NEXUS pass.
+        // A PR can reach `submit` via FORGE/SENTINEL (or leave the queue) between
+        // passes, so when a snapshot exists, refresh it against the live pending
+        // queue: keep the snapshot, then re-include any pending PR whose lifecycle
+        // has since reached submit. When no snapshot exists, fall back to the full
+        // pending queue (VESSEL re-validates the phase before merging, so this is
+        // never unsafe).
+        let effective_merge_ready = match merge_ready_prs {
+            Some(snapshot) => {
+                let lifecycle_store = self.lifecycle_store.lock().unwrap().clone();
+                let mut effective = snapshot;
+                for pr in &pending_prs {
+                    if effective.iter().any(|m| m["number"] == pr["number"]) {
+                        continue;
+                    }
+                    let ticket = pr["ticket_id"].as_str().unwrap_or_default();
+                    let is_submit = match lifecycle_store.as_ref() {
+                        Some(s) => s
+                            .lifecycle(ticket)
+                            .await
+                            .map(|state| state.phase == config::lifecycle::Phase::Submit)
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if is_submit {
+                        effective.push(pr.clone());
+                    }
+                }
+                effective
+            }
+            None => pending_prs,
+        };
 
         let has_ci_workflows = match ci_readiness {
             Some(crate::types::CiReadiness::Ready) => true,
@@ -610,7 +841,7 @@ impl Node for VesselNode {
         Ok(json!({
             "owner": owner,
             "repo": repo,
-            "pending_prs": pending_prs.unwrap_or_default(),
+            "pending_prs": effective_merge_ready,
             "has_ci_workflows": has_ci_workflows,
         }))
     }
@@ -739,15 +970,41 @@ impl Node for VesselNode {
                 continue;
             }
             if !state.merge_ready(&pr_info.head_sha) {
-                info!(
-                    pr_number,
-                    ticket,
-                    review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
-                    human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
-                    delivery_pending = state.pr_delivery.is_some(),
-                    "Deferring PR: waiting for lifecycle approvals or review delivery"
-                );
-                continue;
+                // Reconcile a human's GitHub approval into the lifecycle before
+                // deferring. SENTINEL shares the PR author's GitHub identity, so
+                // it cannot self-approve; an authorized reviewer's APPROVED review
+                // of the current head therefore satisfies the `pr_human` gate.
+                // Review-fetch failures defer only this PR, never the batch.
+                let reconciled = self
+                    .reconcile_github_approval(
+                        &store,
+                        ticket,
+                        &state,
+                        owner,
+                        repo,
+                        pr_number,
+                        &pr_info.head_sha,
+                    )
+                    .await?;
+                let ready = if reconciled {
+                    store
+                        .lifecycle(ticket)
+                        .await?
+                        .merge_ready(&pr_info.head_sha)
+                } else {
+                    false
+                };
+                if !ready {
+                    info!(
+                        pr_number,
+                        ticket,
+                        review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
+                        human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
+                        delivery_pending = state.pr_delivery.is_some(),
+                        "Deferring PR: waiting for lifecycle approvals or review delivery"
+                    );
+                    continue;
+                }
             }
 
             let outcome = self.process_single_pr(owner, repo, pr_info).await?;
@@ -778,6 +1035,7 @@ impl Node for VesselNode {
                 return Ok(Action::new(PAUSE_SIGNAL));
             }
             debug!("No PRs were processed");
+            self.cleanup_terminal_ticket_workspaces(store).await;
             return Ok(Action::new("no_work"));
         }
 
@@ -872,12 +1130,15 @@ impl Node for VesselNode {
                         }
                     );
 
-                    if let Some(pr) = pending_prs
+                    let mut pr_val = pending_prs
                         .iter()
                         .find(|p| p["number"].as_u64() == Some(*pr_number))
-                    {
-                        self.recycle_worker(store, pr).await;
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "number": pr_number }));
+                    if pr_val["ticket_id"].as_str().is_none() {
+                        pr_val["ticket_id"] = json!(ticket_id);
                     }
+                    self.recycle_worker(store, &pr_val).await;
 
                     any_success = true;
                 }
@@ -1268,12 +1529,15 @@ impl Node for VesselNode {
                     self.close_github_issue(store, &tid).await;
                     self.remove_from_pending_prs(store, *pr_number).await;
 
-                    if let Some(pr) = pending_prs
+                    let mut pr_val = pending_prs
                         .iter()
                         .find(|p| p["number"].as_u64() == Some(*pr_number))
-                    {
-                        self.recycle_worker(store, pr).await;
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "number": pr_number }));
+                    if pr_val["ticket_id"].as_str().is_none() {
+                        pr_val["ticket_id"] = json!(tid);
                     }
+                    self.recycle_worker(store, &pr_val).await;
 
                     any_success = true;
                 }
@@ -2142,6 +2406,151 @@ impl VesselNode {
         }
     }
 
+    /// Reconcile a human's GitHub approval into the lifecycle `pr_human` record.
+    ///
+    /// SENTINEL shares the PR author's GitHub identity, and GitHub blocks
+    /// self-review, so an `APPROVED` review can only originate from a distinct
+    /// account. That approval satisfies the `pr_human` merge gate without a
+    /// manual operator CLI entry, provided that:
+    /// - no reviewer currently requests changes (fail closed),
+    /// - the approving reviewer is an `OWNER`, `MEMBER`, or `COLLABORATOR`, and
+    /// - their latest review is `APPROVED` on exactly `head_sha`.
+    ///
+    /// Returns true if the lifecycle was advanced. No-op (false) when the ticket
+    /// is not in `submit`, `pr_human` is already present, the PR has no
+    /// qualifying approval, or reviews could not be fetched (the PR is simply
+    /// deferred to the next pass so other queued PRs keep processing).
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_github_approval(
+        &self,
+        store: &SharedStore,
+        ticket: &str,
+        state: &config::lifecycle::Lifecycle,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        if state.phase != config::lifecycle::Phase::Submit
+            || (state.pr_human.is_some() && state.pr_decision.is_some())
+        {
+            return Ok(false);
+        }
+        let reviews = match self.client.list_pr_reviews(owner, repo, pr_number).await {
+            Ok(reviews) => reviews,
+            Err(e) => {
+                warn!(pr_number, ticket, error = %e,
+                    "Failed to list PR reviews; deferring approval reconciliation");
+                return Ok(false);
+            }
+        };
+        // Any reviewer currently requesting changes vetoes reconciliation.
+        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+            return Ok(false);
+        }
+        // The effective approver: an authorized reviewer whose *latest* review
+        // approves the current head. Stale approvals of older commits and
+        // drive-by approvals from outside accounts do not count.
+        let Some(approver) = github::latest_review_per_user(&reviews)
+            .into_iter()
+            .filter(|r| {
+                r.state_enum() == github::PrReviewState::Approved
+                    && r.is_authorized_reviewer()
+                    && r.commit_id.as_deref() == Some(head_sha)
+            })
+            .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
+            .and_then(|r| r.user.clone())
+        else {
+            info!(
+                pr_number,
+                ticket,
+                head = head_sha,
+                "No authorized GitHub approval of the current head; not reconciling"
+            );
+            return Ok(false);
+        };
+        let report = format!("Approved on GitHub by {approver} at {head_sha}");
+
+        let current = store.lifecycle(ticket).await?;
+        if (current.pr_human.is_some() && current.pr_decision.is_some())
+            || current.head.as_deref() != Some(head_sha)
+        {
+            return Ok(false);
+        }
+        // Only reconcile if Sentinel already verified the candidate in Testing phase.
+        // If the testing gate has not passed, do not reconcile as Sentinel's automated test
+        // verification cannot be bypassed.
+        if current.pr_decision.is_none()
+            && !current.test_decision.as_ref().is_some_and(|t| t.approved)
+        {
+            warn!(
+                pr_number,
+                ticket,
+                "Cannot reconcile GitHub approval into pr_decision: Sentinel test gate has not passed"
+            );
+            return Ok(false);
+        }
+
+        // Record the human approval, satisfy pr_decision if not yet recorded,
+        // then complete the review-delivery handshake so `merge_ready()` passes.
+        let mut cur = current.clone();
+        if cur.pr_human.is_none() {
+            cur = store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "human",
+                    config::lifecycle::Event::Decide {
+                        round: cur.review_round,
+                        phase: config::lifecycle::Phase::Submit,
+                        approved: true,
+                        report,
+                        revision: cur.revision,
+                        head: cur.head.clone(),
+                    },
+                )
+                .await?;
+        }
+        if cur.pr_decision.is_none() {
+            let sentinel_report =
+                format!("Satisfied by verified testing review and GitHub approval by {approver}");
+            cur = store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "sentinel",
+                    config::lifecycle::Event::Decide {
+                        round: cur.review_round,
+                        phase: config::lifecycle::Phase::Submit,
+                        approved: true,
+                        report: sentinel_report,
+                        revision: cur.revision,
+                        head: cur.head.clone(),
+                    },
+                )
+                .await?;
+        }
+        if cur.pr_delivery.is_some() {
+            store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "sentinel",
+                    config::lifecycle::Event::ReviewDelivered {
+                        round: cur.review_round,
+                    },
+                )
+                .await?;
+        }
+        info!(
+            pr_number,
+            ticket,
+            approver = %approver,
+            "Reconciled GitHub approval into lifecycle (pr_human and pr_decision)"
+        );
+        Ok(true)
+    }
+
     /// Reserve and merge only the reviewed candidate with successful current-head CI.
     async fn merge_reviewed(
         &self,
@@ -2458,40 +2867,53 @@ impl VesselNode {
         }
     }
 
-    /// Recycle a worker from Done back to Idle after its PR is merged.
-    /// Also stops the Coder workspace if one was assigned.
+    /// Recycle workers (both FORGE and paired SENTINEL) back to Idle after a PR is merged.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
-        let worker_id = pr["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
+        let target_ticket = pr["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr);
+
+        if target_worker.is_none() && target_ticket.is_none() {
             return;
         }
 
-        // Stop Coder workspace if this worker was using one
-        let slots: HashMap<String, WorkerSlot> =
+        // Fetch slots and recycle matching workers to Idle
+        let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
+        let mut changed = false;
+
+        for (worker_id, slot) in slots.iter_mut() {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
+            }
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
+                match &slot.status {
+                    WorkerStatus::Done { .. }
+                    | WorkerStatus::Assigned { .. }
+                    | WorkerStatus::Working { .. } => {
+                        info!(
+                            worker_id = slot.id,
+                            old_status = ?slot.status,
+                            "Recycling worker to Idle after merge"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
+                        changed = true;
+                    }
+                    _ => {
+                        if slot.workspace_id.is_some() {
+                            slot.workspace_id = None;
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
 
-        // Re-fetch slots after stop_coder_workspace_for_worker may have modified them
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-
-        if let Some(slot) = slots.get_mut(worker_id) {
-            match &slot.status {
-                WorkerStatus::Done { .. } => {
-                    info!(worker_id, "Recycling worker from Done to Idle after merge");
-                    slot.status = WorkerStatus::Idle;
-                    slot.workspace_id = None;
-                    store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-                }
-                other => {
-                    debug!(worker_id, status = ?other, "Worker not in Done state, skipping recycle");
-                }
-            }
+        if changed {
+            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
     }
 
@@ -3080,6 +3502,9 @@ impl VesselNode {
     pub async fn reconcile(&self, store: &SharedStore) -> Result<()> {
         info!("Running VESSEL startup reconciliation");
 
+        // Clean up / retry deletion for any retained workspaces from terminal tickets
+        self.cleanup_terminal_ticket_workspaces(store).await;
+
         let repository: Option<String> = store.get_typed("repository").await;
         let pending_prs: Option<Vec<Value>> = store.get_typed("pending_prs").await;
         let (owner, repo) = parse_repository(repository.as_deref());
@@ -3293,6 +3718,265 @@ mod tests {
         }
     }
 
+    /// Build a VESSEL node whose GitHub reviews endpoint returns `status`/`body`,
+    /// plus a store holding a `submit` lifecycle at head `head` where SENTINEL
+    /// has approved but the human gate is absent and delivery is pending.
+    async fn reconcile_fixture(
+        status: usize,
+        body: &str,
+    ) -> (mockito::ServerGuard, VesselNode, SharedStore) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(status)
+            .with_body(body)
+            .create_async()
+            .await;
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = github::GithubRestClient::with_api_base("test", server.url());
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_delivery":sentinel}),
+            )
+            .await;
+        (server, node, store)
+    }
+
+    async fn run_reconcile(node: &VesselNode, store: &SharedStore) -> bool {
+        let state = store.lifecycle("T-42").await.unwrap();
+        node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head")
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_sets_pr_human_from_approved_review() {
+        // An authorized collaborator (alice) approved the current head. SENTINEL
+        // shares the PR author's identity and cannot self-approve, so this is
+        // a genuine human sign-off.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        assert!(!store.lifecycle("T-42").await.unwrap().merge_ready("head"));
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "GitHub-approved PR should be reconciled"
+        );
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        let human = after.pr_human.as_ref().expect("pr_human must be recorded");
+        assert!(human.approved);
+        assert_eq!(
+            human.actor, "human",
+            "approval must be attributed to a human, not SENTINEL"
+        );
+        assert!(human.report.contains("alice"));
+        assert!(
+            after.pr_delivery.is_none(),
+            "delivery handshake must complete"
+        );
+        assert!(
+            after.merge_ready("head"),
+            "reconciled PR must be merge-ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_satisfies_missing_pr_decision() {
+        // When Forge opens a PR after Sentinel testing approval, pr_decision has
+        // not yet been written. Reconciling an authorized GitHub approval must
+        // satisfy both pr_human and pr_decision so merge_ready passes without
+        // waiting indefinitely for a separate sentinel review.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        // Reset status to have NO pr_decision, simulating an opened PR in submit phase
+        let test_decision = json!({"round":0,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"test_decision":test_decision}),
+            )
+            .await;
+        let before = store.lifecycle("T-42").await.unwrap();
+        assert!(before.pr_decision.is_none());
+        assert!(!before.merge_ready("head"));
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "GitHub-approved PR should be reconciled"
+        );
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.as_ref().is_some_and(|h| h.approved));
+        assert!(after.pr_decision.as_ref().is_some_and(|d| d.approved));
+        assert!(after.pr_delivery.is_none());
+        assert!(
+            after.merge_ready("head"),
+            "reconciled PR must be merge-ready when pr_decision was originally missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_when_sentinel_test_gate_not_passed() {
+        // If Sentinel has not verified the candidate in Testing phase,
+        // reconciling a GitHub approval must NOT satisfy pr_decision.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        // Submit phase status with NO test_decision (Sentinel never approved testing)
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42}),
+            )
+            .await;
+
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "Reconciliation should be rejected when Sentinel test gate has not passed"
+        );
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.is_none());
+        assert!(after.pr_decision.is_none());
+        assert!(!after.merge_ready("head"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_skips_when_not_approved() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"COMMENTED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"comments"}]"#,
+        )
+        .await;
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "not-approved PR must not be reconciled"
+        );
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_is_noop_when_human_already_approved() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head"}]"#,
+        )
+        .await;
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        let human = json!({"round":0,"pr_number":42,"actor":"human","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_human":human}),
+            )
+            .await;
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "already human-approved must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_unauthorized_reviewer() {
+        // A drive-by account without repository authority approves: not a
+        // valid human sign-off.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"mallory"},"author_association":"NONE","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"APPROVED","user":{"login":"eve"},"author_association":"CONTRIBUTOR","commit_id":"head","submitted_at":"2026-10-05T00:00:01Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_stale_approval_of_older_commit() {
+        // The owner approved an earlier commit; new code has since been pushed.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_names_effective_approver() {
+        // alice's only approval is stale (older commit); bob approved the
+        // current head. The audit record must name bob, not alice.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-04T00:00:00Z"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
+        )
+        .await;
+        assert!(run_reconcile(&node, &store).await);
+        let report = store
+            .lifecycle("T-42")
+            .await
+            .unwrap()
+            .pr_human
+            .unwrap()
+            .report;
+        assert!(report.contains("bob"), "report: {report}");
+        assert!(!report.contains("alice"), "report: {report}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_vetoed_by_current_changes_requested() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"CHANGES_REQUESTED","user":{"login":"bob"},"author_association":"MEMBER","commit_id":"head","submitted_at":"2026-10-05T00:00:01Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_defers_on_review_fetch_error() {
+        // A GitHub error must not propagate (which would abort the whole VESSEL
+        // pass); the PR is simply deferred.
+        let (_server, node, store) = reconcile_fixture(404, r#"{"message":"Not Found"}"#).await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_preserves_approval_when_approver_later_comments() {
+        // alice approved the PR, then later left a comment. The comment must not
+        // hide or invalidate her approval.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"COMMENTED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T01:00:00Z","body":"looks good!"}]"#,
+        )
+        .await;
+        assert!(run_reconcile(&node, &store).await);
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.as_ref().is_some_and(|d| d.approved));
+        assert!(after.pr_human.as_ref().unwrap().report.contains("alice"));
+    }
+
     #[tokio::test]
     async fn ticketless_pr_is_reported_for_manual_handling_and_dequeued() {
         let mut server = mockito::Server::new_async().await;
@@ -3349,6 +4033,65 @@ mod tests {
         assert_eq!(result["owner"], "test-owner");
         assert_eq!(result["repo"], "test-repo");
         assert_eq!(result["pending_prs"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_prep_prefers_merge_ready_prs_handoff() {
+        let store = SharedStore::new_in_memory();
+        store.set("repository", json!("test-owner/test-repo")).await;
+        store
+            .set(
+                KEY_PENDING_PRS,
+                json!([
+                    {"number": 1, "ticket_id": "T-1"},
+                    {"number": 2, "ticket_id": "T-2"},
+                ]),
+            )
+            .await;
+        store
+            .set(
+                KEY_MERGE_READY_PRS,
+                json!([{"number": 2, "ticket_id": "T-2"}]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let result = node.prep(&store).await.unwrap();
+
+        let pending = result["pending_prs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["number"].as_u64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_prep_refreshes_stale_empty_merge_ready_handoff() {
+        let store = SharedStore::new_in_memory();
+        store.set("repository", json!("test-owner/test-repo")).await;
+        // NEXUS wrote an empty merge-ready snapshot, but a PR has since reached
+        // submit via FORGE/SENTINEL without another NEXUS pass.
+        store
+            .set(KEY_PENDING_PRS, json!([{"number": 3, "ticket_id": "T-3"}]))
+            .await;
+        store.set(KEY_MERGE_READY_PRS, json!([])).await;
+        store
+            .set(
+                &full_ticket_key_flat("T-3", config::state::KEY_TICKET_STATUS),
+                json!(config::lifecycle::Lifecycle {
+                    phase: config::lifecycle::Phase::Submit,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let result = node.prep(&store).await.unwrap();
+        let pending = result["pending_prs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["number"].as_u64(), Some(3));
     }
 
     #[tokio::test]
@@ -3748,5 +4491,369 @@ mod tests {
         assert!(!d.contains("branch:"));
         assert!(!d.contains("checks:"));
         assert!(!d.contains("annotations:"));
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_recycles_forge_and_sentinel_pair_to_idle() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-1".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let pr = json!({
+            "number": 6,
+            "ticket_id": "T-005",
+            "head_branch": "forge-1/T-005",
+        });
+
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(forge_slot.status, WorkerStatus::Idle),
+            "Forge slot must be recycled to Idle"
+        );
+        assert_eq!(forge_slot.workspace_id, None);
+
+        let sentinel_slot = updated_slots.get("sentinel").unwrap();
+        assert!(
+            matches!(sentinel_slot.status, WorkerStatus::Idle),
+            "Sentinel slot must be recycled to Idle"
+        );
+        assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_does_not_affect_reassigned_worker() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        // forge-1 was reassigned to T-006 with a new workspace
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-006".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-1-new".to_string()),
+            },
+        );
+        // sentinel is still on T-005
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-sentinel".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        // T-005 has an old workspace recorded
+        store
+            .set(
+                &full_ticket_key("T-005", KEY_TICKET_WORKSPACE, "forge"),
+                json!("ws-forge-1-old"),
+            )
+            .await;
+
+        let pr = json!({
+            "number": 6,
+            "ticket_id": "T-005",
+            "head_branch": "forge-1/T-005",
+        });
+
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+
+        // forge-1 MUST NOT be touched because it is working on T-006
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(&forge_slot.status, WorkerStatus::Assigned { ticket_id, .. } if ticket_id == "T-006"),
+            "Forge slot working on T-006 must not be disturbed"
+        );
+        assert_eq!(
+            forge_slot.workspace_id.as_deref(),
+            Some("ws-forge-1-new"),
+            "Forge slot workspace for new ticket must be preserved"
+        );
+
+        // sentinel was on T-005 so it is recycled
+        let sentinel_slot = updated_slots.get("sentinel").unwrap();
+        assert!(
+            matches!(sentinel_slot.status, WorkerStatus::Idle),
+            "Sentinel slot must be recycled to Idle"
+        );
+        assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_failed_workspace_destruction_preserves_references() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-010".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-10".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let ws_key = full_ticket_key("T-010", KEY_TICKET_WORKSPACE, "forge");
+        assert!(
+            store.get_typed::<String>(&ws_key).await.is_none(),
+            "Workspace key should not be set yet"
+        );
+
+        let pending_prs = vec![json!({
+            "number": 10,
+            "ticket_id": "T-010",
+            "head_branch": "forge-1/T-010",
+        })];
+
+        // Attempt destruction when Coder client is unavailable
+        node.destroy_coder_workspace_for_pr(&store, &pending_prs, 10)
+            .await;
+
+        // The ticket-scoped workspace key MUST be recorded for recovery
+        let stored_ws = store.get_typed::<String>(&ws_key).await;
+        assert_eq!(
+            stored_ws.as_deref(),
+            Some("ws-forge-10"),
+            "Ticket workspace key must be recorded when deletion fails"
+        );
+
+        // When recycled, the slot status becomes Idle and slot workspace_id is cleared
+        // so a newly assigned ticket never inherits the old workspace.
+        let pr = json!({
+            "number": 10,
+            "ticket_id": "T-010",
+            "head_branch": "forge-1/T-010",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(forge_slot.status, WorkerStatus::Idle),
+            "Forge slot is set to Idle"
+        );
+        assert_eq!(
+            forge_slot.workspace_id, None,
+            "Slot workspace_id must be cleared on Idle so it is not reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_workspace_found_via_ticket_key_preserves_sentinel_role() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-020".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-20".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-020".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let forge_ws_key = full_ticket_key("T-020", KEY_TICKET_WORKSPACE, "forge");
+        let sentinel_ws_key = full_ticket_key("T-020", KEY_TICKET_WORKSPACE, "sentinel");
+        store.set(&forge_ws_key, json!("ws-forge-20")).await;
+        store.set(&sentinel_ws_key, json!("ws-sentinel-20")).await;
+
+        let pending_prs = vec![json!({
+            "number": 20,
+            "ticket_id": "T-020",
+            "head_branch": "forge-1/T-020",
+            "worker_id": "forge-1",
+        })];
+
+        // Destruction fails because Coder client is unavailable
+        node.destroy_coder_workspace_for_pr(&store, &pending_prs, 20)
+            .await;
+
+        // Sentinel workspace MUST NOT overwrite forge workspace or be lost
+        let forge_stored = store.get_typed::<String>(&forge_ws_key).await;
+        let sentinel_stored = store.get_typed::<String>(&sentinel_ws_key).await;
+
+        assert_eq!(
+            forge_stored.as_deref(),
+            Some("ws-forge-20"),
+            "Forge ticket key must retain its forge workspace ID"
+        );
+        assert_eq!(
+            sentinel_stored.as_deref(),
+            Some("ws-sentinel-20"),
+            "Sentinel ticket key must retain its sentinel workspace ID under sentinel role"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_terminal_ticket_workspaces_retries_and_cleans_up() {
+        let mut server = mockito::Server::new_async().await;
+        // Mock list_chats
+        server
+            .mock("GET", "/api/v2/chats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        // Mock builds delete for forge workspace
+        server
+            .mock("POST", "/api/v2/workspaces/ws-forge-30/builds")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"b1","transition":"delete"}"#)
+            .create_async()
+            .await;
+        // Mock get_workspace returning 404 (deleted)
+        server
+            .mock("GET", "/api/v2/workspaces/ws-forge-30")
+            .with_status(404)
+            .create_async()
+            .await;
+        // Mock builds delete for sentinel workspace
+        server
+            .mock("POST", "/api/v2/workspaces/ws-sentinel-30/builds")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"b2","transition":"delete"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/v2/workspaces/ws-sentinel-30")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_api_token", json!("token-123")).await;
+
+        let node = VesselNode::new(VesselConfig::default());
+
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-030",
+                    "title": "Clean up test",
+                    "body": "",
+                    "priority": 1,
+                    "status": {
+                        "type": "merged",
+                        "worker_id": "forge-1",
+                        "pr_number": 30
+                    }
+                }]),
+            )
+            .await;
+
+        let forge_ws_key = full_ticket_key("T-030", KEY_TICKET_WORKSPACE, "forge");
+        let sentinel_ws_key = full_ticket_key("T-030", KEY_TICKET_WORKSPACE, "sentinel");
+        store.set(&forge_ws_key, json!("ws-forge-30")).await;
+        store.set(&sentinel_ws_key, json!("ws-sentinel-30")).await;
+
+        let mut slots = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: config::state::WorkerStatus::Idle,
+                workspace_id: Some("ws-forge-30".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: config::state::WorkerStatus::Idle,
+                workspace_id: Some("ws-sentinel-30".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        node.cleanup_terminal_ticket_workspaces(&store).await;
+
+        assert!(
+            store.get_typed::<String>(&forge_ws_key).await.is_none(),
+            "Forge workspace key should be cleaned up after successful deletion"
+        );
+        assert!(
+            store.get_typed::<String>(&sentinel_ws_key).await.is_none(),
+            "Sentinel workspace key should be cleaned up after successful deletion"
+        );
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert_eq!(
+            updated_slots["forge-1"].workspace_id, None,
+            "forge-1 workspace_id should be cleared"
+        );
+        assert_eq!(
+            updated_slots["sentinel"].workspace_id, None,
+            "sentinel workspace_id should be cleared"
+        );
     }
 }

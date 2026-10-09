@@ -656,4 +656,4 @@ Entry: `ENTRYPOINT ["openflows"]`.
 - `docs/architecture/openflows-system-architecture.md` §10 — skills, MCP, models, roles (extension points).
 - `docs/architecture/openflows-system-architecture.md` §13 — AI governance and network policy.
 - `docs/architecture/openflows-system-architecture.md` §5.4 — multi-tenant model and Redis namespacing.
-- `quick_start.md` — setup, startup, troubleshooting.
+- `quick_start.md` — one-command setup; `docs/setup-reference.md` — manual setup, troubleshooting.

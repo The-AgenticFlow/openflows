@@ -268,18 +268,27 @@ impl GithubRestClient {
         );
         let resp: CheckSuitesResponse = self.get_json(&url).await?;
 
-        if resp.check_suites.is_empty() {
+        // Ignore ghost check suites from unconfigured/non-CI apps that have 0 check runs.
+        let active_suites: Vec<&CheckSuite> = resp
+            .check_suites
+            .iter()
+            .filter(|s| !is_ghost_check_suite(s))
+            .collect();
+
+        if active_suites.is_empty() {
             return Ok(CiStatus::Success);
         }
 
         let mut has_pending = false;
-        for suite in &resp.check_suites {
+        for suite in active_suites {
             match suite.status.as_str() {
                 "queued" | "in_progress" | "pending" => has_pending = true,
                 "completed"
                     if suite.conclusion.as_deref() == Some("failure")
                         || suite.conclusion.as_deref() == Some("timed_out")
-                        || suite.conclusion.as_deref() == Some("cancelled") =>
+                        || suite.conclusion.as_deref() == Some("cancelled")
+                        || suite.conclusion.as_deref() == Some("action_required")
+                        || suite.conclusion.as_deref() == Some("startup_failure") =>
                 {
                     return Ok(CiStatus::Failure);
                 }
@@ -322,11 +331,17 @@ impl GithubRestClient {
             }
             page += 1;
         }
-        let checks = if suites.is_empty() {
+        // Ignore ghost check suites from unconfigured/non-CI apps that have 0 check runs.
+        let active_suites: Vec<CheckSuite> = suites
+            .into_iter()
+            .filter(|s| !is_ghost_check_suite(s))
+            .collect();
+
+        let checks = if active_suites.is_empty() {
             None
         } else {
             let mut status = CiStatus::Success;
-            for suite in suites {
+            for suite in active_suites {
                 let observed = if suite.status != "completed" {
                     CiStatus::Pending
                 } else {
@@ -377,12 +392,20 @@ impl GithubRestClient {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "check-runs API failed — falling back to check-suites for failure detail");
-                let fallback = self.get_failed_suites_detail(owner, repo, ref_sha).await?;
-                return Ok(CiFailureDetail {
-                    failed_checks: vec![FailedCheck {
-                        name: fallback.clone(),
+                let failed_suites = self
+                    .get_failed_suites(owner, repo, ref_sha)
+                    .await
+                    .unwrap_or_default();
+                let failed_checks = if !failed_suites.is_empty() {
+                    failed_suites
+                } else {
+                    vec![FailedCheck {
+                        name: "CI failed but could not retrieve detailed check names".to_string(),
                         conclusion: "failure".to_string(),
-                    }],
+                    }]
+                };
+                return Ok(CiFailureDetail {
+                    failed_checks,
                     still_running: vec![],
                     job_logs: vec![],
                     annotations: vec![],
@@ -391,8 +414,12 @@ impl GithubRestClient {
         };
 
         if resp.check_runs.is_empty() {
+            let failed_suites = self
+                .get_failed_suites(owner, repo, ref_sha)
+                .await
+                .unwrap_or_default();
             return Ok(CiFailureDetail {
-                failed_checks: vec![],
+                failed_checks: failed_suites,
                 still_running: vec![],
                 job_logs: vec![],
                 annotations: vec![],
@@ -413,7 +440,8 @@ impl GithubRestClient {
                 "completed" => {
                     if let Some(conclusion) = &run.conclusion {
                         match conclusion.as_str() {
-                            "failure" | "timed_out" | "cancelled" | "action_required" => {
+                            "failure" | "timed_out" | "cancelled" | "action_required"
+                            | "startup_failure" => {
                                 failed_checks.push(FailedCheck {
                                     name: name.to_string(),
                                     conclusion: conclusion.clone(),
@@ -427,6 +455,12 @@ impl GithubRestClient {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        if failed_checks.is_empty() {
+            if let Ok(failed_suites) = self.get_failed_suites(owner, repo, ref_sha).await {
+                failed_checks.extend(failed_suites);
             }
         }
 
@@ -494,41 +528,59 @@ impl GithubRestClient {
         Ok(annotations)
     }
 
-    /// Get failure detail from check-suites API as fallback.
-    /// Less detailed than check-runs but works with broader token scopes.
-    async fn get_failed_suites_detail(
+    /// Get structured failure detail from check-suites API.
+    async fn get_failed_suites(
         &self,
         owner: &str,
         repo: &str,
         ref_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FailedCheck>> {
         let url = format!(
             "{}/repos/{}/{}/commits/{}/check-suites",
             self.api_base, owner, repo, ref_sha
         );
         let resp: serde_json::Value = self.get_json_raw(&url).await?;
 
-        let mut failed: Vec<String> = Vec::new();
+        let mut failed: Vec<FailedCheck> = Vec::new();
         if let Some(suites) = resp["check_suites"].as_array() {
             for suite in suites {
                 let status = suite["status"].as_str().unwrap_or("unknown");
                 if status == "completed" {
                     let conclusion = suite["conclusion"].as_str().unwrap_or("");
                     match conclusion {
-                        "failure" | "timed_out" | "cancelled" | "action_required" => {
+                        "failure" | "timed_out" | "cancelled" | "action_required"
+                        | "startup_failure" => {
                             let app_name = suite["app"]["name"].as_str().unwrap_or("unknown");
-                            failed.push(format!("{} ({}) — {}", app_name, conclusion, status));
+                            failed.push(FailedCheck {
+                                name: app_name.to_string(),
+                                conclusion: conclusion.to_string(),
+                            });
                         }
                         _ => {}
                     }
                 }
             }
         }
+        Ok(failed)
+    }
 
+    /// Get failure detail from check-suites API as fallback.
+    /// Less detailed than check-runs but works with broader token scopes.
+    pub async fn get_failed_suites_detail(
+        &self,
+        owner: &str,
+        repo: &str,
+        ref_sha: &str,
+    ) -> Result<String> {
+        let failed = self.get_failed_suites(owner, repo, ref_sha).await?;
         if failed.is_empty() {
             Ok("CI failed but could not retrieve detailed check names".to_string())
         } else {
-            Ok(format!("Failed checks suites:\n{}", failed.join("\n")))
+            let lines: Vec<String> = failed
+                .into_iter()
+                .map(|f| format!("{} ({}) — completed", f.name, f.conclusion))
+                .collect();
+            Ok(format!("Failed checks suites:\n{}", lines.join("\n")))
         }
     }
 
@@ -1074,11 +1126,24 @@ impl GithubRestClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<PrReview>> {
-        let url = format!(
-            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
-            self.api_base, owner, repo, pr_number
-        );
-        self.get_json(&url).await
+        // Fetch every page: a verdict-changing review (e.g. a later
+        // CHANGES_REQUESTED) must never be missed because it fell past page 1.
+        let mut reviews = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/pulls/{}/reviews?per_page=100&page={}",
+                self.api_base, owner, repo, pr_number, page
+            );
+            let batch: Vec<PrReview> = self.get_json(&url).await?;
+            let len = batch.len();
+            reviews.extend(batch);
+            if len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(reviews)
     }
 
     /// List the inline review comments on a pull request.
@@ -1299,6 +1364,18 @@ struct CheckSuitesResponse {
 struct CheckSuite {
     status: String,
     conclusion: Option<String>,
+    #[serde(default)]
+    latest_check_runs_count: Option<u32>,
+    #[serde(default)]
+    app: Option<CheckSuiteApp>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CheckSuiteApp {
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// A structured representation of a failed CI check.
@@ -1545,11 +1622,27 @@ pub struct PrReview {
     pub submitted_at: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    /// SHA of the commit the review was submitted against.
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    /// Reviewer's relationship to the repository (`OWNER`, `MEMBER`,
+    /// `COLLABORATOR`, `CONTRIBUTOR`, `NONE`, ...).
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 impl PrReview {
     pub fn state_enum(&self) -> PrReviewState {
         PrReviewState::from_api_state(&self.state)
+    }
+
+    /// Whether the reviewer holds maintainer/collaborator authority on the
+    /// repository. Drive-by reviews from outside accounts do not qualify.
+    pub fn is_authorized_reviewer(&self) -> bool {
+        matches!(
+            self.author_association.as_deref(),
+            Some("OWNER" | "MEMBER" | "COLLABORATOR")
+        )
     }
 }
 
@@ -1606,17 +1699,20 @@ pub struct ReviewCommentInput {
     pub body: String,
 }
 
-/// Compute the effective review state of a PR from the (possibly superseded)
-/// list of reviews returned by `GET /pulls/{n}/reviews`.
+/// Reduce a PR's review history to the latest review per reviewer.
+///
+/// Reduce a PR's review history to the latest review per reviewer.
 ///
 /// Rules:
-/// - Consider only the latest review per reviewer.
-/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
-///   approve then re-request changes).
-/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
-/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
-pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
-    // Latest review per reviewer (later `submitted_at` wins).
+/// - A review with an approving or change-request verdict (`APPROVED` or
+///   `CHANGES_REQUESTED`) takes precedence over a plain comment (`COMMENTED`).
+/// - Between two reviews that both carry a verdict, the newer one wins
+///   (later `submitted_at`, falling back to insertion order).
+/// - A `COMMENTED` review carries no verdict and never supersedes or withdraws
+///   an existing `APPROVED` or `CHANGES_REQUESTED` review.
+/// - Between reviews without a verdict, the newer one wins.
+/// - Reviews without a reviewer login are ignored.
+pub fn latest_review_per_user(reviews: &[PrReview]) -> Vec<&PrReview> {
     let mut latest: Vec<&PrReview> = Vec::new();
     for review in reviews {
         if review.user.as_deref().is_none() || review.user.as_deref() == Some("") {
@@ -1626,13 +1722,32 @@ pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
         let idx = latest.iter().position(|r| r.user.as_deref() == Some(user));
         let replace = match idx {
             Some(i) => {
-                // Prefer the later review; fall back to insertion order when
-                // timestamps are absent.
-                match (&latest[i].submitted_at, &review.submitted_at) {
+                let existing = latest[i];
+                let is_newer = match (&existing.submitted_at, &review.submitted_at) {
                     (Some(a), Some(b)) => b > a,
                     (None, Some(_)) => true,
                     (Some(_), None) => false,
                     (None, None) => true,
+                };
+                let existing_has_verdict = matches!(
+                    existing.state_enum(),
+                    PrReviewState::Approved | PrReviewState::ChangesRequested
+                );
+                let new_has_verdict = matches!(
+                    review.state_enum(),
+                    PrReviewState::Approved | PrReviewState::ChangesRequested
+                );
+
+                match (existing_has_verdict, new_has_verdict) {
+                    // Both have verdicts: newer verdict wins.
+                    (true, true) => is_newer,
+                    // New review has a verdict while existing does not: verdict wins.
+                    (false, true) => true,
+                    // Existing has a verdict while new review is a comment:
+                    // comment never overwrites a verdict.
+                    (true, false) => false,
+                    // Neither has a verdict: newer comment wins.
+                    (false, false) => is_newer,
                 }
             }
             None => false,
@@ -1647,6 +1762,20 @@ pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
             _ => {}
         }
     }
+    latest
+}
+
+/// Compute the effective review state of a PR from the (possibly superseded)
+/// list of reviews returned by `GET /pulls/{n}/reviews`.
+///
+/// Rules:
+/// - Consider only the latest review per reviewer.
+/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
+///   approve then re-request changes).
+/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
+/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
+pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
+    let latest = latest_review_per_user(reviews);
 
     let mut any_approved = false;
     for review in latest {
@@ -1678,6 +1807,81 @@ fn aggregate_ci_sources(status: Option<CiStatus>, checks: Option<CiStatus>) -> C
     }
 }
 
+/// Determines if a check suite is an unconfigured ghost suite from an installed app that should be ignored.
+///
+/// GitHub automatically creates a `queued` check suite for every installed GitHub App
+/// with checks write permissions on every commit. If the app is not a CI provider (e.g. OpenFlows itself,
+/// Devin) or is not configured for the repository (e.g. SonarQube Cloud), it never creates check runs
+/// and remains in `queued` status with 0 runs indefinitely.
+///
+/// A suite is ONLY treated as a ghost suite if:
+/// 1. Its status is `queued` (or incomplete with no check runs started).
+/// 2. It has explicitly 0 check runs (`latest_check_runs_count == Some(0)`).
+/// 3. It belongs to a known non-CI app or unconfigured app (e.g. OpenFlows, Devin, SonarCloud,
+///    or any app slug configured in `GITHUB_IGNORED_CHECK_APPS`).
+///
+/// Active suites from real CI providers (like GitHub Actions, CircleCI, etc.) and completed
+/// suites (including failed zero-run suites) are NEVER ignored.
+fn is_ghost_check_suite(suite: &CheckSuite) -> bool {
+    // Completed suites must ALWAYS be evaluated — never ignore a completed suite
+    // (even if it has 0 runs, e.g. a startup failure).
+    if suite.status == "completed" {
+        return false;
+    }
+
+    // If the suite has created check runs or is actively in progress, it is not a ghost.
+    if suite.latest_check_runs_count.unwrap_or(0) > 0 || suite.status == "in_progress" {
+        return false;
+    }
+
+    // Only suites with explicitly 0 runs can be ghost suites.
+    if suite.latest_check_runs_count != Some(0) {
+        return false;
+    }
+
+    // Check the app slug / name against known non-CI or ghost app patterns.
+    let app = match &suite.app {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let slug = app.slug.as_deref().unwrap_or("").to_lowercase();
+    let name = app.name.as_deref().unwrap_or("").to_lowercase();
+
+    // GitHub Actions is the official GitHub workflow runner — never ignore it.
+    if slug == "github-actions" || name == "github actions" {
+        return false;
+    }
+
+    // Known non-CI or idle apps that spawn ghost suites with 0 runs:
+    // - OpenFlows's own GitHub App (orchestrator, not a CI runner)
+    // - Devin AI integration (coding assistant, not a CI runner)
+    // - SonarQube Cloud / SonarCloud (when unconfigured on the repo, sits idle in queued)
+    let is_known_ghost = slug.contains("openflows")
+        || name.contains("openflows")
+        || slug.contains("devin")
+        || name.contains("devin")
+        || slug.contains("sonarqubecloud")
+        || slug.contains("sonarcloud")
+        || name.contains("sonar");
+
+    if is_known_ghost {
+        return true;
+    }
+
+    // Allow user-configured ignored apps via environment variable (comma-separated slugs)
+    if let Ok(ignored_env) = std::env::var("GITHUB_IGNORED_CHECK_APPS") {
+        for pattern in ignored_env.split(',') {
+            let p = pattern.trim().to_lowercase();
+            if !p.is_empty() && (slug.contains(&p) || name.contains(&p)) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod pr_review_tests {
     use super::*;
@@ -1688,6 +1892,8 @@ mod pr_review_tests {
             user: Some(user.to_string()),
             submitted_at: Some(ts.to_string()),
             body: None,
+            commit_id: None,
+            author_association: None,
         }
     }
 
@@ -1749,6 +1955,45 @@ mod pr_review_tests {
     }
 
     #[test]
+    fn test_effective_state_approved_not_superseded_by_later_comment() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("COMMENTED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_changes_requested_not_cleared_by_later_comment() {
+        let reviews = vec![
+            review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z"),
+            review("COMMENTED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::ChangesRequested);
+    }
+
+    #[test]
+    fn test_effective_state_comment_followed_by_approval_wins() {
+        let reviews = vec![
+            review("COMMENTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::Approved);
+    }
+
+    #[test]
     fn test_state_enum_parsing() {
         assert_eq!(
             PrReviewState::from_api_state("APPROVED"),
@@ -1799,6 +2044,41 @@ mod status_api_tests {
 mod lifecycle_ci_tests {
     use super::*;
     #[tokio::test]
+    async fn list_pr_reviews_follows_pagination_so_later_veto_is_seen() {
+        let mut server = mockito::Server::new_async().await;
+        let approvals: Vec<_> = (0..100)
+            .map(|i| {
+                serde_json::json!({"state":"APPROVED","user":{"login":format!("u{i}")},
+                    "submitted_at":"2026-10-05T00:00:00Z"})
+            })
+            .collect();
+        let page1 = server
+            .mock("GET", "/repos/org/repo/pulls/7/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(serde_json::to_string(&approvals).unwrap())
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/repos/org/repo/pulls/7/reviews?per_page=100&page=2")
+            .with_status(200)
+            .with_body(r#"[{"state":"CHANGES_REQUESTED","user":{"login":"veto"},"submitted_at":"2026-10-06T00:00:00Z"}]"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        let reviews = client.list_pr_reviews("org", "repo", 7).await.unwrap();
+        assert_eq!(reviews.len(), 101);
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+    #[tokio::test]
     async fn ci_api_does_not_mask_failed_checks_with_successful_status() {
         let mut server = mockito::Server::new_async().await;
         let status = server
@@ -1814,6 +2094,150 @@ mod lifecycle_ci_tests {
             )
             .with_status(200)
             .with_body(r#"{"check_suites":[{"status":"completed","conclusion":"failure"}]}"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Failure
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+    #[tokio::test]
+    async fn ghost_check_suites_with_zero_runs_are_ignored_by_ci_status() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0,"app":{"slug":"my-openflows-app"}},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Success
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn real_ci_queued_suite_with_zero_runs_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0,"app":{"slug":"github-actions"}},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        // GitHub Actions queued suite with 0 runs must stay Pending, not be ignored
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Pending
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn generic_queued_suite_with_zero_runs_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        // Unscoped / generic queued suite with 0 runs must stay Pending
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Pending
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn completed_suite_with_zero_runs_and_failure_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"completed","conclusion":"failure","latest_check_runs_count":0}
+            ]}"#,
+            )
             .create_async()
             .await;
         let client = GithubRestClient {
@@ -1904,6 +2328,91 @@ mod lifecycle_ci_tests {
         assert_eq!(result.sha.as_deref(), Some("merge-commit"));
         merge.assert_async().await;
     }
+    #[tokio::test]
+    async fn startup_failure_in_check_suites_is_reported_in_failure_details() {
+        let mut server = mockito::Server::new_async().await;
+        let check_runs = server
+            .mock("GET", "/repos/org/repo/commits/head/check-runs")
+            .with_status(200)
+            .with_body(r#"{"check_runs":[]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let check_suites = server
+            .mock("GET", "/repos/org/repo/commits/head/check-suites")
+            .with_status(200)
+            .with_body(r#"{"check_suites":[{"status":"completed","conclusion":"startup_failure","app":{"name":"GitHub Actions"}}]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+
+        let structured = client
+            .get_failed_checks_detail_structured("org", "repo", "head")
+            .await
+            .unwrap();
+        assert_eq!(structured.failed_checks.len(), 1);
+        assert_eq!(structured.failed_checks[0].name, "GitHub Actions");
+        assert_eq!(structured.failed_checks[0].conclusion, "startup_failure");
+
+        let text = client
+            .get_failed_checks_detail("org", "repo", "head")
+            .await
+            .unwrap();
+        assert!(text.contains("GitHub Actions"));
+        assert!(text.contains("startup_failure"));
+
+        check_runs.assert_async().await;
+        check_suites.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn startup_failure_in_check_runs_is_reported_in_failure_details() {
+        let mut server = mockito::Server::new_async().await;
+        let check_runs = server
+            .mock("GET", "/repos/org/repo/commits/head/check-runs")
+            .with_status(200)
+            .with_body(r#"{"check_runs":[{"name":"build-and-test","status":"completed","conclusion":"startup_failure","id":42}]}"#)
+            .create_async()
+            .await;
+        let annotations = server
+            .mock("GET", "/repos/org/repo/check-runs/42/annotations")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let actions_runs = server
+            .mock(
+                "GET",
+                "/repos/org/repo/actions/runs?head_sha=head&status=failure&per_page=10",
+            )
+            .with_status(200)
+            .with_body(r#"{"workflow_runs":[]}"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+
+        let structured = client
+            .get_failed_checks_detail_structured("org", "repo", "head")
+            .await
+            .unwrap();
+        assert_eq!(structured.failed_checks.len(), 1);
+        assert_eq!(structured.failed_checks[0].name, "build-and-test");
+        assert_eq!(structured.failed_checks[0].conclusion, "startup_failure");
+
+        check_runs.assert_async().await;
+        annotations.assert_async().await;
+        actions_runs.assert_async().await;
+    }
+
     #[test]
     fn success_cannot_mask_failed_pending_or_missing_ci() {
         assert_eq!(

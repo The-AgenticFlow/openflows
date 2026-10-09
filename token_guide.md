@@ -4,7 +4,7 @@ OpenFlows needs GitHub access for the **controller** (issue/PR sync, CI checks) 
 
 ## 1. GitHub access: GitHub App external auth (required)
 
-The GitHub App external auth (`CODER_EXTERNAL_AUTH_0_*` in `.env`) must be configured — Coder won't start without it. See [quick_start.md](quick_start.md) Step 1 for how to create and install the App.
+The GitHub App external auth (`CODER_EXTERNAL_AUTH_0_*` in `.env`) must be configured — Coder won't start without it. See [setup-reference.md](docs/setup-reference.md) Step 1 for how to create and install the App.
 
 Each workspace owner links their GitHub account (during `tenant add`), and the controller/agents use **that linked token** for GitHub API and git ops. That is the only token acquisition step.
 
@@ -83,7 +83,7 @@ With external auth configured and each tenant user linked during `tenant add`, n
 - Create a new token (old ones may have expired)
 
 **"Permission denied" errors in logs**
-- GitHub: Check the workspace owner has linked the GitHub App and the App is installed on the repo (see quick_start.md Step 4).
+- GitHub: Check the workspace owner has linked the GitHub App and the App is installed on the repo (see docs/setup-reference.md Step 4).
 - Coder: Check you're a member of the workspace/organization
 
 ---

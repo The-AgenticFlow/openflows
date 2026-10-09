@@ -85,6 +85,9 @@ pub enum Event {
         phase: Phase,
         head: Option<String>,
     },
+    Block {
+        reason: String,
+    },
     Plan {
         content: String,
     },
@@ -188,6 +191,7 @@ impl Lifecycle {
                 "review round {round}: {}: {report}",
                 if *approved { "approve" } else { "reject" }
             ),
+            Event::Block { reason } => format!("blocked: {reason}"),
             Event::Plan { .. } => format!("plan revision {} uploaded", self.revision + 1),
             _ => format!("{event:?}"),
         };
@@ -280,6 +284,17 @@ impl Lifecycle {
                 next.pr_delivery = None;
                 next.feedback = None;
                 next.phase = phase;
+            }
+            Event::Block { reason } => {
+                ensure!(
+                    !reason.trim().is_empty(),
+                    "Blocked lifecycle requires a reason"
+                );
+                next.clear_work();
+                next.plan_decision = None;
+                next.pr_delivery = None;
+                next.feedback = Some(reason);
+                next.phase = Phase::Blocked;
             }
             Event::Decide {
                 round,

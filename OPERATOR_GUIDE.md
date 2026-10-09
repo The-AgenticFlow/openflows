@@ -4,7 +4,7 @@ This guide is for **operators running a deployed SaaS that serves per-trial user
 ("Model A"). Each trial user links their own GitHub account and the OpenFlows
 controller drives their repo with **that user's external-auth token**.
 
-> For **local development only**, use [`quick_start.md`](quick_start.md). It uses a
+> For **local development only**, use [`quick_start.md`](quick_start.md) (`./scripts/setup.sh`). It uses a
 > local `docker compose` stack and the GitHub App.
 
 ## Model A at a glance

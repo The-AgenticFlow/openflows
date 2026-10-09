@@ -72,3 +72,14 @@ nix = { version = "0.29", default-features = false, features = ["signal", "proce
 
 # async streams
 tokio-stream = "0.1"
+
+# database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# password / hash-free secret handling uses a lightweight SHA-256 crate
+sha2 = "0.10"
+
+# opaque cursor encoding
+base64 = "0.22"
