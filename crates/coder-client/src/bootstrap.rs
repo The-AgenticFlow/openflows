@@ -23,6 +23,17 @@ pub struct CoderBootstrapper {
     env: Option<config::EnvConfig>,
 }
 
+/// Pre-resolved prerequisites for creating a tenant's Nexus workspace: the
+/// minted tenant client plus the chat-hook secret/URL. Built up-front so the
+/// caller can validate and prepare the replacement **before** taking any
+/// destructive action (e.g. deleting a workspace whose controller token needs
+/// refreshing).
+struct TenantProvision {
+    tenant_client: CoderClient,
+    hook_secret: String,
+    hook_url: String,
+}
+
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
 
@@ -66,14 +77,21 @@ fn tenant_username(tenant_name: &str) -> String {
 /// This keeps already-provisioned tenants on their existing account (so an
 /// upgrade does not silently orphan or recreate their workspace) while still
 /// preventing two distinct tenant names from ever sharing an account.
-async fn resolve_tenant_username(client: &CoderClient, tenant_name: &str) -> String {
+///
+/// A failure to list users is a **hard error** rather than silently assuming
+/// no legacy account exists: swallowing the error would let a transient lookup
+/// failure mint a fresh hashed account and then conflict with (or shadow) the
+/// tenant's real legacy workspace on the next run (P1 "Lookup errors change
+/// tenant accounts").
+async fn resolve_tenant_username(client: &CoderClient, tenant_name: &str) -> Result<String> {
     let legacy = format!("tenant-{}", tenant_name.to_lowercase().replace('.', "-"));
-    if let Ok(users) = client.list_users().await {
-        if users.iter().any(|u| u.username == legacy) {
-            return legacy;
-        }
+    let users = client.list_users().await.with_context(|| {
+        format!("Failed to list users to resolve tenant Coder account for '{tenant_name}'")
+    })?;
+    if users.iter().any(|u| u.username == legacy) {
+        return Ok(legacy);
     }
-    tenant_username(tenant_name)
+    Ok(tenant_username(tenant_name))
 }
 
 /// Parse an RFC3339 timestamp into Unix seconds without pulling in a time
@@ -486,7 +504,7 @@ impl CoderBootstrapper {
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
 
-        let tenant_username = resolve_tenant_username(client, tenant_name).await;
+        let tenant_username = resolve_tenant_username(client, tenant_name).await?;
         let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
 
         // Resolve the administrator's username up front so the legacy-workspace
@@ -587,6 +605,12 @@ impl CoderBootstrapper {
                     "  ⚠ Tenant '{}' controller token is near expiry — rebuilding the workspace to bake in a fresh token",
                     tenant_name
                 );
+                // Prepare the replacement BEFORE touching the live workspace:
+                // resolve build prerequisites and mint a fresh token first. If
+                // any of these fail, the current workspace keeps running with
+                // its still-valid token instead of being deleted and stranded
+                // (P1 "Token refresh removes working controllers").
+                let provision = self.prepare_nexus_provision(client, &tenant_user).await?;
                 client
                     .delete_workspace(&existing.id)
                     .await
@@ -596,15 +620,14 @@ impl CoderBootstrapper {
                             existing.id, tenant_name
                         )
                     })?;
-                // Fall through to the fresh-provision path below with the
-                // already-resolved tenant user.
                 return self
-                    .provision_nexus_workspace(
+                    .create_nexus_workspace(
                         client,
                         tenant_name,
                         &tenant_user,
                         github_repo,
                         registry_json,
+                        &provision,
                     )
                     .await;
             }
@@ -652,32 +675,53 @@ impl CoderBootstrapper {
             eprintln!();
         }
 
-        self.provision_nexus_workspace(
+        let provision = self.prepare_nexus_provision(client, &tenant_user).await?;
+        self.create_nexus_workspace(
             client,
             tenant_name,
             &tenant_user,
             github_repo,
             registry_json,
+            &provision,
         )
         .await
     }
 
-    /// Mint the tenant-scoped token, wait for the tenant's own GitHub
-    /// external-auth grant, and create the tenant's Nexus workspace. Shared by
-    /// the fresh-tenant path and the near-expiry renewal path.
-    async fn provision_nexus_workspace(
+    /// Pre-resolved prerequisites for creating a tenant's Nexus workspace: the
+    /// minted tenant client plus the chat-hook secret/URL. Built up-front so a
+    /// caller can validate and prepare the replacement **before** taking any
+    /// destructive action (e.g. deleting a workspace whose controller token
+    /// needs refreshing).
+    async fn prepare_nexus_provision(
         &self,
         client: &CoderClient,
-        tenant_name: &str,
         tenant_user: &crate::CoderUser,
-        github_repo: &str,
-        registry_json: &str,
-    ) -> Result<String> {
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+    ) -> Result<TenantProvision> {
+        let hook_secret = self
+            .env
+            .as_ref()
+            .and_then(|e| e.hooks.chat_hook_secret.clone())
+            .or_else(|| {
+                config::EnvConfig::from_env()
+                    .ok()
+                    .and_then(|c| c.hooks.chat_hook_secret)
+            })
+            .filter(|s| !s.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the tenant Nexus workspace")?;
+        let hook_url = self
+            .env
+            .as_ref()
+            .and_then(|e| e.hooks.chat_hook_url_effective())
+            .or_else(|| {
+                config::EnvConfig::from_env()
+                    .ok()
+                    .and_then(|c| c.hooks.chat_hook_url_effective())
+            })
+            .unwrap_or_default();
 
-        // 1. Mint a tenant-scoped API token for that user. The nexus controller
-        //    and worker workspaces run under this token (CODER_SESSION_TOKEN),
-        //    so their Coder + GitHub identity is the tenant's, not the admin's.
+        // Mint (and converge) the tenant-scoped Coder token. The nexus
+        // controller and worker workspaces run under this token, so their Coder
+        // + GitHub identity is the tenant's, not the admin's.
         let tenant_api_key = client
             .create_api_token(&tenant_user.id, "openflows-tenant")
             .await
@@ -687,9 +731,33 @@ impl CoderBootstrapper {
             .with_token(tenant_token.clone())
             .with_session_token(&tenant_token);
 
-        // 2. Check the tenant user's GitHub external-auth grant until linked.
-        //    The device flow / status query runs as the tenant user, so each
-        //    tenant links its own GitHub account independently of the admin.
+        Ok(TenantProvision {
+            tenant_client,
+            hook_secret,
+            hook_url,
+        })
+    }
+
+    /// Wait for the tenant's own GitHub external-auth grant and create the
+    /// tenant's Nexus workspace with the already-prepared provision. The caller
+    /// is responsible for preparing the provision first, so this can be reached
+    /// from both the fresh-tenant path and the near-expiry renewal path without
+    /// side effects before readiness.
+    async fn create_nexus_workspace(
+        &self,
+        client: &CoderClient,
+        tenant_name: &str,
+        tenant_user: &crate::CoderUser,
+        github_repo: &str,
+        registry_json: &str,
+        provision: &TenantProvision,
+    ) -> Result<String> {
+        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+        let tenant_client = &provision.tenant_client;
+
+        // Check the tenant user's GitHub external-auth grant until linked. The
+        // device flow / status query runs as the tenant user, so each tenant
+        // links its own GitHub account independently of the admin.
         let coder_url = client.base_url();
         let external_auth_id = self
             .env
@@ -782,31 +850,9 @@ impl CoderBootstrapper {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
-        // 3. Create the nexus workspace under the tenant user.
+        // Create the nexus workspace under the tenant user.
         let redis_url = "redis://redis:6379".to_string();
         let repo_url = format!("https://github.com/{}.git", github_repo);
-
-        let hook_secret = self
-            .env
-            .as_ref()
-            .and_then(|e| e.hooks.chat_hook_secret.clone())
-            .or_else(|| {
-                config::EnvConfig::from_env()
-                    .ok()
-                    .and_then(|c| c.hooks.chat_hook_secret)
-            })
-            .filter(|s| !s.trim().is_empty())
-            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the tenant Nexus workspace")?;
-        let hook_url = self
-            .env
-            .as_ref()
-            .and_then(|e| e.hooks.chat_hook_url_effective())
-            .or_else(|| {
-                config::EnvConfig::from_env()
-                    .ok()
-                    .and_then(|c| c.hooks.chat_hook_url_effective())
-            })
-            .unwrap_or_default();
         let workspace = tenant_client
             .create_workspace_for_user(
                 &tenant_user.id,
@@ -820,8 +866,8 @@ impl CoderBootstrapper {
                         "coder_session_token": tenant_client.session_token(),
                         "tenant": tenant_name,
                         "github_repository": github_repo,
-                        "coder_chat_hook_secret": hook_secret,
-                        "coder_chat_hook_url": hook_url,
+                        "coder_chat_hook_secret": provision.hook_secret,
+                        "coder_chat_hook_url": provision.hook_url,
                         "registry_json": registry_json,
                         "external_auth_id": external_auth_id,
                         "start_controller": true,

@@ -750,12 +750,17 @@ fn invokes_coder_lifecycle(cmd: &str) -> bool {
 /// all surface a `coder` token at a real command boundary instead of slipping
 /// past the guard.
 ///
-/// Control operators **inside a quoted argument are literal** (P2 "Quoted
-/// examples get blocked"): `echo 'example;coder delete ws'` keeps `example;coder`
-/// as a single token rather than fabricating a `coder` command boundary, so
-/// harmless examples and commit messages are not denied. Whitespace still splits
-/// words inside quotes so `sh -c 'coder start ws'` exposes `coder` as a token
-/// that the boundary logic below can recognise.
+/// Control operators **inside a literal quoted argument are literal** (P2
+/// "Quoted examples get blocked"): `echo 'example;coder delete ws'` keeps
+/// `example;coder` as a single token rather than fabricating a `coder` command
+/// boundary, so harmless examples and commit messages are not denied.
+///
+/// But when a quoted argument is the **command string of a shell `-c`**
+/// (`bash -c 'echo ok;coder delete ws'`), its separators ARE real command
+/// boundaries — otherwise a worker could smuggle `coder delete ws` past the
+/// guard inside a `-c` string (P1 "Quoted commands bypass the guard"). The
+/// shell word may be a bare name or an absolute/relative path, and may carry
+/// options (`/bin/sh -c …`, `bash -l -c …`).
 fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
     const CONTROL: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
     let mut tokens: Vec<(String, bool)> = Vec::new();
@@ -763,13 +768,15 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
     let mut cur = String::new();
     let mut has_cur = false;
     let mut quote: Option<char> = None;
+    // True while the current quote is a shell `-c` command string, so
+    // separators inside it are real command boundaries.
+    let mut command_string = false;
 
     for c in cmd.chars() {
         if let Some(q) = quote {
-            // Inside a quote: control operators are literal, whitespace still
-            // splits words, and the closing quote returns to normal parsing.
             if c == q {
                 quote = None;
+                command_string = false;
                 continue;
             }
             if c.is_whitespace() {
@@ -778,6 +785,12 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
                     has_cur = false;
                     at_start = false;
                 }
+            } else if command_string && CONTROL.contains(&c) {
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                }
+                at_start = true;
             } else {
                 cur.push(c);
                 has_cur = true;
@@ -785,7 +798,16 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
             continue;
         }
         match c {
-            '\'' | '"' => quote = Some(c),
+            '\'' | '"' => {
+                // Flush any pending word so the shell-`-c` test sees it.
+                if has_cur {
+                    tokens.push((std::mem::take(&mut cur), at_start));
+                    has_cur = false;
+                    at_start = false;
+                }
+                quote = Some(c);
+                command_string = quote_follows_shell_c(&tokens);
+            }
             c if c.is_whitespace() => {
                 if has_cur {
                     tokens.push((std::mem::take(&mut cur), at_start));
@@ -810,6 +832,30 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
         tokens.push((cur, at_start));
     }
     tokens
+}
+
+/// True when the last completed tokens describe a shell followed by `-c`, i.e.
+/// a following quoted argument is that shell's command string. The shell may be
+/// a bare name or a path (`/bin/sh`), optionally carrying shell options between
+/// it and `-c` (`bash -l -c …`).
+fn quote_follows_shell_c(tokens: &[(String, bool)]) -> bool {
+    let n = tokens.len();
+    if n < 2 || tokens[n - 1].0 != "-c" {
+        return false;
+    }
+    // Walk back over shell options (`-l`, `-i`, ...) to the shell word.
+    let mut k = n - 2;
+    while k > 0 && tokens[k].0.starts_with('-') {
+        k -= 1;
+    }
+    is_shell_word(&tokens[k].0)
+}
+
+/// True when `word` names a shell, either as a bare name or as a path whose
+/// basename is a shell (`sh`, `bash`, `/bin/sh`, `usr/bin/zsh`, ...).
+fn is_shell_word(word: &str) -> bool {
+    let base = word.rsplit('/').next().unwrap_or(word);
+    SHELL_WRAPPERS.contains(&base)
 }
 
 /// True when `tokens[i]` begins a command: it is the first token, it followed
@@ -857,9 +903,15 @@ fn token_at_command_boundary(tokens: &[(String, bool)], i: usize, at_start: bool
     }
     let word = &tokens[j].0;
     if word == "-c" {
-        // `sh -c '<cmd>'` / `bash -c '<cmd>'`: the command after `-c` is at a
-        // real boundary, provided the `-c` belongs to a shell.
-        return j > 0 && SHELL_WRAPPERS.contains(&tokens[j - 1].0.as_str());
+        // `sh -c '<cmd>'` / `/bin/bash -l -c '<cmd>'`: the command after `-c`
+        // is at a real boundary, provided the `-c` belongs to a shell (which
+        // may be an absolute/relative path and may carry options). Otherwise
+        // it is merely text passed to an unrelated command.
+        let mut k = j - 1;
+        while k > 0 && tokens[k].0.starts_with('-') && tokens[k].0 != "-c" {
+            k -= 1;
+        }
+        return is_shell_word(&tokens[k].0);
     }
     if FORWARDING_BOUNDARY_WRAPPERS.contains(&word.as_str()) {
         // `command -v/-V coder` resolves the binary path; it does not invoke a
@@ -1240,6 +1292,16 @@ mod tests {
             "env A=1 B=2 C=3 D=4 E=5 coder delete ws",
             "env A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 I=9 J=10 coder stop my-ws",
             "sudo -u alice -g sudo -H env K=V L=W coder delete ws",
+            // P1: a separator inside a shell `-c` command string is a real
+            // boundary (Review "Quoted commands bypass the guard").
+            "bash -c 'echo ok;coder delete ws'",
+            "sh -c 'echo ok; coder delete ws'",
+            "bash -c \"true && coder stop my-ws\"",
+            // P1: shell `-c` behind an absolute/relative path and/or shell
+            // options (Review "Shell paths bypass the guard").
+            "/bin/sh -c 'coder start other-workspace'",
+            "/usr/bin/bash -l -c 'coder stop my-ws'",
+            "bash -l -c 'coder delete ws'",
         ] {
             assert!(
                 invokes_coder_lifecycle(cmd),
@@ -1279,6 +1341,12 @@ mod tests {
             "echo 'env coder stop my-ws'",
             "printf '%s\\n' \"exec coder delete ws\"",
             "grep -r 'command coder stop' docs/",
+            // A `-c` that does NOT belong to a shell is not a boundary, so the
+            // quoted content is a literal argument (Review "Shell paths bypass
+            // the guard" / "Quoted commands bypass the guard").
+            "python -c 'print(\"coder delete ws\")'",
+            "node -c 'echo ok;coder delete ws'",
+            "echo -c 'foo;coder delete ws'",
         ] {
             assert!(
                 !invokes_coder_lifecycle(cmd),
