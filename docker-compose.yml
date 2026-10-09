@@ -25,6 +25,29 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Openflows control-plane PostgreSQL. This is a separate database and role
+  # from Coder's `coder-db`; the Manager owns and migrates it. Kept out of the
+  # default `up` set because hosted mode is not enabled by default, but available
+  # for local development of the manager foundations (WP-01) and integration
+  # tests. Bind to a dedicated host port so it never collides with coder-db.
+  openflows-db:
+    image: postgres:16-alpine
+    profiles: ["manager"]
+    environment:
+      POSTGRES_USER: openflows
+      POSTGRES_PASSWORD: ${OPENFLOWS_PG_PASSWORD:-openflows}
+      POSTGRES_DB: openflows_control_plane
+    ports:
+      - "${OPENFLOWS_PG_BIND_ADDRESS:-127.0.0.1}:${OPENFLOWS_PG_PORT:-5544}:5432"
+    volumes:
+      - openflows_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openflows"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   coder:
     image: ghcr.io/coder/coder:${CODER_IMAGE_TAG:-v2.37.3}
     user: "0:0"
@@ -45,11 +68,11 @@ services:
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
-      # repos via OIDC. Values come from .env (see docs/setup-reference.md Step 2).
+      # repos via OIDC. Values come from .env (see quick_start.md Step 2).
       # IMPORTANT: `coder server` fails to start if client_id/client_secret are
       # EMPTY, so these MUST be populated in .env BEFORE `docker compose up -d`.
       # A fresh setup is covered by `.env.example` (which ships these populated
-      # with placeholders) + setup-reference Step 2. If your existing `.env` predates
+      # with placeholders) + quick_start Step 2. If your existing `.env` predates
       # this block, add the CODER_EXTERNAL_AUTH_0_* vars (or start from
       # `.env.example`) or Coder will not come up.
       # Callback URL: ${CODER_ACCESS_URL}/external-auth/primary-github/callback
@@ -59,11 +82,6 @@ services:
       CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
       CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
-      # The CODER_SESSION_TOKEN is copied into each tenant's nexus workspace, where the
-      # controller uses it for the Coder API. Coder's 7-day default cap would cut the
-      # controller off after a week, so allow 90 days.
-      CODER_MAX_TOKEN_LIFETIME: ${CODER_MAX_TOKEN_LIFETIME:-2160h}
-      CODER_DEFAULT_TOKEN_LIFETIME: ${CODER_DEFAULT_TOKEN_LIFETIME:-2160h}
       # Agent lifecycle hooks are wired by OpenFlows. Operators do not need to
       # configure Coder's raw hook URL/experiment flags for the bundled stack.
       # OPENFLOWS_HOOK_URL is the single source of truth for the hook endpoint:
@@ -71,6 +89,10 @@ services:
       # so Coder's CODER_CHAT_HOOK_URL and the consumer's expected JWT `aud`
       # stay in lockstep (prevents hook JWT InvalidAudience failures).
       CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks}
+      # OpenFlows controllers use long-lived local service tokens. Hosted mode
+      # will replace this with brokered, renewable credentials.
+      CODER_MAX_TOKEN_LIFETIME: ${CODER_MAX_TOKEN_LIFETIME:-2160h}
+      CODER_DEFAULT_TOKEN_LIFETIME: ${CODER_DEFAULT_TOKEN_LIFETIME:-2160h}
       CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:?Set CODER_CHAT_HOOK_SECRET to 32+ random bytes before enabling lifecycle hooks}
       # Dev-only: allow the plain-http hook URL above.
@@ -98,3 +120,4 @@ volumes:
   redis_data:
   coder_db_data:
   tf_plugin_cache:
+  openflows_db_data:

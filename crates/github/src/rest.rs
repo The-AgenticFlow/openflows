@@ -1679,6 +1679,7 @@ impl PrReviewState {
 /// An inline review comment on a pull request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewComment {
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
@@ -1686,6 +1687,10 @@ pub struct ReviewComment {
     pub body: String,
     #[serde(default, deserialize_with = "deserialize_optional_login")]
     pub user: Option<String>,
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// Input for an inline comment attached to a submitted review.

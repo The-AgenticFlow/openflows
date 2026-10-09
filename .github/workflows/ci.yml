@@ -76,6 +76,33 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --all-targets --all-features
 
+  manager-postgres:
+    name: Manager PostgreSQL integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: openflows
+          POSTGRES_PASSWORD: openflows
+          POSTGRES_DB: openflows_control_plane
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openflows -d openflows_control_plane"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      OPENFLOWS_TEST_DATABASE_URL: postgres://openflows:openflows@localhost:5432/openflows_control_plane
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Run database and health tests
+        run: bash crates/openflows-manager/scripts/run-integration-tests.sh
+
   cargo-doc:
     name: Documentation
     runs-on: ubuntu-latest

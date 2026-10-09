@@ -5,7 +5,8 @@
 // ready_for_merge) and computes the rework directive to dispatch to FORGE.
 
 use anyhow::Result;
-use github::{effective_review_state, PrReviewState};
+use chrono::DateTime;
+use github::{effective_review_state, latest_review_per_user, PrReviewState};
 use pocketflow_core::{CiStatus, PrInfo};
 use tracing::{debug, warn};
 
@@ -70,6 +71,66 @@ pub struct ReworkDirective {
     pub reason: Option<String>,
 }
 
+/// Evidence of prior `/address_review` dispatch used to determine whether
+/// past feedback (reviews or comments) has already been addressed by rework.
+#[derive(Debug, Clone, Default)]
+pub struct ReworkEvidence {
+    /// PR head SHA for which `/address_review` was last dispatched to FORGE.
+    pub dispatched_sha: Option<String>,
+    /// RFC 3339 timestamp when `/address_review` was last dispatched to FORGE.
+    pub dispatched_at: Option<String>,
+}
+
+/// Determine whether a review or inline comment has already been addressed by prior rework.
+///
+/// Returns `true` only if:
+/// 1. The feedback was not submitted against the current candidate head commit.
+/// 2. Evidence proves rework was dispatched (`dispatched_at` and `dispatched_sha`).
+/// 3. The current head differs from `dispatched_sha` (FORGE pushed rework).
+/// 4. The feedback was submitted before or at the time rework was dispatched
+///    (`feedback_timestamp <= dispatched_at`). If feedback was submitted *after*
+///    the dispatch, it represents fresh feedback that the rework commit could not
+///    have addressed.
+fn is_feedback_addressed(
+    feedback_commit_id: Option<&str>,
+    feedback_timestamp_str: Option<&str>,
+    pr_head_sha: &str,
+    evidence: Option<&ReworkEvidence>,
+) -> bool {
+    // If the feedback is explicitly on the current head commit, it has not been addressed.
+    if feedback_commit_id == Some(pr_head_sha) {
+        return false;
+    }
+
+    let Some(ev) = evidence else {
+        return false;
+    };
+
+    let (Some(dispatched_sha), Some(dispatched_at_str)) = (&ev.dispatched_sha, &ev.dispatched_at)
+    else {
+        return false;
+    };
+
+    // If the candidate head hasn't changed since the dispatch, FORGE has not pushed rework.
+    if pr_head_sha == dispatched_sha {
+        return false;
+    }
+
+    // Now verify the timestamp: rework occurred AFTER the feedback was submitted.
+    if let (Some(fb_ts_str), Ok(dispatched_at)) = (
+        feedback_timestamp_str,
+        DateTime::parse_from_rfc3339(dispatched_at_str),
+    ) {
+        if let Ok(fb_ts) = DateTime::parse_from_rfc3339(fb_ts_str) {
+            return fb_ts <= dispatched_at;
+        }
+    }
+
+    // Fallback if timestamps cannot be parsed: if feedback was on dispatched_sha and head has moved,
+    // it was likely addressed.
+    feedback_commit_id == Some(dispatched_sha)
+}
+
 /// Pure state classifier over the inputs that determine the PR lifecycle.
 ///
 /// Priority (per plan):
@@ -121,6 +182,7 @@ pub async fn classify(
     repo: &str,
     pr_info: &PrInfo,
     ci_status: CiStatus,
+    evidence: Option<&ReworkEvidence>,
 ) -> Result<PrMonitorState> {
     let reviews = match client.list_pr_reviews(owner, repo, pr_info.number).await {
         Ok(r) => r,
@@ -150,15 +212,58 @@ pub async fn classify(
         }
     };
 
-    // v1 heuristic: comments are "unaddressed" when there are any and the PR
-    // is not yet approved. Refinable later (e.g. compare to last review_ready).
-    let has_unaddressed_comments = !comments.is_empty() && review_state != PrReviewState::Approved;
+    // If review_state is ChangesRequested, verify whether any reviewer currently has
+    // unaddressed ChangesRequested. If a change request was submitted on an older commit
+    // and addressed by subsequent rework, it does not trigger rework.
+    let effective_review = if review_state == PrReviewState::ChangesRequested {
+        let has_unaddressed_changes_requested = latest_review_per_user(&reviews).iter().any(|r| {
+            r.state_enum() == PrReviewState::ChangesRequested
+                && !is_feedback_addressed(
+                    r.commit_id.as_deref(),
+                    r.submitted_at.as_deref(),
+                    &pr_info.head_sha,
+                    evidence,
+                )
+        });
+        if has_unaddressed_changes_requested {
+            PrReviewState::ChangesRequested
+        } else {
+            PrReviewState::None
+        }
+    } else if review_state == PrReviewState::Approved {
+        // Verify that the approval is from an authorized reviewer AND covers the candidate head commit.
+        let has_authorized_head_approval = latest_review_per_user(&reviews).iter().any(|r| {
+            r.state_enum() == PrReviewState::Approved
+                && r.is_authorized_reviewer()
+                && (r.commit_id.as_deref() == Some(&pr_info.head_sha) || r.commit_id.is_none())
+        });
+        if has_authorized_head_approval {
+            PrReviewState::Approved
+        } else {
+            PrReviewState::None
+        }
+    } else {
+        review_state
+    };
+
+    // Comments are "unaddressed" when there are comments that have not been addressed by prior
+    // rework and the PR is not yet approved.
+    let has_unaddressed_comments = !comments.is_empty()
+        && comments.iter().any(|c| {
+            !is_feedback_addressed(
+                c.commit_id.as_deref(),
+                c.created_at.as_deref(),
+                &pr_info.head_sha,
+                evidence,
+            )
+        })
+        && effective_review != PrReviewState::Approved;
 
     debug!(
         pr = pr_info.number,
         mergeable = ?pr_info.mergeable,
         ci = ?ci_status,
-        review_state = ?review_state,
+        review_state = ?effective_review,
         comments = comments.len(),
         "PR lifecycle classification inputs"
     );
@@ -166,7 +271,7 @@ pub async fn classify(
     Ok(classify_from_parts(
         pr_info.mergeable,
         ci_status,
-        review_state,
+        effective_review,
         has_unaddressed_comments,
     ))
 }
@@ -180,6 +285,14 @@ pub async fn collect_rework(
     repo: &str,
     pr_number: u64,
 ) -> ReworkDirective {
+    if owner.is_empty() || repo.is_empty() {
+        return ReworkDirective {
+            state: PrMonitorState::Comments,
+            pr_number,
+            reason: None,
+        };
+    }
+
     let reason = client
         .list_pr_reviews(owner, repo, pr_number)
         .await
@@ -218,6 +331,7 @@ pub fn build_directive(state: PrMonitorState, pr_number: u64, reason: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pocketflow_core::PrState;
 
     #[test]
     fn classify_priority_conflicts_first() {
@@ -382,5 +496,104 @@ mod tests {
         assert!(d.contains("state: conflicts"));
         // Conflicted files are intentionally NOT embedded — FORGE fetches them.
         assert!(!d.contains("Conflicts:"));
+    }
+
+    #[tokio::test]
+    async fn classify_stale_changes_requested_on_older_commit_is_needs_review() {
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"Fix this","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"commit_old","author_association":"MEMBER"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "commit_new".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+
+        let evidence = ReworkEvidence {
+            dispatched_sha: Some("commit_old".to_string()),
+            dispatched_at: Some("2026-10-08T12:30:00Z".to_string()),
+        };
+
+        let state = classify(
+            &client,
+            "org",
+            "repo",
+            &pr_info,
+            CiStatus::Success,
+            Some(&evidence),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, PrMonitorState::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn classify_changes_requested_race_condition_triggers_rework() {
+        let mut server = mockito::Server::new_async().await;
+        // Review submitted against commit_old AFTER rework was already dispatched at 12:30
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"Fix this race","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:45:00Z","commit_id":"commit_old","author_association":"MEMBER"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "commit_new".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+
+        let evidence = ReworkEvidence {
+            dispatched_sha: Some("commit_old".to_string()),
+            dispatched_at: Some("2026-10-08T12:30:00Z".to_string()),
+        };
+
+        let state = classify(
+            &client,
+            "org",
+            "repo",
+            &pr_info,
+            CiStatus::Success,
+            Some(&evidence),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, PrMonitorState::ChangesRequested);
     }
 }

@@ -960,8 +960,15 @@ impl CoderClient {
             .await
             .context("Failed to stop workspace")?;
 
-        if resp.status().is_success() {
-            info!(workspace_id = id, "Stopped workspace");
+        if resp.status().is_success()
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::GONE
+        {
+            info!(
+                workspace_id = id,
+                status = %resp.status(),
+                "Stopped workspace"
+            );
             Ok(())
         } else {
             let body = resp.text().await.unwrap_or_default();
@@ -983,10 +990,13 @@ impl CoderClient {
             .await
             .context("Failed to delete workspace")?;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::GONE
+        {
             info!(
                 workspace_id = id,
-                "Workspace already deleted (404 Not Found)"
+                status = %resp.status(),
+                "Workspace already deleted"
             );
             return Ok(());
         }
@@ -1000,7 +1010,7 @@ impl CoderClient {
             .await
     }
 
-    /// Wait until a workspace is confirmed deleted (returns 404 or reports status "deleted").
+    /// Wait until a workspace is confirmed deleted (returns 404, 410, or reports status "deleted").
     /// If the delete build fails or cancels, this method returns an error.
     pub async fn wait_for_workspace_deleted(&self, id: &str, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
@@ -1015,10 +1025,14 @@ impl CoderClient {
                 .await;
 
             match resp {
-                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                Ok(r)
+                    if r.status() == reqwest::StatusCode::NOT_FOUND
+                        || r.status() == reqwest::StatusCode::GONE =>
+                {
                     info!(
                         workspace_id = id,
-                        "Workspace confirmed deleted (404 Not Found)"
+                        status = %r.status(),
+                        "Workspace confirmed deleted"
                     );
                     return Ok(());
                 }
@@ -2162,6 +2176,18 @@ mod http_mock {
                 "200 OK",
                 r#"{"id":"ws-deleted","name":"ws-deleted","status":"deleted","latest_build":{"status":"succeeded","transition":"delete"}}"#.to_string(),
             ),
+            ("POST", "/api/v2/workspaces/ws-gone/builds") => (
+                "410 Gone",
+                r#"{"message":"Workspace ws-gone was deleted"}"#.to_string(),
+            ),
+            ("POST", "/api/v2/workspaces/ws-wait-gone/builds") => (
+                "201 Created",
+                r#"{"id":"build-3","transition":"delete"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-wait-gone") => (
+                "410 Gone",
+                r#"{"message":"Workspace ws-wait-gone was deleted"}"#.to_string(),
+            ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
         }
     }
@@ -2429,6 +2455,18 @@ mod tests {
             .delete_workspace("ws-deleted")
             .await
             .expect("workspace with deleted status should succeed");
+
+        // 410 Gone on delete build should be treated as success (already deleted)
+        client
+            .delete_workspace("ws-gone")
+            .await
+            .expect("410 on build should succeed");
+
+        // 410 Gone during wait should be treated as success (confirmed deleted)
+        client
+            .delete_workspace("ws-wait-gone")
+            .await
+            .expect("410 on wait should succeed");
 
         server.shutdown().await;
     }

@@ -1,27 +1,31 @@
 //! Binary entry point for running the OpenFlows Manager service.
 
-use openflows_manager::{error::ManagerError, server};
+use openflows_manager::{config::ManagerConfig, error::ManagerError, server};
 use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), ManagerError> {
     // Initialize the default tracing subscriber before any fallible setup so
     // configuration and bind failures are visible to operators.
-    tracing_subscriber::fmt::init();
+    let filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "openflows_manager=info,tower_http=info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .compact()
+        .init();
 
-    // The manager defaults to localhost to avoid exposing the service by
-    // accident in development. Deployments can opt into a different interface
-    // or port with OPENFLOWS_MANAGER_ADDR.
-    let addr = std::env::var("OPENFLOWS_MANAGER_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:3002".to_string())
-        .parse::<SocketAddr>()
-        .map_err(|error| {
-            ManagerError::Config(format!("invalid OPENFLOWS_MANAGER_ADDR: {error}"))
-        })?;
+    // Centralized, typed configuration. Hosted-mode configuration failures are
+    // surfaced here rather than silently falling back to local behavior.
+    let config = ManagerConfig::from_env().map_err(|e| ManagerError::Config(e.to_string()))?;
+    tracing::info!(mode = %config.mode, addr = %config.http_addr, "starting OpenFlows Manager");
+    let addr = config.http_addr.parse::<SocketAddr>().map_err(|error| {
+        ManagerError::Config(format!("invalid OPENFLOWS_MANAGER_ADDR: {error}"))
+    })?;
 
-    // AppState owns the shared dependencies used by handlers. Keep this
-    // construction in one place so future process-level validation has a single
-    // path before the socket is opened.
+    // AppState owns the shared dependencies used by handlers. In hosted mode it
+    // connects the control-plane database; a failure leaves the process unable
+    // to start rather than silently serving without durable state.
     let state = server::AppState::from_env().await?;
 
     server::bind_and_serve(addr, state, shutdown_signal()).await

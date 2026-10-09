@@ -105,6 +105,8 @@ pub enum VesselOutcome {
         ticket_id: Option<String>,
         pr_number: u64,
         state: String,
+        #[serde(default)]
+        head_sha: Option<String>,
     },
     /// No lifecycle ticket owns this PR; a human must handle it.
     Unmanaged {
