@@ -483,8 +483,7 @@ impl CoderClient {
         f.read_exact(&mut entropy)
             .context("Failed to read secure randomness from /dev/urandom for tenant password")?;
         use base64::Engine;
-        let mut base =
-            base64::engine::general_purpose::STANDARD.encode(entropy);
+        let mut base = base64::engine::general_purpose::STANDARD.encode(entropy);
         // Guarantee uppercase, lowercase, digit, and a special character.
         base.push_str("Aa1!");
         Ok(base)
@@ -829,7 +828,8 @@ impl CoderClient {
     /// Revoke every token for `user_id` whose name matches `name` or the legacy
     /// `name-<suffix>` naming. Runs as the current credential.
     async fn revoke_stale_tokens(&self, user_id: &str, name: &str) {
-        self.revoke_stale_tokens_excluding(user_id, name, None).await;
+        self.revoke_stale_tokens_excluding(user_id, name, None)
+            .await;
     }
 
     /// Revoke stale tokens for `user_id`, skipping the token with id
@@ -2262,7 +2262,12 @@ mod http_mock {
 
     impl Scenario {
         fn conflict_seen(&self) -> bool {
-            matches!(self, Scenario::ConflictThenExisting { conflict_seen: true })
+            matches!(
+                self,
+                Scenario::ConflictThenExisting {
+                    conflict_seen: true
+                }
+            )
         }
         fn mark_conflict(&mut self) {
             if let Scenario::ConflictThenExisting { conflict_seen } = self {
@@ -2859,7 +2864,10 @@ mod tests {
             .expect("create_user should succeed against mock");
         assert_eq!(user.id, "tenant-1");
         assert_eq!(user.username, "tenant-acme");
-        assert!(!password.is_empty(), "a fresh user must receive a generated password");
+        assert!(
+            !password.is_empty(),
+            "a fresh user must receive a generated password"
+        );
 
         let requests = server.requests().await;
         let create = requests
@@ -2904,11 +2912,10 @@ mod tests {
         // GET /users returns an already-provisioned tenant account, so
         // repeated onboarding must reuse it and never POST a new user (which
         // would create a duplicate or reset the account's identity).
-        let server = super::http_mock::HttpMock::new_with_scenario(
-            super::http_mock::Scenario::ExistingUser,
-        )
-        .await
-        .unwrap();
+        let server =
+            super::http_mock::HttpMock::new_with_scenario(super::http_mock::Scenario::ExistingUser)
+                .await
+                .unwrap();
         let client = crate::CoderClient::new(&server.url(), "admin-token");
 
         let (user, password) = client
@@ -2944,7 +2951,9 @@ mod tests {
         // create_user must fall back to listing and reuse the existing user
         // instead of failing.
         let server = super::http_mock::HttpMock::new_with_scenario(
-            super::http_mock::Scenario::ConflictThenExisting { conflict_seen: false },
+            super::http_mock::Scenario::ConflictThenExisting {
+                conflict_seen: false,
+            },
         )
         .await
         .unwrap();
@@ -2968,7 +2977,8 @@ mod tests {
             requests
                 .iter()
                 .filter(|r| r.method == "GET" && r.path == "/api/v2/users")
-                .count() >= 2,
+                .count()
+                >= 2,
             "the 409 path must re-list users to recover the existing account"
         );
 
