@@ -5,7 +5,149 @@ All notable changes to this project will be documented in this file.
 
 ## [1.7.1] - 2026-10-09
 
+### Features
 
+- *(manager)* Initialize structured tracing
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add WP-01 manager foundations
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+### Bug Fixes
+
+- *(controller)* Handle 410 gone and scan pr_opened tickets during rework
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Address remaining review comments
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address WP-01 persistence and test review
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(vessel)* Resolve active forge slot id instead of hardcoded role name
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Propagate fresh head sha in reviews outcome and guard lifecycle transitions
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Verify authorized head approval in rework check
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Route conflicting unapproved PRs to conflict rework after CI success
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel)* Inspect unapproved PRs for review rework before gating on merge_ready
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel,nexus)* Address Greptile review comments on rework loops
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(vessel,nexus)* Autonomous PR review rework reset and GitHub approval detection
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+### Testing
+
+- *(vessel)* Guard collect_rework on empty repo and allocate dedicated stack for mockito test
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+
+
+
+### Contributors
+
+- @Christiantyemele
+- @NkwaTambe
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.7.0...openflows-1.7.1
 
@@ -294,12 +436,6 @@ All notable changes to this project will be documented in this file.
   by @NkwaTambe
 
 
-
-
-### Contributors
-
-- @NkwaTambe
-- @arielpetit
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.6.0...openflows-1.7.0
 
