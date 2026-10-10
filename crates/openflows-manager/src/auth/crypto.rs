@@ -52,6 +52,12 @@ impl Secret {
     pub fn hash(&self) -> String {
         hash_token(&self.encode())
     }
+
+    /// Hash a raw state/token string (e.g. one that arrived on a callback query
+    /// parameter) for comparison against a stored hash.
+    pub fn hash_raw(raw: &str) -> String {
+        hash_token(raw)
+    }
 }
 
 /// SHA-256 hex digest of an arbitrary string value. Used to hash a raw token

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), ManagerError> {
+    load_env_file()?;
     // Initialize the default tracing subscriber before any fallible setup so
     // configuration and bind failures are visible to operators.
     let filter = std::env::var("RUST_LOG")
@@ -29,6 +30,18 @@ async fn main() -> Result<(), ManagerError> {
     let state = server::AppState::from_env().await?;
 
     server::bind_and_serve(addr, state, shutdown_signal()).await
+}
+
+/// Load repository-local deployment settings before typed configuration is
+/// parsed. Existing process environment variables win, so CI and explicit
+/// shell overrides remain authoritative.
+fn load_env_file() -> Result<(), ManagerError> {
+    let path = std::path::Path::new(".env.prod");
+    if path.exists() {
+        dotenvy::from_path(path)
+            .map_err(|error| ManagerError::Config(format!("cannot load .env.prod: {error}")))?;
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
