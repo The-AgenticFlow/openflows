@@ -72,8 +72,22 @@ pub const AUTH_COOKIE_SECURE_ENV: &str = "OPENFLOWS_AUTH_COOKIE_SECURE";
 /// Explicit loopback-development exception (allows insecure cookies / HTTP).
 pub const AUTH_ALLOW_LOOPBACK_ENV: &str = "OPENFLOWS_AUTH_ALLOW_LOOPBACK";
 
+/// The numeric id of the central GitHub App (used to sign App JWTs).
+pub const GITHUB_APP_ID_ENV: &str = "OPENFLOWS_GITHUB_APP_ID";
+/// The slug of the central GitHub App (used to build the installation setup URL).
+pub const GITHUB_APP_SLUG_ENV: &str = "OPENFLOWS_GITHUB_APP_SLUG";
+/// Secret-provider reference for the GitHub App private key (RS256 signing).
+pub const GITHUB_PRIVATE_KEY_REF_ENV: &str = "OPENFLOWS_GITHUB_PRIVATE_KEY_REF";
+/// Secret-provider reference for the GitHub webhook signing secret.
+pub const GITHUB_WEBHOOK_SECRET_REF_ENV: &str = "OPENFLOWS_GITHUB_WEBHOOK_SECRET_REF";
+/// Maximum accepted webhook request body size in bytes (default 2 MiB).
+pub const WEBHOOK_BODY_LIMIT_ENV: &str = "OPENFLOWS_GITHUB_WEBHOOK_BODY_LIMIT";
+
 /// The length (in bytes) of the envelope master key.
 pub const MASTER_KEY_BYTES: usize = 32;
+
+/// Default webhook body-size limit: 2 MiB.
+pub const DEFAULT_WEBHOOK_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 use crate::auth::crypto::EnvelopeCipher;
 use crate::error::ManagerError;
@@ -242,6 +256,58 @@ fn auth_from_env(require_auth: bool, master_key_ref: Option<String>) -> Result<A
     })
 }
 
+/// The parsed value of the webhook body-size limit, validated against a sane
+/// minimum so a misconfiguration cannot silently disable the limit.
+fn webhook_body_limit_from_env() -> usize {
+    let raw = std::env::var(WEBHOOK_BODY_LIMIT_ENV).ok();
+    match raw {
+        None => DEFAULT_WEBHOOK_BODY_LIMIT,
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1024 => n,
+            _ => DEFAULT_WEBHOOK_BODY_LIMIT,
+        },
+    }
+}
+
+/// Centralized GitHub App configuration for the installation connection
+/// lifecycle (WP-03): App JWT signing, installation metadata lookups, and
+/// webhook signature verification. These reference secrets through the secret
+/// provider; the private key and webhook secret are never plaintext config.
+#[derive(Debug, Clone)]
+pub struct GithubAppConfig {
+    /// The central GitHub App numeric id, used to sign App JWTs.
+    pub app_id: Option<i64>,
+    /// The central GitHub App slug, used to build the installation setup URL.
+    pub app_slug: Option<String>,
+    /// Secret-provider reference for the GitHub App private key (RS256).
+    pub private_key_ref: Option<String>,
+    /// Secret-provider reference for the GitHub webhook signing secret.
+    pub webhook_secret_ref: Option<String>,
+    /// Maximum accepted webhook request body size in bytes.
+    pub webhook_body_limit: usize,
+}
+
+/// Load the GitHub App configuration from the environment. Local mode defaults
+/// are unset (the connection lifecycle fails closed until configured).
+pub fn github_app_from_env() -> GithubAppConfig {
+    GithubAppConfig {
+        app_id: std::env::var(GITHUB_APP_ID_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|v| v.trim().parse::<i64>().ok()),
+        app_slug: std::env::var(GITHUB_APP_SLUG_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        private_key_ref: std::env::var(GITHUB_PRIVATE_KEY_REF_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        webhook_secret_ref: std::env::var(GITHUB_WEBHOOK_SECRET_REF_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        webhook_body_limit: webhook_body_limit_from_env(),
+    }
+}
+
 /// The foundational Manager configuration.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -256,6 +322,8 @@ pub struct ManagerConfig {
     pub http_addr: String,
     /// Centralized GitHub user-authorization settings.
     pub auth: AuthConfig,
+    /// Centralized GitHub App installation-connection settings (WP-03).
+    pub github_app: GithubAppConfig,
     /// Secret-provider reference for the GitHub App client secret (OAuth
     /// exchange). Required in hosted mode.
     pub github_client_secret_ref: Option<String>,
@@ -315,12 +383,28 @@ impl ManagerConfig {
                 })?;
                 let crypto_master_key_ref = crypto_master_key_ref
                     .ok_or_else(|| format!("hosted mode requires {CRYPTO_MASTER_KEY_REF_ENV}"))?;
+                let github_app = github_app_from_env();
+                if github_app.app_slug.is_none() {
+                    return Err(format!("hosted mode requires {GITHUB_APP_SLUG_ENV}"));
+                }
+                github_app
+                    .app_id
+                    .ok_or_else(|| format!("hosted mode requires {GITHUB_APP_ID_ENV}"))?;
+                if github_app.private_key_ref.is_none() {
+                    return Err(format!("hosted mode requires {GITHUB_PRIVATE_KEY_REF_ENV}"));
+                }
+                if github_app.webhook_secret_ref.is_none() {
+                    return Err(format!(
+                        "hosted mode requires {GITHUB_WEBHOOK_SECRET_REF_ENV}"
+                    ));
+                }
                 Ok(ManagerConfig {
                     mode,
                     database_url: Some(database_url),
                     secret_provider,
                     http_addr: http_addr_from_env(),
                     auth,
+                    github_app,
                     github_client_secret_ref: Some(github_client_secret_ref),
                     crypto_master_key_ref: Some(crypto_master_key_ref),
                 })
@@ -331,6 +415,7 @@ impl ManagerConfig {
                 secret_provider,
                 http_addr: http_addr_from_env(),
                 auth,
+                github_app: github_app_from_env(),
                 github_client_secret_ref,
                 crypto_master_key_ref,
             }),
@@ -360,6 +445,13 @@ pub fn local_test_config() -> ManagerConfig {
         },
         github_client_secret_ref: None,
         crypto_master_key_ref: None,
+        github_app: GithubAppConfig {
+            app_id: None,
+            app_slug: None,
+            private_key_ref: None,
+            webhook_secret_ref: None,
+            webhook_body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
+        },
     }
 }
 
@@ -405,6 +497,11 @@ mod tests {
         PUBLIC_URL_ENV,
         GITHUB_CLIENT_SECRET_REF_ENV,
         CRYPTO_MASTER_KEY_REF_ENV,
+        GITHUB_APP_ID_ENV,
+        GITHUB_APP_SLUG_ENV,
+        GITHUB_PRIVATE_KEY_REF_ENV,
+        GITHUB_WEBHOOK_SECRET_REF_ENV,
+        WEBHOOK_BODY_LIMIT_ENV,
     ];
 
     /// Set the env required for a hosted-mode config that should validate.
@@ -416,6 +513,10 @@ mod tests {
         std::env::set_var(PUBLIC_URL_ENV, "https://openflows.example.com");
         std::env::set_var(GITHUB_CLIENT_SECRET_REF_ENV, "ref:github-client-secret");
         std::env::set_var(CRYPTO_MASTER_KEY_REF_ENV, "ref:crypto-master-key");
+        std::env::set_var(GITHUB_APP_ID_ENV, "123456");
+        std::env::set_var(GITHUB_APP_SLUG_ENV, "openflows-app");
+        std::env::set_var(GITHUB_PRIVATE_KEY_REF_ENV, "ref:github-private-key");
+        std::env::set_var(GITHUB_WEBHOOK_SECRET_REF_ENV, "ref:github-webhook-secret");
     }
 
     #[test]

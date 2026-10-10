@@ -58,6 +58,16 @@ pub async fn claim(
     owner: &str,
     limit: i32,
 ) -> Result<Vec<OutboxClaim>, ManagerError> {
+    claim_filtered(pool, owner, limit, None).await
+}
+
+/// Claim only event types handled by a specialized worker.
+pub async fn claim_filtered(
+    pool: &PgPool,
+    owner: &str,
+    limit: i32,
+    event_types: Option<&[&str]>,
+) -> Result<Vec<OutboxClaim>, ManagerError> {
     let token = uuid::Uuid::new_v4();
     let rows = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, String, Option<Value>, i32)>(
         "UPDATE outbox_events
@@ -69,6 +79,9 @@ pub async fn claim(
                 SELECT id
                   FROM outbox_events
                  WHERE delivered_at IS NULL
+                   AND failed_at IS NULL
+                   AND (retry_at IS NULL OR retry_at <= clock_timestamp())
+                   AND ($4::text[] IS NULL OR event_type = ANY($4))
                    AND (lease_expires_at IS NULL OR lease_expires_at < now())
                  ORDER BY created_at
                  LIMIT $3
@@ -79,6 +92,7 @@ pub async fn claim(
     .bind(owner)
     .bind(token)
     .bind(limit)
+    .bind(event_types)
     .fetch_all(pool)
     .await
     .map_err(ManagerError::from)?;
@@ -98,6 +112,21 @@ pub async fn claim(
 }
 
 /// Mark a claimed event as delivered.
+pub async fn heartbeat(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, ManagerError> {
+    let result = sqlx::query(
+        "UPDATE outbox_events SET lease_expires_at = clock_timestamp() + interval '30 seconds'
+        WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+          AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL",
+    )
+    .bind(claim.id.0)
+    .bind(&claim.owner)
+    .bind(claim.token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Mark a claimed event as delivered.
 pub async fn mark_delivered(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, ManagerError> {
     let result = sqlx::query("UPDATE outbox_events SET delivered_at = now(), lease_owner = NULL, lease_expires_at = NULL, lease_token = NULL
         WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
@@ -109,6 +138,50 @@ pub async fn mark_delivered(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, 
         .await
         .map_err(ManagerError::from)?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Complete an outbox-owned operation and delivery under the same live lease.
+pub async fn complete_operation_delivery(
+    pool: &PgPool,
+    claim: &OutboxClaim,
+) -> Result<bool, ManagerError> {
+    let operation_id = claim
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("operation_id"))
+        .and_then(Value::as_str)
+        .map(str::parse::<crate::id::OperationId>)
+        .transpose()
+        .map_err(|_| ManagerError::InvalidInput("invalid operation id in outbox".into()))?;
+    let mut tx = pool.begin().await?;
+    let delivered = sqlx::query("UPDATE outbox_events SET delivered_at = now(), lease_owner = NULL, lease_expires_at = NULL, lease_token = NULL
+        WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+          AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL")
+        .bind(claim.id.0).bind(&claim.owner).bind(claim.token)
+        .execute(&mut *tx).await?.rows_affected() == 1;
+    if !delivered {
+        return Ok(false);
+    }
+    if let Some(id) = operation_id {
+        let updated = sqlx::query(
+            "UPDATE operations SET state = 'succeeded', updated_at = now()
+            WHERE id = $1 AND organization_id = $2 AND kind = $3
+              AND state = 'queued' AND lease_owner IS NULL",
+        )
+        .bind(id.0)
+        .bind(claim.organization_id.map(|id| id.0))
+        .bind(&claim.event_type)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(ManagerError::Service(anyhow::anyhow!(
+                "outbox operation is not queued or scope mismatched"
+            )));
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Release a lease without delivering (e.g. transient failure), resetting the
@@ -129,11 +202,48 @@ pub async fn release_lease(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, M
     Ok(result.rows_affected() == 1)
 }
 
+/// Retry temporary failures indefinitely with delays capped at 256 seconds.
+/// Only permanent failures become terminal; only the current lease holder may
+/// change either state.
+pub async fn fail_delivery(
+    pool: &PgPool,
+    claim: &OutboxClaim,
+    permanent: bool,
+) -> Result<bool, ManagerError> {
+    let terminal = permanent;
+    let delay = 2_i32.pow(claim.attempts.clamp(1, 8) as u32);
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query("UPDATE outbox_events
+        SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+            retry_at = CASE WHEN $4 THEN NULL ELSE clock_timestamp() + make_interval(secs => $5) END,
+            failed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END
+        WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+          AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL AND failed_at IS NULL")
+        .bind(claim.id.0).bind(&claim.owner).bind(claim.token).bind(terminal).bind(f64::from(delay))
+        .execute(&mut *tx).await?.rows_affected() == 1;
+    if changed && terminal {
+        if let Some(id) = claim
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("operation_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+        {
+            sqlx::query("UPDATE operations SET state = 'failed', error_code = 'CONNECTION_JOB_FAILED', updated_at = now()
+                WHERE id = $1 AND organization_id = $2 AND kind = $3 AND state = 'queued' AND lease_owner IS NULL")
+                .bind(id).bind(claim.organization_id.map(|id| id.0)).bind(&claim.event_type).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
 /// Count undelivered events, for diagnostics and readiness probes.
 pub async fn pending_count(pool: &PgPool, owner: &str) -> Result<i64, ManagerError> {
     let row: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM outbox_events
           WHERE delivered_at IS NULL
+            AND failed_at IS NULL
             AND (lease_expires_at IS NULL OR lease_expires_at < now() OR lease_owner = $1)",
     )
     .bind(owner)

@@ -54,7 +54,7 @@ pub struct ManagerServices {
     pub organizations: OrganizationsRepository,
     pub tenants: TenantsRepository,
     pub idempotency: IdempotencyService,
-    // WP-02 authentication and organization services.
+    // authentication and organization services.
     pub users: crate::auth::repository::UsersRepository,
     pub sessions: crate::auth::repository::SessionsRepository,
     pub transactions: crate::auth::repository::AuthTransactionRepository,
@@ -66,6 +66,14 @@ pub struct ManagerServices {
     pub rate_limiter: crate::rate_limit::RateLimiter,
     pub auth_config: crate::config::AuthConfig,
     pub github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+    // GitHub App connection lifecycle.
+    pub connections: crate::connections::ConnectionRepository,
+    pub connections_service: crate::connections::ConnectionService,
+    pub connection_worker: crate::connections::ConnectionWorker,
+    pub webhooks: crate::connections::WebhookService,
+    pub app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
+    pub app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
+    pub webhook_secret: Option<Vec<u8>>,
 }
 
 /// The secret-provider adapter name for the isolated in-memory provider.
@@ -139,11 +147,66 @@ impl ManagerServices {
     }
 
     /// Build services from a connected database using the provided auth config
-    /// and GitHub adapter (used by tests with fixture adapters).
+    /// and GitHub adapter (used by tests with fixture adapters). Connection
+    /// services use fixture (fail-closed) App signer/API components so the
+    /// lifecycle routes exist without external configuration; tests that need
+    /// real connection behavior inject their own via [`Self::from_db_with_app`].
     pub fn from_db_with_auth(
         db: Db,
         auth_config: crate::config::AuthConfig,
         github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+    ) -> Self {
+        Self::from_db_with_app(
+            db,
+            auth_config,
+            github,
+            0,
+            std::sync::Arc::new(crate::connections::app_jwt::FixtureAppSigner::new(
+                crate::connections::AppJwtClaims {
+                    iss: 0,
+                    iat: chrono::Utc::now().timestamp(),
+                    exp: chrono::Utc::now().timestamp() + 540,
+                },
+            )),
+            std::sync::Arc::new(UnconfiguredAppApi),
+            None,
+        )
+    }
+
+    /// Build services with an explicit App signer and App API (WP-03). Used by
+    /// tests and by real configuration resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_db_with_app(
+        db: Db,
+        auth_config: crate::config::AuthConfig,
+        github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+        app_id: i64,
+        app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
+        app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
+        webhook_secret: Option<Vec<u8>>,
+    ) -> Self {
+        Self::from_db_with_app_config(
+            db,
+            auth_config,
+            github,
+            app_id,
+            app_signer,
+            app_api,
+            webhook_secret,
+            crate::config::github_app_from_env(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_db_with_app_config(
+        db: Db,
+        auth_config: crate::config::AuthConfig,
+        github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+        app_id: i64,
+        app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
+        app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
+        webhook_secret: Option<Vec<u8>>,
+        github_app: crate::config::GithubAppConfig,
     ) -> Self {
         let pool = db.pool().clone();
         let users = crate::auth::repository::UsersRepository::new(pool.clone());
@@ -174,6 +237,56 @@ impl ManagerServices {
             organizations.clone(),
             idempotency.clone(),
         );
+
+        let connections = crate::connections::ConnectionRepository::new(pool.clone());
+        let attempts = crate::connections::AttemptService::new(
+            connections.clone(),
+            github.clone(),
+            auth_config.clone(),
+            github_app.clone(),
+        );
+        let authority = crate::connections::AuthorityService::new(app_api.clone());
+        let sync = crate::connections::SyncService::new(
+            connections.clone(),
+            app_api.clone(),
+            app_signer.clone(),
+        );
+        let webhooks = crate::connections::WebhookService::new(
+            pool.clone(),
+            connections.clone(),
+            webhook_secret.clone().unwrap_or_default(),
+            github_app.webhook_body_limit,
+            app_id,
+            sync.clone(),
+        );
+        let binding = crate::connections::BindingService::new(
+            pool.clone(),
+            connections.clone(),
+            authority.clone(),
+            app_api.clone(),
+            app_signer.clone(),
+            app_id,
+        );
+        let connections_service = crate::connections::ConnectionService::new(
+            pool.clone(),
+            connections.clone(),
+            attempts,
+            authority.clone(),
+            binding,
+            webhooks.clone(),
+            idempotency.clone(),
+            org_repo.clone(),
+            auth_config.clone(),
+            app_id,
+            app_api.clone(),
+        );
+        let connection_worker = crate::connections::ConnectionWorker::new(
+            pool.clone(),
+            connections.clone(),
+            sync,
+            webhooks.clone(),
+        );
+
         ManagerServices {
             db,
             organizations,
@@ -190,12 +303,20 @@ impl ManagerServices {
             rate_limiter: crate::rate_limit::RateLimiter::new(pool),
             auth_config,
             github,
+            connections,
+            connections_service,
+            connection_worker,
+            webhooks,
+            app_signer,
+            app_api,
+            webhook_secret,
         }
     }
 
     /// Build services from a connected database using configuration and the
-    /// secret provider, resolving the GitHub client secret and envelope master
-    /// key. Hosted-mode secret resolution failures fail closed.
+    /// secret provider, resolving the GitHub client secret, App private key,
+    /// webhook secret, and envelope master key. Hosted-mode secret resolution
+    /// failures fail closed.
     pub async fn from_db_with_config(
         db: Db,
         config: &crate::config::ManagerConfig,
@@ -228,7 +349,38 @@ impl ManagerServices {
             )),
         );
 
-        Ok(Self::from_db_with_auth(db, auth_config, github))
+        // Resolve the App private key (never logged/persisted) and webhook
+        // secret through the secret provider. The App JWT is generated fresh and
+        // never persisted.
+        let app_id = config.github_app.app_id.unwrap_or(0);
+        let private_key = match &config.github_app.private_key_ref {
+            Some(ref_name) => provider.get(ref_name).await.map_err(|e| {
+                ManagerError::Config(format!("failed to resolve GitHub App private key: {e}"))
+            })?,
+            None => Vec::new(),
+        };
+        let app_signer: std::sync::Arc<dyn crate::connections::AppSigner> =
+            std::sync::Arc::new(crate::connections::RealAppSigner::new(app_id, private_key));
+        let app_api: std::sync::Arc<dyn crate::connections::GithubAppApi> = std::sync::Arc::new(
+            crate::connections::RealGithubAppApi::new(auth_config.github_api_base.clone()),
+        );
+        let webhook_secret = match &config.github_app.webhook_secret_ref {
+            Some(ref_name) => Some(provider.get(ref_name).await.map_err(|e| {
+                ManagerError::Config(format!("failed to resolve GitHub webhook secret: {e}"))
+            })?),
+            None => None,
+        };
+
+        Ok(Self::from_db_with_app_config(
+            db,
+            auth_config,
+            github,
+            app_id,
+            app_signer,
+            app_api,
+            webhook_secret,
+            config.github_app.clone(),
+        ))
     }
 
     pub fn from_db(db: Db) -> Self {
@@ -273,6 +425,55 @@ impl crate::auth::github::GithubAuth for UnconfiguredGithub {
         Err(ManagerError::Config(
             "GitHub authentication is not configured".into(),
         ))
+    }
+}
+
+/// A GitHub App API adapter that fails closed when no provider is configured.
+/// Used in pure-local/test mode so unauthenticated App calls never silently
+/// succeed.
+struct UnconfiguredAppApi;
+
+#[async_trait::async_trait]
+impl crate::connections::GithubAppApi for UnconfiguredAppApi {
+    async fn installation(
+        &self,
+        _: &crate::connections::SignedAppJwt,
+        _: i64,
+    ) -> Result<Option<crate::connections::github_app::Installation>, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn accessible_installations(
+        &self,
+        _: &str,
+    ) -> Result<Vec<crate::connections::github_app::AccessibleInstallation>, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn fetch_user(&self, _: &str) -> Result<crate::auth::github::GithubUser, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn organization_membership(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::connections::github_app::OrgMembership>, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn installation_repositories(
+        &self,
+        _: &crate::connections::SignedAppJwt,
+        _: i64,
+        _: u32,
+        _: u32,
+    ) -> Result<Vec<crate::connections::github_app::RepoRef>, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn exchange_installation_token(
+        &self,
+        _: &crate::connections::SignedAppJwt,
+        _: i64,
+        _: &[i64],
+    ) -> Result<crate::connections::github_app::InstallationToken, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
     }
 }
 
@@ -518,12 +719,24 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    axum::serve(
+    let worker = state
+        .services()
+        .map(|services| services.connection_worker.clone());
+    let worker_loop = async move {
+        match worker {
+            Some(worker) => worker.run_forever().await,
+            None => std::future::pending().await,
+        }
+    };
+    let server = axum::serve(
         listener,
         create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    .with_graceful_shutdown(shutdown);
+    tokio::select! {
+        result = async { server.await } => result?,
+        result = worker_loop => result?,
+    }
     Ok(())
 }
 
@@ -543,6 +756,7 @@ async fn request_context(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let is_test_console = request.uri().path() == "/";
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -589,7 +803,14 @@ async fn request_context(
     response
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
-    response.headers_mut().insert("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
+    let csp = if is_test_console {
+        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    } else {
+        "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    };
+    response
+        .headers_mut()
+        .insert("content-security-policy", csp.parse().unwrap());
     response
 }
 

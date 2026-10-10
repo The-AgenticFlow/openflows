@@ -5,7 +5,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # release (advisory `patched = []`). It is pulled in transitively only by
 # `jsonwebtoken`, and this project authenticates lifecycle hooks exclusively
 # with HS256 (see crates/agent-nexus/src/hooks/jwt.rs) — RSA signing/verification
-# is never exercised, so the vulnerable decrypt path is unreachable in our graph.
+# The manager now uses jsonwebtoken's RSA implementation only for signing
+# short-lived GitHub App JWTs; it does not use the affected RSA decryption path.
 # Revisit if a patched `rsa` or an RSA-less jsonwebtoken becomes available.
 ignore = ["RUSTSEC-2023-0071"]
 

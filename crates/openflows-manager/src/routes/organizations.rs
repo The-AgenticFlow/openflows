@@ -81,7 +81,7 @@ pub async fn require_csrf_for_browser(
     csrf::validate_session(headers, &presented)
 }
 
-fn request_id(headers: &HeaderMap) -> String {
+pub fn request_id(headers: &HeaderMap) -> String {
     headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -487,7 +487,7 @@ pub async fn delete_org(
         .into_response())
 }
 
-fn parse_org(s: &str) -> Result<OrganizationId, ManagerError> {
+pub fn parse_org(s: &str) -> Result<OrganizationId, ManagerError> {
     s.parse::<OrganizationId>()
         .map_err(|_| ManagerError::not_found("organization"))
 }
