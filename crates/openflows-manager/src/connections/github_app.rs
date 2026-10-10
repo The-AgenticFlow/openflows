@@ -272,8 +272,8 @@ impl GithubAppApi for RealGithubAppApi {
                 account_id: i.account.id,
                 account_type: parse_account_type(&i.account.type_),
                 account_login: i.account.login,
-                suspended: i.suspended.unwrap_or(false),
-                suspended_by: i.suspended_by,
+                suspended: i.suspended_at.is_some(),
+                suspended_by: i.suspended_by.map(|user| user.login),
                 repository_selection: i.repository_selection,
             })),
             Err(e) if is_not_found(&e) => Ok(None),
@@ -285,19 +285,26 @@ impl GithubAppApi for RealGithubAppApi {
         &self,
         user_token: &str,
     ) -> Result<Vec<AccessibleInstallation>, ManagerError> {
-        let url = self.app_url("/user/installations");
-        let resp: InstallationsResponse = self
-            .get_json(&url, user_token, "application/vnd.github+json")
-            .await?;
-        Ok(resp
-            .installations
+        let mut all = Vec::new();
+        for page in 1..=100u32 {
+            let url = self.app_url(&format!("/user/installations?per_page=100&page={page}"));
+            let resp: InstallationsResponse = self
+                .get_json(&url, user_token, "application/vnd.github+json")
+                .await?;
+            let count = resp.installations.len();
+            all.extend(resp.installations);
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(all
             .into_iter()
             .map(|i| AccessibleInstallation {
                 id: i.id,
                 account_id: i.account.id,
                 account_type: parse_account_type(&i.account.type_),
                 account_login: i.account.login,
-                suspended: i.suspended.unwrap_or(false),
+                suspended: i.suspended_at.is_some(),
             })
             .collect())
     }
@@ -445,8 +452,8 @@ struct InstallationResponse {
     id: i64,
     app_id: Option<i64>,
     account: AccountResponse,
-    suspended: Option<bool>,
-    suspended_by: Option<String>,
+    suspended_at: Option<String>,
+    suspended_by: Option<AccountResponse>,
     repository_selection: Option<String>,
 }
 

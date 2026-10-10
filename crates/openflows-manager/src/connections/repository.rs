@@ -395,7 +395,8 @@ impl ConnectionRepository {
     pub async fn expire_attempts(&self) -> Result<u64, ManagerError> {
         let affected = sqlx::query(
             "UPDATE github_connect_attempts
-                SET status = 'expired'
+                SET status = 'expired', user_credential_ref = NULL,
+                    oauth_code_verifier_ref = NULL
               WHERE status IN ('pending','verified') AND expires_at <= clock_timestamp()",
         )
         .execute(&self.pool)

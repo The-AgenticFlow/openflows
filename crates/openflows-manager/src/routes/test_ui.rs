@@ -68,6 +68,22 @@ function log(message, error = false) {
   $('log').className = error ? 'error' : '';
 }
 function show(id, value) { $(id).textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+function showConnection(value) {
+  const output = $('connection-output');
+  output.textContent = '';
+  if (value.authorization_url) {
+    const link = document.createElement('a'); link.href = value.authorization_url;
+    link.target = '_blank'; link.rel = 'noopener'; link.textContent = 'Open GitHub authorization';
+    output.append(link, document.createTextNode('\n'));
+  }
+  if (value.setup_url) {
+    const link = document.createElement('a'); link.href = value.setup_url;
+    link.target = '_blank'; link.rel = 'noopener'; link.textContent = 'Open GitHub App installation';
+    output.append(link, document.createTextNode('\n'));
+  }
+  const details = document.createElement('pre'); details.textContent = JSON.stringify(value, null, 2);
+  output.append(details);
+}
 async function request(url, options = {}) {
   const response = await fetch(url, { credentials: 'include', ...options });
   const text = await response.text();
@@ -112,9 +128,7 @@ $('start').onclick = async () => {
     connection = await request(`/api/v1/organizations/${organizationId}/github/connect`, { method: 'POST', headers: {
       'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken, 'Idempotency-Key': `ui-connect-${Date.now()}`
     }, body: JSON.stringify({ flow_type: 'both' }) });
-    show('connection-output', connection); log('Connection flow created. Open both links.');
-    if (connection.authorization_url) window.open(connection.authorization_url, '_blank', 'noopener');
-    if (connection.setup_url) window.open(connection.setup_url, '_blank', 'noopener');
+    showConnection(connection); log('Connection flow created. Open both links.');
   } catch (error) { log(error.message, true); show('connection-output', error.message); }
 };
 $('status').onclick = async () => {

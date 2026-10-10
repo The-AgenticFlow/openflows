@@ -147,6 +147,12 @@ impl ConnectionService {
         idempotency_key: &str,
         request_id: &str,
     ) -> Result<ConnectResponse, ManagerError> {
+        if flow_type != FlowType::Both {
+            return Err(ManagerError::api(
+                "UNSUPPORTED_FLOW_TYPE",
+                "only the combined GitHub authorization and installation flow is supported",
+            ));
+        }
         self.require_active_admin(actor, org_id).await?;
 
         let req = IdempotencyRequest {
@@ -496,6 +502,16 @@ impl ConnectionService {
             .idempotency
             .execute(&req, move |conn_tx| {
                 Box::pin(async move {
+                    let member: Option<(String, String)> = sqlx::query_as(
+                        "SELECT m.role, m.status FROM memberships m
+                           JOIN users u ON u.id = m.user_id
+                          WHERE m.organization_id = $1 AND m.user_id = $2
+                            AND u.status = 'active' FOR UPDATE OF m",
+                    )
+                    .bind(org_id.0).bind(caller.0).fetch_optional(&mut *conn_tx).await?;
+                    if !matches!(member, Some((ref role, ref status)) if role == "admin" && status == MembershipStatus::Active.as_str()) {
+                        return Err(ManagerError::api("ORG_ADMIN_REQUIRED", "an organization admin is required for this action"));
+                    }
                     let op = operations::create_in_tx(
                         conn_tx,
                         &operations::NewOperation {
@@ -574,6 +590,16 @@ impl ConnectionService {
             .idempotency
             .execute(&req, move |conn_tx| {
                 Box::pin(async move {
+                    let member: Option<(String, String)> = sqlx::query_as(
+                        "SELECT m.role, m.status FROM memberships m
+                           JOIN users u ON u.id = m.user_id
+                          WHERE m.organization_id = $1 AND m.user_id = $2
+                            AND u.status = 'active' FOR UPDATE OF m",
+                    )
+                    .bind(org_id.0).bind(caller.0).fetch_optional(&mut *conn_tx).await?;
+                    if !matches!(member, Some((ref role, ref status)) if role == "admin" && status == MembershipStatus::Active.as_str()) {
+                        return Err(ManagerError::api("ORG_ADMIN_REQUIRED", "an organization admin is required for this action"));
+                    }
                     let op = operations::create_in_tx(
                         conn_tx,
                         &operations::NewOperation {

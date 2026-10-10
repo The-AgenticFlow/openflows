@@ -756,6 +756,7 @@ async fn request_context(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let is_test_console = request.uri().path() == "/";
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -802,9 +803,14 @@ async fn request_context(
     response
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
-    // The local test console is intentionally a single inline HTML/JS page.
-    // Permit its script while keeping all other resource types blocked.
-    response.headers_mut().insert("content-security-policy", "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
+    let csp = if is_test_console {
+        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    } else {
+        "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    };
+    response
+        .headers_mut()
+        .insert("content-security-policy", csp.parse().unwrap());
     response
 }
 

@@ -53,6 +53,9 @@ impl ConnectionWorker {
 
     /// Claim and process up to 10 pending events once.
     pub async fn run_once(&self) -> Result<(), ManagerError> {
+        // Remove expired OAuth/setup credentials even when no lifecycle event
+        // is queued, so abandoned attempts do not retain secrets indefinitely.
+        self.repo.expire_attempts().await?;
         let owner = format!("connection-worker-{}", std::process::id());
         let claims = outbox::claim_filtered(
             &self.pool,

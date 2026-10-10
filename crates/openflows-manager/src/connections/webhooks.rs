@@ -305,7 +305,7 @@ impl WebhookService {
                 }
                 Ok(true)
             }
-            ("installation", Some("suspended")) => {
+            ("installation", Some("suspend")) => {
                 if connection.is_some() {
                     self.repo
                         .revoke_access(
@@ -318,7 +318,7 @@ impl WebhookService {
                 }
                 Ok(true)
             }
-            ("installation", Some("unsuspended")) | ("installation", Some("created")) => {
+            ("installation", Some("unsuspend")) | ("installation", Some("created")) => {
                 // Never reactivate from a stale event alone: reconcile
                 // authoritative state and only reactivate if GitHub confirms
                 // the installation is active and repos are accessible.
@@ -328,7 +328,7 @@ impl WebhookService {
                 Ok(true)
             }
             ("installation_repositories", Some("removed")) => {
-                if connection.is_some() {
+                if let Some(conn) = &connection {
                     // Conservatively revoke access and mark repos inaccessible.
                     self.repo
                         .revoke_access(
@@ -338,6 +338,7 @@ impl WebhookService {
                             "repositories removed",
                         )
                         .await?;
+                    self.reconcile(conn).await?;
                 }
                 Ok(true)
             }
@@ -368,16 +369,18 @@ impl WebhookService {
             return Ok(());
         }
         let jwt = self.signer().sign().await?;
-        let installation = self
-            .api()
-            .installation(&jwt, conn.installation_id)
-            .await?
-            .ok_or_else(|| {
-                ManagerError::api(
-                    "GITHUB_INSTALLATION_NOT_FOUND",
-                    "GitHub installation not found during reconciliation",
+        let installation = self.api().installation(&jwt, conn.installation_id).await?;
+        let Some(installation) = installation else {
+            self.repo
+                .revoke_access(
+                    self.app_id,
+                    conn.installation_id,
+                    "deleted",
+                    "installation no longer exists",
                 )
-            })?;
+                .await?;
+            return Ok(());
+        };
 
         if installation.app_id != self.app_id || installation.suspended {
             // Fail closed: keep access revoked and record the reason.

@@ -113,7 +113,7 @@ impl BindingService {
         let Some(org_status) = org_status else {
             return Err(ManagerError::not_found("organization"));
         };
-        if org_status == "deleted" || org_status == "suspended" {
+        if org_status != "ready" && org_status != "provisioning" {
             return Err(ManagerError::api(
                 "ORG_UNAVAILABLE",
                 "organization is not available for connection",
@@ -157,8 +157,10 @@ impl BindingService {
                 }
                 sqlx::query("UPDATE github_connections SET status = 'active',
                     access_revoked_reason = NULL, verified_at = clock_timestamp(), updated_at = now()
-                    WHERE id = $1 AND organization_id = $2")
-                    .bind(existing.id.0).bind(org_id.0).execute(&mut *tx).await?;
+                    WHERE id = $1 AND organization_id = $2
+                      AND access_generation = $3")
+                    .bind(existing.id.0).bind(org_id.0).bind(existing.access_generation)
+                    .execute(&mut *tx).await?;
                 outbox::insert_in_tx(&mut tx, Some(org_id), "github.repository_sync",
                     Some(&json!({"connection_id": existing.id.to_string(), "organization_id": org_id.to_string()}))).await?;
                 audit::insert(
