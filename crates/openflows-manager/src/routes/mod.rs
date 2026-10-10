@@ -13,8 +13,8 @@ pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod organizations;
-pub mod webhooks;
 pub mod test_ui;
+pub mod webhooks;
 
 pub fn router() -> Router<AppState> {
     // Keep platform-oriented probes at the root because orchestrators and load

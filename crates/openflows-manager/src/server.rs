@@ -185,8 +185,16 @@ impl ManagerServices {
         app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
         webhook_secret: Option<Vec<u8>>,
     ) -> Self {
-        Self::from_db_with_app_config(db, auth_config, github, app_id, app_signer, app_api,
-            webhook_secret, crate::config::github_app_from_env())
+        Self::from_db_with_app_config(
+            db,
+            auth_config,
+            github,
+            app_id,
+            app_signer,
+            app_api,
+            webhook_secret,
+            crate::config::github_app_from_env(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,9 +359,8 @@ impl ManagerServices {
             })?,
             None => Vec::new(),
         };
-        let app_signer: std::sync::Arc<dyn crate::connections::AppSigner> = std::sync::Arc::new(
-            crate::connections::RealAppSigner::new(app_id, private_key),
-        );
+        let app_signer: std::sync::Arc<dyn crate::connections::AppSigner> =
+            std::sync::Arc::new(crate::connections::RealAppSigner::new(app_id, private_key));
         let app_api: std::sync::Arc<dyn crate::connections::GithubAppApi> = std::sync::Arc::new(
             crate::connections::RealGithubAppApi::new(auth_config.github_api_base.clone()),
         );
@@ -712,7 +719,9 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    let worker = state.services().map(|services| services.connection_worker.clone());
+    let worker = state
+        .services()
+        .map(|services| services.connection_worker.clone());
     let worker_loop = async move {
         match worker {
             Some(worker) => worker.run_forever().await,

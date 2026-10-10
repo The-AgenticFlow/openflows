@@ -2,7 +2,8 @@ use axum::response::Html;
 
 /// Small browser console for exercising the local Manager connection flow.
 pub async fn index() -> Html<&'static str> {
-    Html(r###"<!doctype html>
+    Html(
+        r###"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -123,5 +124,6 @@ $('status').onclick = async () => {
 refreshSession();
 </script>
 </body>
-</html>"###)
+</html>"###,
+    )
 }

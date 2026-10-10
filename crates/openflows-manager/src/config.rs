@@ -387,13 +387,11 @@ impl ManagerConfig {
                 if github_app.app_slug.is_none() {
                     return Err(format!("hosted mode requires {GITHUB_APP_SLUG_ENV}"));
                 }
-                github_app.app_id.ok_or_else(|| {
-                    format!("hosted mode requires {GITHUB_APP_ID_ENV}")
-                })?;
+                github_app
+                    .app_id
+                    .ok_or_else(|| format!("hosted mode requires {GITHUB_APP_ID_ENV}"))?;
                 if github_app.private_key_ref.is_none() {
-                    return Err(format!(
-                        "hosted mode requires {GITHUB_PRIVATE_KEY_REF_ENV}"
-                    ));
+                    return Err(format!("hosted mode requires {GITHUB_PRIVATE_KEY_REF_ENV}"));
                 }
                 if github_app.webhook_secret_ref.is_none() {
                     return Err(format!(

@@ -130,7 +130,12 @@ pub async fn setup_callback(
     let request_id = request_id(&headers);
     let outcome = services
         .connections_service
-        .setup_callback(principal.user_id, &state_param, installation_id, &request_id)
+        .setup_callback(
+            principal.user_id,
+            &state_param,
+            installation_id,
+            &request_id,
+        )
         .await?;
     Ok(callback_redirect(outcome))
 }
@@ -148,7 +153,11 @@ pub async fn list_connections(
     let org_id = parse_org(&org)?;
     let items = services
         .connections_service
-        .list_connections(principal.user_id, org_id, crate::pagination::PageLimit::new(None))
+        .list_connections(
+            principal.user_id,
+            org_id,
+            crate::pagination::PageLimit::new(None),
+        )
         .await?;
     Ok(Json(ConnectionsResponse { items }))
 }
