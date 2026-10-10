@@ -18,3 +18,4 @@ pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 
 [dev-dependencies]
 mockito = "1"
+tempfile = { workspace = true }
