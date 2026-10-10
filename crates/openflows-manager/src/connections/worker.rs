@@ -87,11 +87,9 @@ impl ConnectionWorker {
                     outbox::complete_operation_delivery(&self.pool, &claim).await?;
                 }
                 Err(e) => {
-                    // Release the lease so the event can be retried; keep it
-                    // enqueued. Exhaustion of attempts is handled by the outbox
-                    // (the event stays undelivered and is re-claimed).
                     tracing::warn!(event = %claim.event_type, error = %e, "webhook/connection event failed");
-                    let _ = outbox::release_lease(&self.pool, &claim).await;
+                    let permanent = matches!(&e, ManagerError::Api(a) if matches!(a.code.as_str(), "GITHUB_INSTALLATION_NOT_FOUND" | "NOT_FOUND" | "RESOURCE_NOT_FOUND" | "INVALID_INPUT"));
+                    outbox::fail_delivery(&self.pool, &claim, permanent).await?;
                 }
             }
         }

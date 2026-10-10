@@ -502,6 +502,7 @@ impl ConnectionService {
             .idempotency
             .execute(&req, move |conn_tx| {
                 Box::pin(async move {
+                    require_mutable_org_in_tx(conn_tx, org_id).await?;
                     let member: Option<(String, String)> = sqlx::query_as(
                         "SELECT m.role, m.status FROM memberships m
                            JOIN users u ON u.id = m.user_id
@@ -590,6 +591,7 @@ impl ConnectionService {
             .idempotency
             .execute(&req, move |conn_tx| {
                 Box::pin(async move {
+                    require_mutable_org_in_tx(conn_tx, org_id).await?;
                     let member: Option<(String, String)> = sqlx::query_as(
                         "SELECT m.role, m.status FROM memberships m
                            JOIN users u ON u.id = m.user_id
@@ -655,6 +657,25 @@ impl ConnectionService {
         reference
             .parse()
             .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid operation reference")))
+    }
+}
+
+async fn require_mutable_org_in_tx(
+    conn: &mut sqlx::PgConnection,
+    org_id: OrganizationId,
+) -> Result<(), ManagerError> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(org_id.0)
+            .fetch_optional(conn)
+            .await?;
+    match status.as_deref() {
+        Some("ready" | "provisioning") => Ok(()),
+        None => Err(ManagerError::not_found("organization")),
+        _ => Err(ManagerError::api(
+            "ORG_UNAVAILABLE",
+            "organization is not available for connection changes",
+        )),
     }
 }
 

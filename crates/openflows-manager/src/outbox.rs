@@ -79,6 +79,8 @@ pub async fn claim_filtered(
                 SELECT id
                   FROM outbox_events
                  WHERE delivered_at IS NULL
+                   AND failed_at IS NULL
+                   AND (retry_at IS NULL OR retry_at <= clock_timestamp())
                    AND ($4::text[] IS NULL OR event_type = ANY($4))
                    AND (lease_expires_at IS NULL OR lease_expires_at < now())
                  ORDER BY created_at
@@ -200,11 +202,47 @@ pub async fn release_lease(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, M
     Ok(result.rows_affected() == 1)
 }
 
+/// Reschedule a failed delivery with bounded backoff, or retain it as a
+/// terminal failure. Only the current lease holder may change either state.
+pub async fn fail_delivery(
+    pool: &PgPool,
+    claim: &OutboxClaim,
+    permanent: bool,
+) -> Result<bool, ManagerError> {
+    let terminal = permanent || claim.attempts >= 8;
+    let delay = 2_i32.pow(claim.attempts.clamp(1, 8) as u32);
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query("UPDATE outbox_events
+        SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+            retry_at = CASE WHEN $4 THEN NULL ELSE clock_timestamp() + make_interval(secs => $5) END,
+            failed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END
+        WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+          AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL AND failed_at IS NULL")
+        .bind(claim.id.0).bind(&claim.owner).bind(claim.token).bind(terminal).bind(f64::from(delay))
+        .execute(&mut *tx).await?.rows_affected() == 1;
+    if changed && terminal {
+        if let Some(id) = claim
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("operation_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<uuid::Uuid>().ok())
+        {
+            sqlx::query("UPDATE operations SET state = 'failed', error_code = 'CONNECTION_JOB_FAILED', updated_at = now()
+                WHERE id = $1 AND organization_id = $2 AND kind = $3 AND state = 'queued' AND lease_owner IS NULL")
+                .bind(id).bind(claim.organization_id.map(|id| id.0)).bind(&claim.event_type).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(changed)
+}
+
 /// Count undelivered events, for diagnostics and readiness probes.
 pub async fn pending_count(pool: &PgPool, owner: &str) -> Result<i64, ManagerError> {
     let row: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM outbox_events
           WHERE delivered_at IS NULL
+            AND failed_at IS NULL
             AND (lease_expires_at IS NULL OR lease_expires_at < now() OR lease_owner = $1)",
     )
     .bind(owner)

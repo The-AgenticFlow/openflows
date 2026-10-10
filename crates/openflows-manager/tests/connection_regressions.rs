@@ -1,5 +1,62 @@
 mod common;
 
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn failed_delivery_yields_to_later_jobs_and_stops_after_exhaustion() {
+    let db = common::TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let mut tx = db.pool().begin().await.unwrap();
+    let first = outbox::insert_in_tx(&mut tx, None, "retry.test", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let claim = outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+        .await
+        .unwrap()
+        .remove(0);
+    let mut tx = db.pool().begin().await.unwrap();
+    let second = outbox::insert_in_tx(&mut tx, None, "retry.test", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(outbox::fail_delivery(db.pool(), &claim, false)
+        .await
+        .unwrap());
+    assert!(!outbox::fail_delivery(db.pool(), &claim, true)
+        .await
+        .unwrap());
+    let next = outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(next.id, second);
+    assert!(outbox::mark_delivered(db.pool(), &next).await.unwrap());
+    sqlx::query("UPDATE outbox_events SET retry_at = now() - interval '1 second', attempts = 7 WHERE id = $1")
+        .bind(first.0).execute(db.pool()).await.unwrap();
+    let last = outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(last.attempts, 8);
+    assert!(outbox::fail_delivery(db.pool(), &last, false)
+        .await
+        .unwrap());
+    assert!(
+        outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let state: (bool, bool) = sqlx::query_as(
+        "SELECT failed_at IS NOT NULL, delivered_at IS NULL FROM outbox_events WHERE id = $1",
+    )
+    .bind(first.0)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, (true, true));
+}
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},

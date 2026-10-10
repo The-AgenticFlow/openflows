@@ -67,6 +67,12 @@ impl BindingService {
             )
         })?;
 
+        // Capture the fence before any external proof can become stale.
+        let observed = self
+            .repo
+            .connection_by_installation(self.app_id, installation_id)
+            .await?;
+
         // Fetch the authoritative installation metadata (App-level call; no DB
         // transaction held across the network request).
         let jwt = self.signer.sign().await?;
@@ -149,18 +155,35 @@ impl BindingService {
             .await?
         {
             if existing.organization_id == org_id {
+                let expected_generation = observed
+                    .as_ref()
+                    .filter(|row| row.id == existing.id)
+                    .map(|row| row.access_generation)
+                    .ok_or_else(|| {
+                        ManagerError::api(
+                            "CONNECTION_CHANGED",
+                            "connection changed during verification; retry with fresh proof",
+                        )
+                    })?;
                 if !ConnectionRepository::consume_attempt_in_tx(&mut tx, attempt.id).await? {
                     return Err(ManagerError::api(
                         "CONNECTION_ATTEMPT_EXPIRED",
                         "connection attempt is no longer valid",
                     ));
                 }
-                sqlx::query("UPDATE github_connections SET status = 'active',
+                let updated = sqlx::query("UPDATE github_connections SET status = 'active',
+                    access_generation = access_generation + 1,
                     access_revoked_reason = NULL, verified_at = clock_timestamp(), updated_at = now()
                     WHERE id = $1 AND organization_id = $2
                       AND access_generation = $3")
-                    .bind(existing.id.0).bind(org_id.0).bind(existing.access_generation)
+                    .bind(existing.id.0).bind(org_id.0).bind(expected_generation)
                     .execute(&mut *tx).await?;
+                if updated.rows_affected() != 1 {
+                    return Err(ManagerError::api(
+                        "CONNECTION_CHANGED",
+                        "connection changed during verification; retry with fresh proof",
+                    ));
+                }
                 outbox::insert_in_tx(&mut tx, Some(org_id), "github.repository_sync",
                     Some(&json!({"connection_id": existing.id.to_string(), "organization_id": org_id.to_string()}))).await?;
                 audit::insert(
