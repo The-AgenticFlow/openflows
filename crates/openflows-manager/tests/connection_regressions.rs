@@ -2,7 +2,7 @@ mod common;
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn failed_delivery_yields_to_later_jobs_and_stops_after_exhaustion() {
+async fn temporary_failures_keep_retrying_and_permanent_failures_stop() {
     let db = common::TestDb::new().await.unwrap();
     db.migrate().await.unwrap();
     let mut tx = db.pool().begin().await.unwrap();
@@ -54,7 +54,46 @@ async fn failed_delivery_yields_to_later_jobs_and_stops_after_exhaustion() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(state, (true, true));
+    assert_eq!(state, (false, true));
+    let delay: bool = sqlx::query_scalar("SELECT retry_at > clock_timestamp() AND retry_at <= clock_timestamp() + interval '256 seconds' FROM outbox_events WHERE id = $1")
+        .bind(first.0).fetch_one(db.pool()).await.unwrap();
+    assert!(delay);
+    // Simulate an extended outage, then recovery, without sleeping through
+    // real backoff intervals. Attempt counts above eight must remain eligible.
+    sqlx::query("UPDATE outbox_events SET retry_at = now() - interval '1 second', attempts = 100 WHERE id = $1")
+        .bind(first.0).execute(db.pool()).await.unwrap();
+    let recovered = outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(recovered.id, first);
+    assert_eq!(recovered.attempts, 101);
+    assert!(outbox::complete_operation_delivery(db.pool(), &recovered)
+        .await
+        .unwrap());
+
+    let mut tx = db.pool().begin().await.unwrap();
+    let permanent = outbox::insert_in_tx(&mut tx, None, "retry.test", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let claim = outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(claim.id, permanent);
+    assert!(outbox::fail_delivery(db.pool(), &claim, true)
+        .await
+        .unwrap());
+    assert!(
+        outbox::claim_filtered(db.pool(), "worker", 1, Some(&["retry.test"]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let terminal: bool = sqlx::query_scalar("SELECT failed_at IS NOT NULL AND retry_at IS NULL AND delivered_at IS NULL FROM outbox_events WHERE id = $1")
+        .bind(permanent.0).fetch_one(db.pool()).await.unwrap();
+    assert!(terminal);
 }
 
 use axum::{

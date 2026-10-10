@@ -202,14 +202,15 @@ pub async fn release_lease(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, M
     Ok(result.rows_affected() == 1)
 }
 
-/// Reschedule a failed delivery with bounded backoff, or retain it as a
-/// terminal failure. Only the current lease holder may change either state.
+/// Retry temporary failures indefinitely with delays capped at 256 seconds.
+/// Only permanent failures become terminal; only the current lease holder may
+/// change either state.
 pub async fn fail_delivery(
     pool: &PgPool,
     claim: &OutboxClaim,
     permanent: bool,
 ) -> Result<bool, ManagerError> {
-    let terminal = permanent || claim.attempts >= 8;
+    let terminal = permanent;
     let delay = 2_i32.pow(claim.attempts.clamp(1, 8) as u32);
     let mut tx = pool.begin().await?;
     let changed = sqlx::query("UPDATE outbox_events
