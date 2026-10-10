@@ -1,0 +1,38 @@
+# Disposable CI stack. Never load the operator's .env or production volumes.
+services:
+  redis:
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    ports: ["127.0.0.1::6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  postgres:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    environment:
+      POSTGRES_USER: coder
+      POSTGRES_PASSWORD: ci-disposable-password
+      POSTGRES_DB: coder
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "coder"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  coder:
+    image: ghcr.io/coder/coder:v2.37.3@sha256:a48f82c2c437e032ce3f6970b4e937a7900cad3c76956956955099465b45e542
+    user: "0:0"
+    environment:
+      CODER_PG_CONNECTION_URL: postgres://coder:ci-disposable-password@postgres:5432/coder?sslmode=disable
+      CODER_HTTP_ADDRESS: 0.0.0.0:7080
+      CODER_ACCESS_URL: http://coder:7080
+      CODER_PROVISIONER_DAEMONS: "1"
+      CODER_TELEMETRY_ENABLE: "false"
+      CODER_UPDATE_CHECK: "false"
+      CODER_DERP_SERVER_RELAY_URL: http://coder:7080
+    ports: ["127.0.0.1::7080"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy

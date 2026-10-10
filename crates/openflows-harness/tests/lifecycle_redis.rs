@@ -1,6 +1,6 @@
 //! Run against a disposable Redis: TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test
 //! -p openflows-harness --test lifecycle_redis -- --ignored
-use config::lifecycle::{Event, Phase};
+use config::lifecycle::{Event, Lifecycle, Phase};
 use openflows_harness::HarnessStore;
 use pocketflow_core::SharedStore;
 
@@ -107,4 +107,171 @@ async fn redis_review_lease_serializes_controllers_and_checks_owner() {
     b.release_claim(key, "new-owner").await.unwrap();
     assert!(a.try_claim(key, "third", 30).await.unwrap());
     a.release_claim(key, "third").await.unwrap();
+}
+
+async fn advance(store: &SharedStore, actor: &str, event: Event) -> Lifecycle {
+    let state = store.lifecycle("T-1").await.unwrap();
+    store
+        .transition("T-1", state.version, actor, event)
+        .await
+        .unwrap();
+    store.lifecycle("T-1").await.unwrap()
+}
+
+async fn review(store: &SharedStore, actor: &str) -> Lifecycle {
+    let state = store.lifecycle("T-1").await.unwrap();
+    advance(
+        store,
+        actor,
+        Event::Decide {
+            round: state.review_round,
+            phase: state.phase,
+            approved: true,
+            report: "Container integration review".into(),
+            revision: state.revision,
+            head: state.head,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis in TEST_REDIS_URL"]
+async fn persisted_workflow_requires_current_evidence_and_survives_reconnection() {
+    let url = std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL");
+    let tenant = format!("workflow-test-{}", uuid::Uuid::new_v4());
+    let store = SharedStore::new_redis_with_tenant(&url, Some(tenant.clone()))
+        .await
+        .unwrap();
+    advance(
+        &store,
+        "forge",
+        Event::Plan {
+            content: "Plan".into(),
+        },
+    )
+    .await;
+    advance(
+        &store,
+        "forge",
+        Event::Move {
+            phase: Phase::PlanReady,
+            head: None,
+        },
+    )
+    .await;
+    review(&store, "sentinel").await;
+    let testing = advance(
+        &store,
+        "forge",
+        Event::Move {
+            phase: Phase::Testing,
+            head: Some("candidate-1".into()),
+        },
+    )
+    .await;
+    // An approval without verification cannot authorize publication.
+    assert!(store
+        .transition(
+            "T-1",
+            testing.version,
+            "sentinel",
+            Event::Decide {
+                round: testing.review_round,
+                phase: Phase::Testing,
+                approved: true,
+                report: "Missing evidence".into(),
+                revision: testing.revision,
+                head: testing.head.clone(),
+            }
+        )
+        .await
+        .is_err());
+    advance(
+        &store,
+        "sentinel",
+        Event::Verified {
+            head: "candidate-1".into(),
+            task: "verification-1".into(),
+        },
+    )
+    .await;
+    review(&store, "sentinel").await;
+    advance(&store, "forge", Event::Pr { number: 42 }).await;
+    review(&store, "sentinel").await;
+    let approved = review(&store, "human").await;
+    assert!(
+        !approved.merge_ready("candidate-1"),
+        "review delivery is still pending"
+    );
+    let ready = advance(
+        &store,
+        "sentinel",
+        Event::ReviewDelivered {
+            round: approved.review_round,
+        },
+    )
+    .await;
+    assert!(ready.merge_ready("candidate-1"));
+    assert!(!ready.merge_ready("candidate-2"));
+    assert!(store
+        .transition(
+            "T-1",
+            ready.version,
+            "vessel",
+            Event::BeginMerge {
+                head: "candidate-2".into(),
+            }
+        )
+        .await
+        .is_err());
+
+    // A fresh client must recover the same authoritative state from Redis.
+    drop(store);
+    let resumed = SharedStore::new_redis_with_tenant(&url, Some(tenant.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resumed.lifecycle("T-1").await.unwrap(), ready);
+    let isolated = SharedStore::new_redis_with_tenant(&url, Some(format!("{tenant}-other")))
+        .await
+        .unwrap();
+    assert_eq!(
+        isolated.lifecycle("T-1").await.unwrap(),
+        Lifecycle::default()
+    );
+    advance(
+        &resumed,
+        "vessel",
+        Event::BeginMerge {
+            head: "candidate-1".into(),
+        },
+    )
+    .await;
+    let done = advance(
+        &resumed,
+        "vessel",
+        Event::Merged {
+            number: 42,
+            head: "candidate-1".into(),
+            sha: "merge-commit".into(),
+        },
+    )
+    .await;
+    assert_eq!(done.phase, Phase::Done);
+    assert_eq!(done.merge_sha.as_deref(), Some("merge-commit"));
+    assert!(
+        resumed
+            .transition(
+                "T-1",
+                done.version,
+                "forge",
+                Event::Move {
+                    phase: Phase::Planning,
+                    head: None,
+                }
+            )
+            .await
+            .is_err(),
+        "completed tickets cannot restart"
+    );
 }

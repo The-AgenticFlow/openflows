@@ -2,11 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [ develop ]
+    branches: [ develop, main ]
   pull_request:
-    branches: [ develop ]
+    branches: [ develop, main ]
   merge_group:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,7 +61,7 @@ jobs:
         with:
           components: clippy
       - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   cargo-build:
     name: Build
@@ -63,7 +70,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - name: Build workspace
-        run: cargo build --workspace --all-targets --all-features
+        run: cargo build --locked --workspace --all-targets --all-features
 
   cargo-test:
     name: Test
@@ -74,7 +81,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@9e3720000324bf314ab081346108fc3bab8d6b74 # nextest
       - name: Run tests
-        run: cargo nextest run --workspace --all-targets --all-features
+        run: cargo nextest run --locked --workspace --all-targets --all-features
 
   manager-postgres:
     name: Manager PostgreSQL integration
@@ -83,7 +90,7 @@ jobs:
       contents: read
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_USER: openflows
           POSTGRES_PASSWORD: openflows
@@ -110,7 +117,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - name: Run cargo doc
-        run: cargo doc --workspace --no-deps --all-features
+        run: cargo doc --locked --workspace --no-deps --all-features
 
   cargo-machete:
     name: Unused Dependencies
@@ -132,3 +139,115 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check for typos
         uses: crate-ci/typos@5e38bf262baaf477ca9f241b3a7cd3d277fd7df8 # master
+
+  redis-lifecycle:
+    name: Redis lifecycle integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Run lifecycle tests against disposable Redis
+        run: bash tests/integration/gated_workflow_test.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redis-lifecycle
+          path: target/ci-artifacts/redis/
+          if-no-files-found: error
+
+  coder-e2e:
+    name: Coder container E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Provision and exercise a real worker
+        run: bash tests/e2e/run.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coder-e2e
+          path: target/ci-artifacts/coder/
+          if-no-files-found: error
+
+  delegated-verification:
+    name: Delegated verification container E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Verify candidate code through separate real workers
+        env:
+          OPENFLOWS_E2E_SUITE: verification
+        run: bash tests/e2e/run.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delegated-verification
+          path: target/ci-artifacts/delegated-verification/
+          if-no-files-found: error
+
+  system-fixtures:
+    name: System E2E fixture contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Exercise model, GitHub, Git, and independent acceptance contracts
+        run: bash tests/e2e/system/run.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: system-fixtures
+          path: target/ci-artifacts/system-fixtures/
+          if-no-files-found: error
+
+  merge-gate:
+    name: OpenFlows Merge Gate
+    if: always()
+    needs:
+      - zizmor
+      - cargo-fmt
+      - cargo-clippy
+      - cargo-build
+      - cargo-test
+      - manager-postgres
+      - cargo-doc
+      - cargo-machete
+      - typos
+      - redis-lifecycle
+      - coder-e2e
+      - delegated-verification
+      - system-fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every mandatory job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, sys
+          results = json.loads(os.environ["RESULTS"])
+          failures = {name: job["result"] for name, job in results.items()
+                      if job["result"] != "success"}
+          for name, result in failures.items():
+              print(f"{name}: {result}")
+          sys.exit(bool(failures) or not results)
+          PYTHON

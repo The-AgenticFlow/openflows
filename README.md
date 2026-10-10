@@ -81,6 +81,7 @@ See [`docs/architecture/openflows-system-architecture.md` §10](docs/architectur
 | [quick_start.md](quick_start.md) | One-command setup |
 | [docs/setup-reference.md](docs/setup-reference.md) | Manual setup, hooks, configuration, troubleshooting |
 | [token_guide.md](token_guide.md) | Token acquisition step-by-step |
+| [tests/e2e/README.md](tests/e2e/README.md) | Container CI gate and merge enforcement |
 | [testing_quick_start.md](testing_quick_start.md) | Testing & debugging walkthrough |
 | [docs/architecture/openflows-system-architecture.md](docs/architecture/openflows-system-architecture.md) | Complete system architecture (authoritative) |
 | [docs/architecture/openflows-controller.md](docs/architecture/openflows-controller.md) | Controller deep-dive (Subsystem 01) |
