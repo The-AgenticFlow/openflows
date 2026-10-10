@@ -267,6 +267,13 @@ impl CoderClient {
     }
 
     /// Create a client with a different token (e.g., after bootstrap).
+    ///
+    /// The identity caches (`cached_username`, `cached_org_id`) are **not**
+    /// carried over: a new token may belong to a different principal (e.g. a
+    /// tenant user minted from an admin client), so reusing the source client's
+    /// cached identity would silently attribute the new client's actions to the
+    /// old user. `cached_models` is a deployment-global model catalog and is
+    /// safe to share.
     pub fn with_token(&self, token: String) -> Self {
         Self {
             base_url: self.base_url.clone(),
@@ -276,8 +283,8 @@ impl CoderClient {
             session_token: self.session_token.clone(),
             #[cfg(feature = "chats-api")]
             cached_models: self.cached_models.clone(),
-            cached_org_id: self.cached_org_id.clone(),
-            cached_username: self.cached_username.clone(),
+            cached_org_id: Arc::new(RwLock::new(None)),
+            cached_username: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -458,6 +465,113 @@ impl CoderClient {
         }
     }
 
+    /// Generate a strong, unique password that satisfies Coder's minimum
+    /// password requirements (uppercase, lowercase, digit, special, >= 8 chars).
+    ///
+    /// Used only as a `login_type: "password"` placeholder when creating a
+    /// non-interactive tenant user; the tenant authenticates via a minted API
+    /// token, never this password. Entropy comes from `/dev/urandom` (base64 of
+    /// 24 random bytes). If secure randomness is unavailable the call **fails**
+    /// rather than substituting a weak clock-based value, so a host error can
+    /// never weaken the hidden credential of an active account. A fixed `Aa1!`
+    /// suffix guarantees every required character class.
+    fn generate_tenant_password() -> Result<String> {
+        let mut entropy = [0u8; 24];
+        let mut f = std::fs::File::open("/dev/urandom")
+            .context("Failed to open /dev/urandom for tenant password generation")?;
+        use std::io::Read;
+        f.read_exact(&mut entropy)
+            .context("Failed to read secure randomness from /dev/urandom for tenant password")?;
+        use base64::Engine;
+        let mut base = base64::engine::general_purpose::STANDARD.encode(entropy);
+        // Guarantee uppercase, lowercase, digit, and a special character.
+        base.push_str("Aa1!");
+        Ok(base)
+    }
+
+    /// Create a new Coder user (admin-only) and return it.
+    ///
+    /// Idempotent: if a user with the same email already exists, the existing
+    /// user is returned instead of failing on a conflict, so re-running tenant
+    /// onboarding is safe. `GET /api/v2/users` lists deployment users; a match
+    /// on email (or username) short-circuits the creation.
+    ///
+    /// `POST /api/v2/users` (admin) takes `{ email, username, user_status,
+    /// login_type, organization_ids }` and returns the created `CoderUser`.
+    ///
+    /// Coder v2.37+ requires at least one `organization_ids` entry (an empty
+    /// list returns 400). A truly non-interactive `login_type: "none"` user is
+    /// rejected for non-service accounts ("Login type 'none' requires a service
+    /// account."), and service accounts (which *do* allow `login_type: "none"`)
+    /// require the premium Service Accounts entitlement and cannot complete
+    /// interactive flows. To keep this entitlement-independent and compatible
+    /// with the tenant GitHub link flow, we create a `login_type: "password"`
+    /// user with a strong random password that is never shared. The caller mints
+    /// a tenant-scoped API token via `create_api_token`, so the tenant
+    /// authenticates through that token rather than the generated password.
+    ///
+    /// Returns `(user, password)`; `password` is the generated credential for a
+    /// newly created user and empty for a reused existing user. The caller can
+    /// surface it to the operator so a tenant can sign in to their own Coder
+    /// account to complete the GitHub external-auth link.
+    pub async fn create_user(&self, email: &str, username: &str) -> Result<(CoderUser, String)> {
+        // Reuse an existing user with the same identity when present.
+        if let Ok(users) = self.list_users().await {
+            if let Some(existing) = users
+                .iter()
+                .find(|u| u.email.eq_ignore_ascii_case(email) || u.username == username)
+            {
+                info!(
+                    user_id = %existing.id,
+                    username = %existing.username,
+                    "Reusing existing Coder user"
+                );
+                return Ok((existing.clone(), String::new()));
+            }
+        }
+
+        let organization_id = self.get_default_organization_id().await?;
+        let password = Self::generate_tenant_password()?;
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/users")
+            .json(&serde_json::json!({
+                "email": email,
+                "username": username,
+                "user_status": "active",
+                "login_type": "password",
+                "password": password,
+                "organization_ids": [organization_id],
+            }))
+            .send()
+            .await
+            .context("Failed to create Coder user")?;
+
+        if resp.status().is_success() {
+            let user: CoderUser = resp.json().await?;
+            info!(
+                user_id = %user.id,
+                username = %user.username,
+                "Created Coder user"
+            );
+            Ok((user, password))
+        } else if resp.status().as_u16() == 409 {
+            // A concurrent create won the race; fall back to a lookup.
+            let users = self.list_users().await?;
+            let user = users
+                .into_iter()
+                .find(|u| u.email.eq_ignore_ascii_case(email) || u.username == username)
+                .context(format!(
+                    "Coder user '{}' already exists but not found in listing",
+                    username
+                ))?;
+            Ok((user, String::new()))
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to create Coder user ({}): {}", status, body)
+        }
+    }
+
     /// List all users visible to the authenticated user.
     /// GET /api/v2/users
     pub async fn list_users(&self) -> Result<Vec<CoderUser>> {
@@ -563,87 +677,192 @@ impl CoderClient {
         Ok(org_id)
     }
 
-    /// Create an API token for a user. Attempts to reuse an existing token
-    /// with the same name first for idempotency.
-    pub async fn create_api_token(&self, user_id: &str, name: &str) -> Result<CoderApiKey> {
-        // Try to find an existing token with the same name first
-        let list_resp = self
+    /// List the API tokens (metadata only) for a user.
+    ///
+    /// `GET /api/v2/users/{user}/keys/tokens` returns token *metadata* — the
+    /// raw `key` secret is never included and is exposed only at creation time.
+    /// Each item carries `id` and `token_name`.
+    pub async fn list_api_tokens(&self, user_id: &str) -> Result<Vec<CoderApiKey>> {
+        let resp = self
             .authenticated_request(
                 reqwest::Method::GET,
                 &format!("/api/v2/users/{}/keys/tokens", user_id),
             )
             .send()
-            .await;
+            .await
+            .context("Failed to list API tokens")?;
 
-        if let Ok(resp) = list_resp {
-            if resp.status().is_success() {
-                let list_body: serde_json::Value = resp.json().await.unwrap_or_default();
-                if let Some(items) = list_body.as_array() {
-                    for item in items {
-                        if let Some(item_name) = item.get("name").and_then(|v| v.as_str()) {
-                            if item_name == name {
-                                if let Some(item_key) = item.get("key").and_then(|v| v.as_str()) {
-                                    let api_key = CoderApiKey {
-                                        id: item
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        name: item_name.to_string(),
-                                        key: item_key.to_string(),
-                                    };
-                                    info!(key_name = %api_key.name, "Reusing existing API token");
-                                    return Ok(api_key);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to list API tokens ({}): {}", status, body)
         }
 
-        // No existing token found — create a new one
+        let body: serde_json::Value = resp.json().await?;
+        let items = body.as_array().cloned().unwrap_or_default();
+        Ok(items
+            .into_iter()
+            .filter_map(|item| {
+                let id = item.get("id")?.as_str()?.to_string();
+                let name = item
+                    .get("token_name")
+                    .or_else(|| item.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let expires_at = item
+                    .get("expires_at")
+                    .or_else(|| item.get("expires"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                Some(CoderApiKey {
+                    id,
+                    name,
+                    key: String::new(),
+                    expires_at,
+                })
+            })
+            .collect())
+    }
+
+    /// Revoke a user's API token by id.
+    ///
+    /// Coder exposes token deletion at `DELETE /api/v2/users/{user}/keys/{id}`
+    /// (a token is an API key carrying a `token_name`); the
+    /// `/api/v2/users/{user}/keys/tokens/{id}` path is **not** a route and
+    /// returns 405. Verified against Coder v2.37.
+    pub async fn delete_api_token(&self, user_id: &str, token_id: &str) -> Result<()> {
         let resp = self
             .authenticated_request(
-                reqwest::Method::POST,
-                &format!("/api/v2/users/{}/keys/tokens", user_id),
+                reqwest::Method::DELETE,
+                &format!("/api/v2/users/{}/keys/{}", user_id, token_id),
             )
-            .json(&serde_json::json!({
-                "name": name,
-                "lifetime": 168 * 3600 * 1_000_000_000_i64,
-            }))
             .send()
             .await
-            .context("Failed to create API token")?;
-
+            .context("Failed to delete API token")?;
         if resp.status().is_success() {
-            let body: serde_json::Value = resp.json().await?;
-            let key_value = body
-                .get("key")
-                .and_then(|v| v.as_str())
-                .context("No 'key' field in API token response")?
-                .to_string();
-            let key_id = body
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let name_value = body
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(name)
-                .to_string();
-            let api_key = CoderApiKey {
-                id: key_id,
-                name: name_value,
-                key: key_value,
-            };
-            info!(key_name = %api_key.name, "Created API token");
-            Ok(api_key)
+            Ok(())
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to create API token ({}): {}", status, body)
+            bail!("Failed to delete API token ({}): {}", status, body)
+        }
+    }
+
+    /// Create an API token for a user with the given `name` (a tenant-attributable
+    /// prefix). Coder exposes the raw token `key` only in the creation response,
+    /// so an existing token cannot be read back for reuse.
+    ///
+    /// To keep onboarding idempotent **and** convergent — instead of relying on
+    /// a duplicate-name 409 that may not be returned by every Coder version, and
+    /// instead of accumulating an unrecycled token per run — the fresh token is
+    /// minted **first** and only then are previously created tokens with this
+    /// name (or the legacy `name-*` suffix naming from earlier versions) revoked.
+    /// Repeated runs therefore converge on exactly one active token per `name`
+    /// without leaking standing tenant-scoped credentials.
+    ///
+    /// Minting before revoking keeps the caller's current credential valid until
+    /// the replacement exists. If the caller authenticates with an API token that
+    /// is itself named `openflows`/`openflows-*`, revoking before creating would
+    /// delete that same credential and the replacement request would then fail
+    /// (P1 "Bootstrap deletes its own token"). The stale cleanup below runs with
+    /// the freshly minted credential, never the one still in use for the create.
+    pub async fn create_api_token(&self, user_id: &str, name: &str) -> Result<CoderApiKey> {
+        let lifetime_ns = 168 * 3600 * 1_000_000_000_i64;
+        let path = format!("/api/v2/users/{}/keys/tokens", user_id);
+        let body = serde_json::json!({
+            "token_name": name,
+            "lifetime": lifetime_ns,
+        });
+
+        // Mint the replacement first, while the caller's credential is valid.
+        let first = Self::post_token_request(self, &path, &body).await?;
+        let new_key = if first.status().is_success() {
+            parse_api_token_response(first, name).await?
+        } else if first.status().as_u16() == 409 {
+            // A token with this name already exists (a concurrent add, or the
+            // caller's own prior token). It cannot be read back for reuse, so
+            // clear the stale tokens and retry once.
+            self.revoke_stale_tokens(user_id, name).await;
+            let retry = Self::post_token_request(self, &path, &body).await?;
+            if retry.status().is_success() {
+                parse_api_token_response(retry, name).await?
+            } else {
+                let status = retry.status();
+                let text = retry.text().await.unwrap_or_default();
+                bail!("Failed to create API token ({}): {}", status, text)
+            }
+        } else {
+            let status = first.status();
+            let text = first.text().await.unwrap_or_default();
+            bail!("Failed to create API token ({}): {}", status, text)
+        };
+
+        // Now that a replacement exists, revoke stale tokens (exact-name or the
+        // legacy `name-*` suffix) that are not the token we just minted. Run as
+        // the fresh credential so we never revoke the credential in use.
+        let privileged = self.with_token(new_key.key.clone());
+        privileged
+            .revoke_stale_tokens_excluding(user_id, name, Some(&new_key.id))
+            .await;
+
+        Ok(new_key)
+    }
+
+    /// Send the `POST /users/{user}/keys/tokens` request body on behalf of
+    /// `client`. Free-standing so it can be invoked with both the original and
+    /// the freshly minted credential without lifetime/move issues.
+    async fn post_token_request(
+        client: &CoderClient,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        client
+            .authenticated_request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await
+            .context("Failed to create API token")
+    }
+
+    /// Revoke every token for `user_id` whose name matches `name` or the legacy
+    /// `name-<suffix>` naming. Runs as the current credential.
+    async fn revoke_stale_tokens(&self, user_id: &str, name: &str) {
+        self.revoke_stale_tokens_excluding(user_id, name, None)
+            .await;
+    }
+
+    /// Revoke stale tokens for `user_id`, skipping the token with id
+    /// `keep_id` (the freshly minted replacement) when provided.
+    async fn revoke_stale_tokens_excluding(
+        &self,
+        user_id: &str,
+        name: &str,
+        keep_id: Option<&str>,
+    ) {
+        let Ok(tokens) = self.list_api_tokens(user_id).await else {
+            return;
+        };
+        for token in tokens {
+            if keep_id.is_some_and(|id| id == token.id) {
+                continue;
+            }
+            let stale = token.name == name
+                || token
+                    .name
+                    .strip_prefix(name)
+                    .map(|rest| rest.starts_with('-'))
+                    .unwrap_or(false);
+            if stale {
+                match self.delete_api_token(user_id, &token.id).await {
+                    Ok(_) => {
+                        info!(key_name = %token.name, "Revoked stale API token after recreating")
+                    }
+                    Err(e) => {
+                        warn!(key_name = %token.name, error = %e, "Failed to revoke stale API token")
+                    }
+                }
+            }
         }
     }
 
@@ -1356,6 +1575,42 @@ impl CoderClient {
     }
 }
 
+/// Parse a `POST /api/v2/users/{user}/keys/tokens` (201) response into a
+/// [`CoderApiKey`]. The raw `key` is present only in this creation response.
+async fn parse_api_token_response(
+    resp: reqwest::Response,
+    fallback_name: &str,
+) -> Result<CoderApiKey> {
+    let body: serde_json::Value = resp.json().await?;
+    let key_value = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .context("No 'key' field in API token response")?
+        .to_string();
+    let key_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let name_value = body
+        .get("token_name")
+        .or_else(|| body.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_name)
+        .to_string();
+    let expires_at = body
+        .get("expires_at")
+        .or_else(|| body.get("expires"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(CoderApiKey {
+        id: key_id,
+        name: name_value,
+        key: key_value,
+        expires_at,
+    })
+}
+
 // External-auth (GitHub link) API
 
 impl CoderClient {
@@ -2005,6 +2260,36 @@ mod http_mock {
         handle: Option<tokio::task::JoinHandle<()>>,
     }
 
+    /// User-related route behavior for `create_user` tests.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Scenario {
+        /// `GET /users` returns an empty list and `POST /users` returns 201.
+        Default,
+        /// `GET /users` returns an already-provisioned user; `POST /users`
+        /// must never be reached because the caller reuses the existing account.
+        ExistingUser,
+        /// The first `GET /users` returns an empty list so the caller POSTs;
+        /// the POST returns 409 and flips a flag so subsequent `GET /users`
+        /// (the conflict lookup) return the existing user.
+        ConflictThenExisting { conflict_seen: bool },
+    }
+
+    impl Scenario {
+        fn conflict_seen(&self) -> bool {
+            matches!(
+                self,
+                Scenario::ConflictThenExisting {
+                    conflict_seen: true
+                }
+            )
+        }
+        fn mark_conflict(&mut self) {
+            if let Scenario::ConflictThenExisting { conflict_seen } = self {
+                *conflict_seen = true;
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct RecordedRequest {
         pub method: String,
@@ -2014,10 +2299,19 @@ mod http_mock {
 
     impl HttpMock {
         pub async fn new() -> anyhow::Result<Self> {
+            Self::new_with_scenario(Scenario::Default).await
+        }
+
+        pub async fn new_with_scenario(scenario: Scenario) -> anyhow::Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
             let requests = Arc::new(Mutex::new(Vec::new()));
-            let handle = tokio::spawn(Self::run(listener, Arc::clone(&requests)));
+            let scenario = Arc::new(Mutex::new(scenario));
+            let handle = tokio::spawn(Self::run(
+                listener,
+                Arc::clone(&requests),
+                Arc::clone(&scenario),
+            ));
             Ok(Self {
                 addr,
                 requests,
@@ -2040,14 +2334,19 @@ mod http_mock {
             }
         }
 
-        async fn run(listener: TcpListener, requests: Arc<Mutex<Vec<RecordedRequest>>>) {
+        async fn run(
+            listener: TcpListener,
+            requests: Arc<Mutex<Vec<RecordedRequest>>>,
+            scenario: Arc<Mutex<Scenario>>,
+        ) {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let requests = Arc::clone(&requests);
+                let scenario = Arc::clone(&scenario);
                 tokio::spawn(async move {
-                    let _ = Self::handle_conn(stream, requests).await;
+                    let _ = Self::handle_conn(stream, requests, scenario).await;
                 });
             }
         }
@@ -2055,6 +2354,7 @@ mod http_mock {
         async fn handle_conn(
             mut stream: TcpStream,
             requests: Arc<Mutex<Vec<RecordedRequest>>>,
+            scenario: Arc<Mutex<Scenario>>,
         ) -> std::io::Result<()> {
             let mut buf: Vec<u8> = Vec::with_capacity(4096);
             loop {
@@ -2104,7 +2404,7 @@ mod http_mock {
                     body,
                 });
 
-                let (status, content) = route(&method, &path);
+                let (status, content) = route(&method, &path, &scenario).await;
                 let response = format!(
                     "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                     status,
@@ -2123,7 +2423,48 @@ mod http_mock {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
-    fn route(method: &str, path: &str) -> (&'static str, String) {
+    async fn route(
+        method: &str,
+        path: &str,
+        scenario: &Arc<Mutex<Scenario>>,
+    ) -> (&'static str, String) {
+        // User routes vary by scenario so `create_user` reuse / conflict
+        // paths can be exercised without a real Coder deployment.
+        if path == "/api/v2/users" {
+            let mut guard = scenario.lock().await;
+            return match (method, guard.clone()) {
+                ("GET", Scenario::ExistingUser) => (
+                    "200 OK",
+                    r#"{"users":[{"id":"tenant-1","username":"tenant-acme","email":"tenant-acme@openflows.local"}],"total_count":1}"#
+                        .to_string(),
+                ),
+                ("GET", Scenario::ConflictThenExisting { .. }) => {
+                    // First GET (reuse check) returns empty so the caller
+                    // attempts a POST; after the POST 409, subsequent GETs
+                    // (the conflict lookup) return the existing user.
+                    if guard.conflict_seen() {
+                        (
+                            "200 OK",
+                            r#"{"users":[{"id":"tenant-1","username":"tenant-acme","email":"tenant-acme@openflows.local"}],"total_count":1}"#
+                                .to_string(),
+                        )
+                    } else {
+                        ("200 OK", r#"{"users":[],"total_count":0}"#.to_string())
+                    }
+                }
+                ("GET", _) => ("200 OK", r#"{"users":[],"total_count":0}"#.to_string()),
+                ("POST", Scenario::ConflictThenExisting { .. }) => {
+                    guard.mark_conflict();
+                    ("409 Conflict", r#"{"message":"user already exists"}"#.to_string())
+                }
+                ("POST", _) => (
+                    "201 Created",
+                    r#"{"id":"tenant-1","username":"tenant-acme","email":"tenant-acme@openflows.local"}"#
+                        .to_string(),
+                ),
+                _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+            };
+        }
         match (method, path) {
             ("GET", "/api/v2/organizations") => (
                 "200 OK",
@@ -2155,6 +2496,10 @@ mod http_mock {
             ),
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/users/me") => (
+                "200 OK",
+                r#"{"id":"admin-1","username":"admin","email":"admin@openflows.local"}"#.to_string(),
             ),
             ("POST", "/api/v2/workspaces/ws-delete-me/builds") => (
                 "201 Created",
@@ -2188,7 +2533,36 @@ mod http_mock {
                 "410 Gone",
                 r#"{"message":"Workspace ws-wait-gone was deleted"}"#.to_string(),
             ),
-            _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+            _ => {
+                // Dynamic token routes under `/api/v2/users/{user}/keys/tokens`.
+                if path.starts_with("/api/v2/users/") && path.ends_with("/keys/tokens") {
+                    return match method {
+                        "GET" => (
+                            "200 OK",
+                            r#"[{"id":"tok-1","token_name":"openflows-tenant"},{"id":"tok-2","token_name":"openflows-tenant-deadbeef"}]"#
+                                .to_string(),
+                        ),
+                        "POST" => (
+                            "201 Created",
+                            r#"{"id":"tok-new","key":"sekret-token","token_name":"openflows-tenant"}"#
+                                .to_string(),
+                        ),
+                        _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+                    };
+                }
+                // Token deletion lives at `/api/v2/users/{user}/keys/{id}`
+                // (a token is an API key), not `/keys/tokens/{id}`.
+                if path.starts_with("/api/v2/users/")
+                    && path.contains("/keys/")
+                    && !path.contains("/keys/tokens/")
+                {
+                    return match method {
+                        "DELETE" => ("204 No Content", String::new()),
+                        _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+                    };
+                }
+                ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+            }
         }
     }
 }
@@ -2422,6 +2796,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_api_token_revokes_stale_tokens_and_converges() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // The mock lists two stale tokens (one exact-name, one legacy
+        // `name-<suffix>`), both of which must be revoked before a fresh
+        // token is minted, so repeated runs converge on a single active token
+        // instead of accumulating standing tenant-scoped credentials.
+        let key = client
+            .create_api_token("tenant-1", "openflows-tenant")
+            .await
+            .expect("create_api_token should converge against mock");
+        assert_eq!(key.key, "sekret-token");
+        assert_eq!(key.name, "openflows-tenant");
+
+        let requests = server.requests().await;
+        let deletes = requests
+            .iter()
+            .filter(|r| {
+                r.method == "DELETE"
+                    && r.path.contains("/keys/")
+                    && !r.path.contains("/keys/tokens/")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 2, "both stale tokens must be revoked");
+
+        let creates = requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path.ends_with("/keys/tokens"))
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), 1, "exactly one fresh token must be minted");
+        let body: serde_json::Value =
+            serde_json::from_str(&creates[0].body).expect("create body valid JSON");
+        assert_eq!(
+            body.get("token_name").and_then(|v| v.as_str()),
+            Some("openflows-tenant")
+        );
+        assert!(body.get("lifetime").is_some(), "lifetime must be present");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn delete_workspace_sends_delete_build_transition() {
         let server = super::http_mock::HttpMock::new().await.unwrap();
         let client = crate::CoderClient::new(&server.url(), "test-token");
@@ -2472,6 +2889,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_posts_tenant_identity() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // The mock GET /users returns an empty list, so create_user falls
+        // through to POST /users with a `login_type: password` tenant identity
+        // (Coder v2.37 rejects `login_type: none` for non-service accounts).
+        let (user, password) = client
+            .create_user("tenant-acme@openflows.local", "tenant-acme")
+            .await
+            .expect("create_user should succeed against mock");
+        assert_eq!(user.id, "tenant-1");
+        assert_eq!(user.username, "tenant-acme");
+        assert!(
+            !password.is_empty(),
+            "a fresh user must receive a generated password"
+        );
+
+        let requests = server.requests().await;
+        let create = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v2/users")
+            .expect("expected a POST /api/v2/users request");
+        let body: serde_json::Value =
+            serde_json::from_str(&create.body).expect("create body valid JSON");
+        assert_eq!(
+            body.get("login_type").and_then(|v| v.as_str()),
+            Some("password")
+        );
+        let password = body
+            .get("password")
+            .and_then(|v| v.as_str())
+            .expect("a password must be provided for login_type password");
+        assert!(
+            password.len() >= 8
+                && password.chars().any(|c| c.is_uppercase())
+                && password.chars().any(|c| c.is_lowercase())
+                && password.chars().any(|c| c.is_ascii_digit())
+                && password.chars().any(|c| !c.is_alphanumeric()),
+            "generated tenant password must meet Coder's requirements"
+        );
+        assert_eq!(
+            body.get("user_status").and_then(|v| v.as_str()),
+            Some("active")
+        );
+        assert_eq!(
+            body.get("organization_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1),
+            "at least one organization is required (Coder v2.37+)"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_user_reuses_existing_account_without_posting() {
+        // GET /users returns an already-provisioned tenant account, so
+        // repeated onboarding must reuse it and never POST a new user (which
+        // would create a duplicate or reset the account's identity).
+        let server =
+            super::http_mock::HttpMock::new_with_scenario(super::http_mock::Scenario::ExistingUser)
+                .await
+                .unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        let (user, password) = client
+            .create_user("tenant-acme@openflows.local", "tenant-acme")
+            .await
+            .expect("create_user should reuse the existing account");
+        assert_eq!(user.id, "tenant-1");
+        assert_eq!(user.username, "tenant-acme");
+        assert!(
+            password.is_empty(),
+            "a reused account has no freshly generated password"
+        );
+
+        let requests = server.requests().await;
+        let posts = requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.path == "/api/v2/users")
+            .count();
+        assert_eq!(posts, 0, "reuse must not POST a new user");
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.method == "GET" && r.path == "/api/v2/users"),
+            "reuse must look the account up via GET /users"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_user_resolves_conflict_via_409_lookup() {
+        // A concurrent create wins the race: POST /users returns 409, and
+        // create_user must fall back to listing and reuse the existing user
+        // instead of failing.
+        let server = super::http_mock::HttpMock::new_with_scenario(
+            super::http_mock::Scenario::ConflictThenExisting {
+                conflict_seen: false,
+            },
+        )
+        .await
+        .unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        let (user, _password) = client
+            .create_user("tenant-acme@openflows.local", "tenant-acme")
+            .await
+            .expect("create_user must resolve a 409 conflict via lookup");
+        assert_eq!(user.id, "tenant-1");
+        assert_eq!(user.username, "tenant-acme");
+
+        let requests = server.requests().await;
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.method == "POST" && r.path == "/api/v2/users"),
+            "a POST must be attempted"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.method == "GET" && r.path == "/api/v2/users")
+                .count()
+                >= 2,
+            "the 409 path must re-list users to recover the existing account"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn delete_workspace_fails_when_delete_build_fails() {
         let server = super::http_mock::HttpMock::new().await.unwrap();
         let client = crate::CoderClient::new(&server.url(), "test-token");
@@ -2486,6 +3038,34 @@ mod tests {
             "Error message should explain delete build failed: {}",
             err
         );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_token_clears_identity_caches() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "admin-token");
+
+        // Populate the admin client's username cache, then derive a new client
+        // with a different token and confirm the cached identity is not carried
+        // over — a tenant client must not inherit the admin's cached identity.
+        client.resolve_current_user().await.expect("resolve me");
+        {
+            let guard = client.cached_username.read().await;
+            assert_eq!(guard.as_deref(), Some("admin"));
+        }
+
+        let tenant_client = client.with_token("tenant-token".to_string());
+        {
+            let guard = tenant_client.cached_username.read().await;
+            assert!(guard.is_none(), "with_token must clear the cached username");
+        }
+        {
+            let guard = tenant_client.cached_org_id.read().await;
+            assert!(guard.is_none(), "with_token must clear the cached org id");
+        }
+        assert_eq!(tenant_client.session_token(), "tenant-token");
 
         server.shutdown().await;
     }

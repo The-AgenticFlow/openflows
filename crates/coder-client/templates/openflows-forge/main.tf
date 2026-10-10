@@ -97,6 +97,14 @@ data "coder_parameter" "coder_url" {
   type        = "string"
 }
 
+data "coder_parameter" "external_auth_id" {
+  name        = "external_auth_id"
+  description = "Coder external-auth provider id (CODER_EXTERNAL_AUTH_0_ID) that the tenant linked for GitHub"
+  default     = "primary-github"
+  type        = "string"
+  mutable     = false
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -522,6 +530,11 @@ resource "docker_container" "workspace" {
     "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Forge resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the tenant
+    # owner's linked GitHub App token). Export the provider id and token so a
+    # custom CODER_EXTERNAL_AUTH_0_ID works at runtime.
+    "CODER_EXTERNAL_AUTH_0_ID=${data.coder_parameter.external_auth_id.value}",
+    "CODER_EXTERNAL_AUTH_${replace(replace(upper(data.coder_parameter.external_auth_id.value), "-", "_"), ".", "_")}_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
   ]
 
   # egress allowlist: Coder control plane + github.com + Redis only
@@ -537,5 +550,5 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = "primary-github"
+  id = data.coder_parameter.external_auth_id.value
 }
