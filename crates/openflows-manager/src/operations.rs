@@ -307,6 +307,30 @@ pub async fn get_scoped(
     Ok(row)
 }
 
+/// Fetch an operation only through the caller's current active membership.
+pub async fn get_for_user(
+    pool: &PgPool,
+    id: OperationId,
+    caller: crate::id::UserId,
+) -> Result<Option<OperationRecord>, ManagerError> {
+    let row = sqlx::query_as::<_, OperationRecord>(
+        "SELECT id, organization_id, resource_type, resource_id, kind, idempotency_ref,
+                state, current_step, attempt_count, retry_at, lease_owner, lease_expires_at,
+                error_code, sanitized_result, created_at, updated_at
+           FROM operations
+          WHERE id = $1 AND EXISTS (SELECT 1 FROM memberships m JOIN users u ON u.id=m.user_id
+            JOIN organizations o ON o.id=m.organization_id
+            WHERE m.organization_id=operations.organization_id AND m.user_id=$2
+              AND m.status='active' AND u.status='active' AND o.status <> 'deleted')",
+    )
+    .bind(id.0)
+    .bind(caller.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(ManagerError::from)?;
+    Ok(row)
+}
+
 /// Whether an operation is still leased to `owner`.
 pub async fn is_leased_to(
     pool: &PgPool,

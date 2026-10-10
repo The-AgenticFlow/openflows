@@ -1,7 +1,12 @@
-# Manager foundations (WP-01)
+# Manager foundations and human authorization (WP-01 / WP-02)
 
-The manager owns the Openflows product database, separately from Coder. Hosted
-business endpoints and live Coder compatibility remain work for later packages.
+The manager owns the Openflows product database, separately from Coder. WP-02
+adds GitHub human sign-in, browser and CLI sessions, device approval, organization
+membership, and invitations. GitHub installation connections, Coder provisioning
+workers, and the complete hosted CLI remain later packages.
+
+See [the WP-02 review and handoff](WP02_REVIEW.md) for API contracts, setup,
+fixed defects, test evidence, and deployment prerequisites.
 
 ## Validation
 

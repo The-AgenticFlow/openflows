@@ -41,8 +41,7 @@ fn state_with_unreachable_db() -> AppState {
     let config = openflows_manager::config::ManagerConfig {
         mode: openflows_manager::config::Mode::Hosted,
         database_url: Some(url.to_string()),
-        secret_provider: "in-memory".to_string(),
-        http_addr: "127.0.0.1:3002".to_string(),
+        ..openflows_manager::config::local_test_config()
     };
     AppState::with_services(
         pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),

@@ -45,13 +45,88 @@ impl ReadinessCheck for StoreReadiness {
 ///
 /// Constructed only when the Manager has a control-plane database (hosted mode,
 /// or local development with an explicit database). Repositories and services
-/// expose organization-scoped operations.
+/// expose organization-scoped operations. In addition to the WP-01
+/// repositories, this holds the human-authentication and organization services
+/// added by WP-02.
 #[derive(Clone)]
 pub struct ManagerServices {
     pub db: Db,
     pub organizations: OrganizationsRepository,
     pub tenants: TenantsRepository,
     pub idempotency: IdempotencyService,
+    // WP-02 authentication and organization services.
+    pub users: crate::auth::repository::UsersRepository,
+    pub sessions: crate::auth::repository::SessionsRepository,
+    pub transactions: crate::auth::repository::AuthTransactionRepository,
+    pub org_repo: crate::organizations::OrganizationRepository,
+    pub orgs_service: crate::organizations::OrganizationService,
+    pub session_manager: crate::auth::sessions::SessionManager,
+    pub login: crate::auth::oauth::LoginService,
+    pub device: crate::auth::device::DeviceFlowService,
+    pub rate_limiter: crate::rate_limit::RateLimiter,
+    pub auth_config: crate::config::AuthConfig,
+    pub github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+}
+
+/// The secret-provider adapter name for the isolated in-memory provider.
+pub const IN_MEMORY_SECRET_PROVIDER: &str = "in-memory";
+
+/// Resolve a [`SecretProvider`] by adapter name. Only the in-memory provider is
+/// implemented; any other name fails closed (a durable production adapter is a
+/// deployment decision, not something to invent here).
+pub fn resolve_secret_provider(
+    name: &str,
+) -> Result<Box<dyn crate::secrets::SecretProvider>, ManagerError> {
+    match name {
+        IN_MEMORY_SECRET_PROVIDER => Ok(Box::new(crate::secrets::InMemorySecretProvider::new())),
+        other => Err(ManagerError::Config(format!(
+            "secret provider '{other}' is not implemented; refusing to start"
+        ))),
+    }
+}
+
+/// Load a local JSON object mapping secret references to UTF-8 values.
+/// Parse errors deliberately exclude file contents, which contain credentials.
+async fn populate_development_secrets(
+    provider: &dyn crate::secrets::SecretProvider,
+    contents: &[u8],
+) -> Result<(), ManagerError> {
+    let values: std::collections::HashMap<String, String> = serde_json::from_slice(contents)
+        .map_err(|_| ManagerError::Config("invalid development secrets file".into()))?;
+    for (name, value) in values {
+        provider
+            .put(&name, value.as_bytes())
+            .await
+            .map_err(|_| ManagerError::Config("cannot populate development secrets".into()))?;
+    }
+    Ok(())
+}
+
+/// Resolve the 32-byte envelope master key from the secret provider, or use the
+/// explicit dev key when no ref is configured (local/tests only).
+async fn resolve_master_key(
+    provider: &dyn crate::secrets::SecretProvider,
+    master_key_ref: &Option<String>,
+) -> Result<crate::config::MasterKey, ManagerError> {
+    match master_key_ref {
+        Some(ref_name) => {
+            let bytes = provider
+                .get(ref_name)
+                .await
+                .map_err(|e| ManagerError::Config(format!("failed to resolve master key: {e}")))?;
+            if bytes.len() != crate::config::MASTER_KEY_BYTES {
+                return Err(ManagerError::Config(format!(
+                    "master key at '{ref_name}' has wrong length {} (expected {})",
+                    bytes.len(),
+                    crate::config::MASTER_KEY_BYTES
+                )));
+            }
+            let mut key = [0u8; crate::config::MASTER_KEY_BYTES];
+            key.copy_from_slice(&bytes);
+            Ok(crate::config::MasterKey(key))
+        }
+        None => Ok(crate::config::dev_master_key()),
+    }
 }
 
 impl ManagerServices {
@@ -63,14 +138,141 @@ impl ManagerServices {
         Ok(ManagerServices::from_db(db))
     }
 
-    pub fn from_db(db: Db) -> Self {
+    /// Build services from a connected database using the provided auth config
+    /// and GitHub adapter (used by tests with fixture adapters).
+    pub fn from_db_with_auth(
+        db: Db,
+        auth_config: crate::config::AuthConfig,
+        github: std::sync::Arc<dyn crate::auth::github::GithubAuth>,
+    ) -> Self {
         let pool = db.pool().clone();
+        let users = crate::auth::repository::UsersRepository::new(pool.clone());
+        let sessions = crate::auth::repository::SessionsRepository::new(pool.clone());
+        let transactions = crate::auth::repository::AuthTransactionRepository::new(pool.clone());
+        let org_repo = crate::organizations::OrganizationRepository::new(pool.clone());
+        let organizations = OrganizationsRepository::new(pool.clone());
+        let tenants = TenantsRepository::new(pool.clone());
+        let idempotency = IdempotencyService::new(pool.clone());
+        let session_manager = crate::auth::sessions::SessionManager::new(sessions.clone());
+        let login = crate::auth::oauth::LoginService {
+            pool: pool.clone(),
+            users: users.clone(),
+            transactions: transactions.clone(),
+            sessions: sessions.clone(),
+            session_manager: session_manager.clone(),
+            github: github.clone(),
+            auth_config: auth_config.clone(),
+        };
+        let device = crate::auth::device::DeviceFlowService::new(
+            pool.clone(),
+            sessions.clone(),
+            auth_config.public_url.clone(),
+        );
+        let orgs_service = crate::organizations::OrganizationService::new(
+            pool.clone(),
+            org_repo.clone(),
+            organizations.clone(),
+            idempotency.clone(),
+        );
         ManagerServices {
-            organizations: OrganizationsRepository::new(pool.clone()),
-            tenants: TenantsRepository::new(pool.clone()),
-            idempotency: IdempotencyService::new(pool),
             db,
+            organizations,
+            tenants,
+            idempotency,
+            users,
+            sessions,
+            transactions,
+            org_repo,
+            orgs_service,
+            session_manager,
+            login,
+            device,
+            rate_limiter: crate::rate_limit::RateLimiter::new(pool),
+            auth_config,
+            github,
         }
+    }
+
+    /// Build services from a connected database using configuration and the
+    /// secret provider, resolving the GitHub client secret and envelope master
+    /// key. Hosted-mode secret resolution failures fail closed.
+    pub async fn from_db_with_config(
+        db: Db,
+        config: &crate::config::ManagerConfig,
+        provider: &dyn crate::secrets::SecretProvider,
+    ) -> Result<Self, ManagerError> {
+        // Resolve the GitHub client secret for the OAuth exchange.
+        let client_secret = match &config.github_client_secret_ref {
+            Some(ref_name) => String::from_utf8(provider.get(ref_name).await.map_err(|e| {
+                ManagerError::Config(format!("failed to resolve GitHub client secret: {e}"))
+            })?)
+            .map_err(|_| ManagerError::Config("GitHub client secret is not UTF-8".into()))?,
+            None => String::new(),
+        };
+
+        // Resolve the envelope master key.
+        let master_key = resolve_master_key(provider, &config.crypto_master_key_ref).await?;
+
+        let mut auth_config = config.auth.clone();
+        auth_config.master_key = Some(master_key);
+
+        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> = std::sync::Arc::new(
+            crate::auth::github::RealGithubAuth::new(
+                auth_config.client_id.clone(),
+                client_secret,
+                auth_config.github_api_base.clone(),
+            )
+            .with_redirect_uri(format!(
+                "{}/auth/github/callback",
+                auth_config.public_url.trim_end_matches('/')
+            )),
+        );
+
+        Ok(Self::from_db_with_auth(db, auth_config, github))
+    }
+
+    pub fn from_db(db: Db) -> Self {
+        // Local/test default: use a fixture GitHub adapter and the dev master
+        // key. Handlers that require real GitHub will fail closed when the
+        // adapter is a fixture without configured endpoints.
+        let auth_config = crate::config::local_test_config().auth;
+        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> =
+            std::sync::Arc::new(UnconfiguredGithub);
+        Self::from_db_with_auth(db, auth_config, github)
+    }
+}
+
+/// A GitHub adapter that fails closed when no provider is configured. Used by
+/// `ManagerServices::from_db` in pure-local/test mode so unauthenticated GitHub
+/// calls never silently succeed.
+struct UnconfiguredGithub;
+
+#[async_trait::async_trait]
+impl crate::auth::github::GithubAuth for UnconfiguredGithub {
+    fn authorize_url(&self, _: &crate::auth::github::AuthorizeRequest) -> String {
+        "/auth/github/start".to_string()
+    }
+    async fn exchange_code(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<crate::auth::github::UserToken, ManagerError> {
+        Err(ManagerError::Config(
+            "GitHub authentication is not configured".into(),
+        ))
+    }
+    async fn fetch_user(&self, _: &str) -> Result<crate::auth::github::GithubUser, ManagerError> {
+        Err(ManagerError::Config(
+            "GitHub authentication is not configured".into(),
+        ))
+    }
+    async fn resolve_login(
+        &self,
+        _: &str,
+    ) -> Result<crate::auth::github::GithubUserLookup, ManagerError> {
+        Err(ManagerError::Config(
+            "GitHub authentication is not configured".into(),
+        ))
     }
 }
 
@@ -105,7 +307,21 @@ impl AppState {
         // database is required and a failure here is fatal (never a local
         // fallback). In local mode an explicit database is optional.
         let services = match &config.database_url {
-            Some(url) => Some(Arc::new(ManagerServices::connect(url).await?)),
+            Some(url) => {
+                let db = Db::connect(url).await?;
+                let provider = resolve_secret_provider(&config.secret_provider)?;
+                if config.secret_provider == IN_MEMORY_SECRET_PROVIDER {
+                    if let Some(path) = std::env::var_os("OPENFLOWS_DEV_SECRETS_FILE") {
+                        let contents = std::fs::read(path).map_err(|_| {
+                            ManagerError::Config("cannot read development secrets file".into())
+                        })?;
+                        populate_development_secrets(provider.as_ref(), &contents).await?;
+                    }
+                }
+                let services =
+                    ManagerServices::from_db_with_config(db, &config, provider.as_ref()).await?;
+                Some(Arc::new(services))
+            }
             None => None,
         };
 
@@ -129,12 +345,7 @@ impl AppState {
         let readiness = Arc::new(StoreReadiness {
             store: store.clone(),
         });
-        let config = ManagerConfig {
-            mode: crate::config::Mode::Local,
-            database_url: None,
-            secret_provider: crate::config::DEFAULT_SECRET_PROVIDER.to_string(),
-            http_addr: "127.0.0.1:3002".to_string(),
-        };
+        let config = crate::config::local_test_config();
         Self {
             store,
             readiness,
@@ -147,12 +358,7 @@ impl AppState {
         Self {
             store,
             readiness,
-            config: ManagerConfig {
-                mode: crate::config::Mode::Local,
-                database_url: None,
-                secret_provider: crate::config::DEFAULT_SECRET_PROVIDER.to_string(),
-                http_addr: "127.0.0.1:3002".to_string(),
-            },
+            config: crate::config::local_test_config(),
             services: None,
         }
     }
@@ -283,13 +489,14 @@ pub struct ReadinessReport {
 
 pub fn create_router(state: AppState) -> Router {
     crate::routes::router()
+        .layer(axum::middleware::from_fn(request_context))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
                     tracing::info_span!(
                         "http_request",
                         method = %request.method(),
-                        path = %request.uri().path(),
+                        path = request.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("unmatched"),
                         status = tracing::field::Empty,
                         latency_ms = tracing::field::Empty,
                     )
@@ -311,9 +518,12 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    axum::serve(listener, create_router(state))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -325,4 +535,86 @@ pub async fn bind_and_serve(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "OpenFlows Manager listening");
     serve(listener, state, shutdown).await
+}
+
+tokio::task_local! { pub static REQUEST_ID: String; }
+
+async fn request_context(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|p| p.0.ip().to_string())
+        .unwrap_or_else(|| "unknown-peer".into());
+    request
+        .headers_mut()
+        .insert("x-openflows-peer", peer.parse().expect("IP header"));
+    let request_id = uuid::Uuid::new_v4().to_string();
+    request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    let mut response = REQUEST_ID
+        .scope(request_id.clone(), next.run(request))
+        .await;
+    if (response.status().is_client_error() || response.status().is_server_error())
+        && !response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/json"))
+    {
+        use axum::response::IntoResponse;
+        let status = response.status();
+        let code = if status == axum::http::StatusCode::NOT_FOUND {
+            "RESOURCE_NOT_FOUND"
+        } else if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+            "METHOD_NOT_ALLOWED"
+        } else {
+            "INVALID_INPUT"
+        };
+        response = (status,axum::Json(serde_json::json!({"error":{
+            "code":code,"message":"request could not be accepted","request_id":request_id,"retryable":false
+        }}))).into_response();
+    }
+    response
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("referrer-policy", "no-referrer".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    response.headers_mut().insert("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
+    response
+}
+
+#[cfg(test)]
+mod development_secret_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn development_file_populates_oauth_and_master_key_references() {
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        populate_development_secrets(
+            provider.as_ref(),
+            br#"{"oauth":"client-secret","master":"01234567890123456789012345678901"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.get("oauth").await.unwrap(), b"client-secret");
+        let key = resolve_master_key(provider.as_ref(), &Some("master".into()))
+            .await
+            .unwrap();
+        assert_eq!(key.0, *b"01234567890123456789012345678901");
+        assert!(provider.get("missing").await.is_err());
+        let error = populate_development_secrets(provider.as_ref(), b"private-credential")
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("private-credential"));
+    }
 }

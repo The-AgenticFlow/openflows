@@ -115,6 +115,7 @@ impl TestDb {
     }
 
     /// The number of applied (successful) migrations.
+    #[allow(dead_code)]
     pub async fn applied_migrations(&self) -> Result<i64, ManagerError> {
         let row: (i64,) =
             sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE success = true")
@@ -169,6 +170,7 @@ impl Drop for TestDb {
 }
 
 /// Insert a user row, returning its id.
+#[allow(dead_code)]
 pub async fn insert_user(pool: &PgPool) -> Result<uuid::Uuid, ManagerError> {
     let id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO users (id, display_name, status) VALUES ($1, $2, 'active')")
@@ -182,6 +184,7 @@ pub async fn insert_user(pool: &PgPool) -> Result<uuid::Uuid, ManagerError> {
 
 /// Insert an organization and its owner/admin membership atomically, returning
 /// the organization id. Satisfies the deferred owner FK.
+#[allow(dead_code)]
 pub async fn insert_organization_with_owner(
     pool: &PgPool,
     slug: &str,
@@ -214,6 +217,7 @@ pub async fn insert_organization_with_owner(
 }
 
 /// Insert a GitHub connection belonging to `org`, returning its id.
+#[allow(dead_code)]
 pub async fn insert_connection(
     pool: &PgPool,
     org: uuid::Uuid,
@@ -236,6 +240,7 @@ pub async fn insert_connection(
 }
 
 /// Insert a repository owned by a connection, returning the repo id.
+#[allow(dead_code)]
 pub async fn insert_repository(
     pool: &PgPool,
     org: uuid::Uuid,
@@ -256,4 +261,234 @@ pub async fn insert_repository(
     .await
     .map_err(ManagerError::from)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WP-02 test fixtures and harness
+// ---------------------------------------------------------------------------
+
+/// A deterministic GitHub user for fixtures.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FixtureUser {
+    pub id: i64,
+    pub login: String,
+    pub display_name: String,
+}
+
+/// An injectable GitHub adapter backed by in-memory fixtures, so HTTP tests can
+/// drive the real OAuth/device handlers without network access.
+#[allow(dead_code)]
+pub struct FixtureGithubAuth {
+    /// login -> user mapping used by `resolve_login`.
+    pub users_by_login: std::sync::Mutex<std::collections::HashMap<String, FixtureUser>>,
+    /// The user a callback `code` resolves to (simulates GitHub's callback).
+    pub callback_user: FixtureUser,
+    /// Exchange failures to inject (e.g. wrong verifier).
+    pub fail_exchange: std::sync::atomic::AtomicBool,
+}
+
+#[allow(dead_code)]
+impl FixtureGithubAuth {
+    pub fn new(callback_user: FixtureUser) -> Self {
+        let users_by_login = std::sync::Mutex::new(
+            [
+                (
+                    callback_user.login.clone(),
+                    FixtureUser {
+                        id: callback_user.id,
+                        login: callback_user.login.clone(),
+                        display_name: callback_user.display_name.clone(),
+                    },
+                ),
+                (
+                    "bob".to_string(),
+                    FixtureUser {
+                        id: 2,
+                        login: "bob".to_string(),
+                        display_name: "Bob".to_string(),
+                    },
+                ),
+                (
+                    "carol".to_string(),
+                    FixtureUser {
+                        id: 3,
+                        login: "carol".to_string(),
+                        display_name: "Carol".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        FixtureGithubAuth {
+            users_by_login,
+            callback_user,
+            fail_exchange: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl openflows_manager::auth::github::GithubAuth for FixtureGithubAuth {
+    fn authorize_url(&self, req: &openflows_manager::auth::github::AuthorizeRequest) -> String {
+        format!(
+            "https://github.example/authorize?client_id={}&state={}",
+            req.client_id, req.state
+        )
+    }
+
+    async fn exchange_code(
+        &self,
+        _code: &str,
+        verifier: &str,
+    ) -> Result<openflows_manager::auth::github::UserToken, ManagerError> {
+        if self.fail_exchange.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ManagerError::api("GITHUB_OAUTH_ERROR", "exchange failed"));
+        }
+        // Accept any non-empty verifier (the real PKCE check is on GitHub).
+        if verifier.is_empty() {
+            return Err(ManagerError::api("GITHUB_OAUTH_ERROR", "missing verifier"));
+        }
+        Ok(openflows_manager::auth::github::UserToken {
+            access_token: "ghu_fixture_token".to_string(),
+            refresh_token: Some("ghr_fixture_refresh".to_string()),
+            expires_in: Some(28800),
+        })
+    }
+
+    async fn fetch_user(
+        &self,
+        _token: &str,
+    ) -> Result<openflows_manager::auth::github::GithubUser, ManagerError> {
+        Ok(openflows_manager::auth::github::GithubUser {
+            id: self.callback_user.id,
+            login: self.callback_user.login.clone(),
+            display_name: Some(self.callback_user.display_name.clone()),
+        })
+    }
+
+    async fn resolve_login(
+        &self,
+        login: &str,
+    ) -> Result<openflows_manager::auth::github::GithubUserLookup, ManagerError> {
+        let map = self.users_by_login.lock().unwrap();
+        match map.get(login) {
+            Some(u) => Ok(openflows_manager::auth::github::GithubUserLookup {
+                id: u.id,
+                login: u.login.clone(),
+            }),
+            None => Err(ManagerError::InvalidInput(format!(
+                "GitHub login '{login}' not found"
+            ))),
+        }
+    }
+}
+
+/// Build an [`openflows_manager::auth::config::AuthConfig`] for tests with the
+/// dev master key resolved.
+#[allow(dead_code)]
+pub fn test_auth_config(public_url: &str) -> openflows_manager::config::AuthConfig {
+    openflows_manager::config::AuthConfig {
+        client_id: "test-client".to_string(),
+        public_url: public_url.to_string(),
+        github_api_base: "https://api.github.example".to_string(),
+        cookie_secure: false, // loopback development exception for tests
+        allow_loopback: true,
+        master_key: Some(openflows_manager::config::dev_master_key()),
+    }
+}
+
+/// Build [`openflows_manager::server::ManagerServices`] bound to `db` with the
+/// given fixture GitHub adapter and a test auth config.
+pub fn services_with_auth(
+    db: openflows_manager::db::Db,
+    github: std::sync::Arc<dyn openflows_manager::auth::github::GithubAuth>,
+    public_url: &str,
+) -> openflows_manager::server::ManagerServices {
+    openflows_manager::server::ManagerServices::from_db_with_auth(
+        db,
+        test_auth_config(public_url),
+        github,
+    )
+}
+
+/// Build an axum [`Router`] for HTTP tests from a `TestDb` and a fixture GitHub
+/// adapter. The database must already be migrated. Returns a fully-applied
+/// router (`Router<()>`).
+#[allow(dead_code)]
+pub fn router_with(
+    pool: sqlx::PgPool,
+    github: std::sync::Arc<dyn openflows_manager::auth::github::GithubAuth>,
+    public_url: &str,
+) -> axum::Router<()> {
+    let db = openflows_manager::db::Db::from_pool(pool);
+    let services = services_with_auth(db, github, public_url);
+    let state = openflows_manager::server::AppState::with_services(
+        pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
+        std::sync::Arc::new(OkProbe),
+        services,
+        openflows_manager::config::local_test_config(),
+    );
+    openflows_manager::server::create_router(state)
+}
+
+/// A readiness probe that always succeeds (used in HTTP tests).
+#[derive(Debug, Clone)]
+pub struct OkProbe;
+impl openflows_manager::server::ReadinessCheck for OkProbe {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ManagerError>> + Send + '_>>
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Build the domain services and a fully-applied router together, so tests can
+/// both make HTTP requests and create users/sessions directly.
+#[allow(dead_code)]
+pub fn build_context(
+    pool: sqlx::PgPool,
+    github: std::sync::Arc<dyn openflows_manager::auth::github::GithubAuth>,
+    public_url: &str,
+) -> (openflows_manager::server::ManagerServices, axum::Router<()>) {
+    let db = openflows_manager::db::Db::from_pool(pool);
+    let services = services_with_auth(db, github, public_url);
+    let state = openflows_manager::server::AppState::with_services(
+        pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
+        std::sync::Arc::new(OkProbe),
+        services.clone(),
+        openflows_manager::config::local_test_config(),
+    );
+    let router = openflows_manager::server::create_router(state);
+    (services, router)
+}
+
+/// Create (or fetch) a user by GitHub id/login and return a CLI access-token
+/// (usable as a Bearer credential, which is CSRF-exempt for mutations). Used by
+/// multi-user HTTP tests to avoid driving OAuth per user.
+#[allow(dead_code)]
+pub async fn login_as_user(
+    services: &openflows_manager::server::ManagerServices,
+    github_id: i64,
+    login: &str,
+) -> String {
+    let (user_id, _) = services
+        .users
+        .find_or_create_user(
+            services.db.pool(),
+            "github",
+            &github_id.to_string(),
+            login,
+            login,
+        )
+        .await
+        .expect("create user");
+    let creds = services
+        .sessions
+        .create_cli_session(user_id)
+        .await
+        .expect("create session");
+    creds.access_token
 }

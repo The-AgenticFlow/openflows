@@ -1,6 +1,7 @@
 //! Library entry point for the OpenFlows Manager HTTP service.
 
 pub mod audit;
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod dto;
@@ -8,8 +9,11 @@ pub mod error;
 pub mod id;
 pub mod idempotency;
 pub mod operations;
+pub mod organizations;
 pub mod outbox;
+pub mod pages;
 pub mod pagination;
+pub mod rate_limit;
 pub mod repositories;
 pub mod routes;
 pub mod secrets;

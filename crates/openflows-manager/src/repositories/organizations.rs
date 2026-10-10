@@ -115,8 +115,8 @@ impl OrganizationsRepository {
     pub async fn list_for_user(&self, user: UserId) -> Result<Vec<MembershipDto>, ManagerError> {
         let rows = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
             "SELECT m.organization_id, m.role, m.status
-               FROM memberships m
-              WHERE m.user_id = $1 AND m.status = 'active'
+               FROM memberships m JOIN organizations o ON o.id=m.organization_id
+              WHERE m.user_id = $1 AND m.status = 'active' AND o.status <> 'deleted'
               ORDER BY m.organization_id",
         )
         .bind(user.0)

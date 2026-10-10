@@ -47,7 +47,7 @@ echo "==> Running manager PostgreSQL integration tests (connection URL omitted)"
 # opts in with `--ignored` now that a database is available.
 (
   cd "$MANAGER_CRATE"
-  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --test postgres -- --ignored
+  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --test postgres --test http_auth --test http_org --test org_policy --test review_regressions -- --ignored --test-threads=4
   cargo test --test ready --test health
 )
 
