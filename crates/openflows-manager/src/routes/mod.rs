@@ -8,15 +8,19 @@ use axum::{
 use serde::Serialize;
 
 pub mod auth;
+pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod organizations;
+pub mod webhooks;
+pub mod test_ui;
 
 pub fn router() -> Router<AppState> {
     // Keep platform-oriented probes at the root because orchestrators and load
     // balancers generally expect stable, version-independent health URLs.
     Router::new()
+        .route("/", get(test_ui::index))
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
         // Product/API routes are versioned from the start so future public
@@ -75,6 +79,27 @@ fn api_v1_router() -> Router<AppState> {
             post(organizations::transfer_ownership),
         )
         .route("/operations/{id}", get(organizations::get_operation))
+        // WP-03 GitHub connection lifecycle.
+        .route(
+            "/organizations/{org}/github/connect",
+            post(connections::connect),
+        )
+        .route("/github/oauth/callback", get(connections::oauth_callback))
+        .route("/github/setup", get(connections::setup_callback))
+        .route(
+            "/organizations/{org}/github/connections",
+            get(connections::list_connections),
+        )
+        .route(
+            "/organizations/{org}/github/connections/{id}/reconcile",
+            post(connections::reconcile_connection),
+        )
+        .route(
+            "/organizations/{org}/github/connections/{id}",
+            delete(connections::disconnect),
+        )
+        // WP-03 public signed webhook ingress.
+        .route("/webhooks/github", post(webhooks::receive_webhook))
 }
 
 #[derive(Serialize)]

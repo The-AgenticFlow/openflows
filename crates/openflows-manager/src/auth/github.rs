@@ -73,6 +73,19 @@ pub trait GithubAuth: Send + Sync {
     /// Exchange an authorization code for a user access token (server side).
     async fn exchange_code(&self, code: &str, verifier: &str) -> Result<UserToken, ManagerError>;
 
+    /// Exchange an authorization code using an explicit redirect URI. Used by
+    /// the connection flow, which has its own OAuth callback distinct from
+    /// login. Defaults to [`Self::exchange_code`]; the real client uses the
+    /// given redirect URI so the code issued against that callback validates.
+    async fn exchange_code_with_redirect(
+        &self,
+        code: &str,
+        verifier: &str,
+        _redirect_uri: &str,
+    ) -> Result<UserToken, ManagerError> {
+        self.exchange_code(code, verifier).await
+    }
+
     /// Fetch the authenticated user for a user access token.
     async fn fetch_user(&self, token: &str) -> Result<GithubUser, ManagerError>;
 
@@ -203,6 +216,52 @@ impl GithubAuth for RealGithubAuth {
             id: u.id,
             login: u.login,
             display_name: u.name,
+        })
+    }
+
+    async fn exchange_code_with_redirect(
+        &self,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<UserToken, ManagerError> {
+        let params = vec![
+            ("client_id", self.client_id.clone()),
+            ("client_secret", self.client_secret.clone()),
+            ("code", code.to_string()),
+            ("code_verifier", verifier.to_string()),
+            ("redirect_uri", redirect_uri.to_string()),
+        ];
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.client
+                .post(GITHUB_TOKEN_URL)
+                .header("Accept", "application/json")
+                .form(&params)
+                .send(),
+        )
+        .await
+        .map_err(|_| ManagerError::Service(anyhow::anyhow!("github token exchange timed out")))?
+        .map_err(|e| ManagerError::Service(anyhow::anyhow!("github token exchange failed: {e}")))?;
+
+        let status = resp.status();
+        let body: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid token response")))?;
+
+        if body.error.is_some() || !status.is_success() {
+            return Err(ManagerError::api(
+                "GITHUB_OAUTH_ERROR",
+                "GitHub authorization failed",
+            ));
+        }
+        Ok(UserToken {
+            access_token: body.access_token.ok_or_else(|| {
+                ManagerError::api("GITHUB_OAUTH_ERROR", "GitHub returned no access token")
+            })?,
+            refresh_token: body.refresh_token,
+            expires_in: body.expires_in,
         })
     }
 

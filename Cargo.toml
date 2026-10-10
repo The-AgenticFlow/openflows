@@ -83,3 +83,6 @@ sha2 = "0.10"
 
 # opaque cursor encoding
 base64 = "0.22"
+
+# App JWT signing (RS256)
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
