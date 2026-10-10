@@ -13,6 +13,7 @@ pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod organizations;
+pub mod runtime;
 pub mod test_ui;
 pub mod webhooks;
 
@@ -100,6 +101,12 @@ fn api_v1_router() -> Router<AppState> {
         )
         // WP-03 public signed webhook ingress.
         .route("/webhooks/github", post(webhooks::receive_webhook))
+        // WP-04 runtime credential broker: authenticated by a workspace runtime
+        // credential, never by a human session.
+        .route(
+            "/runtime/github-credentials",
+            post(runtime::github_credentials),
+        )
 }
 
 #[derive(Serialize)]

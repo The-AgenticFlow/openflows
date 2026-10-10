@@ -8,6 +8,12 @@ workers, and the complete hosted CLI remain later packages.
 See [the WP-02 review and handoff](WP02_REVIEW.md) for API contracts, setup,
 fixed defects, test evidence, and deployment prerequisites.
 
+WP-04 adds runtime authentication and the GitHub credential broker: a workspace
+runtime principal (distinct from human sessions) that obtains short-lived GitHub
+installation tokens scoped to its authorized repository and permission profile.
+See [runtime credentials and the GitHub credential broker](../../docs/architecture/runtime-credentials-broker.md)
+and [the WP-04 review](WP04_REVIEW.md).
+
 ## Validation
 
 Ordinary tests require no PostgreSQL server:

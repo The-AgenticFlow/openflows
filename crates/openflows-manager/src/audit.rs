@@ -66,6 +66,13 @@ impl AuditEvent {
         self
     }
 
+    /// Set the actor type (defaults to "user"). Runtime principals record
+    /// "runtime"; platform/operator actors may use other stable types.
+    pub fn actor_type(mut self, actor_type: impl Into<String>) -> Self {
+        self.actor_type = actor_type.into();
+        self
+    }
+
     pub fn resource(mut self, resource_type: impl Into<String>, id: impl Into<uuid::Uuid>) -> Self {
         self.resource_type = Some(resource_type.into());
         self.resource_id = Some(id.into());

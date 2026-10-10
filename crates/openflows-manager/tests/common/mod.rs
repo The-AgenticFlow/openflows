@@ -263,6 +263,61 @@ pub async fn insert_repository(
     Ok(())
 }
 
+/// Insert a running tenant bound to a connection and repository in `org`,
+/// returning the tenant id.
+#[allow(dead_code)]
+pub async fn insert_running_tenant(
+    pool: &PgPool,
+    org: uuid::Uuid,
+    connection_id: uuid::Uuid,
+    github_repository_id: i64,
+    slug: &str,
+) -> Result<uuid::Uuid, ManagerError> {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants
+            (id, organization_id, slug, connection_id, github_repository_id, fleet_size,
+             desired_state, observed_state)
+         VALUES ($1, $2, $3, $4, $5, 1, 'running', 'running')",
+    )
+    .bind(id)
+    .bind(org)
+    .bind(slug)
+    .bind(connection_id)
+    .bind(github_repository_id)
+    .execute(pool)
+    .await
+    .map_err(ManagerError::from)?;
+    Ok(id)
+}
+
+/// Insert a running workspace for a tenant, returning the workspace id.
+#[allow(dead_code)]
+pub async fn insert_running_workspace(
+    pool: &PgPool,
+    org: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    role: &str,
+    slot: i32,
+) -> Result<uuid::Uuid, ManagerError> {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workspaces
+            (id, organization_id, tenant_id, role, slot, desired_state, observed_state,
+             credential_generation)
+         VALUES ($1, $2, $3, $4, $5, 'running', 'running', 0)",
+    )
+    .bind(id)
+    .bind(org)
+    .bind(tenant_id)
+    .bind(role)
+    .bind(slot)
+    .execute(pool)
+    .await
+    .map_err(ManagerError::from)?;
+    Ok(id)
+}
+
 // ---------------------------------------------------------------------------
 // WP-02 test fixtures and harness
 // ---------------------------------------------------------------------------

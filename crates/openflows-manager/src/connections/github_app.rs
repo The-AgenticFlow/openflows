@@ -90,6 +90,10 @@ pub struct InstallationToken {
     pub token: String,
     pub expires_at: DateTime<Utc>,
     pub repository_ids: Vec<i64>,
+    /// The permissions GitHub actually granted, keyed by GitHub permission
+    /// name (e.g. "contents" -> "write"). Validated to match the requested
+    /// profile exactly; a broader or narrower permission set fails closed.
+    pub permissions: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for InstallationToken {
@@ -97,6 +101,7 @@ impl std::fmt::Debug for InstallationToken {
         f.debug_struct("InstallationToken")
             .field("expires_at", &self.expires_at)
             .field("repository_ids", &self.repository_ids)
+            .field("permissions", &self.permissions)
             .field("token", &"[REDACTED]")
             .finish()
     }
@@ -146,14 +151,26 @@ pub trait GithubAppApi: Send + Sync {
     ) -> Result<Vec<RepoRef>, ManagerError>;
 
     /// Exchange the App JWT for a short-lived installation access token,
-    /// limited to the explicit `repository_ids`. Validates the returned
-    /// repository scope so a partial/omitted scope is never silently accepted.
+    /// limited to the explicit `repository_ids` and `permissions` (a map of
+    /// GitHub permission name to level, e.g. "contents" -> "write"). Validates
+    /// the returned repository scope and permissions so a partial, omitted, or
+    /// wider scope is never silently accepted.
     async fn exchange_installation_token(
         &self,
         jwt: &SignedAppJwt,
         installation_id: i64,
         repository_ids: &[i64],
+        permissions: &std::collections::BTreeMap<String, String>,
     ) -> Result<InstallationToken, ManagerError>;
+
+    /// Revoke an installation token upstream before discarding its local lease.
+    /// A fixture adapter can simulate an actual upstream revocation.
+    async fn revoke_installation_token(
+        &self,
+        jwt: &SignedAppJwt,
+        installation_id: i64,
+        token: &str,
+    ) -> Result<(), ManagerError>;
 }
 
 /// The real GitHub API client backed by `reqwest`, with a bounded timeout.
@@ -386,6 +403,7 @@ impl GithubAppApi for RealGithubAppApi {
         jwt: &SignedAppJwt,
         installation_id: i64,
         repository_ids: &[i64],
+        permissions: &std::collections::BTreeMap<String, String>,
     ) -> Result<InstallationToken, ManagerError> {
         if repository_ids.is_empty() {
             return Err(ManagerError::Service(anyhow::anyhow!(
@@ -395,7 +413,10 @@ impl GithubAppApi for RealGithubAppApi {
         let url = self.app_url(&format!(
             "/app/installations/{installation_id}/access_tokens"
         ));
-        let body = serde_json::json!({ "repository_ids": repository_ids });
+        let body = serde_json::json!({
+            "repository_ids": repository_ids,
+            "permissions": permissions,
+        });
         let resp: TokenResponse = self
             .post_json(&url, jwt.raw(), &body, "application/vnd.github+json")
             .await?;
@@ -404,8 +425,9 @@ impl GithubAppApi for RealGithubAppApi {
                 ManagerError::api("GITHUB_UNAVAILABLE", "invalid token expiry from GitHub")
             })?
             .with_timezone(&Utc);
-        // Validate the returned repository scope: it must cover every requested
-        // repository id, otherwise fail closed (never silently narrow scope).
+        // Validate the returned repository scope: it must cover exactly every
+        // requested repository id, otherwise fail closed (never silently narrow
+        // or widen scope).
         let returned: std::collections::BTreeSet<i64> =
             resp.repositories.into_iter().map(|r| r.id).collect();
         let requested: std::collections::BTreeSet<i64> = repository_ids.iter().copied().collect();
@@ -415,11 +437,45 @@ impl GithubAppApi for RealGithubAppApi {
                 "GitHub returned a different repository scope than requested",
             ));
         }
+        // Validate the returned permission set: it must match the requested
+        // profile exactly. A broader set is a privilege escalation and a
+        // narrower set is an unusable/incomplete grant; both fail closed.
+        if resp.permissions != *permissions {
+            return Err(ManagerError::api(
+                "GITHUB_UNAVAILABLE",
+                "GitHub returned different permissions than requested",
+            ));
+        }
         Ok(InstallationToken {
             token: resp.token,
             expires_at,
             repository_ids: returned.into_iter().collect(),
+            permissions: resp.permissions,
         })
+    }
+
+    async fn revoke_installation_token(
+        &self,
+        _jwt: &SignedAppJwt,
+        _installation_id: i64,
+        token: &str,
+    ) -> Result<(), ManagerError> {
+        let response = tokio::time::timeout(
+            self.timeout,
+            self.client
+                .delete(self.app_url("/installation/token"))
+                .bearer_auth(token)
+                .header("Accept", "application/vnd.github+json")
+                .send(),
+        )
+        .await
+        .map_err(|_| ManagerError::api("GITHUB_UNAVAILABLE", "GitHub request timed out"))?
+        .map_err(|_| ManagerError::api("GITHUB_UNAVAILABLE", "GitHub request failed"))?;
+        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(map_github_status(response.status()))
+        }
     }
 }
 
@@ -507,6 +563,8 @@ struct TokenResponse {
     expires_at: String,
     #[serde(default)]
     repositories: Vec<TokenRepository>,
+    #[serde(default)]
+    permissions: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(serde::Deserialize)]

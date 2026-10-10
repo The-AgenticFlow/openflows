@@ -158,7 +158,12 @@ fn api_status(code: &str) -> u16 {
         | "OWNER_REQUIRED"
         | "INVITATION_WRONG_USER"
         | "REAUTH_REQUIRED"
-        | "ORG_UNAVAILABLE" => 403,
+        | "ORG_UNAVAILABLE"
+        | "TENANT_UNAVAILABLE"
+        | "WORKSPACE_UNAVAILABLE"
+        | "CONNECTION_UNAVAILABLE"
+        | "REPOSITORY_UNAVAILABLE"
+        | "AUTH_CHANGED" => 403,
         "RATE_LIMITED" | "TOO_MANY_REQUESTS" => 429,
         "SERVICE_UNAVAILABLE" | "GITHUB_UNAVAILABLE" => 503,
         "GITHUB_OAUTH_ERROR" => 401,

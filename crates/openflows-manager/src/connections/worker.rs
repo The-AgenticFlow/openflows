@@ -11,6 +11,7 @@ use crate::connections::webhooks::WebhookService;
 use crate::error::ManagerError;
 use crate::id::{ConnectionId, OrganizationId};
 use crate::outbox::{self, OutboxClaim};
+use crate::runtime::repository::RuntimeRepository;
 use sqlx::PgPool;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ pub struct ConnectionWorker {
     pub repo: ConnectionRepository,
     pub sync: SyncService,
     pub webhooks: WebhookService,
+    pub runtime_repo: RuntimeRepository,
 }
 
 impl ConnectionWorker {
@@ -32,12 +34,14 @@ impl ConnectionWorker {
         repo: ConnectionRepository,
         sync: SyncService,
         webhooks: WebhookService,
+        runtime_repo: RuntimeRepository,
     ) -> Self {
         ConnectionWorker {
             pool,
             repo,
             sync,
             webhooks,
+            runtime_repo,
         }
     }
 
@@ -118,11 +122,15 @@ impl ConnectionWorker {
                 Ok(())
             }
             "github.disconnect_cleanup" => {
-                // Access was already disabled synchronously at disconnect time.
-                // WP-04 revokes credential leases here; for WP-03 the operation
-                // completes and the connection remains disconnected (binding
-                // history is preserved, no row deletion).
-                let _conn = self.connection_from_payload(&payload).await?;
+                // Access was already disabled synchronously at disconnect time
+                // (status + access-generation increment), which stops new
+                // issuance. WP-04 revokes the recorded credential leases here so
+                // outstanding tokens are discarded asynchronously; the
+                // connection remains disconnected (binding history preserved).
+                let conn = self.connection_from_payload(&payload).await?;
+                self.runtime_repo
+                    .revoke_leases_for_connection(conn.organization_id, conn.id)
+                    .await?;
                 Ok(())
             }
             other => Err(ManagerError::Service(anyhow::anyhow!(
