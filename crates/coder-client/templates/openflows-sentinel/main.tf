@@ -5,6 +5,30 @@ terraform {
   }
 }
 
+variable "docker_network" {
+  description = "Docker network shared by the control plane and tenant workspaces"
+  type        = string
+  default     = "openflows_default"
+}
+
+variable "workspace_image" {
+  description = "Workspace image containing the tools used by the production bootstrap"
+  type        = string
+  default     = "codercom/enterprise-base:ubuntu"
+}
+
+variable "github_api_base" {
+  description = "GitHub REST API origin, including any enterprise API path"
+  type        = string
+  default     = "https://api.github.com"
+}
+
+variable "github_git_base" {
+  description = "Git transport origin used by the controller to provision repository checkouts"
+  type        = string
+  default     = "https://github.com"
+}
+
 variable "role" {
   type        = string
   default     = "sentinel"
@@ -250,7 +274,7 @@ resource "docker_volume" "workspace" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
-  image = "codercom/enterprise-base:ubuntu"
+  image = var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -281,6 +305,8 @@ resource "docker_container" "workspace" {
   }
 
   env = [
+    "GITHUB_API_BASE=${var.github_api_base}",
+    "GITHUB_GIT_BASE=${var.github_git_base}",
     "REDIS_URL=${data.coder_parameter.redis_url.value}",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
@@ -295,7 +321,7 @@ resource "docker_container" "workspace" {
   # (enforced at network level; Redis is a documented exception per docs/governance.md)
 
   networks_advanced {
-    name = "openflows_default"
+    name = var.docker_network
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

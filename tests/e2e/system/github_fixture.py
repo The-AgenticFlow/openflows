@@ -3,7 +3,7 @@ import subprocess
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from git_repository import Repository
+from git_repository import Repository, git
 
 TOKENS = {'ci-forge-token': 'forge', 'ci-sentinel-token': 'sentinel',
     'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator'}
@@ -50,6 +50,22 @@ class GitHub:
         if parts[:3] != ['repos', 'test', 'repo']:
             self.fail(404, 'Unsupported fixture repository or endpoint')
         route = parts[3:]
+        if method == 'GET' and route == ['contents', '.github', 'workflows']:
+            ref = query.get('ref', ['main'])[0]
+            try:
+                head = self.repo.head(ref)
+                tree = git('--git-dir', str(self.repo.bare), 'ls-tree', '-z', f'{head}:.github/workflows')
+            except subprocess.CalledProcessError:
+                self.fail(404, 'Workflow directory not found at requested ref')
+            entries = []
+            for entry in tree.split('\0'):
+                if not entry:
+                    continue
+                metadata, name = entry.split('\t', 1)
+                _mode, kind, sha = metadata.split()
+                entries.append({'name': name, 'path': f'.github/workflows/{name}',
+                    'sha': sha, 'type': 'file' if kind == 'blob' else 'dir'})
+            return 200, entries
         if method == 'GET' and not route:
             return 200, {'full_name': 'test/repo', 'default_branch': 'main',
                 'clone_url': self.repo.url, 'name': 'repo', 'owner': {'login': 'test'}}

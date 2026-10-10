@@ -975,7 +975,9 @@ Before significant work, read the relevant skill file to understand the workflow
             .map(|repo| {
                 // Strip any extra quotes that might have been added during JSON serialization
                 let clean_repo = repo.trim_matches('"');
-                format!("https://github.com/{}.git", clean_repo)
+                config::EnvConfig::from_env()
+                    .map(|e| e.github.repository_clone_url(clean_repo))
+                    .unwrap_or_else(|_| format!("https://github.com/{}.git", clean_repo))
             })
             .unwrap_or_default();
         let template_name = Self::template_name_for_worker(worker_id);

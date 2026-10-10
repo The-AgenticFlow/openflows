@@ -8,6 +8,30 @@ terraform {
 # TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
 # Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
 # (Remove when switching to GitHub releases for the openflows binary.)
+variable "docker_network" {
+  description = "Docker network shared by the control plane and tenant workspaces"
+  type        = string
+  default     = "openflows_default"
+}
+
+variable "workspace_image" {
+  description = "Workspace image containing the tools used by the production bootstrap"
+  type        = string
+  default     = "codercom/enterprise-base:ubuntu"
+}
+
+variable "github_api_base" {
+  description = "GitHub REST API origin, including any enterprise API path"
+  type        = string
+  default     = "https://api.github.com"
+}
+
+variable "github_git_base" {
+  description = "Git transport origin used by the controller to provision repository checkouts"
+  type        = string
+  default     = "https://github.com"
+}
+
 variable "dev_binary_host_path" {
   description = "Absolute host path to the .dev-binaries directory"
   type        = string
@@ -224,7 +248,7 @@ resource "docker_volume" "artifacts" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
-  image = "codercom/enterprise-base:ubuntu"
+  image = var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -250,6 +274,8 @@ resource "docker_container" "workspace" {
   }
 
   env = [
+    "GITHUB_API_BASE=${var.github_api_base}",
+    "GITHUB_GIT_BASE=${var.github_git_base}",
     # Always use internal 'coder' hostname - Coder is reachable as 'coder' from workspace containers
     "CODER_URL=http://coder:7080",
     "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
@@ -275,7 +301,7 @@ resource "docker_container" "workspace" {
   ]
 
   networks_advanced {
-    name = "openflows_default"
+    name = var.docker_network
     # Stable service name so forge/sentinel templates can default
     # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
     aliases = ["openflows-nexus"]

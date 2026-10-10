@@ -166,11 +166,12 @@ impl CoderBootstrapper {
         // 2. Save to file for subsequent process restarts
         std::env::set_var("CODER_SESSION_TOKEN", &session_token);
 
-        if let Ok(home) = std::env::var("HOME") {
-            let session_file = format!("{}/.openflows/coder-session-token", home);
-            if std::fs::create_dir_all(format!("{}/.openflows", home)).is_ok() {
+        if let Ok(tenant) = config::TenantConfig::init_from_env() {
+            let directory = tenant.openflows_home();
+            let session_file = directory.join("coder-session-token");
+            if std::fs::create_dir_all(&directory).is_ok() {
                 let _ = std::fs::write(&session_file, &session_token);
-                info!(session_file = %session_file, "Session token persisted to file");
+                info!(session_file = %session_file.display(), "Session token persisted to file");
             }
         }
 
@@ -443,7 +444,7 @@ impl CoderBootstrapper {
         // 2. Create the nexus workspace under the session user (admin).
         let redis_url = "redis://redis:6379".to_string();
         let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
-        let repo_url = format!("https://github.com/{}.git", github_repo);
+        let repo_url = config::GithubConfig::init_from_env()?.repository_clone_url(github_repo);
 
         // Re-running `tenant add` for an existing tenant returns the existing
         // workspace without changing its build parameters (see
@@ -523,11 +524,14 @@ impl CoderBootstrapper {
     }
 }
 
-/// Compute a hex SHA-256 fingerprint of the template archive bytes.
+/// Fingerprint both the archive and the variables stored by server-side Terraform.
 fn template_hash(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
+    let variables = serde_json::to_vec(&crate::template_variable_values())
+        .expect("template variable strings are JSON serializable");
+    hasher.update(variables);
     hex_encode(&hasher.finalize())
 }
 
@@ -545,10 +549,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Load the persisted template hash store from `~/.openflows/template-hashes.json`.
 /// Returns an empty map if the file doesn't exist or can't be parsed.
 fn load_template_hashes() -> std::collections::HashMap<String, String> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(tenant) = config::TenantConfig::init_from_env() else {
         return Default::default();
     };
-    let path = format!("{}/.openflows/template-hashes.json", home);
+    let path = tenant.openflows_home().join("template-hashes.json");
     match std::fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => Default::default(),
@@ -557,12 +561,12 @@ fn load_template_hashes() -> std::collections::HashMap<String, String> {
 
 /// Persist the template hash store to `~/.openflows/template-hashes.json`.
 fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(tenant) = config::TenantConfig::init_from_env() else {
         return;
     };
-    let dir = format!("{}/.openflows", home);
+    let dir = tenant.openflows_home();
     let _ = std::fs::create_dir_all(&dir);
-    let path = format!("{}/template-hashes.json", dir);
+    let path = dir.join("template-hashes.json");
     if let Ok(json) = serde_json::to_string_pretty(hashes) {
         let _ = std::fs::write(&path, json);
     }

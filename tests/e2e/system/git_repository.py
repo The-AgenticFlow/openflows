@@ -1,6 +1,7 @@
 """Real disposable repository and Git transport for the system fixture."""
 import os
 import socket
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -21,10 +22,16 @@ class Repository:
         if self.bare.exists():
             raise RuntimeError('Fixture requires a fresh disposable directory')
         git('init', '--bare', '--initial-branch=main', str(self.bare))
+        # Match the owner/repo clone URL used by the production bootstrap.
+        (root / 'test').mkdir()
+        (root / 'test' / 'repo.git').symlink_to('../repo.git')
         seed = root / 'seed'
         git('clone', str(self.bare), str(seed))
         (seed / 'answer.txt').write_text('41\n')
-        git('add', 'answer.txt', cwd=seed)
+        workflows = seed / '.github' / 'workflows'
+        workflows.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).with_name('bootstrap-ci.yml'), workflows / 'ci.yml')
+        git('add', 'answer.txt', '.github/workflows/ci.yml', cwd=seed)
         git('commit', '-m', 'seed deliberately broken implementation', cwd=seed)
         git('push', 'origin', 'main', cwd=seed)
         if not port:
@@ -35,7 +42,7 @@ class Repository:
         self.log = (root / 'git-daemon.log').open('w')
         self.daemon = subprocess.Popen(['git', 'daemon', '--reuseaddr', '--export-all',
             '--enable=receive-pack', f'--base-path={root}', f'--listen={host}',
-            f'--port={port}', str(self.bare)], stdout=self.log, stderr=self.log)
+            f'--port={port}', str(root)], stdout=self.log, stderr=self.log)
         try:
             for _ in range(100):
                 if self.daemon.poll() is not None:

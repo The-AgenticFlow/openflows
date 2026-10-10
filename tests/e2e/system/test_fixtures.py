@@ -192,6 +192,17 @@ class GitHubFixtureTest(FixtureCase):
             {'title': 'Fix T-1', 'head': 'fix/T-1', 'base': 'main', 'body': 'Fixes #1'})
         self.pr = pr['number']
 
+    def test_workflow_listing_follows_committed_git_tree(self):
+        code, entries = self.request('GET', '/repos/test/repo/contents/.github/workflows')
+        self.assertEqual(code, 200)
+        self.assertEqual([entry['name'] for entry in entries], ['ci.yml'])
+        self.git('rm', '.github/workflows/ci.yml')
+        self.git('commit', '-m', 'remove CI configuration')
+        self.git('push', 'origin', 'HEAD')
+        code, _ = self.request('GET', '/repos/test/repo/contents/.github/workflows?ref=fix/T-1')
+        self.assertEqual(code, 404)
+        self.assertEqual(self.request('GET', '/repos/test/repo/contents/.github/workflows')[0], 200)
+
     def git(self, *args, cwd=None):
         result = subprocess.run(['git', *args], cwd=cwd or
             (self.checkout if self.checkout.exists() else self.root),

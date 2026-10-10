@@ -2,7 +2,7 @@
 
 The goal is to prove that a new OpenFlows build can take an issue, provision agents, produce a correct change, verify the exact commit, obtain the required approvals, merge that change, and clean up. A passing test must include independent evidence of the resulting code and repository history. An agent saying it completed the task is insufficient.
 
-This is the target architecture. PRs #400 and #401 implement its first two increments; the complete issue-to-merge suite remains to be built. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
+This is the target architecture. PRs #400, #401, and #403 implement its first three increments; the complete issue-to-merge suite remains to be built. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
 
 ## What the existing pull requests do
 
@@ -152,6 +152,12 @@ The full deterministic E2E milestone is complete only when an issue submitted th
 The [system fixtures](../../tests/e2e/system/README.md) implement the local scripted model provider, limited GitHub API adapter, real Git remote, and independent exact-commit acceptance runner. Their mandatory contract job checks the production OpenFlows GitHub client and verifies actual acceptance failure, stale evidence rejection, and Git merging. The model contract checks normal and streamed tool responses and matching tool results.
 
 This is delivery step 3 infrastructure, not the complete system milestone. The production controller, real Coder chats and signed hooks, public human approval, and workspace cleanup across the complete journey remain delivery step 4. The fixture contract driver deliberately controls Git/API calls and must not be presented as proof that agents or the controller performed them.
+
+## Production bootstrap coverage
+
+The first step 4 scenario runs the public tenant CLI against a fresh Coder deployment. It uploads all five production Terraform templates, provisions Nexus, clones the real fixture repository, checks the Rust controller's health, and makes a real Coder chat execute a workspace command. It also checks that unchanged bootstrap reuses template versions, changed Terraform settings produce new versions, and workspace deletion succeeds. Logs are collected before deletion.
+
+This check catches regressions in fresh tenant configuration, template upload and configuration forwarding, Nexus startup, repository cloning, and Coder command execution. It does not yet prove issue discovery, FORGE/SENTINEL chats, signed hook delivery, human approval, or VESSEL merging. Those remain the next part of delivery step 4.
 
 ## Implementation references
 

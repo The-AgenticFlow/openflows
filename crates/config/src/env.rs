@@ -304,9 +304,21 @@ pub struct GithubConfig {
 
     #[envconfig(from = "GITHUB_API_BASE", default = "https://api.github.com")]
     pub api_base: String,
+
+    /// Git transport origin, independently configurable from the REST API.
+    #[envconfig(from = "GITHUB_GIT_BASE", default = "https://github.com")]
+    pub git_base: String,
 }
 
 impl GithubConfig {
+    pub fn repository_clone_url(&self, repository: &str) -> String {
+        format!(
+            "{}/{}.git",
+            self.git_base.trim_end_matches('/'),
+            repository.trim_matches('"')
+        )
+    }
+
     /// Normalize a Coder external-auth provider id to the injected env suffix:
     /// uppercase, `-`/`.`→`_` (e.g. `primary-github` → `PRIMARY_GITHUB`).
     pub fn normalize_external_auth_id(id: &str) -> String {
@@ -357,6 +369,7 @@ impl fmt::Debug for GithubConfig {
         f.debug_struct("GithubConfig")
             .field("repository", &self.repository)
             .field("api_base", &self.api_base)
+            .field("git_base", &self.git_base)
             .finish()
     }
 }

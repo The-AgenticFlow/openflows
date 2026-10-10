@@ -1,0 +1,30 @@
+{
+  "_description": [
+    "This scenario scripts a model response for the production-bootstrap test.",
+    "Coder reaches the model fixture through its real configured provider API.",
+    "The first response requests the execute tool advertised by Coder.",
+    "The requested command runs inside the actual Nexus workspace.",
+    "It checks that the repository contains the deliberately broken value 41.",
+    "It invokes the real OpenFlows binary copied by the production startup script.",
+    "It emits a marker only after those workspace checks succeed.",
+    "The fixture requires that marker in the matching actual tool result.",
+    "Only then does the fixture return its final assistant response.",
+    "The driver also checks the tool exit code and output independently.",
+    "This checks bootstrap execution and does not claim a completed issue or merge."
+  ],
+  "bootstrap-canary": [
+    {
+      "tool": "execute",
+      "arguments": {
+        "command": "set -eu; test \"$(cat answer.txt)\" = 41; openflows --version; printf 'PRODUCTION_BOOTSTRAP_OK\\n'",
+        "workdir": "/home/coder/workspace"
+      }
+    },
+    {
+      "requires": {
+        "contains": "PRODUCTION_BOOTSTRAP_OK"
+      },
+      "text": "The production workspace executed the bootstrap canary."
+    }
+  ]
+}

@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from github_fixture import GitHub, TOKENS
+from external_auth_fixture import ExternalAuth
 
 
 class Rejected(Exception):
@@ -22,6 +23,7 @@ class Rejected(Exception):
 class ScriptedModel:
     def __init__(self, scenario):
         self.scripts = json.loads(scenario.read_text())
+        self.scripts.pop('_description', None)
         self.positions = {}
         self.previous_calls = {}
         self.cache = {}
@@ -99,6 +101,7 @@ class FixtureServer(ThreadingHTTPServer):
         self.root = root
         self.lock = threading.Lock()
         self.model = ScriptedModel(scenario) if service == 'model' else None
+        self.oauth = ExternalAuth(Rejected) if service == 'oauth' else None
         self.github = None
         try:
             if service == 'github':
@@ -139,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/health' and self.command == 'GET':
                 self.send_json(200, {'status': 'ready'})
                 return
-            token = self.headers.get('Authorization', '').removeprefix('Bearer ')
+            token = self.headers.get('Authorization', '').removeprefix('Bearer ').removeprefix('token ')
             role = TOKENS.get(token) if self.server.service == 'github' else None
             if (self.server.service == 'model' and token != 'ci-model-key') or (self.server.service == 'github' and not role):
                 raise Rejected(401, 'Invalid disposable credential')
@@ -152,6 +155,8 @@ class Handler(BaseHTTPRequestHandler):
                     response = self.server.model.complete(body)
                 elif self.server.service == 'github':
                     status, response = self.server.github.handle(self.command, self.path, body, role)
+                elif self.server.service == 'oauth':
+                    status, response = self.server.oauth.handle(self.command, self.path, body, token)
                 else:
                     raise Rejected(404, 'Unsupported fixture request')
         except Rejected as error:
@@ -208,7 +213,7 @@ def create_server(service, root, scenario=None, host='127.0.0.1', port=0,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--service', choices=['model', 'github'], required=True)
+    parser.add_argument('--service', choices=['model', 'github', 'oauth'], required=True)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--scenario', type=Path)
     parser.add_argument('--host', default='127.0.0.1')

@@ -723,6 +723,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             // Derive the tenant fleet registry with pairs applied to forge/sentinel.
             let resolver = openflows::orchestration::OrchestrationResolver::new()
                 .context("Failed to resolve orchestration registry")?;
+            resolver.ensure_orchestration_dir()?;
             let registry_path = resolver.registry_path();
             let base_registry = config::Registry::load(&registry_path).with_context(|| {
                 format!("cannot load base registry at {}", registry_path.display())

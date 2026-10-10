@@ -94,6 +94,25 @@ fn github_config_api_base_default_and_override() {
 }
 
 #[test]
+fn repository_clone_url_uses_configured_git_service() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let guard = EnvGuard::capture(&["GITHUB_GIT_BASE"]);
+    guard.unset_all();
+    let cfg = GithubConfig::init_from_env().unwrap();
+    assert_eq!(
+        cfg.repository_clone_url("test/repo"),
+        "https://github.com/test/repo.git"
+    );
+
+    std::env::set_var("GITHUB_GIT_BASE", "git://github-fixture:9418/");
+    let cfg = GithubConfig::init_from_env().unwrap();
+    assert_eq!(
+        cfg.repository_clone_url("test/repo"),
+        "git://github-fixture:9418/test/repo.git"
+    );
+}
+
+#[test]
 fn env_config_from_env_and_controller_validation() {
     let _g = ENV_LOCK.lock().unwrap();
     let guard = EnvGuard::capture(&[

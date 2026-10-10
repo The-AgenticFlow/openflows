@@ -218,6 +218,25 @@ jobs:
           path: target/ci-artifacts/system-fixtures/
           if-no-files-found: error
 
+  production-bootstrap:
+    name: Production bootstrap container E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Exercise the real tenant CLI, templates, Nexus startup and Coder tools
+        run: bash tests/e2e/system/bootstrap.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-bootstrap
+          path: target/ci-artifacts/production-bootstrap/
+          if-no-files-found: error
+
   merge-gate:
     name: OpenFlows Merge Gate
     if: always()
@@ -235,6 +254,7 @@ jobs:
       - coder-e2e
       - delegated-verification
       - system-fixtures
+      - production-bootstrap
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

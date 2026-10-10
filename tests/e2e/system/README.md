@@ -106,3 +106,21 @@ The contracts check:
 Artifacts under `target/ci-artifacts/system-fixtures/<run>/` include HTTP request/response journals (without authorization headers), Git daemon logs, acceptance evidence, container output, and the production-client test output. Rust diagnostics are copied under `production-client/` on success and failure before its temporary directory is deleted, including when a failed Rust contract prevents the later container tests from running. Tests preserve these before deleting temporary repositories. Cleanup removes only the run's named container and image; server shutdown stops its own Git daemon.
 
 The live suite will validate these adapters against real GitHub and a real model provider. Passing these contract tests does not establish production GitHub authentication or model quality.
+
+## Production bootstrap tracer
+
+Run `bash tests/e2e/system/bootstrap.sh` to exercise a fresh tenant through the actual `openflows tenant add test/repo --name <unique-run-name> --fleet 1` command. It uploads the five bundled production Terraform templates, links a disposable account through Coder's public device-flow API, provisions Nexus with the real startup script, starts the Rust controller, and creates a real Coder chat that executes a workspace command. The driver checks the actual tool result and exit code and saves logs before deleting the workspace. The unique tenant name also isolates the production template's shared artifacts volume between concurrent runs.
+
+This establishes startup and execution. The complete issue → FORGE → SENTINEL → human approval → VESSEL → merged Git journey still needs to be connected. The bootstrap test must not be described as that full journey or as validation of live GitHub OAuth.
+
+The production templates accept `docker_network`, `workspace_image`, `github_api_base`, and `github_git_base` variables. Bootstrap forwards their corresponding `TF_VAR_*` settings to Coder so server-side Terraform receives them. `GITHUB_GIT_BASE` configures the Git origin used by tenant setup and Nexus workspace provisioning. The runner uses an isolated `OPENFLOWS_HOME` and `CODER_CONFIG_DIR` and never loads the developer's `.env`.
+
+After changing configuration, the driver reads each fresh template version's stored variables through Coder's API and verifies the updated value. `template-variables.json` saves those non-sensitive settings. New version IDs alone are insufficient evidence that the settings were forwarded.
+
+Chat state and messages are collected in a `finally` block on success, failure, and chat timeout, before the stack is removed. Inspect `chat-state.json` and `chat.json`; unavailable diagnostic endpoints are recorded in `chat-diagnostics-errors.json` without replacing the original scenario failure. `cleanup.log` preserves removal errors. Cleanup checks that run-owned volume names and image tags are gone, allows resources already removed by Compose, and fails if resources remain or Docker cannot confirm their removal.
+
+## Why Python is used here
+
+Python implements the disposable HTTP providers and the test driver. Its standard library provides HTTP servers, JSON, subprocess execution, and bounded waits, so these helpers need no additional Python packages. Coder still executes real tools, Git still commits and merges real changes, and the OpenFlows controller and harness remain the Rust binaries compiled from the candidate revision. Production workspace creation and startup use the bundled Terraform and shell scripts.
+
+Each newly added source file starts with at least ten explanatory comment lines covering its purpose, the real interfaces it exercises, and its limits. JSON cannot contain comments, so scenario files use an ignored `_description` field for the same introduction.

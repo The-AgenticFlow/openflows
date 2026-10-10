@@ -1,0 +1,58 @@
+# Adds disposable external-service fixtures to the existing Coder test stack.
+# The base Compose file supplies real Coder, PostgreSQL, and Redis services.
+# The OAuth fixture lets the test link an account through Coder's public API.
+# The GitHub fixture serves repository APIs and a real disposable Git remote.
+# The model fixture supplies scripted responses through a normal HTTP API.
+# Coder executes each requested tool in the real provisioned workspace.
+# Lifecycle hooks use a shared disposable signing secret inside this stack.
+# Published service ports bind to loopback and receive automatic port numbers.
+# Each run supplies its own fixture image and private Compose project name.
+# No developer .env file or production credentials are loaded by the runner.
+# These service stand-ins exercise configuration; live GitHub OAuth is separate.
+
+services:
+  coder:
+    environment:
+      CODER_EXPERIMENTS: agent-lifecycle-hooks
+      CODER_CHAT_HOOK_URL: http://openflows-nexus:3001/experimental/hooks/chat
+      CODER_CHAT_HOOK_SECRET: disposable-ci-hook-secret-at-least-32-bytes
+      CODER_CHAT_HOOK_ALLOW_INSECURE: "true"
+      CODER_EXTERNAL_AUTH_0_ID: primary-github
+      CODER_EXTERNAL_AUTH_0_TYPE: github
+      CODER_EXTERNAL_AUTH_0_CLIENT_ID: ci-coder
+      CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: disposable-ci-client-secret
+      CODER_EXTERNAL_AUTH_0_DEVICE_FLOW: "true"
+      CODER_EXTERNAL_AUTH_0_DEVICE_CODE_URL: http://oauth:8080/device/code
+      CODER_EXTERNAL_AUTH_0_TOKEN_URL: http://oauth:8080/oauth/token
+      CODER_EXTERNAL_AUTH_0_AUTH_URL: http://oauth:8080/authorize
+      CODER_EXTERNAL_AUTH_0_VALIDATE_URL: http://oauth:8080/user
+      CODER_EXTERNAL_AUTH_0_API_BASE_URL: http://github-fixture:8080
+    depends_on:
+      oauth:
+        condition: service_healthy
+  oauth:
+    image: ${OPENFLOWS_SYSTEM_FIXTURE_IMAGE:?required}
+    command: [python3, fixtures.py, --service, oauth, --root, /tmp/oauth, --host, 0.0.0.0, --port, "8080", --ready-file, /tmp/ready.json]
+    ports: ["127.0.0.1::8080"]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  github-fixture:
+    image: ${OPENFLOWS_SYSTEM_FIXTURE_IMAGE:?required}
+    command: [python3, fixtures.py, --service, github, --root, /tmp/github, --host, 0.0.0.0, --port, "8080", --git-host, 0.0.0.0, --git-port, "9418", --remote-host, github-fixture, --ready-file, /tmp/ready.json]
+    ports: ["127.0.0.1::8080"]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  model:
+    image: ${OPENFLOWS_SYSTEM_FIXTURE_IMAGE:?required}
+    command: [python3, fixtures.py, --service, model, --root, /tmp/model, --scenario, /opt/fixtures/bootstrap-model.json, --host, 0.0.0.0, --port, "8080", --ready-file, /tmp/ready.json]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

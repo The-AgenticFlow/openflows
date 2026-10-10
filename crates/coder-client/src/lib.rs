@@ -50,6 +50,25 @@ fn check_template_push_output(name: &str, output: &std::process::Output) -> Resu
     Ok(())
 }
 
+/// Values forwarded to server-side Terraform and included in bootstrap caching.
+pub(crate) fn template_variable_values() -> Vec<(&'static str, String)> {
+    [
+        ("TF_VAR_dev_binary_host_path", "dev_binary_host_path"),
+        ("TF_VAR_docker_network", "docker_network"),
+        ("TF_VAR_workspace_image", "workspace_image"),
+        ("TF_VAR_github_api_base", "github_api_base"),
+        ("TF_VAR_github_git_base", "github_git_base"),
+    ]
+    .into_iter()
+    .filter_map(|(env_name, name)| {
+        std::env::var(env_name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| (name, value))
+    })
+    .collect()
+}
+
 fn resolve_coder_cli() -> PathBuf {
     if let Some(path) = std::env::var_os("CODER_CLI_PATH").map(PathBuf::from) {
         if path.is_file() {
@@ -708,15 +727,9 @@ impl CoderClient {
         // stores them and applies them when creating workspaces. Setting them
         // as env vars in the Rust process does NOT reach the server's Terraform
         // execution — the CLI only uploads the template files.
-        let template_variables = [("TF_VAR_dev_binary_host_path", "dev_binary_host_path")];
-        for (env_name, variable_name) in template_variables {
-            if let Ok(value) = std::env::var(env_name) {
-                if value.is_empty() {
-                    continue;
-                }
-                cmd.arg("--variable")
-                    .arg(format!("{}={}", variable_name, value));
-            }
+        for (variable_name, value) in template_variable_values() {
+            cmd.arg("--variable")
+                .arg(format!("{}={}", variable_name, value));
         }
 
         let output = match cmd.output().await {

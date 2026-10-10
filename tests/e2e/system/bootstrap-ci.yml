@@ -1,0 +1,21 @@
+# Seeds a real CI workflow in the disposable repository used by system E2E.
+# The Git fixture commits this file alongside the deliberately broken answer.
+# Nexus discovers it through the real repository Contents API boundary.
+# Its presence prevents the controller from scheduling an unrelated CI-setup issue.
+# The workflow's acceptance requirement is the fixed literal value 42.
+# The initial repository contains 41, so running this check initially fails.
+# A correct candidate must change the implementation before it can pass.
+# The deterministic suite runs an independent trusted acceptance script as well.
+# The independent runner supplies checks for the exact candidate commit SHA.
+# Merely listing this workflow never publishes a passing CI result.
+# This file belongs only to disposable test repositories and uses no secrets.
+name: Acceptance
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: test "$(cat answer.txt)" = 42
