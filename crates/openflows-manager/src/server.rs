@@ -74,6 +74,10 @@ pub struct ManagerServices {
     pub app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
     pub app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
     pub webhook_secret: Option<Vec<u8>>,
+    // WP-04 runtime authentication and GitHub credential broker.
+    pub runtime_repo: crate::runtime::RuntimeRepository,
+    pub runtime_credentials: crate::runtime::RuntimeCredentialService,
+    pub broker: crate::runtime::CredentialBroker,
 }
 
 /// The secret-provider adapter name for the isolated in-memory provider.
@@ -251,6 +255,7 @@ impl ManagerServices {
             app_api.clone(),
             app_signer.clone(),
         );
+        let runtime_repo = crate::runtime::RuntimeRepository::new(pool.clone());
         let webhooks = crate::connections::WebhookService::new(
             pool.clone(),
             connections.clone(),
@@ -258,6 +263,7 @@ impl ManagerServices {
             github_app.webhook_body_limit,
             app_id,
             sync.clone(),
+            runtime_repo.clone(),
         );
         let binding = crate::connections::BindingService::new(
             pool.clone(),
@@ -285,6 +291,18 @@ impl ManagerServices {
             connections.clone(),
             sync,
             webhooks.clone(),
+            runtime_repo.clone(),
+        );
+
+        // WP-04 runtime authentication and GitHub credential broker.
+        let runtime_credentials =
+            crate::runtime::RuntimeCredentialService::new(runtime_repo.clone());
+        let broker = crate::runtime::CredentialBroker::new(
+            runtime_repo.clone(),
+            app_api.clone(),
+            app_signer.clone(),
+            app_id,
+            auth_config.clone(),
         );
 
         ManagerServices {
@@ -310,6 +328,9 @@ impl ManagerServices {
             app_signer,
             app_api,
             webhook_secret,
+            runtime_repo,
+            runtime_credentials,
+            broker,
         }
     }
 
@@ -472,7 +493,16 @@ impl crate::connections::GithubAppApi for UnconfiguredAppApi {
         _: &crate::connections::SignedAppJwt,
         _: i64,
         _: &[i64],
+        _: &std::collections::BTreeMap<String, String>,
     ) -> Result<crate::connections::github_app::InstallationToken, ManagerError> {
+        Err(ManagerError::Config("GitHub App is not configured".into()))
+    }
+    async fn revoke_installation_token(
+        &self,
+        _: &crate::connections::SignedAppJwt,
+        _: i64,
+        _: &str,
+    ) -> Result<(), ManagerError> {
         Err(ManagerError::Config("GitHub App is not configured".into()))
     }
 }

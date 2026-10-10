@@ -18,6 +18,7 @@ use crate::connections::repository::{ConnectionRepository, ConnectionRow};
 use crate::connections::sync::SyncService;
 use crate::error::ManagerError;
 use crate::outbox;
+use crate::runtime::repository::RuntimeRepository;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
@@ -101,6 +102,7 @@ pub struct WebhookService {
     pub body_limit: usize,
     pub app_id: i64,
     pub sync: SyncService,
+    pub runtime_repo: RuntimeRepository,
 }
 
 impl WebhookService {
@@ -111,6 +113,7 @@ impl WebhookService {
         body_limit: usize,
         app_id: i64,
         sync: SyncService,
+        runtime_repo: RuntimeRepository,
     ) -> Self {
         WebhookService {
             pool,
@@ -119,7 +122,26 @@ impl WebhookService {
             body_limit,
             app_id,
             sync,
+            runtime_repo,
         }
+    }
+
+    /// Revoke access on the connection (incrementing the generation so new
+    /// issuance stops) and revoke any outstanding credential leases for that
+    /// connection (discarding already-issued tokens).
+    async fn revoke_access_and_leases(
+        &self,
+        conn: &ConnectionRow,
+        status: &str,
+        reason: &str,
+    ) -> Result<(), ManagerError> {
+        self.repo
+            .revoke_access(self.app_id, conn.installation_id, status, reason)
+            .await?;
+        self.runtime_repo
+            .revoke_leases_for_connection(conn.organization_id, conn.id)
+            .await?;
+        Ok(())
     }
 
     /// Durable webhook ingress. Returns 503 (via error) when persistence is
@@ -293,27 +315,15 @@ impl WebhookService {
 
         match (event, action) {
             ("installation", Some("deleted")) => {
-                if connection.is_some() {
-                    self.repo
-                        .revoke_access(
-                            self.app_id,
-                            installation_id,
-                            "deleted",
-                            "installation deleted",
-                        )
+                if let Some(conn) = &connection {
+                    self.revoke_access_and_leases(conn, "deleted", "installation deleted")
                         .await?;
                 }
                 Ok(true)
             }
             ("installation", Some("suspend")) => {
-                if connection.is_some() {
-                    self.repo
-                        .revoke_access(
-                            self.app_id,
-                            installation_id,
-                            "suspended",
-                            "installation suspended",
-                        )
+                if let Some(conn) = &connection {
+                    self.revoke_access_and_leases(conn, "suspended", "installation suspended")
                         .await?;
                 }
                 Ok(true)
@@ -330,13 +340,7 @@ impl WebhookService {
             ("installation_repositories", Some("removed")) => {
                 if let Some(conn) = &connection {
                     // Conservatively revoke access and mark repos inaccessible.
-                    self.repo
-                        .revoke_access(
-                            self.app_id,
-                            installation_id,
-                            "suspended",
-                            "repositories removed",
-                        )
+                    self.revoke_access_and_leases(conn, "suspended", "repositories removed")
                         .await?;
                     self.reconcile(conn).await?;
                 }
@@ -371,26 +375,14 @@ impl WebhookService {
         let jwt = self.signer().sign().await?;
         let installation = self.api().installation(&jwt, conn.installation_id).await?;
         let Some(installation) = installation else {
-            self.repo
-                .revoke_access(
-                    self.app_id,
-                    conn.installation_id,
-                    "deleted",
-                    "installation no longer exists",
-                )
+            self.revoke_access_and_leases(conn, "deleted", "installation no longer exists")
                 .await?;
             return Ok(());
         };
 
         if installation.app_id != self.app_id || installation.suspended {
             // Fail closed: keep access revoked and record the reason.
-            self.repo
-                .revoke_access(
-                    self.app_id,
-                    conn.installation_id,
-                    "suspended",
-                    "reconciliation found suspended",
-                )
+            self.revoke_access_and_leases(conn, "suspended", "reconciliation found suspended")
                 .await?;
             return Ok(());
         }
