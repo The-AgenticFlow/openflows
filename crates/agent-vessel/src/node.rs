@@ -2765,12 +2765,20 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        // Keep the `/address_review` dispatch marker (head SHA + timestamp) in
-        // place: classification still needs it to recognize that older change
-        // requests were addressed by rework. Clearing it here would make the
-        // caller's next classification re-count the addressed rejection and send
-        // the approved PR back to rework. The marker is cleared once the PR is
-        // actually merged (see the `VesselOutcome::Merged` arm in `post`).
+        // The `/address_review` marker serves two purposes: evidence that rework
+        // happened (needed by classification to recognize addressed feedback) and
+        // the "rework still running for this head" guard in `post` that skips a
+        // duplicate dispatch. They only conflict when the marker still points at
+        // the reconciled head — i.e. the head moved for no dispatch (a reviewer
+        // replaced their rejection with an approval without a new commit). In
+        // that case there is nothing to address, and keeping the marker would make
+        // `post` mistake a later fresh change request for in-flight work and drop
+        // it, so clear it. When the head moved since dispatch, keep the evidence:
+        // classification still needs it, and it is cleared once the PR merges
+        // (the `VesselOutcome::Merged` arm in `post`).
+        if evidence.as_ref().and_then(|e| e.dispatched_sha.as_deref()) == Some(head_sha) {
+            self.clear_address_review_dispatched(store, pr_number).await;
+        }
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -4419,6 +4427,49 @@ mod tests {
                 .await
                 .is_some(),
             "rework evidence must persist until the PR is merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_clears_inflight_marker_when_head_unchanged() {
+        // The reviewer replaced their change request with an approval on the
+        // same head, so the dispatch marker (set when rework was requested)
+        // still points at the reconciled head. It must be cleared, otherwise
+        // `post` treats a later fresh change request as in-flight work and skips
+        // dispatching `/address_review`.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "approval of the current head must reconcile"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_key(42))
+                .await
+                .is_none(),
+            "an in-flight marker pointing at the reconciled head must be cleared so \
+             fresh feedback is not skipped"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_at_key(42))
+                .await
+                .is_none(),
+            "the dispatch timestamp must be cleared alongside the head marker"
         );
     }
 
