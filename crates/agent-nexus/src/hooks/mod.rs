@@ -34,6 +34,7 @@ pub use guard::{is_valid_phase, phase_guard, phase_guidance};
 pub use jwt::verify_hook_jwt;
 pub use kick::maybe_publish_kick;
 pub use sentinel::{sentinel_guidance, sentinel_job, sentinel_phase_guard, SentinelJob};
+pub(crate) use sentinel::{testing_review_prompt, TESTING_GUIDANCE};
 pub use server::{create_router, start_lifecycle_hook_server};
 pub use simulate::dispatch_simulated_event;
 pub use stop::{classify_stop, stop_audit_record, StopClassification};

@@ -9,18 +9,22 @@ description: Evaluation criteria for the SENTINEL reviewer agent
 
 ### 1. Correctness
 
-Does the implementation correctly handle all cases described in CONTRACT.md?
+Does the implementation correctly handle all cases in the exact approved plan DoD and ticket acceptance criteria?
 Does it handle the error paths, edge cases, and boundary conditions?
 
-**FAIL:** any CONTRACT criterion not met, any obvious logic error
+**FAIL:** any approved DoD or ticket criterion not met, any obvious logic error
 
 ### 2. Test coverage
 
-Are all changed files covered by tests?
-Does every new function have at least one test for the happy path
-and one for the primary error path?
+Does the verification strategy map every approved DoD item and relevant
+regression risk to sufficient observed evidence? Are changed executable paths
+covered by meaningful behavioral/error checks where required? Content inspection
+and static assertions can support prose criteria; executable examples still need
+the required behavioral/build evidence. File extensions do not determine scope.
 
-**FAIL:** any changed file with no tests, any new function with no test
+**FAIL:** an unmet criterion, missing necessary regression coverage, or insufficient,
+failed, timed-out or stale evidence. A passing unrelated command is insufficient.
+Read `sentinel-testing` for necessary setup failures and inspection-only limits.
 
 ### 3. Standards compliance
 
@@ -40,7 +44,8 @@ It informs feedback but a single quality concern is not a blocker.
 
 ### 5. No regressions
 
-Do all existing tests still pass?
+Do the selected regression checks establish that relevant existing behavior is preserved?
+Is broader integration or full-suite verification needed by the DoD or diff?
 Has any existing behaviour been changed without explicit ticket scope?
 
 **FAIL:** any previously passing test now failing
@@ -55,13 +60,13 @@ Use this checklist for every segment review:
 ## Evaluation Checklist
 
 ### Correctness
-- [ ] All CONTRACT criteria verified
+- [ ] Every approved DoD and ticket criterion mapped to observed evidence
 - [ ] Error paths handled
 - [ ] Edge cases covered
 - [ ] Boundary conditions tested
 
 ### Test Coverage
-- [ ] All changed files have tests
+- [ ] Checks justified by DoD and implementation risks
 - [ ] New functions have happy path tests
 - [ ] New functions have error path tests
 - [ ] Integration tests where needed
@@ -79,7 +84,7 @@ Use this checklist for every segment review:
 - [ ] Comments where needed
 
 ### No Regressions
-- [ ] All existing tests pass
+- [ ] Selected regression checks pass; omitted broader checks justified
 - [ ] No unintended behavior changes
 ```
 

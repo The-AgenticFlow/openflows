@@ -87,14 +87,16 @@ Testing and submit freeze source. Rework returns through the permitted
 `building` transition, then repeats testing and both review gates; never jump
 from building directly to submit. An old approval cannot override `blocked`.
 
-A rejected test/command/setup failure returns FORGE to `building` under the
-approved plan so it is re-awakened to fix code, command setup or environment.
-Identify setup failures as such; do not claim the tests ran when they could not
-start. FORGE workspaces are provisioned fresh and empty, so the executor
-toolchain (cargo, python, yaml, etc.) is part of FORGE's build environment that
-FORGE installs/repairs during `building` — a missing or broken toolchain in the
-executor is a REPAIRABLE setup failure and must reject into `building`, never
-`blocked`. Use `blocked` only for a genuinely **external** prerequisite outside
+SENTINEL reads `sentinel-testing` and derives checks from the exact approved
+plan DoD before execution. Reconsider irrelevant commands before asking FORGE
+to install tools. A rejected necessary test/command/setup failure returns FORGE
+to `building` under the approved plan to repair code or its environment. Record
+the unverified criterion and diagnostics; do not claim tests ran when they could
+not start. Missing dependencies for necessary checks are repairable workspace
+setup failures, not external blockers. Inspection-only evidence cannot currently
+satisfy the executable A2A gate: report that limitation and request clarification
+or an authorized plan revision, without meaningless commands or a gate bypass.
+Use `blocked` only for a genuinely **external** prerequisite outside
 FORGE's workspace that FORGE cannot resolve by installing/repairing its own
 environment (e.g. missing human approval, unreachable external service,
 credentials/secret unavailable to the project), and record exact evidence and an

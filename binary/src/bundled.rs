@@ -68,6 +68,10 @@ pub(crate) fn bundled_files() -> Vec<BundledFile> {
             content: include_str!("../../orchestration/plugin/skills/sentinel-review/SKILL.md"),
         },
         BundledFile {
+            relative_path: "plugin/skills/sentinel-testing/SKILL.md",
+            content: include_str!("../../orchestration/plugin/skills/sentinel-testing/SKILL.md"),
+        },
+        BundledFile {
             relative_path: "plugin/skills/sentinel-criteria/SKILL.md",
             content: include_str!("../../orchestration/plugin/skills/sentinel-criteria/SKILL.md"),
         },

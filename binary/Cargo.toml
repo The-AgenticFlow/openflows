@@ -40,7 +40,8 @@ clap            = { version = "4", features = ["derive"] }
   tracing-subscriber = { workspace = true }
   dotenvy     = { workspace = true }
   reqwest     = { workspace = true }
+  tempfile    = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 mockito = "1"
-tempfile = "3"

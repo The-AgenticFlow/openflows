@@ -16,6 +16,7 @@
     ],
     "sentinel": [
       "skills/sentinel-review.md",
+      "skills/sentinel-testing/SKILL.md",
       "skills/sentinel-criteria.md",
       "skills/sentinel-webapp-testing.md",
       "skills/sentinel-frontend-design.md",

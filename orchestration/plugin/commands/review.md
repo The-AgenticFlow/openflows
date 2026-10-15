@@ -5,17 +5,12 @@ description: Record a SENTINEL decision for a specific lifecycle review round
 
 # /review
 
-Send project verification commands to FORGE with `verify request`. Each runs in a
-temporary checkout using FORGE's current login-shell environment. The response
-includes argv, candidate HEAD, exit code, stdout and stderr. Correct malformed
-arguments first. For failing commands, timeouts, missing dependencies or executor
-setup failures, record those details in `review.md` and reject the current testing
-round with actionable feedback. This returns FORGE to building under the existing
-approved plan. Distinguish a failed test from a command that could not start.
-Transport errors mean evidence is missing, not that tests failed; report the exact
-error and return actionable executor repair to FORGE. Reserve blocked for external
-prerequisites FORGE cannot resolve. Never approve smoke tests as acceptance evidence.
-
+In testing, read `.agents/skills/sentinel-testing/SKILL.md` before selecting
+checks. Derive and document the strategy from the exact approved plan DoD,
+candidate diff and repository conventions. Reconsider irrelevant commands before
+requesting installation; missing dependencies for necessary checks require
+FORGE repair through rejection into building. Report inspection-only evidence
+limitations and unresolved criteria; never fabricate success or bypass A2A.
 
 Read `openflows-harness status get` and `plan read`. Use the returned `revision`,
 `review_round` and `head` from the artifact you actually review, not from a later
@@ -25,10 +20,11 @@ For a submitted plan:
 ```bash
 openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md
 ```
-For testing, verify implementation against the approved plan and run tests through
+For testing, replace the program/argument placeholders with meaningful checks
+selected from the DoD strategy. Verify implementation against the approved plan through
 A2A in FORGE's clean checkout (FORGE runs `verify serve`):
 ```bash
-openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features
+openflows-harness verify request --expect-exit 0 -- <program> <arguments>
 openflows-harness gate decide --phase testing --revision <N> --round <R> --head <SHA> --verdict approve --report review.md
 ```
 For a recorded PR in submit:

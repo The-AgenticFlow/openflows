@@ -269,6 +269,34 @@ mod registry_skill_tests {
     use super::*;
 
     #[test]
+    fn shipped_registry_makes_testing_strategy_available_to_sentinel() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../orchestration");
+        let registry = config::Registry::load(root.join("agent/registry.json")).unwrap();
+        let skills = registry.get("sentinel").unwrap().skills.clone();
+        assert!(skills.iter().any(|name| name == "sentinel-testing"));
+        let ctx = HookBootstrapContext {
+            skills_dir: Some(root.join("plugin/skills")),
+            skills_by_role: [("sentinel".into(), skills.clone())].into(),
+            ..Default::default()
+        };
+        let loaded = ctx.role_skills("sentinel");
+        assert_eq!(
+            loaded.len(),
+            skills.len(),
+            "all required skill files must resolve"
+        );
+        let testing = loaded
+            .iter()
+            .find(|doc| doc.name == "sentinel-testing")
+            .unwrap();
+        assert!(testing.content.contains("Definition of Done"));
+        // Bootstrap excerpts are capped: the complete skill remains on disk.
+        assert!(std::fs::read_to_string(&testing.path)
+            .unwrap()
+            .contains("Inspection-only limitation"));
+    }
+
+    #[test]
     fn skills_follow_registry_not_role_prefix() {
         let root = std::env::temp_dir().join(format!("bootstrap-skills-{}", uuid::Uuid::new_v4()));
         for name in ["forge-unlisted", "custom-planning"] {

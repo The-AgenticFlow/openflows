@@ -17,6 +17,7 @@
       "max_instances": 1,
       "skills": [
         "sentinel-review",
+        "sentinel-testing",
         "sentinel-criteria",
         "shared-harness-protocol"
       ]

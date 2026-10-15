@@ -313,6 +313,34 @@ fn is_shell_separator(word: &str) -> bool {
     matches!(word, "|" | ";" | "&&" | "||")
 }
 
+/// Shared strategy guidance for both the initial chat and subsequent hook turns.
+/// Command selection belongs to SENTINEL, not a language/file-type router.
+pub const TESTING_GUIDANCE: &str = "Read `.agents/skills/sentinel-testing/SKILL.md` before selecting commands. \
+    Read status get, dispatch read and plan read; derive a verification strategy from the exact approved plan Definition of Done (DoD), candidate diff, repository conventions and acceptance criteria. \
+    Write review.md mapping every DoD item and relevant regression risk to sufficient inspection/checks, selection rationale, observed evidence and unresolved gaps. \
+    Choose the smallest sufficient meaningful checks, broadening when warranted; there is no universal build command or file-type exemption. \
+    Execute selected checks through `openflows-harness verify request --expect-exit 0 -- <program> <arguments>` in FORGE at the recorded candidate HEAD. \
+    Pass separate tokens after --; correct argument mistakes. \
+    Reconsider irrelevant commands before requesting installation: only missing dependencies for necessary checks require actionable setup repair via testing rejection into building. \
+    Record task ID, argv, expected/actual exit, HEAD and diagnostics; do not claim tests ran when they could not start. \
+    Transport failures mean missing evidence. \
+    Reserve blocked for external prerequisites FORGE cannot resolve. \
+    If only inspection is meaningful, document the executable-evidence limitation and request clarification or an authorized plan revision; never fabricate evidence or run trivial commands to pass the gate. \
+    Successful A2A execution alone does not prove all criteria. \
+    Approve only with sufficient evidence for every DoD item and successful candidate-bound A2A verification, using the exact revision, review round and HEAD. \
+    Rejection preserves the approved plan and returns FORGE to building. \
+    Human testing review remains TODO; human PR approval and current-head CI remain required in submit. \
+    Unfamiliar tools are allowed in the temporary checkout; destructive/control-plane operations remain denied.";
+
+/// Bind the initial testing instruction to the same lifecycle snapshot as dispatch.
+pub fn testing_review_prompt(ticket_id: &str, state: &config::lifecycle::Lifecycle) -> String {
+    let head = state.head.as_deref().unwrap_or("");
+    format!(
+        "Testing review for {ticket_id}. Review approved plan revision {} at head {head}, review round {}. {TESTING_GUIDANCE} Decide with `openflows-harness gate decide --phase testing --revision {} --head {head} --round {} --verdict approve --report review.md` (or reject).",
+        state.revision, state.review_round, state.revision, state.review_round
+    )
+}
+
 /// Sentinel-level guidance injected so the model knows what job it is on.
 pub fn sentinel_guidance(st: &TicketState) -> String {
     match sentinel_job(st) {
@@ -322,7 +350,7 @@ pub fn sentinel_guidance(st: &TicketState) -> String {
              `openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`."
                 .to_string()
         }
-        SentinelJob::TestingReview => "Review implementation against the approved plan; run A2A verification and gate decide --phase testing with exact revision/head and a report. Map the approved plan criteria to commands and observed results in the report. A rejection returns FORGE to building to fix code, command setup or environment; identify setup failures as such and do not claim the tests ran when they could not start. FORGE workspaces are provisioned fresh and empty, so the executor toolchain (cargo, python, yaml, etc.) is part of FORGE's build environment that FORGE installs/repairs during building — a missing or broken toolchain in the executor is a REPAIRABLE setup failure and must REJECT into building so FORGE is re-awakened to install the tools and re-enter testing. Reserve `status set blocked` ONLY for a genuinely EXTERNAL prerequisite outside FORGE's workspace that FORGE cannot resolve by installing/repairing its own environment (e.g. missing human approval, unreachable external service, credentials/secret unavailable to the project). Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Human testing review is TODO; successful A2A verification and SENTINEL approval permit submit.".to_string(),
+        SentinelJob::TestingReview => TESTING_GUIDANCE.to_string(),
         SentinelJob::PrReview => {
             "SENTINEL PR review: FORGE is `submit` with a PR to review. Read the \
              ticket + diff, write your evaluation report (*-eval.md / final-review.md), \

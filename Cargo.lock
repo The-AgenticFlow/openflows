@@ -1869,6 +1869,7 @@ dependencies = [
  "agent-sentinel",
  "agent-vessel",
  "anyhow",
+ "async-trait",
  "clap",
  "coder-client",
  "config",

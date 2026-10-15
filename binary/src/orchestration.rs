@@ -93,6 +93,52 @@ impl OrchestrationResolver {
             .map(|s| s.trim().to_string())
     }
 
+    /// Add the skill required by current SENTINEL instructions without resetting
+    /// user configuration or dropping fields unknown to the typed registry.
+    fn ensure_sentinel_testing_skill(&self) -> Result<()> {
+        use std::io::Write;
+        let path = self.registry_path().canonicalize()?;
+        let mut registry: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path)?)
+                .context("Failed to read registry for SENTINEL skill upgrade")?;
+        let team = registry
+            .get_mut("team")
+            .and_then(|v| v.as_array_mut())
+            .context("Registry team must be an array")?;
+        let mut changed = false;
+        for role in team {
+            if role.get("id").and_then(|v| v.as_str()) != Some("sentinel") {
+                continue;
+            }
+            let role = role
+                .as_object_mut()
+                .context("SENTINEL registry entry must be an object")?;
+            let skills = role
+                .entry("skills")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .context("SENTINEL skills must be an array")?;
+            if !skills
+                .iter()
+                .any(|skill| skill.as_str() == Some("sentinel-testing"))
+            {
+                skills.push(serde_json::json!("sentinel-testing"));
+                changed = true;
+            }
+        }
+        if changed {
+            let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+            file.as_file()
+                .set_permissions(std::fs::metadata(&path)?.permissions())?;
+            writeln!(file, "{}", serde_json::to_string_pretty(&registry)?)?;
+            file.as_file().sync_all()?;
+            file.persist(&path)
+                .context("Failed to persist SENTINEL skill upgrade")?;
+            info!("Added required sentinel-testing skill to existing registry; preserved other settings");
+        }
+        Ok(())
+    }
+
     pub fn ensure_orchestration_dir(&self) -> Result<std::path::PathBuf> {
         let orch_dir = self.orchestrator_dir.join("orchestration");
 
@@ -131,6 +177,7 @@ impl OrchestrationResolver {
             info!(path = %target.display(), "Wrote bundled orchestration file");
         }
 
+        self.ensure_sentinel_testing_skill()?;
         self.write_version_file(&orch_dir)?;
 
         if written > 0 {
@@ -199,6 +246,7 @@ impl OrchestrationResolver {
             written += 1;
         }
 
+        self.ensure_sentinel_testing_skill()?;
         self.write_version_file(&orch_dir)?;
 
         info!(
@@ -279,5 +327,232 @@ impl OrchestrationResolver {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use provisioner::{CommandOutput, DirEntry, Provisioner, WorkspaceTransport};
+    use std::path::{Path, PathBuf};
+
+    // Exercise real provisioning reads/copies, with a local fixture replacing SSH.
+    struct LocalWorkspace(PathBuf);
+
+    #[async_trait]
+    impl WorkspaceTransport for LocalWorkspace {
+        async fn read_file(&self, path: &str) -> Result<String> {
+            Ok(std::fs::read_to_string(self.0.join(path))?)
+        }
+        async fn write_file(&self, path: &str, content: &str) -> Result<()> {
+            let target = self.0.join(path);
+            std::fs::create_dir_all(target.parent().unwrap())?;
+            Ok(std::fs::write(target, content)?)
+        }
+        async fn copy_file(&self, source: &Path, target: &str) -> Result<()> {
+            self.write_file(target, &std::fs::read_to_string(source)?)
+                .await
+        }
+        async fn create_dir_all(&self, path: &str) -> Result<()> {
+            Ok(std::fs::create_dir_all(self.0.join(path))?)
+        }
+        async fn path_exists(&self, path: &str) -> bool {
+            self.0.join(path).exists()
+        }
+        async fn execute(&self, command: &str) -> Result<CommandOutput> {
+            let output = std::process::Command::new("bash")
+                .args(["-c", command])
+                .current_dir(&self.0)
+                .output()?;
+            Ok(CommandOutput {
+                stdout: String::from_utf8(output.stdout)?,
+                stderr: String::from_utf8(output.stderr)?,
+                exit_code: output.status.code().unwrap_or(-1),
+            })
+        }
+        async fn list_directory(&self, _path: &str) -> Result<Vec<DirEntry>> {
+            anyhow::bail!("bundle provisioning should not list workspace directories")
+        }
+        async fn symlink_or_copy(&self, source: &Path, target: &str) -> Result<()> {
+            self.copy_file(source, target).await
+        }
+        async fn remove_dir_all(&self, path: &str) -> Result<()> {
+            Ok(std::fs::remove_dir_all(self.0.join(path))?)
+        }
+    }
+
+    #[tokio::test]
+    async fn materialized_bundle_provisions_all_required_sentinel_skills() {
+        let installation = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        // No source checkout/candidate fallback: only the embedded bundle exists.
+        let resolver = OrchestrationResolver {
+            candidates: vec![],
+            orchestrator_dir: installation.path().to_path_buf(),
+        };
+        let orchestration = resolver.ensure_orchestration_dir().unwrap();
+        let registry = config::Registry::load(resolver.registry_path()).unwrap();
+        let sentinel = registry.get("sentinel").unwrap();
+        assert!(sentinel
+            .skills
+            .iter()
+            .any(|name| name == "sentinel-testing"));
+        // Catch future required-skill omissions for every enabled role as well.
+        for role in registry.team.iter().filter(|role| role.enabled) {
+            for skill in &role.skills {
+                assert!(
+                    orchestration
+                        .join("plugin/skills")
+                        .join(skill)
+                        .join("SKILL.md")
+                        .is_file(),
+                    "{} requires unbundled skill {skill}",
+                    role.id
+                );
+            }
+        }
+        let transport = LocalWorkspace(workspace.path().to_path_buf());
+        assert_eq!(transport.execute("git init -q").await.unwrap().exit_code, 0);
+        Provisioner::new(installation.path())
+            .provision_role(&transport, "sentinel", &registry)
+            .await
+            .unwrap();
+        for skill in &sentinel.skills {
+            let bundled = std::fs::read_to_string(
+                orchestration
+                    .join("plugin/skills")
+                    .join(skill)
+                    .join("SKILL.md"),
+            )
+            .unwrap();
+            let delivered = transport
+                .read_file(&format!(".agents/skills/{skill}/SKILL.md"))
+                .await
+                .unwrap();
+            assert_eq!(delivered, bundled, "complete skill must reach SENTINEL");
+        }
+        let status = transport.execute("git status --porcelain").await.unwrap();
+        assert_eq!(status.exit_code, 0, "{}", status.stderr);
+        assert!(
+            status.stdout.is_empty(),
+            "generated instructions must stay out of candidate commits"
+        );
+        assert!(transport
+            .read_file(".git/info/exclude")
+            .await
+            .unwrap()
+            .contains("/.agents/skills/sentinel-testing/SKILL.md"));
+        assert_eq!(
+            transport.read_file("AGENTS.md").await.unwrap(),
+            std::fs::read_to_string(orchestration.join("agent/agents/sentinel.agent.md")).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn upgrade_preserves_custom_registry_and_delivers_required_skill() {
+        for reset in [false, true] {
+            let installation = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let resolver = OrchestrationResolver {
+                candidates: vec![],
+                orchestrator_dir: installation.path().to_path_buf(),
+            };
+            std::fs::create_dir_all(resolver.registry_path().parent().unwrap()).unwrap();
+            let mut expected = serde_json::json!({
+                "default_cli": "codex", "allowed_domains": ["example.test"],
+                "team": [
+                    {"id": "forge", "enabled": false, "max_instances": 7, "skills": ["custom-forge"]},
+                    {"id": "sentinel", "enabled": true, "cli": "goose", "max_instances": 3,
+                     "skills": ["sentinel-criteria", "sentinel-review"],
+                     "mcp": {"custom": "retained"}, "allowed_domains": ["role.example.test"]}
+                ]
+            });
+            std::fs::write(
+                resolver.registry_path(),
+                serde_json::to_string_pretty(&expected).unwrap(),
+            )
+            .unwrap();
+            if reset {
+                resolver.reset_orchestration_dir().unwrap();
+            } else {
+                resolver.ensure_orchestration_dir().unwrap();
+            }
+            expected["team"][1]["skills"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!("sentinel-testing"));
+            let upgraded = std::fs::read_to_string(resolver.registry_path()).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&upgraded).unwrap(),
+                expected
+            );
+            // Repeated startup/reset adds no duplicates and does not rewrite the registry.
+            resolver.ensure_orchestration_dir().unwrap();
+            resolver.reset_orchestration_dir().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(resolver.registry_path()).unwrap(),
+                upgraded
+            );
+            let registry = config::Registry::load(resolver.registry_path()).unwrap();
+            let transport = LocalWorkspace(workspace.path().to_path_buf());
+            Provisioner::new(installation.path())
+                .provision_role(&transport, "sentinel", &registry)
+                .await
+                .unwrap();
+            assert_eq!(
+                transport
+                    .read_file(".agents/skills/sentinel-testing/SKILL.md")
+                    .await
+                    .unwrap(),
+                include_str!("../../orchestration/plugin/skills/sentinel-testing/SKILL.md")
+            );
+        }
+    }
+
+    #[test]
+    fn skill_upgrade_preserves_disabled_or_absent_roles_and_rejects_bad_registry() {
+        for (input, succeeds, adds_skill) in [
+            (
+                r#"{"team":[{"id":"sentinel","enabled":false}]}"#,
+                true,
+                true,
+            ),
+            (r#"{"team":[]}"#, true, false),
+            (
+                r#"{"team":[{"id":"sentinel","enabled":false,"future_setting":42}],"future_root":true}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"team":[{"id":"sentinel","skills":"invalid"}]}"#,
+                false,
+                false,
+            ),
+            ("invalid json", false, false),
+        ] {
+            let installation = tempfile::tempdir().unwrap();
+            let resolver = OrchestrationResolver {
+                candidates: vec![],
+                orchestrator_dir: installation.path().to_path_buf(),
+            };
+            std::fs::create_dir_all(resolver.registry_path().parent().unwrap()).unwrap();
+            std::fs::write(resolver.registry_path(), input).unwrap();
+            assert_eq!(resolver.ensure_sentinel_testing_skill().is_ok(), succeeds);
+            let result = std::fs::read_to_string(resolver.registry_path()).unwrap();
+            if adds_skill {
+                let role =
+                    serde_json::from_str::<serde_json::Value>(&result).unwrap()["team"][0].clone();
+                assert_eq!(role["enabled"], false);
+                assert_eq!(role["skills"], serde_json::json!(["sentinel-testing"]));
+                let mut original: serde_json::Value = serde_json::from_str(input).unwrap();
+                original["team"][0]["skills"] = serde_json::json!(["sentinel-testing"]);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+                    original
+                );
+            } else {
+                assert_eq!(result, input);
+            }
+        }
     }
 }

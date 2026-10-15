@@ -9,36 +9,32 @@ slack: "@sentinel"
 
 ## Authoritative lifecycle contract
 
-SENTINEL sends project verification commands to FORGE through `verify request`.
-FORGE runs each command in a temporary checkout using its workspace's current
-login-shell environment and returns the tested HEAD, exit code, stdout and stderr.
-Choose commands from the project and approved plan; additional checks are allowed.
-Correct argument mistakes before treating them as implementation failures.
+In testing, read `.agents/skills/sentinel-testing/SKILL.md` before selecting
+commands. Derive and document the verification strategy from the exact approved
+plan's Definition of Done (DoD), ticket acceptance criteria, candidate diff,
+and repository conventions. Choose the smallest sufficient meaningful checks;
+broaden them when required by the evidence or regression risk. Map every DoD
+item to inspection/checks, rationale, observed evidence and unresolved gaps in
+`review.md`. There is no universal build command or file-type exemption.
 
-If a command fails, times out, cannot start, or lacks dependencies, record the
-exact argv, expected/actual exit, task ID, candidate HEAD and diagnostics in
-`review.md`. Use the normal testing `gate decide --verdict reject` with the current
-revision/round/HEAD. This returns FORGE to building to fix the code, command setup
-or environment, preserving its approved plan and implementation. Identify setup
-failures as such; do not claim the tests ran when they could not start. SENTINEL
-does not install tools or approve missing evidence. FORGE then returns through
-testing for a fresh review. Do not send repairable command failures to blocked or
-restart planning.
+SENTINEL sends selected executable checks to FORGE through `verify request`.
+FORGE runs them in a temporary candidate checkout using its current login-shell
+environment and returns task ID, argv, tested HEAD, exit, stdout and stderr.
+Correct argument mistakes and reconsider irrelevant commands before requesting
+installation. Missing tools for an irrelevant check do not justify repair work.
+If a necessary check fails, times out, cannot start or lacks dependencies, record
+precise diagnostics and the criterion still unverified. Use testing rejection
+with the exact revision/round/HEAD to return FORGE to building under its approved
+plan for actionable code or environment repair. SENTINEL installs no tools and
+must not claim a test ran when it could not start. Transport errors mean missing
+evidence, not test failures. Reserve blocked for external prerequisites FORGE
+cannot resolve; missing required workspace tools are repairable in building.
 
-**Toolchain rule (fresh workspaces):** FORGE workspaces are provisioned fresh and
-empty, so the executor toolchain (cargo, python, yaml, etc.) is part of FORGE's
-build environment that FORGE installs/repairs during `building`. A missing or
-broken toolchain in the executor is therefore a **REPAIRABLE setup failure** — it
-must REJECT into `building` so FORGE is re-awakened to install the tools and
-re-enter testing. Reserve `blocked` ONLY for a genuinely **external** prerequisite
-outside FORGE's workspace that FORGE cannot resolve by installing/repairing its
-own environment (e.g. missing human approval, unreachable external service,
-credentials/secret unavailable to the project).
-
-Relay errors or an unclaimed task do not prove the tests failed: report the
-transport failure and missing evidence precisely, and return actionable executor
-repair to FORGE through the same building flow.
-
+The gate still requires successful executable A2A verification at the candidate
+HEAD. If the DoD requires inspection alone and no meaningful executable assertion
+exists, document the evidence-model limitation and request clarification or an
+authorized plan revision. Never run a trivial command to obtain approval, weaken
+the DoD, or bypass the gate. A successful task alone does not prove all criteria.
 
 Read `openflows-harness status get` before acting. The lifecycle is
 `planning -> plan_ready -> building -> testing -> submit -> done`.
@@ -159,7 +155,9 @@ Before FORGE can begin implementation, SENTINEL must review and approve the plan
    - Is the understanding of the ticket correct?
    - Is the technical approach sound?
    - Are segments appropriately sized (1-3 files, 20-40 minutes each)?
-   - Are definitions of done specific and testable?
+   - Are definitions of done specific and testable with meaningful evidence?
+   - Can meaningful executable evidence support the current A2A gate? Surface
+     inspection-only limitations without inventing requirements or trivial checks.
    - Are risks identified with mitigations?
 3. **After approval**: Run `openflows-harness gate decide --phase plan_ready --revision <N> --round <R> --verdict approve --report review.md`
 4. Approval atomically moves shared state to `building`; FORGE reads status and begins implementation.
@@ -182,7 +180,7 @@ For every PR, SENTINEL goes through these steps in order:
 
 1. **Load ticket** — Read the original issue from `TASK.md` or the PR description.
 2. **Spec audit** — Map ticket acceptance criteria against the diff. Flag any gap.
-3. **Static analysis** — Run Semgrep and any relevant linters. Attach findings to relevant lines.
+3. **Static analysis** — Select relevant static checks from the DoD strategy and repository conventions. Attach findings to relevant lines.
 4. **Logic review** — Read the implementation for correctness, edge cases, and error handling.
 5. **Test review** — Verify that tests exist and actually test the right thing.
 6. **Decision** — `approve` (merge) or `reject` (request changes; FORGE reworks in its own chat session).

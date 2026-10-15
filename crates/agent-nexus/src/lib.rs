@@ -2225,7 +2225,14 @@ Use `openflows-harness` for all coordination:
                         "branch": ticket.branch,
                         "review_type": if testing {"testing"} else {"planning_gate"},
                         "plan": plan_content,
-                        "instructions": "Read status get. Review the exact revision and review_round. For testing, run A2A verification at the recorded head. Record gate decide with phase, revision, round, head (testing), verdict and report. Rejection returns work to FORGE.",
+                        "revision": lifecycle.revision,
+                        "review_round": lifecycle.review_round,
+                        "head": lifecycle.head,
+                        "instructions": if testing {
+                            hooks::TESTING_GUIDANCE
+                        } else {
+                            "Read status get and plan read. Review the exact revision and review_round. Record gate decide with phase, revision, round, verdict and report. Rejection returns work to FORGE."
+                        },
                     });
                     store.set(&dispatch_key, dispatch_payload).await;
 
@@ -2241,7 +2248,7 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = if testing {
-                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. A rejection returns FORGE to building to fix the code, command setup or environment, preserving its approved plan; do not claim the tests ran when they could not start — identify setup failures as such. IMPORTANT: FORGE workspaces are provisioned fresh and empty, so the executor toolchain (cargo, python, yaml, etc.) is part of FORGE's build environment and FORGE installs/repairs it during building. A missing or broken toolchain in the executor is therefore a REPAIRABLE setup failure FORGE must fix — REJECT into building so FORGE is re-awakened to install the tools and re-enter testing. Reserve `status set blocked` ONLY for a genuinely EXTERNAL prerequisite outside FORGE's workspace that FORGE cannot resolve by installing/repairing its own environment (e.g. missing human approval, unreachable external service, credentials/secret unavailable to the project). Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
+                        hooks::testing_review_prompt(&ticket.id, &lifecycle)
                     } else {
                         format!("Review plan revision {} for {}. Read `openflows-harness plan read`. Write review.md with actionable feedback. Run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict approve --report review.md` (or reject). Do not change source. A rejection is recorded and returned to FORGE.",lifecycle.revision,ticket.id,lifecycle.revision,lifecycle.review_round)
                     };
@@ -6231,11 +6238,26 @@ mod tests {
             .with_body(r#"{"id":"review-chat","workspace_id":"ws","status":"waiting"}"#)
             .create_async()
             .await;
+        let testing_followup = server
+            .mock("POST", "/api/v2/chats/review-chat/messages")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("Testing review for T-1".into()),
+                mockito::Matcher::Regex("sentinel-testing/SKILL.md".into()),
+                mockito::Matcher::Regex("--revision 2 --head abc --round 3".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"id":"testing-followup"}"#)
+            .expect(1)
+            .create_async()
+            .await;
         let followup = server
             .mock("POST", "/api/v2/chats/review-chat/messages")
+            .match_body(mockito::Matcher::Regex(
+                "Review plan revision|Review the PR".into(),
+            ))
             .with_status(200)
             .with_body(r#"{"id":"followup"}"#)
-            .expect(3)
+            .expect(2)
             .create_async()
             .await;
         let store = SharedStore::new_in_memory();
@@ -6304,6 +6326,7 @@ mod tests {
                     .await;
             }
         }
+        testing_followup.assert_async().await;
         followup.assert_async().await;
         create.assert_async().await;
         assert_eq!(
@@ -6468,7 +6491,11 @@ mod tests {
             .await;
         let create = server
             .mock("POST", "/api/v2/chats")
-            .match_body(mockito::Matcher::Regex("Testing review for T-1".into()))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("Testing review for T-1".into()),
+                mockito::Matcher::Regex("sentinel-testing/SKILL.md".into()),
+                mockito::Matcher::Regex("--revision 1 --head head-sha --round 2".into()),
+            ]))
             .with_status(201)
             .with_body(r#"{"id":"review-chat","workspace_id":"ws"}"#)
             .expect(1)
@@ -6504,7 +6531,8 @@ mod tests {
             head: Some("head-sha".into()),
             review_round: 2,
             version: 3,
-            plan: "# Plan".into(),
+            plan: "# DoD\nREADME describes supported port 8080; validate content consistency."
+                .into(),
             ..Default::default()
         };
         store
@@ -6517,6 +6545,21 @@ mod tests {
         node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
             .await;
         create.assert_async().await;
+        let dispatch = store
+            .get(&full_ticket_key("T-1", KEY_TICKET_DISPATCH, "sentinel"))
+            .await
+            .unwrap();
+        assert_eq!(dispatch["revision"], 1);
+        assert_eq!(dispatch["review_round"], 2);
+        assert_eq!(dispatch["head"], "head-sha");
+        assert_eq!(
+            dispatch["plan"],
+            "# DoD\nREADME describes supported port 8080; validate content consistency."
+        );
+        let guidance = dispatch["instructions"].as_str().unwrap();
+        assert!(guidance.contains("Definition of Done"));
+        assert!(guidance.contains("sentinel-testing/SKILL.md"));
+        assert!(!guidance.contains("cargo test"));
         assert_eq!(
             store
                 .get_typed::<String>(&review_chat_key("T-1", "testing:1:head-sha:2"))
