@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
 use crate::pr_monitor::{
-    build_directive, classify, collect_rework, PrMonitorState, ReworkEvidence,
+    build_directive, classify, collect_rework, is_feedback_addressed, PrMonitorState,
+    ReworkEvidence,
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
@@ -2647,8 +2648,21 @@ impl VesselNode {
                 return Ok(false);
             }
         };
-        // Any reviewer currently requesting changes vetoes reconciliation.
-        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+        // Recompute the effective state after excluding change requests that
+        // prior rework already addressed, so a stale rejection no longer vetoes
+        // a valid approval of the current head. Genuinely unaddressed change
+        // requests are still included and keep blocking reconciliation.
+        let evidence = Self::get_rework_evidence(store, pr_number).await;
+        let review_state = github::effective_review_state_excluding(&reviews, |r| {
+            r.state_enum() == github::PrReviewState::ChangesRequested
+                && is_feedback_addressed(
+                    r.commit_id.as_deref(),
+                    r.submitted_at.as_deref(),
+                    head_sha,
+                    evidence.as_ref(),
+                )
+        });
+        if review_state != github::PrReviewState::Approved {
             return Ok(false);
         }
         // The effective approver: an authorized reviewer whose *latest* review
@@ -4262,6 +4276,69 @@ mod tests {
         )
         .await;
         assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_accepts_head_approval_after_addressed_change_request() {
+        // alice requested changes on the old head; FORGE reworked it; bob then
+        // approved the current head. The stale rejection must not veto bob's
+        // valid approval (#396).
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z","body":"Fix this"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "approval of the current head must reconcile once the change request is addressed"
+        );
+        let after = store.lifecycle("T-42").await.unwrap();
+        let human = after.pr_human.as_ref().expect("pr_human must be recorded");
+        assert!(human.approved);
+        assert!(
+            human.report.contains("bob"),
+            "report must name the effective approver: {}",
+            human.report
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_vetoed_by_change_request_after_rework() {
+        // alice requested changes AFTER rework was dispatched: fresh feedback
+        // the rework commit cannot have addressed. It must still veto bob's
+        // approval of the current head.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T02:00:00Z","body":"Still broken"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T03:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "an unaddressed change request must still block reconciliation"
+        );
         assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
     }
 
