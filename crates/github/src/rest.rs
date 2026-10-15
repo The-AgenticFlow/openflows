@@ -1780,10 +1780,26 @@ pub fn latest_review_per_user(reviews: &[PrReview]) -> Vec<&PrReview> {
 /// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
 /// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
 pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
-    let latest = latest_review_per_user(reviews);
+    effective_review_state_excluding(reviews, |_| false)
+}
 
+/// Compute the effective review state after dropping reviews for which
+/// `exclude` returns `true`.
+///
+/// Exclusion happens on the latest review per reviewer *before* aggregation,
+/// so removing a stale `CHANGES_REQUESTED` re-evaluates the remaining reviews:
+/// a valid `APPROVED` on the current head is no longer hidden behind a change
+/// request that prior rework has addressed. A change request that is not
+/// excluded still vetoes, as before.
+pub fn effective_review_state_excluding<F>(reviews: &[PrReview], exclude: F) -> PrReviewState
+where
+    F: Fn(&PrReview) -> bool,
+{
     let mut any_approved = false;
-    for review in latest {
+    for review in latest_review_per_user(reviews) {
+        if exclude(review) {
+            continue;
+        }
         match review.state_enum() {
             PrReviewState::ChangesRequested => return PrReviewState::ChangesRequested,
             PrReviewState::Approved => any_approved = true,
@@ -1996,6 +2012,46 @@ mod pr_review_tests {
         let latest = latest_review_per_user(&reviews);
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].state_enum(), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_excluding_recomputes_approval_behind_addressed_rejection() {
+        let mut alice_change = review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z");
+        alice_change.commit_id = Some("old-head".to_string());
+        let mut bob_approve = review("APPROVED", "bob", "2026-01-02T00:00:00Z");
+        bob_approve.commit_id = Some("head".to_string());
+        let reviews = vec![alice_change, bob_approve];
+
+        // Unfiltered, the (stale) change request still vetoes the approval.
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+        // Excluding the addressed change request re-aggregates the rest.
+        assert_eq!(
+            effective_review_state_excluding(&reviews, |r| {
+                r.state_enum() == PrReviewState::ChangesRequested
+            }),
+            PrReviewState::Approved
+        );
+    }
+
+    #[test]
+    fn test_effective_state_excluding_still_vetoes_unexcluded_change_request() {
+        let mut alice_change = review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z");
+        alice_change.commit_id = Some("old-head".to_string());
+        let mut carol_change = review("CHANGES_REQUESTED", "carol", "2026-01-04T00:00:00Z");
+        carol_change.commit_id = Some("head".to_string());
+        let reviews = vec![alice_change, carol_change];
+
+        // Only alice's change request is excluded; carol's still blocks.
+        assert_eq!(
+            effective_review_state_excluding(&reviews, |r| {
+                r.user.as_deref() == Some("alice")
+                    && r.state_enum() == PrReviewState::ChangesRequested
+            }),
+            PrReviewState::ChangesRequested
+        );
     }
 
     #[test]

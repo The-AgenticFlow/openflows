@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
 use crate::pr_monitor::{
-    build_directive, classify, collect_rework, PrMonitorState, ReworkEvidence,
+    build_directive, classify, collect_rework, is_feedback_addressed, PrMonitorState,
+    ReworkEvidence,
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
@@ -1116,6 +1117,11 @@ impl Node for VesselNode {
                     pr_title,
                     pr_body,
                 } => {
+                    // The PR has left the review loop; the rework evidence is no
+                    // longer needed and the per-PR dispatch marker can be dropped.
+                    self.clear_address_review_dispatched(store, *pr_number)
+                        .await;
+
                     VesselNotifier::emit_ticket_merged(
                         store,
                         ticket_id,
@@ -2647,8 +2653,21 @@ impl VesselNode {
                 return Ok(false);
             }
         };
-        // Any reviewer currently requesting changes vetoes reconciliation.
-        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+        // Recompute the effective state after excluding change requests that
+        // prior rework already addressed, so a stale rejection no longer vetoes
+        // a valid approval of the current head. Genuinely unaddressed change
+        // requests are still included and keep blocking reconciliation.
+        let evidence = Self::get_rework_evidence(store, pr_number).await;
+        let review_state = github::effective_review_state_excluding(&reviews, |r| {
+            r.state_enum() == github::PrReviewState::ChangesRequested
+                && is_feedback_addressed(
+                    r.commit_id.as_deref(),
+                    r.submitted_at.as_deref(),
+                    head_sha,
+                    evidence.as_ref(),
+                )
+        });
+        if review_state != github::PrReviewState::Approved {
             return Ok(false);
         }
         // The effective approver: an authorized reviewer whose *latest* review
@@ -2746,7 +2765,20 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        self.clear_address_review_dispatched(store, pr_number).await;
+        // The `/address_review` marker serves two purposes: evidence that rework
+        // happened (needed by classification to recognize addressed feedback) and
+        // the "rework still running for this head" guard in `post` that skips a
+        // duplicate dispatch. They only conflict when the marker still points at
+        // the reconciled head — i.e. the head moved for no dispatch (a reviewer
+        // replaced their rejection with an approval without a new commit). In
+        // that case there is nothing to address, and keeping the marker would make
+        // `post` mistake a later fresh change request for in-flight work and drop
+        // it, so clear it. When the head moved since dispatch, keep the evidence:
+        // classification still needs it, and it is cleared once the PR merges
+        // (the `VesselOutcome::Merged` arm in `post`).
+        if evidence.as_ref().and_then(|e| e.dispatched_sha.as_deref()) == Some(head_sha) {
+            self.clear_address_review_dispatched(store, pr_number).await;
+        }
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -4078,7 +4110,11 @@ mod tests {
             .unwrap_or(99);
         assert_eq!(attempts, 0, "review attempts must be reset upon approval");
         let dispatched = store.get(&address_review_dispatched_key(42)).await;
-        assert!(dispatched.is_none(), "dispatch key must be cleared");
+        assert!(
+            dispatched.is_some(),
+            "rework evidence must survive reconciliation so classification can still \
+             exclude the addressed change request (cleared on merge)"
+        );
 
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
         assert!(
@@ -4262,6 +4298,206 @@ mod tests {
         )
         .await;
         assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_accepts_head_approval_after_addressed_change_request() {
+        // alice requested changes on the old head; FORGE reworked it; bob then
+        // approved the current head. The stale rejection must not veto bob's
+        // valid approval (#396).
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z","body":"Fix this"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "approval of the current head must reconcile once the change request is addressed"
+        );
+        let after = store.lifecycle("T-42").await.unwrap();
+        let human = after.pr_human.as_ref().expect("pr_human must be recorded");
+        assert!(human.approved);
+        assert!(
+            human.report.contains("bob"),
+            "report must name the effective approver: {}",
+            human.report
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_then_classification_stays_approved() {
+        // Regression guard for the approval/rework handoff (#396): after
+        // reconciliation accepts the approval, the caller reloads the rework
+        // evidence and classifies the PR. Reconciliation must not delete that
+        // evidence, or the addressed change request counts again and the
+        // approved PR is routed back to rework instead of merging.
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z","body":"Fix this"},
+                    {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+            )
+            // Once for reconciliation, once for the classification that follows.
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = github::GithubRestClient::with_api_base("test", server.url());
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_delivery":sentinel}),
+            )
+            .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "reconciliation must accept the authorized approval of the current head"
+        );
+
+        // Mirror the exec caller: reload rework evidence from the store *after*
+        // reconciliation, then classify the PR lifecycle state.
+        let evidence = VesselNode::get_rework_evidence(&store, 42).await;
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "head".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+        let state = classify(
+            &node.client,
+            "org",
+            "repo",
+            &pr_info,
+            CiStatus::Success,
+            evidence.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            PrMonitorState::ReadyForMerge,
+            "an approved PR must not return to rework after reconciliation"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_key(42))
+                .await
+                .is_some(),
+            "rework evidence must persist until the PR is merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_clears_inflight_marker_when_head_unchanged() {
+        // The reviewer replaced their change request with an approval on the
+        // same head, so the dispatch marker (set when rework was requested)
+        // still points at the reconciled head. It must be cleared, otherwise
+        // `post` treats a later fresh change request as in-flight work and skips
+        // dispatching `/address_review`.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "approval of the current head must reconcile"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_key(42))
+                .await
+                .is_none(),
+            "an in-flight marker pointing at the reconciled head must be cleared so \
+             fresh feedback is not skipped"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_at_key(42))
+                .await
+                .is_none(),
+            "the dispatch timestamp must be cleared alongside the head marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_vetoed_by_change_request_after_rework() {
+        // alice requested changes AFTER rework was dispatched: fresh feedback
+        // the rework commit cannot have addressed. It must still veto bob's
+        // approval of the current head.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T02:00:00Z","body":"Still broken"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T03:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "an unaddressed change request must still block reconciliation"
+        );
         assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
     }
 

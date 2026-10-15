@@ -6,7 +6,7 @@
 pub mod rest;
 
 pub use rest::{
-    effective_review_state, latest_review_per_user, CheckAnnotationDetail, CiFailureDetail,
-    FailedCheck, GitHubIssueResponse, GithubRestClient, PrReview, PrReviewState, ReviewComment,
-    ReviewCommentInput,
+    effective_review_state, effective_review_state_excluding, latest_review_per_user,
+    CheckAnnotationDetail, CiFailureDetail, FailedCheck, GitHubIssueResponse, GithubRestClient,
+    PrReview, PrReviewState, ReviewComment, ReviewCommentInput,
 };
