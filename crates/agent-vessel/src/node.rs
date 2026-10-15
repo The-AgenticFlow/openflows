@@ -1117,6 +1117,11 @@ impl Node for VesselNode {
                     pr_title,
                     pr_body,
                 } => {
+                    // The PR has left the review loop; the rework evidence is no
+                    // longer needed and the per-PR dispatch marker can be dropped.
+                    self.clear_address_review_dispatched(store, *pr_number)
+                        .await;
+
                     VesselNotifier::emit_ticket_merged(
                         store,
                         ticket_id,
@@ -2760,7 +2765,12 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        self.clear_address_review_dispatched(store, pr_number).await;
+        // Keep the `/address_review` dispatch marker (head SHA + timestamp) in
+        // place: classification still needs it to recognize that older change
+        // requests were addressed by rework. Clearing it here would make the
+        // caller's next classification re-count the addressed rejection and send
+        // the approved PR back to rework. The marker is cleared once the PR is
+        // actually merged (see the `VesselOutcome::Merged` arm in `post`).
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -4092,7 +4102,11 @@ mod tests {
             .unwrap_or(99);
         assert_eq!(attempts, 0, "review attempts must be reset upon approval");
         let dispatched = store.get(&address_review_dispatched_key(42)).await;
-        assert!(dispatched.is_none(), "dispatch key must be cleared");
+        assert!(
+            dispatched.is_some(),
+            "rework evidence must survive reconciliation so classification can still \
+             exclude the addressed change request (cleared on merge)"
+        );
 
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
         assert!(
@@ -4311,6 +4325,100 @@ mod tests {
             human.report.contains("bob"),
             "report must name the effective approver: {}",
             human.report
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_then_classification_stays_approved() {
+        // Regression guard for the approval/rework handoff (#396): after
+        // reconciliation accepts the approval, the caller reloads the rework
+        // evidence and classifies the PR. Reconciliation must not delete that
+        // evidence, or the addressed change request counts again and the
+        // approved PR is routed back to rework instead of merging.
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z","body":"Fix this"},
+                    {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T02:00:00Z","body":"LGTM"}]"#,
+            )
+            // Once for reconciliation, once for the classification that follows.
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = github::GithubRestClient::with_api_base("test", server.url());
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_delivery":sentinel}),
+            )
+            .await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old-head"))
+            .await;
+        store
+            .set(
+                &address_review_dispatched_at_key(42),
+                json!("2026-10-05T01:00:00Z"),
+            )
+            .await;
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "reconciliation must accept the authorized approval of the current head"
+        );
+
+        // Mirror the exec caller: reload rework evidence from the store *after*
+        // reconciliation, then classify the PR lifecycle state.
+        let evidence = VesselNode::get_rework_evidence(&store, 42).await;
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "head".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+        let state = classify(
+            &node.client,
+            "org",
+            "repo",
+            &pr_info,
+            CiStatus::Success,
+            evidence.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            PrMonitorState::ReadyForMerge,
+            "an approved PR must not return to rework after reconciliation"
+        );
+        assert!(
+            store
+                .get(&address_review_dispatched_key(42))
+                .await
+                .is_some(),
+            "rework evidence must persist until the PR is merged"
         );
     }
 
