@@ -140,6 +140,34 @@ data "coder_parameter" "coder_url" {
   type        = "string"
 }
 
+data "coder_parameter" "hosted" {
+  name = "hosted"
+  type = "bool"
+  default = "false"
+  mutable = false
+}
+
+data "coder_parameter" "runtime_secret_ref" {
+  name = "runtime_secret_ref"
+  type = "string"
+  default = ""
+  mutable = false
+}
+
+data "coder_parameter" "workspace_image_digest" {
+  name        = "workspace_image_digest"
+  description = "Release-pinned sha256 digest for the hosted workspace image"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "a2a_relay_addr" {
+  name = "a2a_relay_addr"
+  type = "string"
+  default = "openflows-nexus:3000"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -160,7 +188,26 @@ resource "coder_agent" "main" {
 
     # Setup git credentials from Coder external auth (the tenant's linked
     # GitHub App token). PAT flow removed — external auth is the sole source.
-    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    mkdir -p /home/coder/.local/state/openflows
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { log "FATAL: runtime secret is not mounted"; exit 1; }
+      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+import json, shlex, sys
+d=json.load(open(sys.argv[1]))
+for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]: print('export %s=%s' % (env,shlex.quote(str(d[key]))))
+PY
+)"
+      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
+      OF_RUNTIME_ACCESS_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["access_token"])' "$SESSION")
+      export OF_RUNTIME_ACCESS_TOKEN
+      OF_RUNTIME_REFRESH_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["refresh_token"])' "$SESSION")
+      export OF_RUNTIME_REFRESH_TOKEN
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+    else
+      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+    fi
     if [ -n "$GIT_TOKEN" ]; then
       # System-level helper so git works for BOTH the agent user (pushes) and
       # the sudo'd root clone below (their $HOME differ).
@@ -254,14 +301,39 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
+    # Broker-backed git credential refresh. The startup installation token is
+    # short-lived, so a long-running worker's push can outlive it. Refresh the
+    # runtime session and re-fetch a fresh installation token from the Manager
+    # broker, then rewrite the stored git credentials so pushes keep
+    # authenticating mid-task. Runs in the background for the workspace
+    # lifetime; harmless when the Manager is unreachable.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      nohup bash -c '
+        REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
+        while true; do
+          sleep 480
+          RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+          ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+          REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+          GIT=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"git\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
+          TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          echo "https://x-access-token:$${TOKEN}@github.com" > /home/coder/.git-credentials
+          sudo cp /home/coder/.git-credentials /root/.git-credentials
+          sudo chmod 600 /root/.git-credentials
+        done
+      ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
+    fi
+
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # Use the BASE role so the controller can find the heartbeat under the
     # base-role key (not the worker id — sentinel always matches base role).
-    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="sentinel"
-    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
@@ -274,7 +346,7 @@ resource "docker_volume" "workspace" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
-  image = var.workspace_image
+  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -304,18 +376,29 @@ resource "docker_container" "workspace" {
     }
   }
 
-  env = [
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/runtime.json"
+      host_path = data.coder_parameter.runtime_secret_ref.value
+      read_only = true
+    }
+  }
+
+  env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
-    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     "OPENFLOWS_ROLE=sentinel",
-    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_RELAY_ADDR=${data.coder_parameter.a2a_relay_addr.value}",
     "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-  ]
+  ], data.coder_parameter.hosted.value == "true" ? [] : [
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+  ])
 
   # egress allowlist: Coder control plane + github.com + Redis only
   # (enforced at network level; Redis is a documented exception per docs/governance.md)
@@ -330,5 +413,7 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = "primary-github"
+  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
+  id       = "primary-github"
+  optional = true
 }

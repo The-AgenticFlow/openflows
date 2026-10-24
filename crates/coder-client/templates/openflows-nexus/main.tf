@@ -60,6 +60,22 @@ data "coder_parameter" "redis_url" {
   type        = "string"
 }
 
+data "coder_parameter" "redis_username" {
+  name        = "redis_username"
+  description = "Tenant-scoped Redis ACL username for hosted workspaces"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "redis_namespace" {
+  name        = "redis_namespace"
+  description = "Immutable tenant Redis namespace for hosted workspaces"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "repo_url" {
   name        = "repo_url"
   description  = "Git repository URL to clone into the workspace"
@@ -72,6 +88,14 @@ data "coder_parameter" "tenant" {
   description  = "OpenFlows tenant identifier"
   default     = ""
   type        = "string"
+}
+
+data "coder_parameter" "fleet_size" {
+  name        = "fleet_size"
+  description = "Requested number of Forge/Sentinel worker pairs"
+  default     = "1"
+  type        = "number"
+  mutable     = false
 }
 
 data "coder_parameter" "registry_json" {
@@ -109,6 +133,37 @@ data "coder_parameter" "start_controller" {
   description  = "Whether to auto-start the OpenFlows controller on workspace startup"
   default     = "true"
   type        = "bool"
+}
+
+# Hosted runtime mode. When true, the workspace sources scoped runtime
+# credentials from the secret-injection backend's mounted file
+# (OPENFLOWS_RUNTIME_CREDENTIAL_FILE) instead of platform/deployment-wide
+# credentials: the platform Coder session token, the deployment-wide lifecycle
+# hook signing secret, and the owner's GitHub external-auth token are never
+# exported into the runtime in this mode. Local mode (the default) preserves the
+# existing operator workflow unchanged.
+data "coder_parameter" "hosted" {
+  name        = "hosted"
+  description  = "Whether this workspace is provisioned in hosted mode (scoped runtime credentials)"
+  default     = "false"
+  type        = "bool"
+  mutable     = false
+}
+
+data "coder_parameter" "runtime_secret_ref" {
+  name        = "runtime_secret_ref"
+  description = "Provisioner-resolved per-workspace secret reference"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "workspace_image_digest" {
+  name        = "workspace_image_digest"
+  description = "Release-pinned sha256 digest for the hosted workspace image"
+  default     = ""
+  type        = "string"
+  mutable     = false
 }
 
 resource "coder_agent" "main" {
@@ -157,10 +212,42 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # Setup git credentials from Coder external auth (the tenant's linked
-    # GitHub App token). PAT flow removed — external auth is the sole source.
-    # The Controller resolves its own GitHub token from CODER_EXTERNAL_AUTH_*.
-    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    # Setup git credentials. Local mode uses Coder external auth (the owner's
+    # linked GitHub App token). Hosted mode never exports the external-auth
+    # token into the runtime: it sources a scoped credential from the
+    # secret-injection backend's mounted file instead, so no platform or
+    # deployment-wide credential reaches the workspace.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      test -r "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" || { echo "FATAL: runtime secret is not mounted" >&2; exit 1; }
+      eval "$(python3 - "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" <<'PY'
+import json, shlex, sys
+d=json.load(open(sys.argv[1]))
+for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace'),('CODER_CHAT_HOOK_SECRET','hook_key'),('CODER_CHAT_HOOK_URL','hook_url')]:
+    print('export %s=%s' % (env, shlex.quote(str(d[key]))))
+PY
+)"
+      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
+      eval "$(python3 - "$SESSION" <<'PY'
+import json, shlex, sys
+d=json.loads(sys.argv[1])
+print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
+print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
+PY
+)"
+      # The controller uses this Manager runtime session for hosted
+      # control-plane calls. It is intentionally distinct from Coder user
+      # credentials, which are never exported into the workspace.
+      export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
+      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+      # Readiness is reported only after the controller has obtained the
+      # credentials it needs to start. Registration is sufficient for the
+      # first broker exchange during provisioning; this heartbeat is the
+      # authoritative signal used to complete tenant provisioning.
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+    else
+      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+    fi
     if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
       echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
@@ -209,12 +296,35 @@ resource "coder_agent" "main" {
     else
       export CODER_URL="${data.coder_parameter.coder_url.value}"
     fi
-    export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
-    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    # Hosted mode never exports the platform Coder session token or the
+    # deployment-wide hook signing secret into the runtime; scoped runtime
+    # credentials come from the mounted secret-injection file. Local mode keeps
+    # the existing operator workflow unchanged.
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
+      export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
+    fi
+    # Hosted mode already loaded the tenant-scoped Redis endpoint from the
+    # mounted runtime secret above. Do not overwrite it with a Terraform
+    # parameter: parameters are visible to Coder and are not the secret
+    # delivery channel.
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export REDIS_URL="${data.coder_parameter.redis_url.value}"
+      export OPENFLOWS_REDIS_USERNAME="${data.coder_parameter.redis_username.value}"
+      export OPENFLOWS_REDIS_NAMESPACE="${data.coder_parameter.redis_namespace.value}"
+    fi
+    # Fleet size is authoritative only for hosted runtimes, where the Manager
+    # passes it as a workspace parameter. Local tenants supply their fleet
+    # through OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a
+    # parameter that defaults to 1 here would shrink that registry fleet.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
+    fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
-    export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
-    export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
+    fi
     if [ -n "${data.coder_parameter.coder_chat_hook_url.value}" ]; then
       export CODER_CHAT_HOOK_URL="${data.coder_parameter.coder_chat_hook_url.value}"
     fi
@@ -248,7 +358,7 @@ resource "docker_volume" "artifacts" {
 
 resource "docker_container" "workspace" {
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
-  image = var.workspace_image
+  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -273,38 +383,54 @@ resource "docker_container" "workspace" {
     }
   }
 
-  env = [
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/runtime.json"
+      host_path      = data.coder_parameter.runtime_secret_ref.value
+      read_only      = true
+    }
+  }
+
+  env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
     # Always use internal 'coder' hostname - Coder is reachable as 'coder' from workspace containers
     "CODER_URL=http://coder:7080",
-    "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
-    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
-    "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
-    "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
-    # tenant owner's linked GitHub App token). Export it here: Coder injects the
-    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
-    # env var, so without this the controller's resolve_token() would find nothing.
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
     # reach it over the shared docker network (issue #143). Workspaces address
     # it via the `openflows-nexus` network alias below.
     "A2A_RELAY_ADDR=0.0.0.0:3000",
     # Path to shared artifacts (agent personas, skills, standards, plans)
     "ARTIFACTS_DIR=/home/coder/.openflows/artifacts",
-  ]
+  ], data.coder_parameter.hosted.value == "true" ? [] : [
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_REDIS_USERNAME=${data.coder_parameter.redis_username.value}",
+    "OPENFLOWS_REDIS_NAMESPACE=${data.coder_parameter.redis_namespace.value}",
+    # Local mode only: platform/deployment-wide credentials and the legacy
+    # registry. Hosted mode sources scoped runtime credentials from the
+    # secret-injection backend and never exports these into the runtime.
+    "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
+    "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
+    "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
+    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
+    # tenant owner's linked GitHub App token). Export it here: Coder injects the
+    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
+    # env var, so without this the controller's resolve_token() would find nothing.
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github[0].access_token}",
+  ])
 
   networks_advanced {
     name = var.docker_network
     # Stable service name so forge/sentinel templates can default
     # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
-    aliases = ["openflows-nexus"]
+    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"]
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]
@@ -313,5 +439,7 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = "primary-github"
+  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
+  id       = "primary-github"
+  optional = true
 }

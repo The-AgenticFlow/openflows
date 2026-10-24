@@ -61,6 +61,10 @@ pub struct LoginService {
     pub session_manager: SessionManager,
     pub github: std::sync::Arc<dyn GithubAuth>,
     pub auth_config: AuthConfig,
+    /// Optional Zep context-layer integration. When present, a newly-created
+    /// application user is mirrored to Zep (`user.add`) on signup so the
+    /// agents get durable per-user context. Best-effort.
+    pub zep: Option<crate::zep::service::ZepService>,
 }
 
 impl LoginService {
@@ -167,7 +171,7 @@ impl LoginService {
             .display_name
             .clone()
             .unwrap_or_else(|| github_user.login.clone());
-        let (user_id, _created) = self
+        let (user_id, created) = self
             .users
             .find_or_create_user(
                 &self.pool,
@@ -177,6 +181,16 @@ impl LoginService {
                 &display_name,
             )
             .await?;
+
+        // Mirror newly-registered users into Zep so their agent has durable,
+        // per-user context. Best-effort and idempotent (keyed by user_id).
+        if created {
+            if let Some(zep) = &self.zep {
+                let (first, last) = split_name(&display_name);
+                zep.user_add(&user_id.to_string(), &first, &last, None)
+                    .await;
+            }
+        }
 
         // Discard the provider access token after ordinary login.
         drop(token);
@@ -201,5 +215,44 @@ impl LoginService {
             .validate_browser_session(&hash_token(access_token))
             .await?;
         Ok(principal.map(|p| (p.session_id, p.user_id)))
+    }
+}
+
+/// Split a display name into (first, last) for Zep's user fields. Falls back
+/// to the whole name as the first name when there is no space separator.
+fn split_name(full: &str) -> (String, String) {
+    let trimmed = full.trim();
+    match trimmed.split_once(' ') {
+        Some((first, rest)) => {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                (first.to_string(), String::new())
+            } else {
+                (first.to_string(), rest.to_string())
+            }
+        }
+        None => (trimmed.to_string(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_name_handles_first_last_and_single() {
+        assert_eq!(split_name("Jane Smith"), ("Jane".into(), "Smith".into()));
+        assert_eq!(
+            split_name("Ada Lovelace King"),
+            ("Ada".into(), "Lovelace King".into())
+        );
+        assert_eq!(split_name("octocat"), ("octocat".into(), String::new()));
+        assert_eq!(split_name("  spaced  "), ("spaced".into(), String::new()));
+    }
+
+    #[test]
+    fn split_name_handles_multiple_internal_spaces() {
+        assert_eq!(split_name("A  B"), ("A".into(), "B".into()));
+        assert_eq!(split_name("Name "), ("Name".into(), String::new()));
     }
 }

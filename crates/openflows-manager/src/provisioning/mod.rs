@@ -9,10 +9,13 @@
 //! [`ReleaseSource`] (local filesystem or a pinned hosted GitHub release),
 //! never from customer-supplied URLs.
 
+pub mod docker;
 pub mod release_provider;
 pub mod source;
+pub mod tenant_worker;
 pub mod worker;
 
 pub use release_provider::{ReleaseProvider, ReleaseProviderError};
 pub use source::{ReleaseCache, ReleaseSource, ResolvedRelease};
+pub use tenant_worker::{err as tenant_err, TenantProvisionOutcome, TenantProvisionWorker};
 pub use worker::{err, OrgProvisionOutcome, OrgProvisionWorker};

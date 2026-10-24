@@ -4,6 +4,43 @@ use tracing::{info, warn};
 
 use crate::bundled::bundled_files;
 
+/// Publish binary-owned hooks into the shared artifacts volume before workers
+/// start. No checkout of the OpenFlows repository is required at runtime.
+pub fn publish_worker_hooks(artifacts_dir: &std::path::Path) -> Result<()> {
+    for file in bundled_files()
+        .into_iter()
+        .filter(|file| file.relative_path.starts_with("plugin/hooks/"))
+    {
+        let target = artifacts_dir.join(file.relative_path);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::write(&target, file.content)
+            .with_context(|| format!("Cannot publish worker hook {}", target.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod worker_hook_tests {
+    #[test]
+    fn publishes_and_refreshes_hooks_without_a_source_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("PLAN.md");
+        std::fs::write(&plan, "tenant plan").unwrap();
+        super::publish_worker_hooks(dir.path()).unwrap();
+        let hook = dir.path().join("plugin/hooks/forge/session_start.sh");
+        let expected = include_str!("../../orchestration/plugin/hooks/forge/session_start.sh");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), expected);
+        assert!(dir
+            .path()
+            .join("plugin/hooks/sentinel/stop_require_eval.sh")
+            .is_file());
+        std::fs::write(&hook, "outdated hook").unwrap();
+        super::publish_worker_hooks(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(plan).unwrap(), "tenant plan");
+    }
+}
+
 const ORCHESTRATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct BundledFile {

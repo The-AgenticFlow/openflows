@@ -16,6 +16,7 @@ use sqlx::{PgConnection, PgPool};
 /// Default operation lease and heartbeat intervals.
 pub const LEASE_DURATION: Duration = Duration::seconds(30);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::seconds(10);
+pub const MAX_AUTOMATIC_ATTEMPTS: i32 = 8;
 
 /// The lifecycle states of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +162,8 @@ pub async fn claim_kind(
           WHERE id = (
                 SELECT id
                   FROM operations
-                 WHERE state IN ('queued', 'running', 'retryable_failed')
+                 WHERE (state IN ('queued', 'running')
+                        OR (state = 'retryable_failed' AND retry_at IS NOT NULL))
                    AND (lease_expires_at IS NULL OR lease_expires_at < now())
                    AND (retry_at IS NULL OR retry_at <= now())
                    AND ($3::text IS NULL OR kind = $3)
@@ -185,6 +187,145 @@ pub async fn claim_kind(
         token,
         pool: pool.clone(),
     }))
+}
+
+/// Claim one operation from a set of kinds while reserving the organization's
+/// provisioning slot in the same database transaction. The advisory lock is
+/// scoped to the organization, so separate Manager instances cannot both pass
+/// the quota check before either one records its lease. Tenant deletion is a
+/// finalizer: after normal attempts are exhausted, an unresolved deletion is
+/// eligible again after five minutes while its tenant is still `deleting`.
+pub async fn claim_kinds_with_org_slot(
+    pool: &PgPool,
+    owner: &str,
+    kinds: &[&str],
+) -> Result<Option<LeaseGuard>, ManagerError> {
+    if kinds.is_empty() {
+        return Ok(None);
+    }
+
+    let candidates = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+        "SELECT id, organization_id
+           FROM (
+             SELECT DISTINCT ON (organization_id) id, organization_id, created_at
+               FROM operations
+              WHERE (state IN ('queued', 'running')
+                 OR (state = 'retryable_failed' AND retry_at IS NOT NULL)
+                 OR (kind = 'tenant.delete' AND state = 'retryable_failed'
+                     AND retry_at IS NULL AND updated_at < now() - interval '5 minutes'
+                     AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = operations.resource_id
+                                 AND t.organization_id = operations.organization_id
+                                 AND t.desired_state = 'deleting')))
+                AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                AND (retry_at IS NULL OR retry_at <= now())
+                AND kind = ANY($1::text[])
+              ORDER BY organization_id,
+                       CASE WHEN kind = 'tenant.delete' THEN 0 ELSE 1 END,
+                       created_at
+           ) candidates
+          ORDER BY created_at",
+    )
+    .bind(kinds)
+    .fetch_all(pool)
+    .await
+    .map_err(ManagerError::from)?;
+
+    for (operation_id, organization_id) in candidates {
+        let token = uuid::Uuid::new_v4();
+        let mut tx = pool.begin().await.map_err(ManagerError::from)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(organization_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
+
+        let candidate = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+            "SELECT id, organization_id
+               FROM operations
+              WHERE id = $1
+                AND (state IN ('queued', 'running')
+                     OR (state = 'retryable_failed' AND retry_at IS NOT NULL)
+                     OR (kind = 'tenant.delete' AND state = 'retryable_failed'
+                         AND retry_at IS NULL AND updated_at < now() - interval '5 minutes'
+                         AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = operations.resource_id
+                                     AND t.organization_id = operations.organization_id
+                                     AND t.desired_state = 'deleting')))
+                AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                AND (retry_at IS NULL OR retry_at <= now())
+                AND kind = ANY($2::text[])
+              FOR UPDATE",
+        )
+        .bind(operation_id)
+        .bind(kinds)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?;
+
+        let Some((operation_id, organization_id)) = candidate else {
+            tx.commit().await.map_err(ManagerError::from)?;
+            continue;
+        };
+
+        let max: i32 = sqlx::query_scalar(
+            "SELECT max_concurrent_provisioning_ops
+               FROM tenant_quotas
+              WHERE organization_id = $1
+              FOR UPDATE",
+        )
+        .bind(organization_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?
+        .unwrap_or(1);
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM operations
+              WHERE organization_id = $1
+                AND id <> $2
+                AND state = 'running'
+                AND lease_expires_at > clock_timestamp()
+                AND kind = ANY($3::text[])",
+        )
+        .bind(organization_id)
+        .bind(operation_id)
+        .bind(kinds)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?;
+        if active >= i64::from(max) {
+            tx.commit().await.map_err(ManagerError::from)?;
+            continue;
+        }
+
+        sqlx::query(
+            "UPDATE operations
+                SET lease_owner = $1,
+                    lease_expires_at = clock_timestamp() + interval '30 seconds',
+                    lease_token = $2,
+                    attempt_count = attempt_count + 1,
+                    state = 'running',
+                    updated_at = now()
+              WHERE id = $3",
+        )
+        .bind(owner)
+        .bind(token)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?;
+        tx.commit().await.map_err(ManagerError::from)?;
+
+        return Ok(Some(LeaseGuard {
+            operation_id: OperationId::from_uuid(operation_id),
+            organization_id: OrganizationId::from_uuid(organization_id),
+            owner: owner.to_string(),
+            token,
+            pool: pool.clone(),
+        }));
+    }
+
+    Ok(None)
 }
 
 impl LeaseGuard {
@@ -251,6 +392,34 @@ impl LeaseGuard {
         Ok(affected == 1)
     }
 
+    /// Return an operation to the queue without consuming an execution
+    /// attempt. This is used when a per-organization concurrency slot is
+    /// temporarily occupied by another live operation.
+    pub async fn requeue(&self, waiting_step: &str) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE operations
+                SET state = 'queued',
+                    current_step = $1,
+                    attempt_count = GREATEST(attempt_count - 1, 0),
+                    retry_at = NULL,
+                    lease_owner = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+              WHERE id = $2 AND lease_owner = $3 AND lease_token = $4
+                AND state = 'running' AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(waiting_step)
+        .bind(self.operation_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
     /// Mark the operation succeeded. Only the current lease owner with a live
     /// lease can succeed it; a stale worker is rejected.
     pub async fn complete(&self, sanitized_result: Option<Value>) -> Result<bool, ManagerError> {
@@ -284,11 +453,20 @@ impl LeaseGuard {
         retryable: bool,
         error_code: Option<&str>,
     ) -> Result<bool, ManagerError> {
+        let attempts: i32 = sqlx::query_scalar(
+            "SELECT attempt_count FROM operations
+              WHERE id = $1 AND lease_owner = $2 AND lease_token = $3",
+        )
+        .bind(self.operation_id.0)
+        .bind(&self.owner)
+        .bind(self.token)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(MAX_AUTOMATIC_ATTEMPTS);
         let (state, retry_at) = if retryable {
-            (
-                OperationState::RetryableFailed.as_str(),
-                Some(Utc::now() + Duration::seconds(1)),
-            )
+            let retry_at =
+                (attempts < MAX_AUTOMATIC_ATTEMPTS).then(|| Utc::now() + retry_delay(attempts));
+            (OperationState::RetryableFailed.as_str(), retry_at)
         } else {
             (OperationState::Failed.as_str(), None)
         };
@@ -335,6 +513,46 @@ impl LeaseGuard {
         .rows_affected();
         Ok(affected == 1)
     }
+}
+
+fn retry_delay(attempt: i32) -> Duration {
+    let exponent = attempt.clamp(1, 6) as u32;
+    Duration::seconds((1_i64 << exponent).min(60))
+}
+
+/// Requeue a retryable operation, an organization import failure created
+/// before bounded import recovery, or a failed template promotion after its
+/// operator has corrected the underlying Coder configuration.
+/// A live lease cannot be stolen from an active worker; the adapter retains its
+/// per-release import attempt limit even when the operation is manually retried.
+pub async fn retry_in_tx(
+    conn: &mut PgConnection,
+    id: OperationId,
+    organization_id: OrganizationId,
+) -> Result<(), ManagerError> {
+    let affected = sqlx::query(
+        "UPDATE operations
+            SET state = 'queued', retry_at = NULL, lease_owner = NULL,
+                lease_token = NULL, lease_expires_at = NULL, error_code = NULL,
+                attempt_count = 0, updated_at = now()
+          WHERE id = $1 AND organization_id = $2
+            AND (state = 'retryable_failed'
+                 OR (state = 'failed' AND kind = 'org.provision'
+                     AND error_code = 'IMPORT_FAILED')
+                 OR (state = 'failed' AND kind = 'template.promote'))
+            AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp())",
+    )
+    .bind(id.0)
+    .bind(organization_id.0)
+    .execute(conn)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        return Err(ManagerError::Conflict(
+            "operation is not available for retry".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fetch an operation by id, requiring the org scope. Returns `None` when the

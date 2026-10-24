@@ -168,6 +168,20 @@ impl ReleaseProvider {
     }
 
     fn build_manifest_from_source(&self) -> Result<Vec<u8>, ReleaseProviderError> {
+        let image_digest = std::env::var("OPENFLOWS_WORKSPACE_IMAGE_DIGEST")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if let Some(digest) = image_digest.as_deref() {
+            let valid = digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !valid {
+                return Err(ReleaseProviderError(
+                    "OPENFLOWS_WORKSPACE_IMAGE_DIGEST must be sha256 followed by 64 hexadecimal characters"
+                        .into(),
+                ));
+            }
+        }
         let mut roles = BTreeMap::new();
         for role in Role::ALL {
             let dir = self.source_dir.join(format!("openflows-{}", role.as_str()));
@@ -182,7 +196,7 @@ impl ReleaseProvider {
                     archive: role.archive_name(),
                     sha256,
                     parameter_schema_version: 1,
-                    image_digest: None,
+                    image_digest: image_digest.clone(),
                 },
             );
         }

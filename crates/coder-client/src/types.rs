@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct UsersResponse {
     #[serde(default)]
     pub users: Vec<CoderUser>,
-    #[serde(default)]
+    #[serde(default, alias = "count")]
     pub total_count: u64,
 }
 
@@ -125,16 +125,20 @@ pub struct CoderTemplate {
 
 /// A Coder template version.
 ///
-/// Returned by `GET /api/v2/organizations/{org}/templates/{template}/versions`
-/// and by `POST .../versions` (import). The import job status tells us whether
-/// the version's provisioning job succeeded; we never infer publication from a
-/// timestamp alone.
+/// Returned by `GET /api/v2/templates/{template}/versions`,
+/// `GET /api/v2/templateversions/{version}`, and `POST
+/// /api/v2/organizations/{org}/templateversions`. The nested provisioner job
+/// status tells us whether the version's import succeeded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoderTemplateVersion {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    #[serde(default, rename = "template_id")]
+    #[serde(
+        default,
+        rename = "template_id",
+        deserialize_with = "nullable_template_id"
+    )]
     pub template_id: String,
     #[serde(default, rename = "organization_id")]
     pub organization_id: String,
@@ -153,9 +157,9 @@ pub struct CoderProvisionerJob {
     pub id: String,
     #[serde(default)]
     pub status: String,
-    #[serde(default, rename = "error")]
+    #[serde(default, rename = "error", deserialize_with = "nullable_string")]
     pub error: String,
-    #[serde(default, rename = "error_code")]
+    #[serde(default, rename = "error_code", deserialize_with = "nullable_string")]
     pub error_code: String,
 }
 
@@ -167,7 +171,10 @@ impl CoderProvisionerJob {
 
     /// The job has reached a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "succeeded" | "failed" | "cancelled")
+        matches!(
+            self.status.as_str(),
+            "succeeded" | "failed" | "canceled" | "cancelled"
+        )
     }
 }
 
@@ -194,7 +201,10 @@ impl CoderImportJob {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "succeeded" | "failed" | "cancelled")
+        matches!(
+            self.status.as_str(),
+            "succeeded" | "failed" | "canceled" | "cancelled"
+        )
     }
 }
 
@@ -237,20 +247,8 @@ pub struct CoderTemplateCreated {
     pub name: String,
 }
 
-/// The request body for `POST /api/v2/organizations/{org}/templates/{template}/versions`.
-///
-/// Hosted operations require explicit organization, template, and a deterministic version
-/// name so publication is idempotent and never inferred from timestamps.
-#[derive(Debug, Clone, Serialize)]
-pub struct CreateTemplateVersionRequest {
-    /// The deterministic, immutable version name (e.g. the release id).
-    pub name: String,
-    /// The directory name inside the uploaded archive.
-    #[serde(rename = "directory", skip_serializing_if = "Option::is_none")]
-    pub directory: Option<String>,
-}
-
-/// The request body for `POST /api/v2/organizations/{org}/templates`.
+/// The Coder v2 template creation request. The pinned API requires the first
+/// successfully submitted template version id as `template_version_id`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateTemplateRequest {
     pub name: String,
@@ -259,12 +257,58 @@ pub struct CreateTemplateRequest {
     #[serde(rename = "default_ttl_ms", skip_serializing_if = "Option::is_none")]
     pub default_ttl_ms: Option<i64>,
     /// The id of the version this template should initially point at.
-    #[serde(rename = "active_version_id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "template_version_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateTemplateVersionRequest {
+    pub name: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    pub storage_method: String,
+    pub file_id: String,
+    pub provisioner: String,
+    #[serde(default)]
+    pub tags: std::collections::HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_variable_values: Vec<TemplateVariableValue>,
+}
+
+/// A Terraform variable persisted with a Coder template version.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateVariableValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoderUploadedFile {
+    #[serde(default, rename = "hash")]
+    pub id: String,
+}
+
+fn nullable_template_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    nullable_string(deserializer)
+}
+
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// A Coder workspace used to parse explicit-org/owner/version responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "CoderWorkspaceDetailWire")]
 pub struct CoderWorkspaceDetail {
     pub id: String,
     #[serde(default)]
@@ -279,6 +323,89 @@ pub struct CoderWorkspaceDetail {
     pub template_version_id: String,
 }
 
+#[derive(Deserialize)]
+struct CoderWorkspaceDetailWire {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    owner_id: String,
+    #[serde(default)]
+    organization_id: String,
+    #[serde(default)]
+    template_id: String,
+    template_version_id: Option<String>,
+    latest_build: Option<CoderWorkspaceVersionWire>,
+}
+
+#[derive(Deserialize)]
+struct CoderWorkspaceVersionWire {
+    template_version_id: String,
+}
+
+impl TryFrom<CoderWorkspaceDetailWire> for CoderWorkspaceDetail {
+    type Error = &'static str;
+
+    fn try_from(wire: CoderWorkspaceDetailWire) -> Result<Self, Self::Error> {
+        // Coder returns the pinned version on the latest build, not the workspace.
+        // Accept the flattened representation for compatibility, but never accept
+        // contradictory identities.
+        let nested = wire.latest_build.map(|build| build.template_version_id);
+        if let (Some(flat), Some(build)) = (&wire.template_version_id, &nested) {
+            if flat != build {
+                return Err("conflicting workspace template version identities");
+            }
+        }
+        Ok(Self {
+            id: wire.id,
+            name: wire.name,
+            owner_id: wire.owner_id,
+            organization_id: wire.organization_id,
+            template_id: wire.template_id,
+            template_version_id: nested.or(wire.template_version_id).unwrap_or_default(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod workspace_detail_tests {
+    use super::*;
+
+    #[test]
+    fn reads_version_from_coder_latest_build() {
+        let workspace: CoderWorkspaceDetail = serde_json::from_value(serde_json::json!({
+            "id": "workspace", "name": "nexus", "owner_id": "owner",
+            "organization_id": "org", "template_id": "template",
+            "template_active_version_id": "different-active-version",
+            "latest_build": {"id": "build", "template_version_id": "pinned-version"}
+        }))
+        .unwrap();
+        assert_eq!(workspace.template_version_id, "pinned-version");
+        assert_eq!(workspace.organization_id, "org");
+        assert_eq!(workspace.owner_id, "owner");
+    }
+
+    #[test]
+    fn rejects_conflicting_versions() {
+        assert!(
+            serde_json::from_value::<CoderWorkspaceDetail>(serde_json::json!({
+                "id": "workspace", "template_version_id": "one",
+                "latest_build": {"template_version_id": "two"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_version_does_not_use_active_template_version() {
+        let workspace: CoderWorkspaceDetail = serde_json::from_value(serde_json::json!({
+            "id": "workspace", "template_active_version_id": "active"
+        }))
+        .unwrap();
+        assert!(workspace.template_version_id.is_empty());
+    }
+}
+
 /// A Coder user with the organization id for membership verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoderUserDetail {
@@ -288,8 +415,24 @@ pub struct CoderUserDetail {
     pub username: String,
     #[serde(default, rename = "organization_ids")]
     pub organization_ids: Vec<String>,
+    #[serde(default)]
+    pub is_service_account: bool,
     #[serde(default, rename = "roles")]
+    pub roles: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateServiceAccountRequest {
+    pub username: String,
+    pub name: String,
+    /// Must be empty for Coder service accounts.
+    pub email: String,
+    pub login_type: String,
+    pub password: String,
+    pub organization_ids: Vec<String>,
     pub roles: Vec<String>,
+    pub service_account: bool,
+    pub user_status: String,
 }
 
 /// A Coder organization membership/roles payload for permission checks.
@@ -641,6 +784,10 @@ pub struct CreateChatRequest {
     /// this organization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization_id: Option<String>,
+    /// Set only by a trusted control plane creating a Chat on behalf of its
+    /// verified tenant owner. Coder checks impersonation privileges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     /// Workspace ID to run the chat in.
     pub workspace_id: String,
     /// The model config ID (from `/api/v2/organizations/{org}/chats/models`).

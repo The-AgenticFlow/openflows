@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tempfile = { workspace = true }
+fs2 = "0.4"
 config = { version = "0.2.0", path = "../config" }
 coder-client = { version = "0.1.0", path = "../coder-client" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
@@ -24,6 +27,7 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 base64 = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
@@ -34,11 +38,14 @@ url = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 futures = { workspace = true }
 futures-util = { workspace = true }
+fred = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = "0.12"
 tar = "0.4"
 flate2 = "1"
 hex = "0.4"
+aws-config = { version = "1.13.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = "1.123.0"
 
 [features]
 default = []

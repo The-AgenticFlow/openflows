@@ -38,16 +38,13 @@ impl InMemoryBackend {
     async fn keys(&self, pattern: &str) -> Vec<String> {
         let map = self.map.read().await;
         map.keys()
-            .filter(|k| {
-                if pattern == "*" || pattern.ends_with('*') {
-                    let prefix = pattern.trim_end_matches('*');
-                    k.starts_with(prefix)
-                } else {
-                    k == &pattern
-                }
-            })
+            .filter(|k| glob_match(pattern, k))
             .cloned()
             .collect()
+    }
+
+    async fn scan_keys(&self, pattern: &str) -> Vec<String> {
+        self.keys(pattern).await
     }
 }
 
@@ -65,17 +62,54 @@ impl RedisBackend {
         Ok(Self { client })
     }
 
+    /// Tenant-scoped key lookup. The per-tenant SET index is populated on
+    /// every writer (see `Backend::set` and `Backend::transition`), so this
+    /// avoids SCAN entirely — required for the ACL-restricted tenant users
+    /// (`-keys -scan`). Patterns are matched as globs against the stored keys.
+    ///
+    /// When the index yields nothing, a best-effort SCAN backfills keys that
+    /// predate the index (e.g. written before this code was deployed). On a
+    /// tenant-ACL connection that SCAN is denied and simply returns empty.
     async fn keys(&self, pattern: &str) -> Vec<String> {
+        use fred::interfaces::SetsInterface;
+        let Some(index) = tenant_index_key(pattern) else {
+            return Vec::new();
+        };
+        let keys: Vec<String> = self
+            .client
+            .smembers(index.clone())
+            .await
+            .unwrap_or_default();
+        let mut matches: Vec<String> = keys
+            .into_iter()
+            .filter(|key| glob_match(pattern, key))
+            .collect();
+        if matches.is_empty() {
+            for key in self.scan_keys(pattern).await {
+                if glob_match(pattern, &key) && !matches.contains(&key) {
+                    matches.push(key.clone());
+                    let _ = self.client.sadd::<i64, _, _>(index.clone(), key).await;
+                }
+            }
+        }
+        matches
+    }
+
+    /// Cross-tenant / whole-store enumeration using SCAN. This is only used by
+    /// `raw_keys`, which callers invoke on an admin (non-tenant-ACL) connection,
+    /// so SCAN is permitted. It handles middle wildcards and existing keys that
+    /// predate the per-tenant index.
+    async fn scan_keys(&self, pattern: &str) -> Vec<String> {
         use fred::types::scan::Scanner;
         use futures::StreamExt;
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         let mut stream = self.client.scan(pattern, None, None);
         while let Some(result) = stream.next().await {
             if let Ok(mut scan_result) = result {
                 if let Some(page) = scan_result.take_results() {
                     for key in page {
                         if let Some(s) = key.into_string() {
-                            keys.push(s);
+                            out.push(s);
                         }
                     }
                 }
@@ -84,7 +118,7 @@ impl RedisBackend {
                 }
             }
         }
-        keys
+        out
     }
 
     async fn ping(&self) -> Result<()> {
@@ -92,6 +126,36 @@ impl RedisBackend {
         let _: String = self.client.ping(None).await?;
         Ok(())
     }
+}
+
+/// Minimal glob matcher compatible with the patterns used by Redis key
+/// enumeration: `*` matches any run of characters, `?` matches a single
+/// character, and everything else matches literally.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn redis_op_timeout() -> Duration {
@@ -158,6 +222,9 @@ impl Backend {
                     {
                         warn!(key, %error, "Redis set failed");
                     }
+                    if let Some(index) = tenant_index_key(key) {
+                        let _ = b.client.sadd::<i64, _, _>(index, key).await;
+                    }
                 }
             }
         }
@@ -172,6 +239,9 @@ impl Backend {
                 use fred::prelude::*;
                 if let Err(error) = bounded_redis::<i64, _, _>("DEL", b.client.del(key)).await {
                     warn!(key, %error, "Redis del failed");
+                }
+                if let Some(index) = tenant_index_key(key) {
+                    let _ = b.client.srem::<i64, _, _>(index, key).await;
                 }
             }
         }
@@ -196,6 +266,27 @@ impl Backend {
         }
     }
 
+    /// SCAN-based enumeration used by `raw_keys`. Only call on an admin
+    /// connection where SCAN is permitted by the Redis ACL.
+    async fn scan_keys(&self, pattern: &str) -> Vec<String> {
+        match self {
+            Backend::InMemory(b) => b.scan_keys(pattern).await,
+            Backend::Redis(b) => {
+                match tokio::time::timeout(redis_op_timeout(), b.scan_keys(pattern)).await {
+                    Ok(keys) => keys,
+                    Err(_) => {
+                        warn!(
+                            pattern,
+                            timeout_secs = redis_op_timeout().as_secs(),
+                            "Redis scan_keys timed out"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    }
+
     async fn ping(&self) -> Result<()> {
         match self {
             Backend::InMemory(_) => Ok(()),
@@ -204,6 +295,12 @@ impl Backend {
                 .context("Redis PING timed out")?,
         }
     }
+}
+
+fn tenant_index_key(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("ns:")?;
+    let tenant = rest.split_once(':')?.0;
+    Some(format!("ns:{tenant}:_keys"))
 }
 
 // ── SharedStore (public API) ──────────────────────────────────────────────
@@ -366,8 +463,12 @@ impl SharedStore {
     /// Raw key scan on the backend WITHOUT tenant namespacing.
     /// `pattern` is matched as-is against full Redis keys (e.g. "ns:*").
     /// Returns the full Redis keys that matched.
+    ///
+    /// Unlike `keys`, this uses SCAN and therefore requires a connection with
+    /// SCAN permission (the admin URL). It supports cross-tenant and middle
+    /// wildcard patterns and finds keys that predate the per-tenant index.
     pub async fn raw_keys(&self, pattern: &str) -> Vec<String> {
-        self.backend.keys(pattern).await
+        self.backend.scan_keys(pattern).await
     }
 
     /// Raw delete of a full Redis key WITHOUT tenant namespacing.
@@ -452,12 +553,18 @@ impl SharedStore {
                     "transition CAS",
                     b.client.eval(
                         script,
-                        vec![key],
+                        vec![key.clone()],
                         vec![raw.unwrap_or_default(), serde_json::to_string(&next)?],
                     ),
                 )
                 .await?;
                 anyhow::ensure!(changed == 1, "Lifecycle changed; refresh before retrying");
+                // Keep the per-tenant key index in sync so `keys()` scans can
+                // find lifecycle status keys written here rather than via `set`.
+                if let Some(index) = tenant_index_key(&key) {
+                    use fred::interfaces::SetsInterface;
+                    let _ = b.client.sadd::<i64, _, _>(index, &key).await;
+                }
                 Ok(next)
             }
         }
@@ -601,5 +708,117 @@ mod claim_tests {
         assert!(store.try_claim("review:T-1", "owner", 0).await.is_err());
         assert!(store.try_claim("review:T-1", "owner", 120).await.unwrap());
         assert!(other.try_claim("review:T-1", "owner", 120).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod redis_index_tests {
+    use super::*;
+    use config::lifecycle::Event;
+
+    /// These tests need a live Redis; point `OPENFLOWS_TEST_REDIS_URL` at one
+    /// (e.g. `redis://127.0.0.1:6399`). They are skipped when it is unset.
+    fn redis_url() -> Option<String> {
+        std::env::var("OPENFLOWS_TEST_REDIS_URL").ok()
+    }
+
+    #[tokio::test]
+    async fn index_covers_set_and_transition_and_raw_keys_scan() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping: OPENFLOWS_TEST_REDIS_URL unset");
+            return;
+        };
+        let store = SharedStore::new_redis_with_tenant(&url, Some("ten-a".into()))
+            .await
+            .unwrap();
+        store.ping().await.unwrap();
+
+        // `set` populates the per-tenant index.
+        store
+            .set("ticket:T1:chat:forge", serde_json::json!("chat-1"))
+            .await;
+        assert!(
+            store
+                .keys("ticket:*")
+                .await
+                .iter()
+                .any(|k| k.contains("T1:chat")),
+            "keys() should find keys written via set"
+        );
+
+        // `transition` must also maintain the index so lifecycle status keys
+        // written directly are discoverable (review comment 31).
+        store
+            .transition(
+                "T1",
+                0,
+                "forge",
+                Event::Plan {
+                    content: "p".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .keys("ticket:*")
+                .await
+                .iter()
+                .any(|k| k.contains("T1:status")),
+            "keys() should find the lifecycle status key written via transition"
+        );
+
+        // Cross-tenant enumeration must work through raw_keys (comment 32).
+        let raw = store.raw_keys("ns:*").await;
+        assert!(
+            raw.iter().any(|k| k.starts_with("ns:ten-a:")),
+            "raw_keys(ns:*) should see tenant keys, got: {raw:?}"
+        );
+
+        // Middle wildcards must match through raw_keys (comment 32).
+        store
+            .set("ticket:T1:recovery_attempts", serde_json::json!(0))
+            .await;
+        let recovery = store.raw_keys("ns:ten-a:ticket:*:recovery_attempts").await;
+        assert!(
+            recovery.iter().any(|k| k.contains("T1:recovery_attempts")),
+            "middle wildcard raw_keys should find recovery counters, got: {recovery:?}"
+        );
+    }
+
+    /// The tenant path must keep working for an ACL-restricted user that has
+    /// `-keys -scan` denied, because `keys()` reads the per-tenant SET index
+    /// (only falling back to SCAN when the index is empty). Point
+    /// `OPENFLOWS_TEST_REDIS_URL` at a Redis where a user
+    /// `tenant-test`/`testpass` exists with the tenant ACL from redis.rs.
+    #[tokio::test]
+    async fn keys_works_without_scan_acl() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping: OPENFLOWS_TEST_REDIS_URL unset");
+            return;
+        };
+        let store = SharedStore::new_redis_with_tenant(&url, Some("ten-a".into()))
+            .await
+            .unwrap();
+        store.ping().await.unwrap();
+        // Seed via the admin-style URL first, then read back through the
+        // restricted user below if the base URL already carries those creds.
+        let restricted = if url.contains("tenant-test") {
+            Some(store)
+        } else {
+            None
+        };
+        if let Some(store) = restricted {
+            store
+                .set("ticket:T2:chat:forge", serde_json::json!("chat-2"))
+                .await;
+            let found = store.keys("ticket:*").await;
+            assert!(
+                found.iter().any(|k| k.contains("T2:chat")),
+                "keys() must resolve via the index for a -scan user, got: {found:?}"
+            );
+        } else {
+            eprintln!("skipping: OPENFLOWS_TEST_REDIS_URL has no tenant-test credentials");
+        }
     }
 }

@@ -10,6 +10,115 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub const RUNTIME_MANAGER_URL_ENV: &str = "OPENFLOWS_RUNTIME_MANAGER_URL";
+
+/// Coder's authenticated lifecycle hook endpoint and JWT audience.
+pub fn coder_hook_url(public_url: &str) -> Result<String, String> {
+    let configured = std::env::var("OPENFLOWS_HOOK_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/api/v1/hooks/coder/chat",
+                public_url.trim_end_matches('/')
+            )
+        });
+    let value = configured.trim();
+    let url =
+        url::Url::parse(value).map_err(|_| "OPENFLOWS_HOOK_URL must be an absolute HTTP(S) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/api/v1/hooks/coder/chat"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("OPENFLOWS_HOOK_URL must target /api/v1/hooks/coder/chat without credentials, query, or fragment".into());
+    }
+    Ok(value.to_string())
+}
+
+/// URL used by Coder workspaces to reach Manager. This can be a private
+/// service address while browser, GitHub, and OAuth callbacks use PUBLIC_URL.
+pub fn runtime_manager_url(public_url: &str) -> Result<String, String> {
+    let configured = std::env::var(RUNTIME_MANAGER_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| public_url.to_string());
+    let value = configured.trim().trim_end_matches('/');
+    let url = url::Url::parse(value)
+        .map_err(|_| "OPENFLOWS_RUNTIME_MANAGER_URL must be an absolute HTTP(S) origin")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err("OPENFLOWS_RUNTIME_MANAGER_URL must be an HTTP(S) origin without credentials, path, query, or fragment".into());
+    }
+    Ok(value.to_string())
+}
+
+/// Resolve the tenant-specific hook destination used for transport and JWT audience.
+pub fn runtime_hook_url(tenant: uuid::Uuid) -> Result<String, String> {
+    runtime_hook_url_from_base(
+        &std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL").unwrap_or_default(),
+        tenant,
+    )
+}
+
+fn runtime_hook_url_from_base(base: &str, tenant: uuid::Uuid) -> Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into());
+    }
+    let expanded = base.replace("{tenant}", &tenant.to_string());
+    let url = url::Url::parse(&expanded)
+        .map_err(|_| "OPENFLOWS_RUNTIME_RELAY_BASE_URL must be an absolute HTTP(S) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL must be HTTP(S) without credentials, query, or fragment".into());
+    }
+    Ok(format!("{expanded}/experimental/hooks/chat"))
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn expands_tenant_and_normalizes_base() {
+        let tenant = uuid::Uuid::nil();
+        assert_eq!(
+            runtime_hook_url_from_base(" http://127.0.0.1:7081/tenants/{tenant}/ ", tenant)
+                .unwrap(),
+            format!("http://127.0.0.1:7081/tenants/{tenant}/experimental/hooks/chat")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_relay_urls() {
+        for base in [
+            "",
+            "relative/path",
+            "ftp://relay",
+            "http://user:secret@relay",
+            "http://relay?x=1",
+            "http://relay#fragment",
+        ] {
+            assert!(runtime_hook_url_from_base(base, uuid::Uuid::nil()).is_err());
+        }
+    }
+}
+
 /// The deployment mode of the Manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +162,7 @@ pub const MODE_ENV: &str = "OPENFLOWS_MODE";
 pub const DATABASE_URL_ENV: &str = "OPENFLOWS_DATABASE_URL";
 /// The environment variable selecting the secret-provider adapter.
 pub const SECRET_PROVIDER_ENV: &str = "OPENFLOWS_SECRET_PROVIDER";
+pub const AWS_SECRETS_PREFIX_ENV: &str = "OPENFLOWS_AWS_SECRETS_PREFIX";
 /// The default secret-provider adapter name for local mode and tests.
 pub const DEFAULT_SECRET_PROVIDER: &str = "in-memory";
 
@@ -99,6 +209,7 @@ pub const CODER_URL_ENV: &str = "CODER_URL";
 /// browser responses, logs, errors, audit/outbox payloads, or template
 /// parameters.
 pub const CODER_OPERATOR_TOKEN_REF_ENV: &str = "OPENFLOWS_CODER_OPERATOR_TOKEN_REF";
+pub const CODER_HOOK_SECRET_REF_ENV: &str = "OPENFLOWS_CODER_HOOK_SECRET_REF";
 /// The pinned Coder version baseline for readiness (e.g. `v2.37.3`).
 pub const CODER_VERSION_BASELINE_ENV: &str = "OPENFLOWS_CODER_VERSION_BASELINE";
 /// The operator-configured provisioner backend adapter name.
@@ -107,6 +218,8 @@ pub const PROVISIONER_BACKEND_ENV: &str = "OPENFLOWS_PROVISIONER_BACKEND";
 pub const DEFAULT_CODER_VERSION_BASELINE: &str = "v2.37.3";
 /// Default provisioner backend (operator input; validated, not fabricated).
 pub const DEFAULT_PROVISIONER_BACKEND: &str = "docker";
+pub const REDIS_ADMIN_URL_ENV: &str = "OPENFLOWS_REDIS_ADMIN_URL";
+pub const RUNTIME_REDIS_URL_ENV: &str = "OPENFLOWS_RUNTIME_REDIS_URL";
 
 // ---------------------------------------------------------------------------
 // Template release source configuration.
@@ -130,11 +243,47 @@ pub const TEMPLATE_MANIFEST_SHA256_ENV: &str = "OPENFLOWS_TEMPLATE_MANIFEST_SHA2
 pub const TEMPLATE_GITHUB_TOKEN_REF_ENV: &str = "OPENFLOWS_GITHUB_TEMPLATE_TOKEN_REF";
 /// Maximum accepted bytes for a downloaded release artifact (default 256 MiB).
 pub const RELEASE_MAX_DOWNLOAD_BYTES_ENV: &str = "OPENFLOWS_RELEASE_MAX_DOWNLOAD_BYTES";
+
+// ---------------------------------------------------------------------------
+// Tenant runtime limits (minimal infrastructure safeguards).
+//
+// These are platform-configured ceilings enforced centrally in the Manager.
+// The defaults are the minimal safeguards named by the specification (max 2
+// active tenants per organization, max 2 workers per tenant in addition to its
+// Nexus controller, and max 1 active provisioning operation per organization).
+// Only platform operators may configure higher limits (these keys are startup
+// configuration, never a customer-facing endpoint).
+// ---------------------------------------------------------------------------
+/// Default maximum active tenants per organization.
+pub const DEFAULT_TENANT_MAX_PER_ORG: i32 = 2;
+/// Default maximum workers per tenant (in addition to its Nexus controller).
+pub const DEFAULT_TENANT_MAX_WORKERS: i32 = 2;
+/// Default maximum concurrent provisioning operations per organization.
+pub const DEFAULT_TENANT_MAX_PROVISIONING_OPS: i32 = 1;
+/// Env var: maximum active tenants per organization.
+pub const TENANT_MAX_PER_ORG_ENV: &str = "OPENFLOWS_TENANT_MAX_PER_ORG";
+/// Env var: maximum workers per tenant.
+pub const TENANT_MAX_WORKERS_ENV: &str = "OPENFLOWS_TENANT_MAX_WORKERS";
+/// Env var: maximum concurrent provisioning operations per organization.
+pub const TENANT_MAX_PROVISIONING_OPS_ENV: &str = "OPENFLOWS_TENANT_MAX_PROVISIONING_OPS";
 /// Per-request download timeout in seconds (default 30).
 pub const RELEASE_TIMEOUT_SECS_ENV: &str = "OPENFLOWS_RELEASE_TIMEOUT_SECS";
 /// Directory for the bounded verified-artifact cache (default
 /// `.openflows/release-cache`).
 pub const RELEASE_CACHE_DIR_ENV: &str = "OPENFLOWS_RELEASE_CACHE_DIR";
+
+// ---------------------------------------------------------------------------
+// Zep context-layer configuration.
+// ---------------------------------------------------------------------------
+/// Zep API key. Never committed; load from the environment. When absent, Zep
+/// integration is disabled and all Zep calls become no-ops.
+pub const ZEP_API_KEY_ENV: &str = "ZEP_API_KEY";
+/// Optional override for the Zep API base URL (defaults to the Zep v3 REST
+/// endpoint). Useful for Zep Enterprise / self-hosted deployments.
+pub const ZEP_API_URL_ENV: &str = "ZEP_API_URL";
+/// The shared organization-knowledge graph id. Every user's agent can draw on
+/// knowledge added to this graph.
+pub const ZEP_ORG_GRAPH_ID_ENV: &str = "ZEP_ORG_GRAPH_ID";
 
 /// Default maximum downloaded artifact size: 256 MiB.
 pub const DEFAULT_RELEASE_MAX_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
@@ -562,6 +711,105 @@ pub fn github_app_from_env() -> GithubAppConfig {
     }
 }
 
+/// Tenant runtime limits (minimal infrastructure safeguards).
+///
+/// These ceilings are enforced centrally by the Manager. They are operator
+/// startup configuration only: there is no customer-facing endpoint to raise
+/// them, so only a platform operator (with write access to the Manager
+/// environment) can configure higher limits. Defaults are the minimal
+/// safeguards named by the specification.
+#[derive(Debug, Clone)]
+pub struct TenantLimits {
+    /// Maximum active tenants per organization.
+    pub max_tenants_per_org: i32,
+    /// Maximum workers per tenant, in addition to its Nexus controller.
+    pub max_workers_per_tenant: i32,
+    /// Maximum concurrent provisioning operations per organization. When the
+    /// organization's execution slot is occupied, further provisioning work is
+    /// queued rather than rejected as a resource-limit violation.
+    pub max_concurrent_provisioning_ops: i32,
+}
+
+impl TenantLimits {
+    fn from_env() -> Result<Self, String> {
+        Ok(TenantLimits {
+            max_tenants_per_org: parse_positive(
+                TENANT_MAX_PER_ORG_ENV,
+                DEFAULT_TENANT_MAX_PER_ORG,
+            )?,
+            max_workers_per_tenant: parse_positive(
+                TENANT_MAX_WORKERS_ENV,
+                DEFAULT_TENANT_MAX_WORKERS,
+            )?,
+            max_concurrent_provisioning_ops: parse_positive(
+                TENANT_MAX_PROVISIONING_OPS_ENV,
+                DEFAULT_TENANT_MAX_PROVISIONING_OPS,
+            )?,
+        })
+    }
+}
+
+impl Default for TenantLimits {
+    fn default() -> Self {
+        TenantLimits {
+            max_tenants_per_org: DEFAULT_TENANT_MAX_PER_ORG,
+            max_workers_per_tenant: DEFAULT_TENANT_MAX_WORKERS,
+            max_concurrent_provisioning_ops: DEFAULT_TENANT_MAX_PROVISIONING_OPS,
+        }
+    }
+}
+
+/// Parse a positive-integer environment setting, defaulting when absent.
+fn parse_positive(env: &str, default: i32) -> Result<i32, String> {
+    match std::env::var(env).ok() {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<i32>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("{env} must be a positive integer")),
+        },
+    }
+}
+
+/// Zep context-layer configuration.
+///
+/// Zep is optional: when no `ZEP_API_KEY` is configured, the Manager runs
+/// without Zep and all integration calls become no-ops. When configured, the
+/// API key is held in memory for outbound HTTP calls and never committed,
+/// logged, or exposed in responses.
+#[derive(Debug, Clone)]
+pub struct ZepConfig {
+    /// The Zep API key (from `ZEP_API_KEY`).
+    pub api_key: String,
+    /// Base URL for the Zep v3 REST API.
+    pub api_url: String,
+    /// The shared organization-knowledge graph id.
+    pub org_graph_id: String,
+}
+
+impl ZepConfig {
+    /// Load Zep configuration from the environment. Returns `None` when Zep is
+    /// not configured (no API key), which disables the integration.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let api_key = match std::env::var(ZEP_API_KEY_ENV).ok() {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => return Ok(None),
+        };
+        let api_url = std::env::var(ZEP_API_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::zep::DEFAULT_ZEP_API_URL.to_string());
+        let org_graph_id = std::env::var(ZEP_ORG_GRAPH_ID_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::zep::ontology::ORG_GRAPH_ID.to_string());
+        Ok(Some(ZepConfig {
+            api_key,
+            api_url,
+            org_graph_id,
+        }))
+    }
+}
+
 /// The foundational Manager configuration.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -588,12 +836,23 @@ pub struct ManagerConfig {
     pub coder_url: Option<String>,
     /// Secret-provider reference for the platform-only Coder operator token.
     pub coder_operator_token_ref: Option<String>,
+    pub coder_hook_secret_ref: Option<String>,
     /// The pinned Coder version baseline for readiness.
     pub coder_version_baseline: String,
     /// The operator-configured provisioner backend adapter.
     pub provisioner_backend: String,
+    /// Privileged Redis endpoint used only by the Manager to create/revoke ACL
+    /// users and clear immutable tenant namespaces.
+    pub redis_admin_url: Option<String>,
+    /// Non-privileged Redis origin placed into per-workspace secret material;
+    /// tenant username/password are added by the injection backend.
+    pub runtime_redis_url: Option<String>,
     /// The operator-configured template release source.
     pub release_source: ReleaseSourceConfig,
+    /// Tenant runtime limits (minimal infrastructure safeguards).
+    pub tenant_limits: TenantLimits,
+    /// Zep context-layer configuration. `None` disables Zep integration.
+    pub zep: Option<ZepConfig>,
 }
 
 impl ManagerConfig {
@@ -629,14 +888,27 @@ impl ManagerConfig {
         let coder_operator_token_ref = std::env::var(CODER_OPERATOR_TOKEN_REF_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty());
+        let coder_hook_secret_ref = std::env::var(CODER_HOOK_SECRET_REF_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let coder_version_baseline = std::env::var(CODER_VERSION_BASELINE_ENV)
             .unwrap_or_else(|_| DEFAULT_CODER_VERSION_BASELINE.to_string());
         let provisioner_backend = std::env::var(PROVISIONER_BACKEND_ENV)
             .unwrap_or_else(|_| DEFAULT_PROVISIONER_BACKEND.to_string());
+        let redis_admin_url = std::env::var(REDIS_ADMIN_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let runtime_redis_url = std::env::var(RUNTIME_REDIS_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
 
         let release_source = ReleaseSourceConfig::from_env()?;
 
         let auth = auth_from_env(mode == Mode::Hosted, crypto_master_key_ref.clone())?;
+
+        let tenant_limits = TenantLimits::from_env()?;
+
+        let zep = ZepConfig::from_env()?;
 
         if mode == Mode::Hosted || !auth.client_id.is_empty() {
             auth.validate_origin()?;
@@ -648,12 +920,16 @@ impl ManagerConfig {
                         "hosted mode requires {DATABASE_URL_ENV}; refusing to fall back to local mode"
                     )
                 })?;
-                if configured_secret_provider.is_none()
-                    || secret_provider == DEFAULT_SECRET_PROVIDER
-                {
+                if secret_provider != crate::secrets::AWS_SECRETS_MANAGER_PROVIDER {
                     return Err(format!(
-                        "hosted mode requires a durable {SECRET_PROVIDER_ENV}; in-memory is local/test only"
+                        "hosted mode requires {SECRET_PROVIDER_ENV}=aws-secrets-manager; filesystem and in-memory are local/test only"
                     ));
+                }
+                if std::env::var(AWS_SECRETS_PREFIX_ENV)
+                    .ok()
+                    .is_none_or(|prefix| prefix.trim().is_empty())
+                {
+                    return Err(format!("hosted mode requires {AWS_SECRETS_PREFIX_ENV}"));
                 }
                 // Missing hosted authentication configuration must fail closed.
                 let github_client_secret_ref = github_client_secret_ref.ok_or_else(|| {
@@ -681,6 +957,17 @@ impl ManagerConfig {
                 let coder_operator_token_ref = coder_operator_token_ref.ok_or_else(|| {
                     format!("hosted mode requires {CODER_OPERATOR_TOKEN_REF_ENV}")
                 })?;
+                let coder_hook_secret_ref = coder_hook_secret_ref
+                    .ok_or_else(|| format!("hosted mode requires {CODER_HOOK_SECRET_REF_ENV}"))?;
+                let redis_admin_url = redis_admin_url
+                    .ok_or_else(|| format!("hosted mode requires {REDIS_ADMIN_URL_ENV}"))?;
+                let runtime_redis_url = runtime_redis_url
+                    .ok_or_else(|| format!("hosted mode requires {RUNTIME_REDIS_URL_ENV}"))?;
+                if provisioner_backend == DEFAULT_PROVISIONER_BACKEND {
+                    return Err(format!(
+                        "hosted mode refuses shared Docker provisioning: set {PROVISIONER_BACKEND_ENV} to a backend with validated per-tenant network and secret-mount isolation"
+                    ));
+                }
                 Ok(ManagerConfig {
                     mode,
                     database_url: Some(database_url),
@@ -692,9 +979,14 @@ impl ManagerConfig {
                     crypto_master_key_ref: Some(crypto_master_key_ref),
                     coder_url: Some(coder_url),
                     coder_operator_token_ref: Some(coder_operator_token_ref),
+                    coder_hook_secret_ref: Some(coder_hook_secret_ref),
                     coder_version_baseline,
                     provisioner_backend,
+                    redis_admin_url: Some(redis_admin_url),
+                    runtime_redis_url: Some(runtime_redis_url),
                     release_source,
+                    tenant_limits,
+                    zep,
                 })
             }
             Mode::Local => Ok(ManagerConfig {
@@ -708,9 +1000,14 @@ impl ManagerConfig {
                 crypto_master_key_ref,
                 coder_url,
                 coder_operator_token_ref,
+                coder_hook_secret_ref,
                 coder_version_baseline,
                 provisioner_backend,
+                redis_admin_url,
+                runtime_redis_url,
                 release_source,
+                tenant_limits,
+                zep,
             }),
         }
     }
@@ -740,8 +1037,11 @@ pub fn local_test_config() -> ManagerConfig {
         crypto_master_key_ref: None,
         coder_url: None,
         coder_operator_token_ref: None,
+        coder_hook_secret_ref: None,
         coder_version_baseline: DEFAULT_CODER_VERSION_BASELINE.to_string(),
         provisioner_backend: DEFAULT_PROVISIONER_BACKEND.to_string(),
+        redis_admin_url: None,
+        runtime_redis_url: None,
         github_app: GithubAppConfig {
             app_id: None,
             app_slug: None,
@@ -750,6 +1050,12 @@ pub fn local_test_config() -> ManagerConfig {
             webhook_body_limit: DEFAULT_WEBHOOK_BODY_LIMIT,
         },
         release_source: ReleaseSourceConfig::Local,
+        tenant_limits: TenantLimits {
+            max_tenants_per_org: DEFAULT_TENANT_MAX_PER_ORG,
+            max_workers_per_tenant: DEFAULT_TENANT_MAX_WORKERS,
+            max_concurrent_provisioning_ops: DEFAULT_TENANT_MAX_PROVISIONING_OPS,
+        },
+        zep: None,
     }
 }
 
@@ -791,8 +1097,11 @@ mod tests {
         MODE_ENV,
         DATABASE_URL_ENV,
         SECRET_PROVIDER_ENV,
+        AWS_SECRETS_PREFIX_ENV,
         GITHUB_CLIENT_ID_ENV,
         PUBLIC_URL_ENV,
+        RUNTIME_MANAGER_URL_ENV,
+        "OPENFLOWS_HOOK_URL",
         GITHUB_CLIENT_SECRET_REF_ENV,
         CRYPTO_MASTER_KEY_REF_ENV,
         GITHUB_APP_ID_ENV,
@@ -802,8 +1111,11 @@ mod tests {
         WEBHOOK_BODY_LIMIT_ENV,
         CODER_URL_ENV,
         CODER_OPERATOR_TOKEN_REF_ENV,
+        CODER_HOOK_SECRET_REF_ENV,
         CODER_VERSION_BASELINE_ENV,
         PROVISIONER_BACKEND_ENV,
+        REDIS_ADMIN_URL_ENV,
+        RUNTIME_REDIS_URL_ENV,
         RELEASE_SOURCE_ENV,
         TEMPLATE_REPOSITORY_ENV,
         TEMPLATE_RELEASE_TAG_ENV,
@@ -813,15 +1125,60 @@ mod tests {
         RELEASE_MAX_DOWNLOAD_BYTES_ENV,
         RELEASE_TIMEOUT_SECS_ENV,
         RELEASE_CACHE_DIR_ENV,
+        TENANT_MAX_PER_ORG_ENV,
+        TENANT_MAX_WORKERS_ENV,
+        TENANT_MAX_PROVISIONING_OPS_ENV,
+        ZEP_API_KEY_ENV,
+        ZEP_API_URL_ENV,
+        ZEP_ORG_GRAPH_ID_ENV,
     ];
+
+    #[test]
+    fn runtime_manager_origin_can_use_private_container_route() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(RUNTIME_MANAGER_URL_ENV, "http://host.docker.internal:3002");
+        assert_eq!(
+            runtime_manager_url("https://public.example").unwrap(),
+            "http://host.docker.internal:3002"
+        );
+        std::env::set_var(
+            RUNTIME_MANAGER_URL_ENV,
+            "http://user:pass@host:3002/private",
+        );
+        assert!(runtime_manager_url("https://public.example").is_err());
+    }
+
+    #[test]
+    fn coder_hook_audience_can_use_private_container_route() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://host.docker.internal:3002/api/v1/hooks/coder/chat",
+        );
+        assert_eq!(
+            coder_hook_url("https://public.example").unwrap(),
+            "http://host.docker.internal:3002/api/v1/hooks/coder/chat"
+        );
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://host.docker.internal:3002/wrong",
+        );
+        assert!(coder_hook_url("https://public.example").is_err());
+    }
 
     /// Set the env required for a hosted-mode config that should validate.
     fn set_hosted_env() {
         std::env::set_var(MODE_ENV, "hosted");
         std::env::set_var(DATABASE_URL_ENV, "postgres://hosted.example/control");
-        std::env::set_var(SECRET_PROVIDER_ENV, "vault");
+        std::env::set_var(SECRET_PROVIDER_ENV, "aws-secrets-manager");
+        std::env::set_var(AWS_SECRETS_PREFIX_ENV, "openflows/staging");
         std::env::set_var(GITHUB_CLIENT_ID_ENV, "client-id");
         std::env::set_var(PUBLIC_URL_ENV, "https://openflows.example.com");
+        std::env::set_var(CODER_HOOK_SECRET_REF_ENV, "ref:coder-hook-secret");
+        std::env::set_var(REDIS_ADMIN_URL_ENV, "redis://admin:secret@redis:6379");
+        std::env::set_var(RUNTIME_REDIS_URL_ENV, "redis://redis:6379");
         std::env::set_var(GITHUB_CLIENT_SECRET_REF_ENV, "ref:github-client-secret");
         std::env::set_var(CRYPTO_MASTER_KEY_REF_ENV, "ref:crypto-master-key");
         std::env::set_var(GITHUB_APP_ID_ENV, "123456");
@@ -830,6 +1187,7 @@ mod tests {
         std::env::set_var(GITHUB_WEBHOOK_SECRET_REF_ENV, "ref:github-webhook-secret");
         std::env::set_var(CODER_URL_ENV, "https://coder.example.com");
         std::env::set_var(CODER_OPERATOR_TOKEN_REF_ENV, "ref:coder-operator-token");
+        std::env::set_var(PROVISIONER_BACKEND_ENV, "kubernetes");
     }
 
     #[test]
@@ -886,12 +1244,24 @@ mod tests {
             cfg.database_url.as_deref(),
             Some("postgres://hosted.example/control")
         );
-        assert_eq!(cfg.secret_provider, "vault");
+        assert_eq!(cfg.secret_provider, "aws-secrets-manager");
         // Hosted mode requires the auth secret refs.
         assert!(cfg.github_client_secret_ref.is_some());
         assert!(cfg.crypto_master_key_ref.is_some());
         // Master key is resolved later from the provider (None here).
         assert!(cfg.auth.master_key.is_none());
+        assert_eq!(cfg.provisioner_backend, "kubernetes");
+    }
+
+    #[test]
+    fn hosted_mode_rejects_unisolated_shared_docker_backend() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::set_var(PROVISIONER_BACKEND_ENV, DEFAULT_PROVISIONER_BACKEND);
+
+        let error = ManagerConfig::from_env().unwrap_err();
+        assert!(error.contains("refuses shared Docker provisioning"));
     }
 
     #[test]
@@ -903,6 +1273,28 @@ mod tests {
 
         let err = ManagerConfig::from_env().unwrap_err();
         assert!(err.contains(SECRET_PROVIDER_ENV));
+    }
+
+    #[test]
+    fn hosted_mode_rejects_filesystem_secrets() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::set_var(SECRET_PROVIDER_ENV, "filesystem");
+
+        let err = ManagerConfig::from_env().unwrap_err();
+        assert!(err.contains("aws-secrets-manager"));
+    }
+
+    #[test]
+    fn hosted_mode_requires_aws_namespace() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::remove_var(AWS_SECRETS_PREFIX_ENV);
+
+        let err = ManagerConfig::from_env().unwrap_err();
+        assert!(err.contains(AWS_SECRETS_PREFIX_ENV));
     }
 
     #[test]
@@ -1091,5 +1483,70 @@ mod tests {
 
         let cfg = ManagerConfig::from_env().unwrap();
         assert!(matches!(cfg.release_source, ReleaseSourceConfig::Local));
+    }
+
+    #[test]
+    fn tenant_limits_default_to_minimal_safeguards_and_validate() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::remove_var(TENANT_MAX_PER_ORG_ENV);
+        std::env::remove_var(TENANT_MAX_WORKERS_ENV);
+        std::env::remove_var(TENANT_MAX_PROVISIONING_OPS_ENV);
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert_eq!(cfg.tenant_limits.max_tenants_per_org, 2);
+        assert_eq!(cfg.tenant_limits.max_workers_per_tenant, 2);
+        assert_eq!(cfg.tenant_limits.max_concurrent_provisioning_ops, 1);
+
+        std::env::set_var(TENANT_MAX_PER_ORG_ENV, "5");
+        std::env::set_var(TENANT_MAX_WORKERS_ENV, "3");
+        std::env::set_var(TENANT_MAX_PROVISIONING_OPS_ENV, "2");
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert_eq!(cfg.tenant_limits.max_tenants_per_org, 5);
+        assert_eq!(cfg.tenant_limits.max_workers_per_tenant, 3);
+        assert_eq!(cfg.tenant_limits.max_concurrent_provisioning_ops, 2);
+
+        std::env::set_var(TENANT_MAX_PER_ORG_ENV, "0");
+        assert!(ManagerConfig::from_env().is_err());
+        std::env::set_var(TENANT_MAX_PER_ORG_ENV, "abc");
+        assert!(ManagerConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn zep_is_disabled_without_an_api_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::remove_var(ZEP_API_KEY_ENV);
+        std::env::remove_var(ZEP_API_URL_ENV);
+        std::env::remove_var(ZEP_ORG_GRAPH_ID_ENV);
+        assert!(ZepConfig::from_env().unwrap().is_none());
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert!(cfg.zep.is_none());
+    }
+
+    #[test]
+    fn zep_defaults_apply_when_only_the_api_key_is_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(ZEP_API_KEY_ENV, "zep_test_key");
+        std::env::remove_var(ZEP_API_URL_ENV);
+        std::env::remove_var(ZEP_ORG_GRAPH_ID_ENV);
+        let zep = ZepConfig::from_env().unwrap().expect("zep configured");
+        assert_eq!(zep.api_key, "zep_test_key");
+        assert_eq!(zep.api_url, crate::zep::DEFAULT_ZEP_API_URL);
+        assert_eq!(zep.org_graph_id, crate::zep::ontology::ORG_GRAPH_ID);
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert!(cfg.zep.is_some());
+    }
+
+    #[test]
+    fn zep_url_and_org_graph_override_are_honored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        std::env::set_var(ZEP_API_KEY_ENV, "zep_test_key");
+        std::env::set_var(ZEP_API_URL_ENV, "https://zep.example.com/api/v2");
+        std::env::set_var(ZEP_ORG_GRAPH_ID_ENV, "custom-org-graph");
+        let zep = ZepConfig::from_env().unwrap().expect("zep configured");
+        assert_eq!(zep.api_url, "https://zep.example.com/api/v2");
+        assert_eq!(zep.org_graph_id, "custom-org-graph");
     }
 }

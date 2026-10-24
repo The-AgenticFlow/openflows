@@ -148,7 +148,7 @@ pub fn to_http_response(error: &ManagerError) -> (u16, serde_json::Value) {
 fn api_status(code: &str) -> u16 {
     match code {
         "NOT_FOUND" | "RESOURCE_NOT_FOUND" => 404,
-        "CONFLICT" | "INSTALLATION_ALREADY_BOUND" => 409,
+        "CONFLICT" | "INSTALLATION_ALREADY_BOUND" | "CODER_SCOPE_MISMATCH" => 409,
         "INVALID_INPUT" | "DEVICE_CODE_INVALID" => 422,
         "UNAUTHORIZED" | "MISSING_AUTH" | "AUTH_FAILED" | "CSRF_FAILED" => 401,
         "FORBIDDEN"
@@ -164,8 +164,19 @@ fn api_status(code: &str) -> u16 {
         | "CONNECTION_UNAVAILABLE"
         | "REPOSITORY_UNAVAILABLE"
         | "AUTH_CHANGED" => 403,
-        "RATE_LIMITED" | "TOO_MANY_REQUESTS" => 429,
-        "SERVICE_UNAVAILABLE" | "GITHUB_UNAVAILABLE" => 503,
+        "CODER_REAUTH_REQUIRED" | "CODER_CHAT_FORBIDDEN" => 403,
+        "RATE_LIMITED" | "TOO_MANY_REQUESTS" | "TENANT_LIMIT_REACHED" | "WORKER_LIMIT_REACHED" => {
+            429
+        }
+        "SERVICE_UNAVAILABLE"
+        | "GITHUB_UNAVAILABLE"
+        | "CODER_UNAVAILABLE"
+        | "CODER_CHAT_UNAVAILABLE"
+        | "TEMPLATE_PROMOTION_DB_FAILED" => 503,
+        "CODER_TEMPLATE_ACCESS_DENIED"
+        | "CODER_TEMPLATE_API_NOT_FOUND"
+        | "CODER_TEMPLATE_REJECTED"
+        | "CODER_INVALID_RESPONSE" => 502,
         "GITHUB_OAUTH_ERROR" => 401,
         _ => 500,
     }

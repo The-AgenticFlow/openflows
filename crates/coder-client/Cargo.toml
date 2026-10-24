@@ -6,6 +6,7 @@ license = "MIT"
 description = "Client library for the Coder REST API"
 
 [dependencies]
+flate2 = "1"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
@@ -20,6 +21,7 @@ sha2 = "0.10"
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.26", optional = true, features = ["rustls-tls-webpki-roots"] }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

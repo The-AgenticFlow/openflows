@@ -80,6 +80,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # password / hash-free secret handling uses a lightweight SHA-256 crate
 sha2 = "0.10"
+zeroize = "1"
 
 # opaque cursor encoding
 base64 = "0.22"

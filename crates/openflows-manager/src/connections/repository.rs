@@ -700,6 +700,33 @@ impl ConnectionRepository {
         .map_err(ManagerError::from)?;
         Ok(rows.into_iter().map(RepositoryRow::from).collect())
     }
+
+    /// Resolve a GitHub `owner/repository` name to the immutable repository id
+    /// only when an active installation in this organization currently has
+    /// access to it.
+    pub async fn accessible_repository_id(
+        &self,
+        organization_id: OrganizationId,
+        full_name: &str,
+    ) -> Result<Option<i64>, ManagerError> {
+        sqlx::query_scalar(
+            "SELECT r.github_repository_id
+               FROM github_repositories r
+               JOIN github_connections c
+                 ON c.id = r.connection_id AND c.organization_id = r.organization_id
+              WHERE r.organization_id = $1
+                AND lower(r.full_name) = lower($2)
+                AND r.accessible = true
+                AND c.status = 'active'
+              ORDER BY r.github_repository_id
+              LIMIT 1",
+        )
+        .bind(organization_id.0)
+        .bind(full_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ManagerError::from)
+    }
 }
 
 type AttemptTuple = (

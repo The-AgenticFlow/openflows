@@ -20,12 +20,43 @@ bindings are backfilled by most recent creation time, with release ID breaking
 ties. Successful organization readiness, release selection, and operation
 completion are now committed together. Startup preserves retired releases.
 
-The current real Coder adapter expects an operator-managed provisioner daemon
-using the key name `openflows-provisioner-<coder-organization-id>`. Only `idle`
-or `busy` daemons with that key qualify as online. Readiness does not create or
-discard provisioner credentials. Automatic backend deployment and the real
-template upload API remain unfinished work; passing fixture tests does
-not establish live Coder compatibility.
+Failed template imports receive at most three attempts per organization, role,
+and release. Replacement versions use deterministic `-retry-1` / `-retry-2`
+suffixes; successful and still-running imports are reused. Coder's top-level
+job error can hide the underlying provider-download failure, so this bounded
+retry policy applies to failed imports generally. Cancelled jobs are not
+automatically replaced. Repeated failures still prevent organization readiness.
+The test console's operation ID field and **Retry operation** button can requeue
+an existing failed `org.provision` operation with `IMPORT_FAILED`, including
+operations created before this recovery support. Retrying does not reset the
+three-version import budget.
+
+With `OPENFLOWS_PROVISIONER_BACKEND=docker`, Manager automatically reserves a
+key identity, creates its Coder provisioner key, encrypts the credential in
+`managed_provisioners`, and starts an organization-specific Docker container.
+Only an `idle` or `busy` daemon authenticated with that key qualifies as ready.
+Retries reuse the key and container. Interrupted key creation is recovered by
+revoking only the uniquely reserved key before recreating it. Docker's
+`unless-stopped` policy handles process/host restarts, and a Manager loop every
+30 seconds restores missing or stopped containers for active organizations.
+
+The Docker host must be trusted: provisioners mount its Docker socket. Each
+container receives only its own credential file (0600) from
+`OPENFLOWS_PROVISIONER_SECRET_DIR` (default `.local/provisioners`, directory
+0700). Keep this directory durable and at the same absolute path for all
+Manager replicas sharing the Docker host. For a containerized Manager, mount
+the directory at the same path on host and Manager and supply Docker access.
+The master key must remain stable so stored credentials can be decrypted.
+
+`OPENFLOWS_PROVISIONER_CODER_URL` overrides the container-facing Coder URL;
+otherwise loopback addresses become `host.docker.internal`. Optional settings
+are `OPENFLOWS_PROVISIONER_NETWORK`, `OPENFLOWS_PROVISIONER_IMAGE` (defaults to
+the pinned Coder version), `OPENFLOWS_PROVISIONER_DOCKER_SOCKET`, and
+`OPENFLOWS_DOCKER_BINARY`. Docker Desktop's bundled CLI is detected on macOS.
+Other backends still require an operator-managed daemon with key name
+`openflows-provisioner-<coder-organization-id>`; Kubernetes launch automation
+is not provided by this Docker implementation. Template publication and tenant
+execution must still be validated separately from provisioner readiness.
 
 Ordinary tests require no PostgreSQL server:
 
@@ -118,3 +149,11 @@ cargo run -p openflows-manager
 ```sh
 cargo test -p openflows-manager provisioning::source
 ```
+
+# Deployment commands
+
+Use `openflows-manager --config .env.openflows setup`, then `doctor` and `serve`.
+From source, prefix each with `cargo run -p openflows-manager --` instead of
+`openflows-manager`. See the [operator deployment guide](../../docs/implementation/centralized-deployment/operator-deployment.md)
+for the shared configuration file, generated credentials, local Compose stack,
+and the remaining production isolation requirement.

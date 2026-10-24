@@ -66,6 +66,20 @@ impl ReleaseService {
             super::packaging::validate_archive(archive)?;
         }
 
+        // A release label is an immutable operator-visible identity. Returning
+        // an existing release is safe only when the complete manifest digest
+        // matches; silently accepting different bytes here would let a
+        // restarted deployment alter releases already bound to organizations.
+        if let Some((existing, _)) = self.repo.get_release_by_version(&manifest.release).await? {
+            if existing.manifest_sha256 == digest {
+                return Ok((ReleaseId::from_uuid(existing.id), digest));
+            }
+            return Err(ManagerError::Conflict(format!(
+                "configured template release '{}' differs from the immutable release already stored (stored manifest digest {}, configured manifest digest {}); publish the changed templates under a new OPENFLOWS_RELEASE_NAME",
+                manifest.release, existing.manifest_sha256, digest
+            )));
+        }
+
         let release_id = ReleaseId::new();
         if let Err(error) = self
             .repo
@@ -314,8 +328,57 @@ async fn organization_coder_org(
         })
 }
 
-/// The deterministic internal Coder organization name derived from an
-/// Openflows organization id. Never a customer-chosen name.
+/// The deterministic, compact internal Coder organization name derived from
+/// an Openflows organization id. UUID bytes are base32-encoded without
+/// padding so the result stays within common Coder organization-name limits
+/// while retaining all 128 bits of identity. Never customer-chosen.
 pub fn internal_org_name(organization_id: OrganizationId) -> String {
-    format!("of-{}", organization_id.0)
+    const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+    let mut encoded = String::with_capacity(26);
+    let mut accumulator = 0u32;
+    let mut bits = 0u8;
+    for byte in organization_id.0.as_bytes() {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            encoded.push(BASE32[((accumulator >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        encoded.push(BASE32[((accumulator << (5 - bits)) & 0x1f) as usize] as char);
+    }
+
+    format!("of-{encoded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_org_name;
+    use crate::id::OrganizationId;
+    use uuid::Uuid;
+
+    #[test]
+    fn coder_organization_name_is_compact_and_deterministic() {
+        let id = OrganizationId::from_uuid(
+            Uuid::parse_str("25725444-cf89-4edc-ab66-d4d9dd42e7d8").unwrap(),
+        );
+        let name = internal_org_name(id);
+
+        assert_eq!(name, "of-evzfirgprfhnzk3g2tm52qxh3a");
+        assert!(name.len() <= 32);
+        assert!(name.chars().all(|character| character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || character == '-'));
+        assert_eq!(internal_org_name(id), name);
+    }
+
+    #[test]
+    fn coder_organization_names_are_unique_for_distinct_ids() {
+        let first = OrganizationId::from_uuid(Uuid::from_u128(1));
+        let second = OrganizationId::from_uuid(Uuid::from_u128(2));
+
+        assert_ne!(internal_org_name(first), internal_org_name(second));
+    }
 }

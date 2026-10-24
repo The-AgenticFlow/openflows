@@ -254,6 +254,19 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let store =
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
+    let runtime_control = agent_nexus::runtime_control::RuntimeControlClient::from_env()?;
+    if let Some(runtime) = runtime_control.clone() {
+        // Registration establishes identity. Periodic heartbeats establish
+        // controller liveness after Redis and tenant configuration are ready.
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = runtime.heartbeat().await {
+                    tracing::warn!(%error, "Manager runtime heartbeat failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
     if reset_store {
         let cleared = reset_tenant_runtime_state(&store).await;
         tracing::info!(
@@ -310,6 +323,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
+    if let Some(artifacts_dir) = std::env::var_os("ARTIFACTS_DIR") {
+        openflows::orchestration::publish_worker_hooks(std::path::Path::new(&artifacts_dir))
+            .context("Failed to publish hooks to the shared worker artifacts volume")?;
+    }
 
     let registry_path = resolver.registry_path();
     // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
@@ -401,6 +418,9 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
     let mut nexus_node = openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone());
+    if let Some(runtime) = runtime_control {
+        nexus_node = nexus_node.with_runtime_control(runtime);
+    }
     if let Some(ref relay) = a2a_relay {
         nexus_node = nexus_node.with_a2a_relay(relay.clone());
     }
@@ -537,7 +557,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 // Transient errors (Redis drops, Coder API timeouts, GitHub
                 // rate limits) should not stop the orchestration loop.
                 tracing::error!(
-                    error = %e,
+                    error = %format!("{e:#}"),
                     poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
                     "Controller flow pass failed — will retry on next poll (self-healing)"
                 );

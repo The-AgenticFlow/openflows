@@ -70,11 +70,10 @@ Do not infer successful publication from `updated_at` alone. Require successful 
 On org creation, transactionally insert product org, creator membership, audit/outbox, and operation. Return 202. A leased worker executes:
 
 1. Verify supported Coder version, license capabilities, and configured release.
-2. Ensure Coder organization using a deterministic internal name derived from Openflows UUID; persist ID immediately.
+2. Ensure Coder organization using a deterministic internal name derived from Openflows UUID and the exact OpenFlows display name; persist ID immediately.
 3. Ensure organization provisioner credentials and backend deployment; wait for heartbeat with a timeout.
 4. Publish/import the approved template release for that org.
-5. Verify org-scoped model availability and required Agents/chat capability.
-6. Mark org ready only when all required resources are ready. GitHub connection is independent and may occur while provisioning runs; tenant creation requires both readiness and access.
+5. Mark org ready after successful template imports. Model availability and Agents/chat configuration are independent and must not block organization provisioning. GitHub connection is independent and may occur while provisioning runs; tenant creation requires both readiness and access.
 
 Platform startup resumes unfinished operations and reconciles configured releases. It does not create customer organizations speculatively or eagerly start every workspace.
 
@@ -150,6 +149,6 @@ Add `CoderOrganizationId`, `CoderTemplateId`, `CoderTemplateVersionId`, owner-aw
 
 Update Nexus provisioning and all its default-org call sites. Replace local template-hash cache with server-side `(Coder deployment, org, release, role)` records. Update all five templates, controller environment resolution, Git credential setup, and lifecycle hook routing together.
 
-Tests: same template names in two orgs resolve correctly; pinned versions survive promotion; concurrent tenant creation is unique; retries after every step do not duplicate resources; missing provisioner/model/license prevents ready; wrong-owner 409 recovery rejected; no global secrets in build parameters/state/logs; runtime renewal works after 24 hours; Redis ACL and network access to another tenant denied; scoped Coder tokens cannot cross tenant boundaries.
+Tests: same template names in two orgs resolve correctly; pinned versions survive promotion; concurrent tenant creation is unique; retries after every step do not duplicate resources; missing provisioner/license or failed imports prevent ready; missing models do not block organization provisioning; wrong-owner 409 recovery rejected; no global secrets in build parameters/state/logs; runtime renewal works after 24 hours; Redis ACL and network access to another tenant denied; scoped Coder tokens cannot cross tenant boundaries.
 
 References: [organizations](https://coder.com/docs/admin/users/organizations), [template API](https://coder.com/docs/reference/api/templates), [workspace API](https://coder.com/docs/reference/api/workspaces), [machine-user creation](https://coder.com/docs/reference/cli/users/create). Verify exact routes, fields, and permissions against the pinned Coder version before implementing adapters.

@@ -1,9 +1,8 @@
 //! Types for the Coder adapter.
 
 /// The result of verifying a Coder deployment's capabilities during
-/// organization readiness reconciliation. All three must hold for an
-/// organization to become ready; a missing license, provisioner, model, or
-/// template prerequisite must produce an explicit not-ready state.
+/// organization readiness reconciliation. Version and license are prerequisites
+/// for provisioning; model/chat capability is independent of template readiness.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoderCapabilities {
     /// The operator-required Coder version baseline is met.
@@ -48,3 +47,14 @@ pub struct TemplatePublicationResult {
 
 /// Re-export the org id type for convenience.
 pub use coder_client::CoderOrganizationId as OrgId;
+
+/// The Coder machine owner (service account) id that owns a tenant's
+/// workspaces. Verified to belong only to the tenant's organization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CoderOwnerId(pub String);
+
+impl CoderOwnerId {
+    pub fn new(id: impl Into<String>) -> Self {
+        CoderOwnerId(id.into())
+    }
+}

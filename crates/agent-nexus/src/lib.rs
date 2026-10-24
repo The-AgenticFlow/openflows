@@ -29,6 +29,7 @@ use tracing::{debug, error, info, warn};
 
 pub mod a2a;
 pub mod hooks;
+pub mod runtime_control;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
 /// (Inlined from the deleted agent-client crate.)
@@ -252,6 +253,7 @@ pub struct NexusNode {
     pub persona_path: PathBuf,
     pub registry_path: PathBuf,
     pub a2a_relay: Option<std::sync::Arc<crate::a2a::A2ARelay>>,
+    runtime_control: Option<runtime_control::RuntimeControlClient>,
 }
 
 impl NexusNode {
@@ -260,6 +262,7 @@ impl NexusNode {
             persona_path: persona_path.into(),
             registry_path: registry_path.into(),
             a2a_relay: None,
+            runtime_control: None,
         }
     }
 
@@ -267,6 +270,11 @@ impl NexusNode {
     /// and surface pending verify tasks in orchestration decisions.
     pub fn with_a2a_relay(mut self, relay: std::sync::Arc<crate::a2a::A2ARelay>) -> Self {
         self.a2a_relay = Some(relay);
+        self
+    }
+
+    pub fn with_runtime_control(mut self, runtime: runtime_control::RuntimeControlClient) -> Self {
+        self.runtime_control = Some(runtime);
         self
     }
 
@@ -296,6 +304,17 @@ impl NexusNode {
             .ok()
             .and_then(|e| e.github.resolve_token())
             .filter(|t| !t.is_empty())
+    }
+
+    async fn github_api_token(&self) -> Result<String> {
+        if let Some(runtime) = &self.runtime_control {
+            return runtime.github_api_token().await;
+        }
+        self.resolve_github_token()
+            .ok()
+            .filter(|token| !token.is_empty())
+            .or_else(|| self.resolve_github_token_from_env_or_file())
+            .context("GitHub token is not configured")
     }
 
     fn load_registry(&self) -> Result<Registry> {
@@ -382,21 +401,15 @@ Before significant work, read the relevant skill file to understand the workflow
             return Ok(());
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => t,
-                None => {
-                    warn!("GitHub token not configured, skipping issue sync");
-                    return Ok(());
-                }
-            },
-        };
+        let token = self.github_api_token().await?;
 
         let client = github::GithubRestClient::new(&token);
         let gh_issues = match client.list_open_issues(owner, repo_name).await {
             Ok(issues) => issues,
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("GitHub issue API request failed"));
+                }
                 warn!(error = %e, "GitHub API request failed during issue sync");
                 return Ok(());
             }
@@ -450,24 +463,15 @@ Before significant work, read the relevant skill file to understand the workflow
             return Ok(());
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) => t,
-            Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => {
-                    info!("Using GitHub token from env / external auth / token file for PR sync");
-                    t
-                }
-                None => {
-                    warn!("GitHub token not configured, skipping PR sync");
-                    return Ok(());
-                }
-            },
-        };
+        let token = self.github_api_token().await?;
 
         let client = github::GithubRestClient::new(&token);
         let gh_prs = match client.list_open_prs(owner, repo_name).await {
             Ok(prs) => prs,
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("GitHub pull request API request failed"));
+                }
                 warn!(error = %e, "Failed to fetch open PRs from GitHub");
                 return Ok(());
             }
@@ -813,9 +817,16 @@ Before significant work, read the relevant skill file to understand the workflow
     }
 
     async fn sync_registry(&self, store: &SharedStore) -> Result<()> {
-        let registry = self
+        let mut registry = self
             .load_registry()
             .context("Cannot initialize worker fleet from registry")?;
+        if let Ok(value) = std::env::var("OPENFLOWS_FLEET_SIZE") {
+            let pairs: u32 = value
+                .parse()
+                .context("OPENFLOWS_FLEET_SIZE must be a positive integer")?;
+            anyhow::ensure!(pairs > 0, "OPENFLOWS_FLEET_SIZE must be positive");
+            registry = registry.with_team_fleet(pairs);
+        }
         anyhow::ensure!(
             !registry.forge_slots().is_empty(),
             "Worker fleet has no enabled FORGE slots; check enabled and max_instances in {}",
@@ -906,6 +917,12 @@ Before significant work, read the relevant skill file to understand the workflow
         worker_id: &str,
         ticket_id: &str,
     ) -> Result<Option<String>> {
+        if let Some(runtime) = &self.runtime_control {
+            return self
+                .provision_managed_workspace(store, runtime, worker_id, ticket_id)
+                .await;
+        }
+
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let existing_workspace_id = match slots.get(worker_id) {
@@ -1175,6 +1192,96 @@ Before significant work, read the relevant skill file to understand the workflow
         Ok(Some(workspace.id))
     }
 
+    /// Hosted workers are created by Manager from the authenticated Nexus
+    /// runtime scope.  The controller supplies only scheduling data; Manager
+    /// resolves the organization, creator-owned Coder identity, release, and
+    /// secret mounts.  This deliberately avoids obtaining any Coder credential
+    /// inside the customer workspace.
+    async fn provision_managed_workspace(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let slot = slots
+            .get(worker_id)
+            .context("worker slot disappeared while provisioning")?;
+
+        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+            let status = runtime.worker_status(workspace_id).await?;
+            if status.desired_state == "running" && status.observed_state == "running" {
+                info!(
+                    worker_id,
+                    workspace_id,
+                    role = %status.role,
+                    slot = ?status.slot,
+                    "Managed worker workspace is ready"
+                );
+                return Ok(Some(workspace_id.to_string()));
+            }
+            anyhow::bail!(
+                "managed worker workspace {} is still {} / {}",
+                workspace_id,
+                status.desired_state,
+                status.observed_state
+            );
+        }
+
+        let role = Self::worker_role(worker_id);
+        let slot_number = worker_id
+            .rsplit_once('-')
+            .and_then(|(_, value)| value.parse::<i32>().ok());
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
+        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
+            )
+            .await;
+        let idempotency_store_key = format!("runtime:worker-request:{worker_id}:{ticket_id}");
+        let idempotency_key: String = store
+            .get_typed(&idempotency_store_key)
+            .await
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        store
+            .set(&idempotency_store_key, json!(idempotency_key))
+            .await;
+
+        let requested = runtime
+            .request_worker(
+                role,
+                slot_number,
+                Some(ticket_id),
+                (!branch.is_empty()).then_some(branch.as_str()),
+                Some(&a2a_pair_token),
+                &idempotency_key,
+            )
+            .await?;
+        if let Some(slot) = slots.get_mut(worker_id) {
+            slot.workspace_id = Some(requested.workspace_id.clone());
+        }
+        store
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(&slots)?)
+            .await;
+        info!(
+            worker_id,
+            ticket_id,
+            workspace_id = %requested.workspace_id,
+            operation_id = %requested.operation_id,
+            status = %requested.status,
+            "Requested managed worker workspace"
+        );
+        anyhow::bail!(
+            "managed worker workspace {} is queued; it will be adopted after Manager reports it ready",
+            requested.workspace_id
+        );
+    }
+
     /// A persisted workspace ID is not proof that instruction provisioning succeeded.
     async fn ensure_workspace_instructions(
         &self,
@@ -1339,6 +1446,16 @@ Before significant work, read the relevant skill file to understand the workflow
         // Generic recovery uses a different chat key and would create a second
         // reviewer (and overwrite its dispatch with builder instructions).
         if Self::worker_role(worker_id) == "sentinel" {
+            return;
+        }
+
+        if let Some(runtime) = &self.runtime_control {
+            if let Err(error) = self
+                .create_managed_chat_for_assignment(store, runtime, worker_id, ticket)
+                .await
+            {
+                warn!(worker_id, ticket_id, error = %error, "Managed Chat creation deferred; retrying on next poll");
+            }
             return;
         }
 
@@ -1674,6 +1791,7 @@ Use `openflows-harness` for all coordination:
 
         let chat_req = CreateChatRequest {
             organization_id,
+            owner_id: None,
             workspace_id: workspace_id.clone(),
             model_config_id,
             content: vec![coder_client::types::ChatInputPart::text(initial_prompt)],
@@ -1815,6 +1933,55 @@ Use `openflows-harness` for all coordination:
         // Store workspace_id mapping
         let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
         store.set(&ws_key, json!(workspace_id)).await;
+    }
+
+    async fn create_managed_chat_for_assignment(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        worker_id: &str,
+        ticket: &Ticket,
+    ) -> Result<()> {
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let workspace_id = slots
+            .get(worker_id)
+            .and_then(|slot| slot.workspace_id.as_deref())
+            .context("worker workspace is not assigned yet")?;
+        let role = Self::worker_role(worker_id);
+        let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, role);
+        let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, role);
+        let prompt = format!(
+            "You are the OpenFlows {role} agent for ticket {id}.\n\nTitle: {title}\n\n{body}\n\nRead /home/coder/workspace/AGENTS.md and /home/coder/workspace/{role}.agent.md if present. Read `openflows-harness dispatch read` and `openflows-harness status get`, then write a plan and report `plan_ready` before implementation.",
+            id=ticket.id, title=ticket.title, body=ticket.body,
+        );
+        let chat = runtime
+            .create_chat(workspace_id, &ticket.id, &prompt)
+            .await?;
+        if chat.workspace_id != workspace_id {
+            anyhow::bail!("Manager returned a Chat for a different workspace");
+        }
+        store.set(&chat_key, json!(chat.chat_id)).await;
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, role),
+                json!("started"),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role),
+                json!(workspace_id),
+            )
+            .await;
+        let mut dispatch: serde_json::Value = store.get_typed(&dispatch_key).await
+            .unwrap_or_else(|| json!({"ticket_id":ticket.id,"title":ticket.title,"body":ticket.body,"branch":ticket.branch}));
+        if let Some(obj) = dispatch.as_object_mut() {
+            obj.insert("chat_id".into(), json!(chat.chat_id));
+        }
+        store.set(&dispatch_key, dispatch).await;
+        info!(worker_id, ticket_id = %ticket.id, chat_id = %chat.chat_id, "Managed Coder Chat ready");
+        Ok(())
     }
 
     /// Send a harness-aware resume prompt to a chat that is stuck.
@@ -2262,6 +2429,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(
@@ -2555,6 +2723,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(&pr_review_prompt)],
@@ -2865,6 +3034,7 @@ Use `openflows-harness` for all coordination:
 
             let chat_req = coder_client::types::CreateChatRequest {
                 organization_id: Some(organization_id),
+                owner_id: None,
                 workspace_id: workspace_id.clone(),
                 model_config_id: None,
                 content: vec![],
@@ -2907,38 +3077,40 @@ Use `openflows-harness` for all coordination:
         store: &SharedStore,
         owner: &str,
         repo_name: &str,
-    ) -> CiReadiness {
+    ) -> Result<CiReadiness> {
         if owner.is_empty() || repo_name.is_empty() {
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
         // Check local CI first - supports current directory AND workspace directories
-        if Self::local_repo_matches(owner, repo_name) && Self::local_ci_config_exists() {
+        if self.runtime_control.is_none()
+            && Self::local_repo_matches(owner, repo_name)
+            && Self::local_ci_config_exists()
+        {
             info!("Local CI configuration found for repository — CI is ready");
             store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
         // Also check workspace directories (e.g., ~/Sandbox/{repo}/.github/workflows)
-        if Self::check_workspace_ci_config(owner, repo_name) {
+        if self.runtime_control.is_none() && Self::check_workspace_ci_config(owner, repo_name) {
             info!(
                 workspace_path = %Self::detect_workspace_path(owner, repo_name).display(),
                 "CI configuration found in workspace directory — CI is ready"
             );
             store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => t,
-                None => {
-                    warn!("GitHub token not configured, assuming CI is ready");
-                    store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                    return CiReadiness::Ready;
+        let token = match self.github_api_token().await {
+            Ok(token) => token,
+            Err(error) => {
+                if self.runtime_control.is_some() {
+                    return Err(error.context("hosted controller cannot verify CI readiness"));
                 }
-            },
+                warn!(%error, "Cannot verify CI readiness without a GitHub credential");
+                return Ok(CiReadiness::Missing);
+            }
         };
 
         let client = github::GithubRestClient::new(&token);
@@ -2946,16 +3118,19 @@ Use `openflows-harness` for all coordination:
             Ok(true) => {
                 info!("CI workflows found in repository — CI is ready");
                 store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                CiReadiness::Ready
+                Ok(CiReadiness::Ready)
             }
             Ok(false) => {
                 info!("No CI workflows found in repository — CI setup required");
-                CiReadiness::Missing
+                Ok(CiReadiness::Missing)
             }
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("hosted controller cannot check GitHub workflows"));
+                }
                 warn!(error = %e, "Failed to check CI workflows, assuming ready");
                 store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                CiReadiness::Ready
+                Ok(CiReadiness::Ready)
             }
         }
     }
@@ -3176,7 +3351,7 @@ Use `openflows-harness` for all coordination:
             .parse()
             .with_context(|| format!("Could not parse issue number from: {}", number_str))?;
 
-        let nexus_token = match self.resolve_github_token() {
+        let nexus_token = match self.github_api_token().await {
             Ok(t) => t,
             Err(e) => {
                 anyhow::bail!("GitHub token not configured for nexus: {}", e);
@@ -4550,14 +4725,20 @@ impl Node for NexusNode {
         let repo_name = parts.next().unwrap_or("").to_string();
 
         if let Err(e) = self.sync_issues(store, &owner, &repo_name).await {
+            if self.runtime_control.is_some() {
+                return Err(e.context("hosted controller cannot sync GitHub issues"));
+            }
             warn!("Failed to sync issues from GitHub: {}", e);
         }
 
         if let Err(e) = self.sync_open_prs(store, &owner, &repo_name).await {
+            if self.runtime_control.is_some() {
+                return Err(e.context("hosted controller cannot sync GitHub pull requests"));
+            }
             warn!("Failed to sync open PRs from GitHub: {}", e);
         }
 
-        let ci_readiness = self.check_ci_readiness(store, &owner, &repo_name).await;
+        let ci_readiness = self.check_ci_readiness(store, &owner, &repo_name).await?;
         store.set(KEY_CI_READINESS, json!(ci_readiness)).await;
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
@@ -4898,10 +5079,7 @@ impl Node for NexusNode {
                 })
                 .collect();
             if !needs_pr_restore.is_empty() {
-                let token = self
-                    .resolve_github_token()
-                    .ok()
-                    .or_else(|| self.resolve_github_token_from_env_or_file());
+                let token = self.github_api_token().await.ok();
                 if let Some(token) = token {
                     let gh = github::GithubRestClient::new(&token);
                     if let Ok(prs) = gh.list_open_prs(&owner, &repo_name).await {
@@ -5352,17 +5530,24 @@ impl Node for NexusNode {
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
                     if let Some(issue_url) = &decision.issue_url {
-                        if let Err(e) = self
-                            .sync_assignment_to_github(worker_id, ticket_id, issue_url)
-                            .await
-                        {
-                            warn!(
-                                worker_id,
-                                ticket_id,
-                                issue_url,
-                                error = %e,
-                                "Failed to sync assignment to GitHub — continuing anyway"
-                            );
+                        // A hosted workspace uses a repository-scoped GitHub App
+                        // installation token. It represents the App, not a
+                        // separate human worker account that can be assigned
+                        // through GitHub's issue assignee API. The internal
+                        // ticket/worker assignment above remains authoritative.
+                        if self.runtime_control.is_none() {
+                            if let Err(e) = self
+                                .sync_assignment_to_github(worker_id, ticket_id, issue_url)
+                                .await
+                            {
+                                warn!(
+                                    worker_id,
+                                    ticket_id,
+                                    issue_url,
+                                    error = %e,
+                                    "Failed to sync assignment to GitHub — continuing anyway"
+                                );
+                            }
                         }
                     }
                 }
@@ -6382,6 +6567,7 @@ mod tests {
             .await;
         let request = coder_client::types::CreateChatRequest {
             organization_id: None,
+            owner_id: None,
             workspace_id: "ws".into(),
             model_config_id: None,
             content: vec![],
@@ -6431,6 +6617,7 @@ mod tests {
                 .await;
             let req = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "ws".into(),
                 model_config_id: None,
                 content: vec![],
@@ -6584,6 +6771,7 @@ mod tests {
             store.set("ticket:T-1:sentinel_session", json!("old")).await;
             let request = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "new-ws".into(),
                 model_config_id: None,
                 content: vec![],

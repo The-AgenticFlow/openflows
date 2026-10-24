@@ -4,7 +4,7 @@
 //! reconciliation. It keeps external Coder calls outside database
 //! transactions, persists progress step-by-step, fences stale lease holders,
 //! and never marks a suspended/deleted organization ready. A failed import,
-//! missing license, missing provisioner heartbeat, or missing model produces an
+//! missing license or missing provisioner heartbeat produces an
 //! explicit not-ready state with a sanitized error code.
 
 use crate::coder::CoderAdapter;
@@ -28,7 +28,6 @@ pub mod step {
     pub const ENSURE_ORG: &str = "ensure_org";
     pub const ENSURE_PROVISIONER: &str = "ensure_provisioner";
     pub const PUBLISH_TEMPLATES: &str = "publish_templates";
-    pub const VERIFY_MODELS: &str = "verify_models";
     pub const MARK_READY: &str = "mark_ready";
 }
 
@@ -39,7 +38,6 @@ pub mod err {
     pub const CODER_ORG_FAILED: &str = "CODER_ORG_FAILED";
     pub const PROVISIONER_NOT_READY: &str = "PROVISIONER_NOT_READY";
     pub const IMPORT_FAILED: &str = "IMPORT_FAILED";
-    pub const MODEL_CAPABILITY_UNAVAILABLE: &str = "MODEL_CAPABILITY_UNAVAILABLE";
     pub const ORG_STATE_CHANGED: &str = "ORG_STATE_CHANGED";
 }
 
@@ -233,17 +231,18 @@ impl OrgProvisionWorker {
             return Ok(OrgProvisionOutcome::StaleLease);
         }
         let internal_name = internal_org_name(org_id);
-        let mapped: Option<String> =
-            sqlx::query_scalar("SELECT coder_organization_id FROM organizations WHERE id = $1")
-                .bind(org_id.0)
-                .fetch_one(&self.pool)
-                .await?;
+        let (mapped, display_name): (Option<String>, String) = sqlx::query_as(
+            "SELECT coder_organization_id, display_name FROM organizations WHERE id = $1",
+        )
+        .bind(org_id.0)
+        .fetch_one(&self.pool)
+        .await?;
         let coder_org = if let Some(id) = mapped {
             coder_client::CoderOrganizationId::new(id)
         } else {
             match self
                 .adapter
-                .ensure_organization(&internal_name, &internal_name)
+                .ensure_organization(&internal_name, &display_name)
                 .await
             {
                 Ok(org) => org,
@@ -298,7 +297,7 @@ impl OrgProvisionWorker {
             .publish_for_org(org_id, release_id, self.adapter.as_ref(), &artifacts)
             .await
         {
-            let terminal = matches!(&e, ManagerError::Api(api) if api.code == err::IMPORT_FAILED);
+            let terminal = matches!(&e, ManagerError::Api(api) if api.code == err::IMPORT_FAILED || api.code == "IMPORT_CANCELLED");
             let code = err::IMPORT_FAILED;
             self.record_not_ready(guard, org_id, code, &e.to_string())
                 .await?;
@@ -308,29 +307,8 @@ impl OrgProvisionWorker {
             return Ok(OrgProvisionOutcome::NotReady(org_id, code));
         }
 
-        // 7. Verify org-scoped model/chat capability.
-        if !guard.set_step(step::VERIFY_MODELS).await? {
-            return Ok(OrgProvisionOutcome::StaleLease);
-        }
-        let models_ok = self
-            .adapter
-            .verify_org_models(&coder_org)
-            .await
-            .unwrap_or(false);
-        if !models_ok {
-            self.record_not_ready(
-                guard,
-                org_id,
-                err::MODEL_CAPABILITY_UNAVAILABLE,
-                "no org-scoped model / Agents-chat capability",
-            )
-            .await?;
-            return Ok(OrgProvisionOutcome::NotReady(
-                org_id,
-                err::MODEL_CAPABILITY_UNAVAILABLE,
-            ));
-        }
-
+        // Organization provisioning ends with successful template publication.
+        // Model configuration is independent of organization readiness.
         if !guard.set_step(step::MARK_READY).await? {
             return Ok(OrgProvisionOutcome::StaleLease);
         }
@@ -363,7 +341,7 @@ impl OrgProvisionWorker {
                 err::RELEASE_NOT_CONFIGURED,
             ));
         }
-        sqlx::query("UPDATE organizations SET status = 'ready', model_capability_ok = true,
+        sqlx::query("UPDATE organizations SET status = 'ready',
             provisioner_status = 'ready', last_readiness_error = NULL, updated_at = now() WHERE id = $1")
             .bind(org_id.0).execute(&mut *tx).await?;
         ReleaseRepository::bind_org_release_in_tx(&mut tx, org_id, release_id).await?;
@@ -390,7 +368,7 @@ impl OrgProvisionWorker {
             Ok(OrgProvisionOutcome::Ready(_)) => {} // Completed atomically in provision().
             Ok(OrgProvisionOutcome::NotReady(org_id, code)) => {
                 // Not-ready is a retryable failure: prerequisites may later be
-                // met (e.g. provisioner or model becomes available).
+                // met (e.g. provisioner becomes available).
                 let ok = guard
                     .fail(code != err::ORG_STATE_CHANGED, Some(code))
                     .await?;

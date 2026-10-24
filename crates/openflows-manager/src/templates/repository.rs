@@ -144,6 +144,34 @@ impl ReleaseRepository {
         }
     }
 
+    /// Look up a release by its operator-visible version.
+    ///
+    /// Versions are immutable deployment labels. This lookup lets callers
+    /// distinguish a harmless restart of an already-imported release from an
+    /// attempt to reuse a version for different template bytes.
+    pub async fn get_release_by_version(
+        &self,
+        version: &str,
+    ) -> Result<Option<(ReleaseRow, BTreeMap<Role, RoleManifestEntry>)>, ManagerError> {
+        let row = sqlx::query_as::<_, ReleaseRow>(
+            "SELECT id, version, manifest_sha256, artifact_uri, status,
+                    approved_by, approved_at, created_at
+               FROM template_releases
+              WHERE version = $1",
+        )
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ManagerError::from)?;
+        match row {
+            Some(row) => {
+                let roles = self.load_roles(row.id).await?;
+                Ok(Some((row, roles)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Fetch a release by id.
     pub async fn get_release(
         &self,

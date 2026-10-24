@@ -15,6 +15,16 @@ use sqlx::PgPool;
 
 /// The audience value bound to workspace runtime credentials.
 pub const WORKSPACE_AUDIENCE: &str = "openflows-workspace";
+pub const WORKSPACE_REFRESH_AUDIENCE: &str = "openflows-workspace-refresh";
+
+/// Result of atomically consuming a workspace bootstrap credential.
+#[derive(Debug, Clone)]
+pub struct ConsumedBootstrap {
+    pub workspace_id: WorkspaceId,
+    pub generation: i64,
+    pub bootstrap_secret_ref: String,
+    pub runtime_secret_ref: Option<String>,
+}
 
 /// A row describing the authenticated runtime and its derived scope. All
 /// authorization-relevant state is captured in one trusted read.
@@ -26,6 +36,7 @@ pub struct RuntimeScope {
     pub workspace_generation: i64,
     pub workspace_observed_state: String,
     pub workspace_desired_state: String,
+    pub workspace_registered_at: Option<DateTime<Utc>>,
     pub tenant_id: TenantId,
     pub tenant_desired_state: String,
     pub tenant_observed_state: String,
@@ -41,6 +52,8 @@ pub struct RuntimeScope {
     pub credential_expires_at: DateTime<Utc>,
     pub credential_revoked_at: Option<DateTime<Utc>>,
     pub credential_audience: String,
+    pub credential_family_id: uuid::Uuid,
+    pub credential_family_expires_at: DateTime<Utc>,
 }
 
 /// A credential lease row used to record and later revoke an issued token.
@@ -89,6 +102,7 @@ impl RuntimeRepository {
 
     /// Store a freshly issued runtime credential (hash only). The raw secret is
     /// returned to the trusted caller exactly once and never persisted.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_credential(
         &self,
         id: uuid::Uuid,
@@ -97,11 +111,14 @@ impl RuntimeRepository {
         audience: &str,
         expires_at: DateTime<Utc>,
         generation: i64,
+        family_id: uuid::Uuid,
+        family_expires_at: DateTime<Utc>,
     ) -> Result<(), ManagerError> {
         sqlx::query(
             "INSERT INTO runtime_credentials
-                (id, workspace_id, credential_hash, audience, expires_at, generation)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+                (id, workspace_id, credential_hash, audience, expires_at, generation,
+                 family_id, family_expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(id)
         .bind(workspace_id.0)
@@ -109,10 +126,157 @@ impl RuntimeRepository {
         .bind(audience)
         .bind(expires_at)
         .bind(generation)
+        .bind(family_id)
+        .bind(family_expires_at)
         .execute(&self.pool)
         .await
         .map_err(ManagerError::from)?;
         Ok(())
+    }
+
+    /// Persist a one-time, short-lived bootstrap credential. The raw value is
+    /// held only by the secret-injection backend; PostgreSQL stores its hash.
+    pub async fn insert_bootstrap(
+        &self,
+        id: uuid::Uuid,
+        workspace_id: WorkspaceId,
+        hash: &str,
+        secret_ref: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE workspace_bootstrap_credentials
+                SET revoked_at = clock_timestamp()
+              WHERE workspace_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(workspace_id.0)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO workspace_bootstrap_credentials
+                (id, workspace_id, credential_hash, secret_ref, expires_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(workspace_id.0)
+        .bind(hash)
+        .bind(secret_ref)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        // The workspace row points at the stable mounted bundle, not the
+        // short-lived bootstrap object. Provisioning updates that bundle in
+        // place after this transaction commits.
+        sqlx::query("UPDATE workspaces SET registered_at = NULL, updated_at = now() WHERE id = $1")
+            .bind(workspace_id.0)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn live_bootstrap_ref(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<(String, DateTime<Utc>)>, ManagerError> {
+        let row = sqlx::query_as(
+            "SELECT secret_ref, expires_at
+               FROM workspace_bootstrap_credentials
+              WHERE workspace_id = $1 AND consumed_at IS NULL
+                AND revoked_at IS NULL AND expires_at > clock_timestamp()",
+        )
+        .bind(workspace_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Atomically consume a bootstrap value and mint its first access/refresh
+    /// pair. A replay observes no live bootstrap row and fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consume_bootstrap_and_insert_session(
+        &self,
+        bootstrap_hash: &str,
+        access_id: uuid::Uuid,
+        access_hash: &str,
+        access_expires_at: DateTime<Utc>,
+        refresh_id: uuid::Uuid,
+        refresh_hash: &str,
+        family_id: uuid::Uuid,
+        family_expires_at: DateTime<Utc>,
+    ) -> Result<Option<ConsumedBootstrap>, ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(uuid::Uuid, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT b.workspace_id, w.credential_generation, b.secret_ref, w.runtime_secret_ref
+               FROM workspace_bootstrap_credentials b
+               JOIN workspaces w ON w.id = b.workspace_id
+               JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
+              WHERE b.credential_hash = $1 AND b.consumed_at IS NULL
+                AND b.revoked_at IS NULL AND b.expires_at > clock_timestamp()
+                AND w.desired_state NOT IN ('deleting', 'deleted')
+                AND t.desired_state NOT IN ('deleting', 'deleted')
+              FOR UPDATE OF b, w",
+        )
+        .bind(bootstrap_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workspace_id, generation, bootstrap_secret_ref, runtime_secret_ref)) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE workspace_bootstrap_credentials SET consumed_at = clock_timestamp()
+              WHERE credential_hash = $1 AND consumed_at IS NULL",
+        )
+        .bind(bootstrap_hash)
+        .execute(&mut *tx)
+        .await?;
+        for (id, hash, audience, expires_at) in [
+            (
+                access_id,
+                access_hash,
+                WORKSPACE_AUDIENCE,
+                access_expires_at,
+            ),
+            (
+                refresh_id,
+                refresh_hash,
+                WORKSPACE_REFRESH_AUDIENCE,
+                family_expires_at,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO runtime_credentials
+                    (id, workspace_id, credential_hash, audience, expires_at, generation,
+                     family_id, family_expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(id)
+            .bind(workspace_id)
+            .bind(hash)
+            .bind(audience)
+            .bind(expires_at)
+            .bind(generation)
+            .bind(family_id)
+            .bind(family_expires_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE workspaces SET registered_at = clock_timestamp(), updated_at = now()
+              WHERE id = $1",
+        )
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(ConsumedBootstrap {
+            workspace_id: WorkspaceId::from_uuid(workspace_id),
+            generation,
+            bootstrap_secret_ref,
+            runtime_secret_ref,
+        }))
     }
 
     /// Revoke a specific runtime credential by id (set revoked_at). Returns
@@ -170,26 +334,57 @@ impl RuntimeRepository {
 
     /// Atomically rotate the workspace generation, revoke old credentials and
     /// leases, and insert the replacement credential.
-    pub async fn rotate_credential(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rotate_credential_pair(
         &self,
-        id: uuid::Uuid,
+        access_id: uuid::Uuid,
         workspace_id: WorkspaceId,
-        hash: &str,
-        expires_at: DateTime<Utc>,
+        presented_refresh_hash: Option<&str>,
+        access_hash: &str,
+        access_expires_at: DateTime<Utc>,
+        refresh_id: uuid::Uuid,
+        refresh_hash: &str,
+        family_id: uuid::Uuid,
+        family_expires_at: DateTime<Utc>,
     ) -> Result<i64, ManagerError> {
         let mut tx = self.pool.begin().await?;
         let generation: i64 = sqlx::query_scalar(
             "UPDATE workspaces SET credential_generation = credential_generation + 1, updated_at = now()
-             WHERE id = $1 RETURNING credential_generation",
-        ).bind(workspace_id.0).fetch_optional(&mut *tx).await?
+             WHERE id = $1
+               AND ($2::text IS NULL OR EXISTS (
+                 SELECT 1 FROM runtime_credentials rc
+                  WHERE rc.workspace_id = workspaces.id
+                    AND rc.credential_hash = $2
+                    AND rc.audience = 'openflows-workspace-refresh'
+                    AND rc.revoked_at IS NULL
+                    AND rc.expires_at > clock_timestamp()
+                    AND rc.generation = workspaces.credential_generation
+               ))
+             RETURNING credential_generation",
+        ).bind(workspace_id.0).bind(presented_refresh_hash).fetch_optional(&mut *tx).await?
             .ok_or_else(|| ManagerError::not_found("workspace"))?;
         sqlx::query("UPDATE runtime_credentials SET revoked_at = clock_timestamp() WHERE workspace_id = $1 AND revoked_at IS NULL")
             .bind(workspace_id.0).execute(&mut *tx).await?;
         sqlx::query("UPDATE credential_leases SET revoked_at = clock_timestamp(), encrypted_ref = NULL WHERE workspace_id = $1 AND revoked_at IS NULL")
             .bind(workspace_id.0).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO runtime_credentials (id, workspace_id, credential_hash, audience, expires_at, generation) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(id).bind(workspace_id.0).bind(hash).bind(WORKSPACE_AUDIENCE).bind(expires_at).bind(generation)
-            .execute(&mut *tx).await?;
+        for (id, hash, audience, expires_at) in [
+            (
+                access_id,
+                access_hash,
+                WORKSPACE_AUDIENCE,
+                access_expires_at,
+            ),
+            (
+                refresh_id,
+                refresh_hash,
+                WORKSPACE_REFRESH_AUDIENCE,
+                family_expires_at,
+            ),
+        ] {
+            sqlx::query("INSERT INTO runtime_credentials (id, workspace_id, credential_hash, audience, expires_at, generation, family_id, family_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+                .bind(id).bind(workspace_id.0).bind(hash).bind(audience).bind(expires_at).bind(generation)
+                .bind(family_id).bind(family_expires_at).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(generation)
     }
@@ -227,6 +422,7 @@ impl RuntimeRepository {
                     w.credential_generation AS workspace_generation,
                     w.observed_state AS workspace_observed_state,
                     w.desired_state AS workspace_desired_state,
+                    w.registered_at AS workspace_registered_at,
                     t.id AS tenant_id, t.desired_state AS tenant_desired_state,
                     t.observed_state AS tenant_observed_state,
                     o.id AS organization_id, o.status AS organization_status,
@@ -235,7 +431,9 @@ impl RuntimeRepository {
                     c.installation_id, t.github_repository_id AS repository_id,
                     r.accessible AS repository_accessible,
                     rc.generation AS credential_generation, rc.expires_at AS credential_expires_at,
-                    rc.revoked_at AS credential_revoked_at, rc.audience AS credential_audience
+                    rc.revoked_at AS credential_revoked_at, rc.audience AS credential_audience,
+                    rc.family_id AS credential_family_id,
+                    rc.family_expires_at AS credential_family_expires_at
                FROM runtime_credentials rc
                JOIN workspaces w ON w.id = rc.workspace_id
                JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
@@ -265,6 +463,7 @@ impl RuntimeRepository {
                     w.credential_generation AS workspace_generation,
                     w.observed_state AS workspace_observed_state,
                     w.desired_state AS workspace_desired_state,
+                    w.registered_at AS workspace_registered_at,
                     t.id AS tenant_id, t.desired_state AS tenant_desired_state,
                     t.observed_state AS tenant_observed_state,
                     o.id AS organization_id, o.status AS organization_status,
@@ -378,8 +577,17 @@ impl RuntimeRepository {
               AND rc.generation = $9 AND rc.audience = 'openflows-workspace'
               AND rc.revoked_at IS NULL AND rc.expires_at > clock_timestamp()
               AND o.status IN ('ready','provisioning') AND c.status = 'active'
-              AND t.desired_state = 'running' AND t.observed_state = 'running'
-              AND w.desired_state = 'running' AND w.observed_state = 'running'
+              AND t.desired_state IN ('running', 'provisioning')
+              AND t.observed_state NOT IN ('deleted', 'deleting')
+              AND w.desired_state IN ('running', 'provisioning')
+              AND (
+                    w.observed_state = 'running'
+                    OR (
+                        w.observed_state = 'provisioning'
+                        AND w.desired_state = 'provisioning'
+                        AND w.registered_at IS NOT NULL
+                    )
+              )
               AND w.role = $10 AND r.accessible
             FOR UPDATE OF r")
             .bind(scope.organization_id.0).bind(scope.tenant_id.0).bind(scope.workspace_id.0)
@@ -460,7 +668,7 @@ impl RuntimeRepository {
               WHERE l.id = $1 AND c.access_generation = $2
                 AND w.credential_generation = $3
                 AND c.status = 'active' AND w.observed_state = 'running'
-                AND w.desired_state = 'running'",
+                AND w.desired_state IN ('running', 'provisioning')",
         )
         .bind(lease_id.0)
         .bind(expected_connection_generation)
@@ -559,6 +767,7 @@ struct RuntimeScopeRow {
     workspace_generation: i64,
     workspace_observed_state: String,
     workspace_desired_state: String,
+    workspace_registered_at: Option<DateTime<Utc>>,
     tenant_id: uuid::Uuid,
     tenant_desired_state: String,
     tenant_observed_state: String,
@@ -574,6 +783,8 @@ struct RuntimeScopeRow {
     credential_expires_at: DateTime<Utc>,
     credential_revoked_at: Option<DateTime<Utc>>,
     credential_audience: String,
+    credential_family_id: uuid::Uuid,
+    credential_family_expires_at: DateTime<Utc>,
 }
 
 impl From<RuntimeScopeRow> for RuntimeScope {
@@ -585,6 +796,7 @@ impl From<RuntimeScopeRow> for RuntimeScope {
             workspace_generation: t.workspace_generation,
             workspace_observed_state: t.workspace_observed_state,
             workspace_desired_state: t.workspace_desired_state,
+            workspace_registered_at: t.workspace_registered_at,
             tenant_id: TenantId::from_uuid(t.tenant_id),
             tenant_desired_state: t.tenant_desired_state,
             tenant_observed_state: t.tenant_observed_state,
@@ -600,6 +812,8 @@ impl From<RuntimeScopeRow> for RuntimeScope {
             credential_expires_at: t.credential_expires_at,
             credential_revoked_at: t.credential_revoked_at,
             credential_audience: t.credential_audience,
+            credential_family_id: t.credential_family_id,
+            credential_family_expires_at: t.credential_family_expires_at,
         }
     }
 }
@@ -613,6 +827,7 @@ struct WorkspaceScopeRow {
     workspace_generation: i64,
     workspace_observed_state: String,
     workspace_desired_state: String,
+    workspace_registered_at: Option<DateTime<Utc>>,
     tenant_id: uuid::Uuid,
     tenant_desired_state: String,
     tenant_observed_state: String,
@@ -635,6 +850,7 @@ impl From<WorkspaceScopeRow> for RuntimeScope {
             workspace_generation: t.workspace_generation,
             workspace_observed_state: t.workspace_observed_state,
             workspace_desired_state: t.workspace_desired_state,
+            workspace_registered_at: t.workspace_registered_at,
             tenant_id: TenantId::from_uuid(t.tenant_id),
             tenant_desired_state: t.tenant_desired_state,
             tenant_observed_state: t.tenant_observed_state,
@@ -650,6 +866,8 @@ impl From<WorkspaceScopeRow> for RuntimeScope {
             credential_expires_at: DateTime::<Utc>::UNIX_EPOCH,
             credential_revoked_at: None,
             credential_audience: String::new(),
+            credential_family_id: uuid::Uuid::nil(),
+            credential_family_expires_at: DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 }

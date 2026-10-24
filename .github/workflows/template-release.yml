@@ -41,6 +41,14 @@ jobs:
 
       - name: Build deterministic template release
         run: |
+          docker pull codercom/enterprise-base:ubuntu
+          IMAGE_REFERENCE="$(docker image inspect --format '{{index .RepoDigests 0}}' codercom/enterprise-base:ubuntu)"
+          OPENFLOWS_WORKSPACE_IMAGE_DIGEST="${IMAGE_REFERENCE#*@}"
+          if ! printf '%s' "$OPENFLOWS_WORKSPACE_IMAGE_DIGEST" | grep -qE '^sha256:[0-9a-fA-F]{64}$'; then
+            echo "::error::Could not resolve an immutable workspace image digest"
+            exit 1
+          fi
+          export OPENFLOWS_WORKSPACE_IMAGE_DIGEST
           cargo run -p openflows-manager --bin build-template-release -- \
             crates/coder-client/templates \
             "${{ steps.release.outputs.version }}" \

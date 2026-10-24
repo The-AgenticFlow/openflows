@@ -18,6 +18,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 /// The size of an OAuth `state` value / device secret / invitation token in
 /// bytes (32 bytes = 256 bits).
@@ -33,6 +34,12 @@ pub type KeyVersion = u32;
 
 /// A raw 256-bit secret, kept out of the public DTO surface.
 pub struct Secret(pub [u8; TOKEN_BYTES]);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl Secret {
     /// Generate a fresh cryptographically-random 256-bit secret.

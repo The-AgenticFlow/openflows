@@ -8,12 +8,16 @@ use axum::{
 use serde::Serialize;
 
 pub mod auth;
+pub mod coder_hooks;
+pub mod coder_identity;
 pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod organizations;
+pub mod platform_releases;
 pub mod runtime;
+pub mod tenants;
 pub mod test_ui;
 pub mod webhooks;
 
@@ -31,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", get(auth::login_page))
         .route("/auth/github/start", get(auth::github_start))
         .route("/auth/github/callback", get(auth::github_callback))
+        .route("/auth/coder/callback", get(coder_identity::callback))
         .route("/auth/cli/verify", get(device::device_verify_page))
         .route("/auth/cli/approve", post(device::device_approve))
         .route(
@@ -43,6 +48,8 @@ fn api_v1_router() -> Router<AppState> {
     Router::new()
         .route("/", get(api_index))
         .route("/me", get(auth::me))
+        .route("/auth/coder", get(coder_identity::status))
+        .route("/auth/coder/start", post(coder_identity::start))
         .route("/auth/refresh", post(auth::refresh))
         .route("/auth/csrf", get(auth::csrf_token))
         .route("/invitations/accept", post(invitations::accept_json))
@@ -80,6 +87,39 @@ fn api_v1_router() -> Router<AppState> {
             post(organizations::transfer_ownership),
         )
         .route("/operations/{id}", get(organizations::get_operation))
+        .route(
+            "/operations/{id}/retry",
+            post(organizations::retry_operation),
+        )
+        .route(
+            "/platform/organizations/{org}/template-release/promote-configured",
+            post(platform_releases::promote_configured_release),
+        )
+        // Authorized organization-scoped tenant lifecycle.
+        .route(
+            "/organizations/{org}/tenants",
+            get(tenants::list_tenants).post(tenants::create_tenant),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}",
+            get(tenants::get_tenant).delete(tenants::delete_tenant),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}/start",
+            post(tenants::start_tenant),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}/stop",
+            post(tenants::stop_tenant),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}/clean",
+            post(tenants::clean_tenant),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}/status",
+            get(tenants::tenant_status),
+        )
         // GitHub connection lifecycle.
         .route(
             "/organizations/{org}/github/connect",
@@ -101,12 +141,29 @@ fn api_v1_router() -> Router<AppState> {
         )
         // Public signed webhook ingress.
         .route("/webhooks/github", post(webhooks::receive_webhook))
+        .route("/hooks/coder/chat", post(coder_hooks::receive))
         // Runtime credential broker: authenticated by a workspace runtime
         // credential, never by a human session.
         .route(
             "/runtime/github-credentials",
             post(runtime::github_credentials),
         )
+        // Runtime worker provisioning and workspace lifecycle:
+        // authenticated by a workspace runtime credential (the tenant Nexus).
+        .route("/runtime/workspaces", post(runtime::request_worker))
+        .route("/runtime/chats", post(runtime::create_chat))
+        .route(
+            "/runtime/workspaces/{workspace}",
+            get(runtime::get_workspace).delete(runtime::delete_workspace),
+        )
+        .route(
+            "/runtime/workspaces/{workspace}/stop",
+            post(runtime::stop_workspace),
+        )
+        .route("/runtime/register", post(runtime::register))
+        .route("/runtime/heartbeat", post(runtime::heartbeat))
+        .route("/runtime/refresh", post(runtime::refresh))
+        .route("/runtime/revoke", post(runtime::revoke))
 }
 
 #[derive(Serialize)]

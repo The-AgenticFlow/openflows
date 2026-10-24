@@ -31,6 +31,7 @@ pub struct MockVersion {
 /// Internal simulated Coder state.
 #[derive(Debug, Default)]
 struct State {
+    org_display_names: HashMap<String, String>,
     orgs: HashMap<String, String>,            // internal_name -> org id
     templates: HashMap<String, MockTemplate>, // template id -> template
     /// org id -> set of template ids
@@ -41,6 +42,11 @@ struct State {
     models_ok: HashSet<String>,         // org id
     next_template_id: u64,
     next_version_id: u64,
+    /// org id -> set of machine-owner ids
+    machine_owners: HashMap<String, HashSet<String>>,
+    /// workspace id -> simulated workspace
+    workspaces: HashMap<String, MockWorkspace>,
+    next_workspace_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +55,19 @@ struct MockTemplate {
     org_id: String,
     name: String,
     active_version_id: Option<String>,
+}
+
+/// A simulated tenant workspace in the mock Coder deployment.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct MockWorkspace {
+    id: String,
+    name: String,
+    org_id: String,
+    owner_id: String,
+    template_id: String,
+    version_id: String,
+    running: bool,
 }
 
 /// Configuration knobs a test sets to drive failure and success scenarios.
@@ -63,6 +82,12 @@ pub struct MockCoderConfig {
     /// When true, `ensure_organization` fabricates nothing but creation of an
     /// org is rejected (simulates insufficient license).
     pub organization_creation_denied: bool,
+    /// When false, tenant workspaces never become ready (simulates a build
+    /// that never reaches running).
+    pub tenant_workspace_ready: bool,
+    /// When true, machine-owner creation is rejected (simulates missing
+    /// Premium/service-account capability).
+    pub machine_owner_denied: bool,
 }
 
 impl Default for MockCoderConfig {
@@ -74,6 +99,8 @@ impl Default for MockCoderConfig {
             models_ok: true,
             import_status_override: None,
             organization_creation_denied: false,
+            tenant_workspace_ready: true,
+            machine_owner_denied: false,
         }
     }
 }
@@ -95,12 +122,22 @@ impl Default for MockCoderAdapter {
                 models_ok: true,
                 import_status_override: None,
                 organization_creation_denied: false,
+                tenant_workspace_ready: true,
+                machine_owner_denied: false,
             })),
         }
     }
 }
 
 impl MockCoderAdapter {
+    pub fn organization_display_name(&self, org: &CoderOrganizationId) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .org_display_names
+            .get(&org.0)
+            .cloned()
+    }
     pub fn set_active_version(&self, template_id: &str, version_id: &str) {
         let mut state = self.state.lock().unwrap();
         assert!(state
@@ -171,7 +208,6 @@ impl CoderAdapter for MockCoderAdapter {
         internal_name: &str,
         display_name: &str,
     ) -> Result<CoderOrganizationId, ManagerError> {
-        let _ = display_name;
         if self.config.lock().unwrap().organization_creation_denied {
             return Err(ManagerError::api(
                 "ORGANIZATION_CREATE_DENIED",
@@ -183,6 +219,9 @@ impl CoderAdapter for MockCoderAdapter {
             return Ok(CoderOrganizationId::new(id.clone()));
         }
         let id = internal_name.to_string();
+        state
+            .org_display_names
+            .insert(id.clone(), display_name.to_string());
         state.orgs.insert(internal_name.to_string(), id.clone());
         Ok(CoderOrganizationId::new(id))
     }
@@ -329,5 +368,247 @@ impl CoderAdapter for MockCoderAdapter {
             self.state.lock().unwrap().models_ok.insert(org.0.clone());
         }
         Ok(ok)
+    }
+
+    async fn ensure_user_owner(
+        &self,
+        _org: &CoderOrganizationId,
+        _owner: &crate::coder::types::CoderOwnerId,
+    ) -> Result<(), ManagerError> {
+        if self.config.lock().unwrap().machine_owner_denied {
+            return Err(ManagerError::api(
+                "CODER_USER_OWNER_FAILED",
+                "linked owner unavailable",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_machine_owner(
+        &self,
+        org: &CoderOrganizationId,
+        tenant_id: crate::id::TenantId,
+    ) -> Result<crate::coder::types::CoderOwnerId, ManagerError> {
+        if self.config.lock().unwrap().machine_owner_denied {
+            return Err(ManagerError::api(
+                "TENANT_RUNTIME_UNSUPPORTED",
+                "machine-owner creation denied (Premium/service-account missing)",
+            ));
+        }
+        let id = format!("owner-{}-{}", org.0, tenant_id.0);
+        self.state
+            .lock()
+            .unwrap()
+            .machine_owners
+            .entry(org.0.clone())
+            .or_default()
+            .insert(id.clone());
+        Ok(crate::coder::types::CoderOwnerId::new(id))
+    }
+
+    async fn create_tenant_workspace(
+        &self,
+        org: &CoderOrganizationId,
+        owner: &crate::coder::types::CoderOwnerId,
+        template_id: &CoderTemplateId,
+        version_id: &CoderTemplateVersionId,
+        name: &str,
+    ) -> Result<coder_client::CoderWorkspaceDetail, ManagerError> {
+        let running = self.config.lock().unwrap().tenant_workspace_ready;
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state
+            .workspaces
+            .values()
+            .find(|workspace| workspace.owner_id == owner.0 && workspace.name == name)
+        {
+            if existing.org_id != org.0
+                || existing.template_id != template_id.0
+                || existing.version_id != version_id.0
+            {
+                return Err(ManagerError::api(
+                    "CODER_SCOPE_MISMATCH",
+                    "same-name mock workspace has incompatible ownership",
+                ));
+            }
+            return Ok(coder_client::CoderWorkspaceDetail {
+                id: existing.id.clone(),
+                name: existing.name.clone(),
+                owner_id: existing.owner_id.clone(),
+                organization_id: existing.org_id.clone(),
+                template_id: existing.template_id.clone(),
+                template_version_id: existing.version_id.clone(),
+            });
+        }
+        state.next_workspace_id += 1;
+        let id = format!("ws-{}-{}", org.0, state.next_workspace_id);
+        state.workspaces.insert(
+            id.clone(),
+            MockWorkspace {
+                id: id.clone(),
+                name: name.to_string(),
+                org_id: org.0.clone(),
+                owner_id: owner.0.clone(),
+                template_id: template_id.0.clone(),
+                version_id: version_id.0.clone(),
+                running,
+            },
+        );
+        Ok(coder_client::CoderWorkspaceDetail {
+            id: id.clone(),
+            name: name.to_string(),
+            owner_id: owner.0.clone(),
+            organization_id: org.0.clone(),
+            template_id: template_id.0.clone(),
+            template_version_id: version_id.0.clone(),
+        })
+    }
+
+    async fn wait_workspace_ready(
+        &self,
+        org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<(), ManagerError> {
+        let state = self.state.lock().unwrap();
+        match state.workspaces.get(workspace_id) {
+            Some(ws) if ws.running && ws.org_id == org.0 => Ok(()),
+            _ => Err(ManagerError::api(
+                "TENANT_WS_NOT_READY",
+                format!("workspace {workspace_id} is not ready"),
+            )),
+        }
+    }
+
+    async fn delete_workspace(
+        &self,
+        org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<(), ManagerError> {
+        let mut state = self.state.lock().unwrap();
+        match state.workspaces.get(workspace_id) {
+            Some(ws) if ws.org_id == org.0 => {
+                state.workspaces.remove(workspace_id);
+                Ok(())
+            }
+            None => Ok(()),
+            _ => Err(ManagerError::api(
+                "CODER_SCOPE_MISMATCH",
+                "workspace belongs to another organization",
+            )),
+        }
+    }
+
+    async fn start_workspace(
+        &self,
+        org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<(), ManagerError> {
+        let mut state = self.state.lock().unwrap();
+        let workspace = state
+            .workspaces
+            .get_mut(workspace_id)
+            .filter(|workspace| workspace.org_id == org.0)
+            .ok_or_else(|| ManagerError::not_found("workspace"))?;
+        workspace.running = true;
+        Ok(())
+    }
+
+    async fn restart_workspace(
+        &self,
+        org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<(), ManagerError> {
+        // The mock has no separate build history; a restart leaves the
+        // workspace in its configured ready state.
+        self.start_workspace(org, workspace_id).await
+    }
+
+    async fn stop_workspace(
+        &self,
+        org: &CoderOrganizationId,
+        workspace_id: &str,
+    ) -> Result<(), ManagerError> {
+        let mut state = self.state.lock().unwrap();
+        let workspace = state
+            .workspaces
+            .get_mut(workspace_id)
+            .filter(|workspace| workspace.org_id == org.0)
+            .ok_or_else(|| ManagerError::not_found("workspace"))?;
+        workspace.running = false;
+        Ok(())
+    }
+
+    async fn delete_machine_owner(
+        &self,
+        org: &CoderOrganizationId,
+        owner: &crate::coder::types::CoderOwnerId,
+    ) -> Result<(), ManagerError> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .workspaces
+            .values()
+            .any(|workspace| workspace.owner_id == owner.0)
+        {
+            return Err(ManagerError::api(
+                "CODER_OWNER_IN_USE",
+                "machine owner still owns a workspace",
+            ));
+        }
+        if let Some(owners) = state.machine_owners.get_mut(&org.0) {
+            owners.remove(&owner.0);
+        }
+        Ok(())
+    }
+}
+
+impl MockCoderAdapter {
+    /// Whether a machine owner exists for `org` in the mock.
+    pub fn has_machine_owner(&self, org: &CoderOrganizationId) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .machine_owners
+            .get(&org.0)
+            .map(|set| !set.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// The machine owner id recorded for a tenant in `org`, if any.
+    pub fn machine_owner(
+        &self,
+        org: &CoderOrganizationId,
+        tenant_id: &crate::id::TenantId,
+    ) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .machine_owners
+            .get(&org.0)
+            .and_then(|set| {
+                set.iter()
+                    .find(|o| o.contains(&tenant_id.0.to_string()))
+                    .cloned()
+            })
+    }
+
+    /// Whether a workspace exists for a given owner in `org`.
+    pub fn has_workspace_for_owner(&self, org: &CoderOrganizationId, owner: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .values()
+            .any(|w| w.org_id == org.0 && w.owner_id == owner)
+    }
+
+    /// The version id recorded for the first workspace in `org` owned by
+    /// `owner`, used to assert pinned template/version selection.
+    pub fn workspace_version(&self, org: &CoderOrganizationId, owner: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .values()
+            .find(|w| w.org_id == org.0 && w.owner_id == owner)
+            .map(|w| w.version_id.clone())
     }
 }

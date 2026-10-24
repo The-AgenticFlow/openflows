@@ -9,7 +9,7 @@
 //! 3. Duplicate publication retries converge.
 //! 4. Version pins survive active-pointer changes.
 //!
-//! Plus: wrong-scope rejection, missing license/provisioner/model prevents
+//! Plus: wrong-scope rejection, missing license/provisioner prevents
 //! readiness, suspension during provisioning cannot restore readiness,
 //! customer users cannot approve/promote releases, and secrets do not appear
 //! in persisted operational records.
@@ -40,7 +40,7 @@ struct PausedAdapter {
     inner: Arc<MockCoderAdapter>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
-    at_models: bool,
+    at_templates: bool,
 }
 
 #[async_trait::async_trait]
@@ -51,7 +51,7 @@ impl openflows_manager::coder::CoderAdapter for PausedAdapter {
         openflows_manager::coder::types::CoderCapabilities,
         openflows_manager::error::ManagerError,
     > {
-        if !self.at_models {
+        if !self.at_templates {
             self.entered.notify_one();
             self.release.notified().await;
         }
@@ -81,6 +81,10 @@ impl openflows_manager::coder::CoderAdapter for PausedAdapter {
         openflows_manager::coder::TemplatePublicationResult,
         openflows_manager::error::ManagerError,
     > {
+        if self.at_templates && name == "openflows-vessel" {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.inner
             .ensure_template_version(org, name, version, archive)
             .await
@@ -89,17 +93,14 @@ impl openflows_manager::coder::CoderAdapter for PausedAdapter {
         &self,
         org: &coder_client::CoderOrganizationId,
     ) -> Result<bool, openflows_manager::error::ManagerError> {
-        if self.at_models {
-            self.entered.notify_one();
-            self.release.notified().await;
-        }
-        self.inner.verify_org_models(org).await
+        let _ = org;
+        panic!("organization provisioning must not query models")
     }
 }
 
 fn pause_worker(
     h: &WorkerHarness,
-    at_models: bool,
+    at_templates: bool,
 ) -> (
     OrgProvisionWorker,
     Arc<tokio::sync::Notify>,
@@ -112,7 +113,7 @@ fn pause_worker(
         inner: h.adapter.clone(),
         entered: entered.clone(),
         release: release.clone(),
-        at_models,
+        at_templates,
     });
     (worker, entered, release)
 }
@@ -335,7 +336,19 @@ async fn cross_org_template_names_resolve_to_distinct_ids() {
     let owner = insert_user(&h.pool, "owner").await;
 
     let (org_a, guard_a) = provision_org(&h.pool, "acme-a", owner).await;
+    sqlx::query("UPDATE organizations SET display_name = $1 WHERE id = $2")
+        .bind("Acme Research & Development")
+        .bind(org_a.0)
+        .execute(&h.pool)
+        .await
+        .unwrap();
     let outcome = h.worker.provision(&guard_a).await.unwrap();
+    assert_eq!(
+        h.adapter
+            .organization_display_name(&coder_org_for(org_a))
+            .as_deref(),
+        Some("Acme Research & Development")
+    );
     assert_eq!(
         outcome,
         openflows_manager::provisioning::OrgProvisionOutcome::Ready(org_a)
@@ -385,6 +398,47 @@ async fn cross_org_template_names_resolve_to_distinct_ids() {
 // ---------------------------------------------------------------------------
 // Acceptance criterion 2: failed imports prevent readiness.
 // ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn failed_org_import_can_be_requeued_but_other_terminal_failures_cannot() {
+    for (slug, code, allowed) in [
+        ("retry-import", "IMPORT_FAILED", true),
+        ("retry-other", "CODER_ORG_FAILED", false),
+    ] {
+        let h = harness(MockCoderConfig::default()).await;
+        let owner = insert_user(&h.pool, "owner").await;
+        let (org, guard) = provision_org(&h.pool, slug, owner).await;
+        assert!(guard.fail(false, Some(code)).await.unwrap());
+        let id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM operations WHERE organization_id = $1")
+                .bind(org.0)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        let mut conn = h.pool.acquire().await.unwrap();
+        let wrong_scope = operations::retry_in_tx(
+            &mut conn,
+            openflows_manager::id::OperationId::from_uuid(id),
+            OrganizationId::from_uuid(uuid::Uuid::new_v4()),
+        )
+        .await;
+        assert!(wrong_scope.is_err());
+        let result = operations::retry_in_tx(
+            &mut conn,
+            openflows_manager::id::OperationId::from_uuid(id),
+            org,
+        )
+        .await;
+        assert_eq!(result.is_ok(), allowed);
+        let state: String = sqlx::query_scalar("SELECT state FROM operations WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(state, if allowed { "queued" } else { "failed" });
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
 async fn failed_import_prevents_ready() {
@@ -541,7 +595,7 @@ async fn version_pins_survive_republication() {
 }
 
 // ---------------------------------------------------------------------------
-// Missing license / provisioner / model prevents readiness.
+// License and provisioner are prerequisites; model configuration is independent.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
@@ -587,7 +641,7 @@ async fn missing_provisioner_heartbeat_prevents_ready() {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn missing_org_models_prevents_ready() {
+async fn missing_org_models_does_not_prevent_ready() {
     let config = MockCoderConfig {
         models_ok: false,
         ..Default::default()
@@ -598,12 +652,19 @@ async fn missing_org_models_prevents_ready() {
     let outcome = h.worker.provision(&guard).await.unwrap();
     assert_eq!(
         outcome,
-        openflows_manager::provisioning::OrgProvisionOutcome::NotReady(
-            org,
-            openflows_manager::provisioning::err::MODEL_CAPABILITY_UNAVAILABLE
-        )
+        openflows_manager::provisioning::OrgProvisionOutcome::Ready(org)
     );
-    assert_eq!(org_status(&h.pool, org).await, "provisioning");
+    assert_eq!(org_status(&h.pool, org).await, "ready");
+    let model_ok: Option<bool> =
+        sqlx::query_scalar("SELECT model_capability_ok FROM organizations WHERE id = $1")
+            .bind(org.0)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        model_ok, None,
+        "provisioning must not claim model readiness"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -29,9 +29,26 @@ use config::{GithubConfig, TenantConfig};
 use envconfig::Envconfig;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock as SyncRwLock;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Typed HTTP rejection from Coder, without copying its response body into
+/// application logs or API responses.
+#[derive(Debug)]
+pub struct CoderHttpError {
+    pub operation: &'static str,
+    pub status: reqwest::StatusCode,
+}
+
+impl std::fmt::Display for CoderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Coder {} returned HTTP {}", self.operation, self.status)
+    }
+}
+
+impl std::error::Error for CoderHttpError {}
 
 fn check_template_push_output(name: &str, output: &std::process::Output) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -51,7 +68,10 @@ fn check_template_push_output(name: &str, output: &std::process::Output) -> Resu
 }
 
 /// Values forwarded to server-side Terraform and included in bootstrap caching.
-pub(crate) fn template_variable_values() -> Vec<(&'static str, String)> {
+/// Terraform variable values configured by the operator for template imports.
+/// They are sent to Coder with each managed template version so its server-side
+/// provisioner sees the same configuration as the local bootstrap CLI.
+pub fn template_variable_values() -> Vec<(&'static str, String)> {
     [
         ("TF_VAR_dev_binary_host_path", "dev_binary_host_path"),
         ("TF_VAR_docker_network", "docker_network"),
@@ -120,6 +140,8 @@ fn resolve_coder_cli() -> PathBuf {
 pub struct CoderClient {
     base_url: String,
     token: String,
+    /// Shared, rotated platform credential. Only Manager clients set this.
+    shared_token: Option<Arc<SyncRwLock<String>>>,
     http: reqwest::Client,
     /// Workspace name for `coder ssh` (e.g., "forge-1-T-041").
     workspace_name: Option<String>,
@@ -219,6 +241,7 @@ impl CoderClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            shared_token: None,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -243,6 +266,12 @@ impl CoderClient {
     /// via the `CODER_SESSION_TOKEN` environment variable.
     pub fn with_session_token(mut self, token: &str) -> Self {
         self.session_token = Some(token.to_string());
+        self
+    }
+
+    /// Use a credential that the Manager can rotate while workers keep running.
+    pub fn with_shared_token(mut self, token: Arc<SyncRwLock<String>>) -> Self {
+        self.shared_token = Some(token);
         self
     }
 
@@ -272,6 +301,7 @@ impl CoderClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: String::new(),
+            shared_token: None,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -290,6 +320,7 @@ impl CoderClient {
         Self {
             base_url: self.base_url.clone(),
             token,
+            shared_token: None,
             http: self.http.clone(),
             workspace_name: self.workspace_name.clone(),
             session_token: self.session_token.clone(),
@@ -327,8 +358,15 @@ impl CoderClient {
         path: &str,
     ) -> reqwest::RequestBuilder {
         let mut req = self.http.request(method, self.url(path));
-        if !self.token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.token));
+        let token = self.shared_token.as_ref().map(|token| {
+            token
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
+        let token = token.as_deref().unwrap_or(&self.token);
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         req
     }
@@ -892,14 +930,11 @@ impl CoderClient {
         if resp.status().is_success() {
             Ok(resp.json().await?)
         } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Failed to list Coder templates in org '{}' ({}): {}",
-                org_id.0,
-                status,
-                body
-            )
+            Err(CoderHttpError {
+                operation: "list organization templates",
+                status: resp.status(),
+            }
+            .into())
         }
     }
 
@@ -942,7 +977,9 @@ impl CoderClient {
         }
     }
 
-    /// List the versions of a template within an explicit organization.
+    /// List template versions by template id and verify both organization and
+    /// template identity. Coder's list endpoint is global by template UUID;
+    /// there is no organization-prefixed list route in the v2 API.
     pub async fn list_template_versions(
         &self,
         org_id: &CoderOrganizationId,
@@ -951,24 +988,36 @@ impl CoderClient {
         let resp = self
             .authenticated_request(
                 reqwest::Method::GET,
-                &format!(
-                    "/api/v2/organizations/{}/templates/{}/versions",
-                    org_id.0, template_id.0
-                ),
+                &format!("/api/v2/templates/{}/versions", template_id.0),
             )
             .send()
             .await
             .context("Failed to list Coder template versions")?;
         if resp.status().is_success() {
-            Ok(resp.json().await?)
+            let versions: Vec<CoderTemplateVersion> = resp.json().await?;
+            for version in &versions {
+                if !version.organization_id.is_empty() && version.organization_id != org_id.0 {
+                    bail!(
+                        "Coder template version belongs to organization '{}', expected '{}'",
+                        version.organization_id,
+                        org_id.0
+                    );
+                }
+                if !version.template_id.is_empty() && version.template_id != template_id.0 {
+                    bail!(
+                        "Coder template version belongs to template '{}', expected '{}'",
+                        version.template_id,
+                        template_id.0
+                    );
+                }
+            }
+            Ok(versions)
         } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Failed to list Coder template versions ({}): {}",
-                status,
-                body
-            )
+            Err(CoderHttpError {
+                operation: "list template versions",
+                status: resp.status(),
+            }
+            .into())
         }
     }
 
@@ -979,63 +1028,115 @@ impl CoderClient {
     pub async fn create_template_version(
         &self,
         org_id: &CoderOrganizationId,
-        template_id: &CoderTemplateId,
+        template_id: Option<&CoderTemplateId>,
         version_name: &str,
         archive: &[u8],
     ) -> Result<CoderTemplateVersion> {
-        let url = format!(
-            "{}/api/v2/organizations/{}/templates/{}/versions",
-            self.base_url, org_id.0, template_id.0
-        );
-        let req = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/x-tar")
-            .query(&[("name", version_name)])
-            .body(archive.to_vec())
-            .send()
+        self.create_template_version_with_variables(org_id, template_id, version_name, archive, &[])
             .await
-            .context("Failed to upload Coder template version")?;
-        if req.status().is_success() {
-            let version: CoderTemplateVersion = req.json().await?;
-            if version.id.is_empty() {
-                bail!("Coder template version created without an id");
-            }
-            Ok(version)
-        } else {
-            let status = req.status();
-            let body = req.text().await.unwrap_or_default();
-            bail!(
-                "Failed to create Coder template version ({}): {}",
-                status,
-                body
-            )
-        }
     }
 
-    /// Fetch an import job by id within an explicit organization.
-    pub async fn get_import_job(
+    /// Create a template version with Terraform variables persisted by Coder
+    /// for its server-side provisioner.
+    pub async fn create_template_version_with_variables(
         &self,
         org_id: &CoderOrganizationId,
-        job_id: &str,
-    ) -> Result<Option<CoderImportJob>> {
+        template_id: Option<&CoderTemplateId>,
+        version_name: &str,
+        archive: &[u8],
+        variables: &[crate::types::TemplateVariableValue],
+    ) -> Result<CoderTemplateVersion> {
+        let mut decoder = flate2::read::GzDecoder::new(archive);
+        let mut tar_archive = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut tar_archive)
+            .context("Failed to decode packaged Coder template")?;
+        let upload_response = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/files")
+            .header("Content-Type", "application/x-tar")
+            .body(tar_archive)
+            .send()
+            .await
+            .context("Failed to upload Coder template archive")?;
+        if !upload_response.status().is_success() {
+            return Err(CoderHttpError {
+                operation: "upload template archive",
+                status: upload_response.status(),
+            }
+            .into());
+        }
+        let uploaded: CoderUploadedFile = upload_response.json().await?;
+        if uploaded.id.is_empty() {
+            bail!("Coder file upload returned no archive hash");
+        }
+        let request = CreateTemplateVersionRequest {
+            name: version_name.to_string(),
+            message: format!("OpenFlows managed template release {version_name}"),
+            template_id: template_id.map(|id| id.0.clone()),
+            storage_method: "file".into(),
+            file_id: uploaded.id,
+            provisioner: "terraform".into(),
+            tags: std::collections::HashMap::new(),
+            user_variable_values: variables.to_vec(),
+        };
+        let response = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/organizations/{}/templateversions", org_id.0),
+            )
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to create Coder template version")?;
+        if !response.status().is_success() {
+            return Err(CoderHttpError {
+                operation: "create template version",
+                status: response.status(),
+            }
+            .into());
+        }
+        let version: CoderTemplateVersion = response.json().await?;
+        if version.id.is_empty() {
+            bail!("Coder template version created without an id");
+        }
+        Ok(version)
+    }
+
+    /// Fetch a template version by id and verify it belongs to the expected org.
+    /// Coder exposes the import/provisioner job nested in this response; there
+    /// is no organization-scoped `/imports/{job_id}` endpoint in the pinned API.
+    pub async fn get_template_version(
+        &self,
+        org_id: &CoderOrganizationId,
+        version_id: &str,
+    ) -> Result<Option<CoderTemplateVersion>> {
         let resp = self
             .authenticated_request(
                 reqwest::Method::GET,
-                &format!("/api/v2/organizations/{}/imports/{}", org_id.0, job_id),
+                &format!("/api/v2/templateversions/{version_id}"),
             )
             .send()
             .await
-            .context("Failed to get Coder import job")?;
+            .context("Failed to get Coder template version")?;
         if resp.status().is_success() {
-            Ok(Some(resp.json().await?))
+            let version: CoderTemplateVersion = resp.json().await?;
+            if !version.organization_id.is_empty() && version.organization_id != org_id.0 {
+                bail!(
+                    "Coder template version belongs to organization '{}', expected '{}'",
+                    version.organization_id,
+                    org_id.0
+                );
+            }
+            Ok(Some(version))
         } else if resp.status().as_u16() == 404 {
             Ok(None)
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to get Coder import job ({}): {}", status, body)
+            bail!(
+                "Failed to get Coder template version ({}): {}",
+                status,
+                body
+            )
         }
     }
 
@@ -1093,6 +1194,31 @@ impl CoderClient {
                 "Failed to create Coder provisioner key ({}): {}",
                 status,
                 body
+            )
+        }
+    }
+
+    /// Remove a provisioner key reserved by the caller. Missing keys are already
+    /// reconciled; other failures must not be mistaken for absence.
+    pub async fn delete_provisioner_key(
+        &self,
+        org: &CoderOrganizationId,
+        name: &str,
+    ) -> Result<()> {
+        let response = self
+            .authenticated_request(
+                reqwest::Method::DELETE,
+                &format!("/api/v2/organizations/{}/provisionerkeys/{}", org.0, name),
+            )
+            .send()
+            .await
+            .context("Failed to delete Coder provisioner key")?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            bail!(
+                "Coder provisioner key cleanup failed ({})",
+                response.status()
             )
         }
     }
@@ -1161,8 +1287,9 @@ impl CoderClient {
         req: &crate::types::CreateWorkspaceRequestExplicit,
     ) -> Result<CoderWorkspaceDetail> {
         let payload = serde_json::json!({
-            "organization_id": req.organization_id,
-            "template_id": req.template_id,
+            // Coder requires exactly one of template_id and
+            // template_version_id. Tenant provisioning is pinned to the
+            // already-resolved version, so send only that field.
             "template_version_id": req.template_version_id,
             "name": req.name,
             "rich_parameter_values": req.rich_parameter_values.as_deref().unwrap_or_default(),
@@ -1170,7 +1297,10 @@ impl CoderClient {
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
-                &format!("/api/v2/users/{}/workspaces", owner_user_id),
+                &format!(
+                    "/api/v2/organizations/{}/members/{}/workspaces",
+                    req.organization_id, owner_user_id
+                ),
             )
             .json(&payload)
             .send()
@@ -1193,6 +1323,40 @@ impl CoderClient {
         }
     }
 
+    /// Fetch a workspace by its immutable owner/name route. Hosted retry
+    /// recovery uses this instead of creating a second workspace after a
+    /// timeout whose response may have been lost.
+    pub async fn get_workspace_by_owner_and_name(
+        &self,
+        owner_user_id: &str,
+        workspace_name: &str,
+    ) -> Result<Option<CoderWorkspaceDetail>> {
+        let owner: String =
+            url::form_urlencoded::byte_serialize(owner_user_id.as_bytes()).collect();
+        let name: String =
+            url::form_urlencoded::byte_serialize(workspace_name.as_bytes()).collect();
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/users/{owner}/workspace/{name}"),
+            )
+            .send()
+            .await
+            .context("Failed to find workspace by owner and name")?;
+        if resp.status().is_success() {
+            Ok(Some(resp.json().await?))
+        } else if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            Ok(None)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to find workspace ({status}): {body}")
+        }
+    }
+
     /// Fetch a Coder user detail including organization membership, used to
     /// verify a machine owner belongs only to its mapped organization.
     pub async fn get_user_detail(&self, user_id: &str) -> Result<Option<CoderUserDetail>> {
@@ -1209,6 +1373,99 @@ impl CoderClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!("Failed to get Coder user detail ({}): {}", status, body)
+        }
+    }
+
+    /// Verify a linked human account and grant only basic organization membership.
+    pub async fn ensure_personal_org_member(
+        &self,
+        org: &CoderOrganizationId,
+        user_id: &str,
+    ) -> Result<()> {
+        let response = self
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/users/{user_id}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        let user: serde_json::Value = response.json().await?;
+        if user["id"].as_str() != Some(user_id)
+            || user["is_service_account"].as_bool().unwrap_or(false)
+            || user["login_type"].as_str() != Some("github")
+            || user["status"].as_str() != Some("active")
+        {
+            bail!("CODER_OWNER_INACTIVE: linked owner must be an active GitHub user");
+        }
+        if user["organization_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&org.0)))
+        {
+            return Ok(());
+        }
+        let response = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/organizations/{}/members/{user_id}", org.0),
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() && response.status().as_u16() != 409 {
+            bail!("CODER_OWNER_MEMBERSHIP_FAILED: {}", response.status());
+        }
+        let verified = self
+            .get_user_detail(user_id)
+            .await?
+            .context("Coder owner disappeared")?;
+        if !verified.organization_ids.contains(&org.0) {
+            bail!("CODER_OWNER_MEMBERSHIP_FAILED");
+        }
+        Ok(())
+    }
+
+    /// Create an organization-scoped service account. The caller must verify
+    /// the returned organization membership before using it as a workspace
+    /// owner.
+    pub async fn create_service_account(
+        &self,
+        request: &crate::types::CreateServiceAccountRequest,
+    ) -> Result<CoderUserDetail> {
+        let resp = self
+            .authenticated_request(reqwest::Method::POST, "/api/v2/users")
+            .json(request)
+            .send()
+            .await
+            .context("Failed to create Coder service account")?;
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "Failed to create Coder service account ({}): {}",
+                status,
+                body
+            )
+        }
+    }
+
+    /// Delete a service account after all of its tenant workspaces are gone.
+    /// Missing users are treated as already reconciled.
+    pub async fn delete_user(&self, user_id: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(reqwest::Method::DELETE, &format!("/api/v2/users/{user_id}"))
+            .send()
+            .await
+            .context("Failed to delete Coder user")?;
+        if resp.status().is_success()
+            || matches!(
+                resp.status(),
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+            )
+        {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete Coder user ({status}): {body}")
         }
     }
 
@@ -1384,6 +1641,69 @@ impl CoderClient {
         }
     }
 
+    /// Restart through a stop build followed by a start build. A start-only
+    /// Terraform apply can retain the existing container and never rerun its
+    /// startup script. Wait for pending builds before submitting a transition.
+    pub async fn restart_workspace(&self, id: &str) -> Result<()> {
+        let status = self.wait_workspace_build_terminal(id).await?;
+        if matches!(status.as_str(), "deleted" | "deleting") {
+            bail!("Cannot restart a deleted workspace");
+        }
+        if status != "stopped" {
+            self.submit_workspace_transition(id, "stop").await?;
+            let status = self.wait_workspace_build_terminal(id).await?;
+            if status != "stopped" {
+                bail!("Workspace stop did not succeed: {}", status);
+            }
+        }
+        self.submit_workspace_transition(id, "start").await
+    }
+
+    async fn wait_workspace_build_terminal(&self, id: &str) -> Result<String> {
+        tokio::time::timeout(Duration::from_secs(15 * 60), async {
+            loop {
+                let workspace = self.get_workspace(id).await?;
+                let status = workspace
+                    .latest_build
+                    .as_ref()
+                    .map(|build| build.status.as_str())
+                    .filter(|status| !status.is_empty())
+                    .unwrap_or(&workspace.status);
+                match status {
+                    "running" | "stopped" | "failed" | "canceled" | "deleted" => {
+                        return Ok(status.to_string())
+                    }
+                    "pending" | "starting" | "stopping" | "canceling" | "deleting" => (),
+                    _ => bail!("Unexpected workspace build status: {}", status),
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+        .await
+        .context("Timed out waiting for workspace build")?
+    }
+
+    async fn submit_workspace_transition(&self, id: &str, transition: &str) -> Result<()> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::POST,
+                &format!("/api/v2/workspaces/{}/builds", id),
+            )
+            .json(&serde_json::json!({ "transition": transition }))
+            .send()
+            .await
+            .context("Failed to restart workspace")?;
+
+        if resp.status().is_success() {
+            info!(workspace_id = id, "Restarted workspace");
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to restart workspace ({}): {}", status, body)
+        }
+    }
+
     /// Stop a running workspace.
     pub async fn stop_workspace(&self, id: &str) -> Result<()> {
         let resp = self
@@ -1413,6 +1733,45 @@ impl CoderClient {
 
     /// Delete a workspace by triggering a delete build and waiting for deletion to complete.
     pub async fn delete_workspace(&self, id: &str) -> Result<()> {
+        let current = self
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/workspaces/{id}"))
+            .send()
+            .await
+            .context("Failed to check workspace before deletion")?;
+        if matches!(current.status().as_u16(), 404 | 410) {
+            info!(workspace_id = id, status = %current.status(), "Workspace already deleted");
+            return Ok(());
+        }
+        if !current.status().is_success() {
+            return Err(CoderHttpError {
+                operation: "check workspace before deletion",
+                status: current.status(),
+            }
+            .into());
+        }
+        // A prior attempt may have completed after Manager gave up waiting.
+        // Confirm Coder's resource state before asking it to start another
+        // delete build; some Coder versions reject duplicate transitions.
+        let workspace: CoderWorkspace = current
+            .json()
+            .await
+            .context("Failed to read workspace before deletion")?;
+        if workspace.workspace_status() == WorkspaceStatus::Deleted
+            || workspace.latest_build.as_ref().is_some_and(|build| {
+                build.transition.as_deref() == Some("delete") && build.status == "succeeded"
+            })
+        {
+            info!(workspace_id = id, "Workspace already deleted");
+            return Ok(());
+        }
+        if workspace.latest_build.as_ref().is_some_and(|build| {
+            build.transition.as_deref() == Some("delete")
+                && matches!(build.status.as_str(), "pending" | "running")
+        }) {
+            return self
+                .wait_for_workspace_deleted(id, Duration::from_secs(60))
+                .await;
+        }
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
@@ -1437,8 +1796,52 @@ impl CoderClient {
         }
 
         if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to delete workspace: {}", body)
+            let status = resp.status();
+            // Coder can reject a repeated delete build even though an earlier
+            // attempt already deleted the workspace. Confirm the final state
+            // before treating a conflict or validation rejection as failure.
+            if matches!(status.as_u16(), 400 | 409 | 422) {
+                let check = self
+                    .authenticated_request(
+                        reqwest::Method::GET,
+                        &format!("/api/v2/workspaces/{id}"),
+                    )
+                    .send()
+                    .await
+                    .context("Failed to verify workspace deletion")?;
+                if matches!(check.status().as_u16(), 404 | 410) {
+                    info!(workspace_id = id, %status, "Workspace already deleted");
+                    return Ok(());
+                }
+                if check.status().is_success() {
+                    let workspace: CoderWorkspace = check
+                        .json()
+                        .await
+                        .context("Failed to verify workspace deletion")?;
+                    if workspace.workspace_status() == WorkspaceStatus::Deleted
+                        || workspace.latest_build.as_ref().is_some_and(|build| {
+                            build.transition.as_deref() == Some("delete")
+                                && build.status == "succeeded"
+                        })
+                    {
+                        info!(workspace_id = id, %status, "Workspace already deleted");
+                        return Ok(());
+                    }
+                    if workspace.latest_build.as_ref().is_some_and(|build| {
+                        build.transition.as_deref() == Some("delete")
+                            && matches!(build.status.as_str(), "pending" | "running")
+                    }) {
+                        return self
+                            .wait_for_workspace_deleted(id, Duration::from_secs(60))
+                            .await;
+                    }
+                }
+            }
+            return Err(CoderHttpError {
+                operation: "delete workspace",
+                status,
+            }
+            .into());
         }
 
         self.wait_for_workspace_deleted(id, Duration::from_secs(60))
@@ -2289,6 +2692,7 @@ impl CoderClient {
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
         let chat_req = CreateChatRequest {
             organization_id: Some(organization_id),
+            owner_id: None,
             workspace_id: workspace.id.clone(),
             model_config_id,
             content: vec![ChatInputPart::text(prompt)],
@@ -2539,7 +2943,47 @@ mod http_mock {
                     body,
                 });
 
-                let (status, content) = route(&method, &path);
+                let (status, content) = if path == "/api/v2/workspaces/ws-delete-running"
+                    && method == "GET"
+                {
+                    let requests = requests.lock().await;
+                    let checks = requests
+                        .iter()
+                        .filter(|r| r.method == "GET" && r.path == path)
+                        .count();
+                    let (state, build_state) = if checks > 1 {
+                        ("deleted", "succeeded")
+                    } else {
+                        ("deleting", "running")
+                    };
+                    ("200 OK", serde_json::json!({"id":"ws-delete-running", "status":state, "latest_build":{"status":build_state, "transition":"delete"}}).to_string())
+                } else if path == "/api/v2/workspaces/ws-delete-me" && method == "GET" {
+                    let requests = requests.lock().await;
+                    let submitted = requests.iter().any(|r| {
+                        r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-me/builds"
+                    });
+                    let (state, build_state) = if submitted {
+                        ("deleted", "succeeded")
+                    } else {
+                        ("running", "succeeded")
+                    };
+                    ("200 OK", serde_json::json!({"id":"ws-delete-me", "status":state, "latest_build":{"status":build_state, "transition": if submitted { "delete" } else { "start" }}}).to_string())
+                } else if path == "/api/v2/workspaces/ws-restart" {
+                    let requests = requests.lock().await;
+                    let stopped = requests.iter().any(|r| {
+                        r.method == "POST" && r.path == "/api/v2/workspaces/ws-restart/builds"
+                    });
+                    let state = if stopped { "stopped" } else { "running" };
+                    (
+                        "200 OK",
+                        serde_json::json!({"id":"ws-restart", "latest_build":{"status":state}})
+                            .to_string(),
+                    )
+                } else if path == "/api/v2/workspaces/ws-restart/builds" {
+                    ("201 Created", "{}".to_string())
+                } else {
+                    route(&method, &path)
+                };
                 let response = format!(
                     "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
                     status,
@@ -2591,9 +3035,33 @@ mod http_mock {
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
             ),
+            ("POST", "/api/v2/files") => (
+                "201 Created",
+                r#"{"hash":"file-hash-1"}"#.to_string(),
+            ),
+            ("POST", "/api/v2/organizations/org-abc/templateversions") => (
+                "201 Created",
+                r#"{"id":"version-1","name":"release-1","template_id":null,"organization_id":"org-abc","job":{"id":"job-1","status":"pending"}}"#.to_string(),
+            ),
+            ("GET", "/api/v2/templateversions/version-1") => (
+                "200 OK",
+                r#"{"id":"version-1","name":"release-1","template_id":null,"organization_id":"org-abc","job":{"id":"job-1","status":"succeeded"}}"#.to_string(),
+            ),
+            ("GET", "/api/v2/templates/template-abc/versions") => (
+                "200 OK",
+                r#"[{"id":"version-1","name":"release-1","template_id":"template-abc","organization_id":"org-abc","job":{"id":"job-1","status":"succeeded","error":null,"error_code":null}}]"#.to_string(),
+            ),
+            ("GET", "/api/v2/templates/template-foreign/versions") => (
+                "200 OK",
+                r#"[{"id":"version-foreign","name":"release-1","template_id":"template-foreign","organization_id":"other-org","job":{"id":"job-2","status":"succeeded"}}]"#.to_string(),
+            ),
             ("POST", "/api/v2/workspaces/ws-delete-me/builds") => (
                 "201 Created",
                 r#"{"id":"build-1","transition":"delete"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-delete-me") => (
+                "200 OK",
+                r#"{"id":"ws-delete-me","name":"ws-delete-me","status":"deleted","latest_build":{"status":"succeeded","transition":"delete"}}"#.to_string(),
             ),
             ("POST", "/api/v2/workspaces/ws-delete-fail/builds") => (
                 "201 Created",
@@ -2615,6 +3083,22 @@ mod http_mock {
                 "410 Gone",
                 r#"{"message":"Workspace ws-gone was deleted"}"#.to_string(),
             ),
+            ("POST", "/api/v2/workspaces/ws-already-deleted/builds") => (
+                "400 Bad Request",
+                r#"{"message":"workspace has already been deleted"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-already-deleted") => (
+                "404 Not Found",
+                r#"{"message":"workspace was deleted"}"#.to_string(),
+            ),
+            ("POST", "/api/v2/workspaces/ws-delete-denied/builds") => (
+                "403 Forbidden",
+                r#"{"message":"operator credential expired"}"#.to_string(),
+            ),
+            ("GET", "/api/v2/workspaces/ws-delete-denied") => (
+                "200 OK",
+                r#"{"id":"ws-delete-denied","name":"ws-delete-denied","status":"running"}"#.to_string(),
+            ),
             ("POST", "/api/v2/workspaces/ws-wait-gone/builds") => (
                 "201 Created",
                 r#"{"id":"build-3","transition":"delete"}"#.to_string(),
@@ -2631,6 +3115,26 @@ mod http_mock {
 #[cfg(test)]
 mod tests {
     use super::parse_chat_models_body;
+
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn manager_requests_use_the_latest_shared_operator_token() {
+        let token = Arc::new(RwLock::new("first-key".to_owned()));
+        let client = crate::CoderClient::new("https://coder.example.test", "first-key")
+            .with_shared_token(token.clone());
+        let first = client
+            .authenticated_request(reqwest::Method::GET, "/api/v2/users/me")
+            .build()
+            .unwrap();
+        assert_eq!(first.headers()["authorization"], "Bearer first-key");
+        *token.write().unwrap() = "second-key".to_owned();
+        let second = client
+            .authenticated_request(reqwest::Method::GET, "/api/v2/users/me")
+            .build()
+            .unwrap();
+        assert_eq!(second.headers()["authorization"], "Bearer second-key");
+    }
 
     #[test]
     fn coder_cli_path_override_takes_precedence() {
@@ -2685,6 +3189,126 @@ mod tests {
         assert!(error.contains("403"));
         assert!(error.contains("chat access denied"));
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn template_version_upload_uses_coder_v237_api_contract() {
+        use std::io::Write;
+
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let org = crate::CoderOrganizationId::new("org-abc");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"fake tar archive").unwrap();
+        let archive = encoder.finish().unwrap();
+
+        let created = client
+            .create_template_version_with_variables(
+                &org,
+                None,
+                "release-1",
+                &archive,
+                &[crate::types::TemplateVariableValue {
+                    name: "dev_binary_host_path".into(),
+                    value: "/opt/openflows/.dev-binaries".into(),
+                }],
+            )
+            .await
+            .expect("version upload and create must match Coder routes");
+        assert_eq!(created.id, "version-1");
+        assert_eq!(created.job.as_ref().unwrap().id, "job-1");
+        assert_eq!(created.template_id, "");
+
+        let fetched = client
+            .get_template_version(&org, &created.id)
+            .await
+            .expect("fetch version")
+            .expect("version exists");
+        assert!(fetched.job.as_ref().unwrap().is_succeeded());
+
+        let requests = server.requests().await;
+        let upload = requests
+            .iter()
+            .find(|request| request.method == "POST" && request.path == "/api/v2/files")
+            .expect("archive must be uploaded to /api/v2/files");
+        assert!(!upload.body.is_empty());
+
+        let create = requests
+            .iter()
+            .find(|request| {
+                request.method == "POST"
+                    && request.path == "/api/v2/organizations/org-abc/templateversions"
+            })
+            .expect("version must be created through the organization endpoint");
+        let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
+        assert_eq!(body["storage_method"], "file");
+        assert_eq!(body["file_id"], "file-hash-1");
+        assert_eq!(body["provisioner"], "terraform");
+        assert!(body.get("template_id").is_none());
+        assert_eq!(
+            body["user_variable_values"],
+            serde_json::json!([{
+                "name": "dev_binary_host_path",
+                "value": "/opt/openflows/.dev-binaries"
+            }])
+        );
+        assert!(requests.iter().any(|request| {
+            request.method == "GET" && request.path == "/api/v2/templateversions/version-1"
+        }));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_template_version_rejects_cross_organization_response() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let error = client
+            .get_template_version(&crate::CoderOrganizationId::new("other-org"), "version-1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected 'other-org'"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_template_versions_uses_global_template_route_and_checks_scope() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let org = crate::CoderOrganizationId::new("org-abc");
+        let template = crate::CoderTemplateId::new("template-abc");
+        let versions = client
+            .list_template_versions(&org, &template)
+            .await
+            .expect("list using Coder's template-id route");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].id, "version-1");
+        assert_eq!(versions[0].job.as_ref().unwrap().error, "");
+        assert_eq!(versions[0].job.as_ref().unwrap().error_code, "");
+
+        let error = client
+            .list_template_versions(&org, &crate::CoderTemplateId::new("template-foreign"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected 'org-abc'"));
+
+        let requests = server.requests().await;
+        assert!(requests.iter().any(|request| {
+            request.method == "GET" && request.path == "/api/v2/templates/template-abc/versions"
+        }));
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn coder_canceled_status_is_terminal() {
+        let job = crate::CoderProvisionerJob {
+            id: "job-canceled".into(),
+            status: "canceled".into(),
+            error: String::new(),
+            error_code: String::new(),
+        };
+        assert!(job.is_terminal());
     }
 
     #[test]
@@ -2828,6 +3452,7 @@ mod tests {
 
         let req = CreateChatRequest {
             organization_id: Some("org-abc".to_string()),
+            owner_id: Some("tenant-owner".to_string()),
             workspace_id: "ws-1".to_string(),
             model_config_id: None,
             content: vec![crate::types::ChatInputPart::text("hello")],
@@ -2853,6 +3478,27 @@ mod tests {
             .expect("organization_id must be present and a string");
         assert!(!org_id.is_empty(), "organization_id must not be empty");
         assert_eq!(org_id, "org-abc");
+        assert_eq!(body["owner_id"], "tenant-owner");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_workspace_stops_before_starting() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        client.restart_workspace("ws-restart").await.unwrap();
+        let requests = server.requests().await;
+        let transitions: Vec<String> = requests
+            .iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| {
+                serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["transition"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(transitions, vec!["stop", "start"]);
         server.shutdown().await;
     }
 
@@ -2890,12 +3536,32 @@ mod tests {
             .delete_workspace("ws-deleted")
             .await
             .expect("workspace with deleted status should succeed");
+        assert!(!server
+            .requests()
+            .await
+            .iter()
+            .any(|r| { r.method == "POST" && r.path == "/api/v2/workspaces/ws-deleted/builds" }));
+        client
+            .delete_workspace("ws-delete-running")
+            .await
+            .expect("an existing delete build should be waited on");
+        assert!(!server.requests().await.iter().any(|r| {
+            r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-running/builds"
+        }));
 
         // 410 Gone on delete build should be treated as success (already deleted)
         client
             .delete_workspace("ws-gone")
             .await
             .expect("410 on build should succeed");
+
+        client
+            .delete_workspace("ws-already-deleted")
+            .await
+            .expect("a rejected repeat delete must succeed after confirming 404");
+        assert!(!server.requests().await.iter().any(|r| {
+            r.method == "POST" && r.path == "/api/v2/workspaces/ws-already-deleted/builds"
+        }));
 
         // 410 Gone during wait should be treated as success (confirmed deleted)
         client
@@ -2922,6 +3588,20 @@ mod tests {
             err
         );
 
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_reports_coder_denial_without_response_body() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+        let err = client
+            .delete_workspace("ws-delete-denied")
+            .await
+            .unwrap_err();
+        let coder = err.downcast_ref::<crate::CoderHttpError>().unwrap();
+        assert_eq!(coder.status, reqwest::StatusCode::FORBIDDEN);
+        assert!(!err.to_string().contains("operator credential expired"));
         server.shutdown().await;
     }
 }

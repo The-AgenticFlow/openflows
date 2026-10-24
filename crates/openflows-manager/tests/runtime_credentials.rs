@@ -575,6 +575,41 @@ async fn api_purpose_requests_api_permission_profile() {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
+async fn provisioning_runtime_can_request_credentials_after_heartbeat() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+
+    // A freshly started Coder workspace registers and heartbeats before the
+    // tenant worker promotes its desired state to `running`. Its startup script
+    // needs this exchange to clone the tenant repository, so the broker must
+    // permit this narrow bootstrap state while retaining observed=running.
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'provisioning' WHERE id = (\
+             SELECT tenant_id FROM workspaces WHERE id = $1\
+         )",
+    )
+    .bind(ctx.workspace_id.0)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workspaces SET desired_state = 'provisioning' WHERE id = $1")
+        .bind(ctx.workspace_id.0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .router
+        .clone()
+        .oneshot(broker_request("git", &ctx.raw_credential))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
 async fn human_credentials_are_rejected_at_runtime_endpoint() {
     let db = TestDb::new().await.unwrap();
     db.migrate().await.unwrap();
