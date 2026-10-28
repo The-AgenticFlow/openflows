@@ -3,6 +3,80 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.8.0] - 2026-10-28
+
+### Features
+
+- *(hooks)* Add worker hooks publishing and related tests
+
+
+
+
+
+
+- *(manager)* Add hosted tenant runtimes and operator setup
+
+
+
+
+
+
+### Bug Fixes
+
+- *(runtime)* Address hosted runtime review findings
+
+
+
+
+
+
+### Testing
+
+- *(uncategorized)* Preserve verification log before workspace deletion
+
+
+
+
+
+
+- *(uncategorized)* Verify checkout isolation and stale review guards independently
+
+
+
+
+
+
+### Miscellaneous Tasks
+
+- *(uncategorized)* Sync main into develop for release promotion
+
+
+
+
+
+
+### Continuous Integration
+
+- *(uncategorized)* Verify candidate code through real paired workers
+
+
+
+
+
+
+- *(uncategorized)* Gate merges on real container integration tests
+
+
+
+
+
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.7.1...openflows-1.8.0
+
+
+
 ## [1.7.1] - 2026-10-09
 
 ### Features
