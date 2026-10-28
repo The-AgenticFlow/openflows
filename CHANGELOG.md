@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @Christiantyemele
+
 - *(manager)* Add hosted tenant runtimes and operator setup
 
 
@@ -21,7 +24,290 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @Christiantyemele
+
+- *(manager)* Add hosted template release sources
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add Coder template release provisioning
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add runtime credential broker
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add GitHub App connection lifecycle
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Complete WP-02 human auth and org authorization
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add organization policy, membership, and invitation APIs
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add browser and CLI device authentication
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Add WP-02 auth persistence and crypto primitives
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Enforce role-scoped GitHub delivery
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Complete hosted runtime management flow
+
+
+
+
+
+
+
+  by @Christiantyemele
+
 ### Bug Fixes
+
+- *(deployment)* Complete hook startup configuration
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Drain recovered reviews and prove pending CI holds
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Coordinate release cache writers and restore default binary
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address hosted template release review
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Include template release builder
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Align promotion and readiness locks
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Close remaining release review gaps
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address provisioning review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Preserve shared tokens on cached request failures
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address runtime credential broker review
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Retain temporary failures for automatic retry
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Fence reconnects and bound connection job retries
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address GitHub lifecycle review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Address authentication and organization review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Satisfy spelling checks
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(nexus)* Retain rework delivery ids
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(nexus)* Align managed worker branch resolution
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Fence tenant cleanup and rework delivery
+
+
+
+
+
+
+
+  by @Christiantyemele
 
 - *(runtime)* Address hosted runtime review findings
 
@@ -30,7 +316,254 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @Christiantyemele
+
+- *(runtime)* Filter template promotions by supported release
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Address remaining review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Close remaining review threads
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Close remaining hosted lifecycle races
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Address hosted lifecycle review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Address hosted lifecycle review findings (part 2)
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Forward managed worker assignment
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(runtime)* Address hosted lifecycle review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(security)* Resolve cargo-deny advisories on develop
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Address PR creation review feedback
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+### Documentation
+
+- *(centralized-deployment)* Add implementation plan and compatibility baseline
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Remove implementation history from test architecture
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(e2e)* Shorten introductory comments
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(github)* Require only essential fields in bug report form
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(github)* Add issue templates and security policy
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Define the complete end-to-end testing architecture
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+### Styling
+
+- *(manager)* Format connection flow changes
+
+
+
+
+
+
+
+  by @Christiantyemele
+
 ### Testing
+
+- *(coder)* Cover refreshable hosted gh credentials
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Connect the production issue-to-merge workflow
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(e2e)* Preserve failure evidence and verify applied settings and cleanup
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(lifecycle)* Isolate the human approval merge gate
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(uncategorized)* Refactor test descriptions and organization
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Fix fixture readiness, diagnostics, and tool matching
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(uncategorized)* Add deterministic system E2E service fixtures
+
+
+
+
+
+
+
+  by @NkwaTambe
 
 - *(uncategorized)* Preserve verification log before workspace deletion
 
@@ -39,6 +572,9 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @NkwaTambe
+
 - *(uncategorized)* Verify checkout isolation and stale review guards independently
 
 
@@ -46,7 +582,20 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @NkwaTambe
+
 ### Miscellaneous Tasks
+
+- *(manager)* Remove review handoff file
+
+
+
+
+
+
+
+  by @Christiantyemele
 
 - *(uncategorized)* Sync main into develop for release promotion
 
@@ -54,6 +603,19 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Remove unrelated Zep integration
+
+
+
+
+
+
+
+  by @Christiantyemele
 
 ### Continuous Integration
 
@@ -64,6 +626,9 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @NkwaTambe
+
 - *(uncategorized)* Gate merges on real container integration tests
 
 
@@ -72,6 +637,16 @@ All notable changes to this project will be documented in this file.
 
 
 
+  by @NkwaTambe
+
+
+
+
+### Contributors
+
+- @Christiantyemele
+- @NkwaTambe
+- @lele-maxwell
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.7.1...openflows-1.8.0
 
@@ -216,12 +791,6 @@ All notable changes to this project will be documented in this file.
   by @NkwaTambe
 
 
-
-
-### Contributors
-
-- @Christiantyemele
-- @NkwaTambe
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.7.0...openflows-1.7.1
 
