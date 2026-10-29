@@ -31,6 +31,9 @@ on:
       version:
         description: 'Version to build and push, e.g. 1.3.1 (manual dispatch only)'
         required: true
+      rust_version:
+        description: 'Optional Rust builder version override for rebuilding an existing release tag'
+        required: false
 
 concurrency:
   group: docker-publish-${{ github.ref }}
@@ -109,6 +112,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
+
+      - name: Override Rust builder version
+        if: inputs.rust_version != ''
+        env:
+          RUST_VERSION: ${{ inputs.rust_version }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RUST_VERSION" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::Invalid Rust version '$RUST_VERSION'"
+            exit 1
+          fi
+          sed -i -E "s|^FROM rust:[^ ]+ AS builder$|FROM rust:${RUST_VERSION}-bookworm AS builder|" Dockerfile
+          grep -q "^FROM rust:${RUST_VERSION}-bookworm AS builder$" Dockerfile
           persist-credentials: false
 
       - name: Set up Docker Buildx
