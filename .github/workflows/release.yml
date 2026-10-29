@@ -270,14 +270,17 @@ jobs:
         run: |
           set -euo pipefail
           # Only dispatch when THIS push actually created a release tag.
-          # release-plz tags the pushed commit `openflows-X.Y.Z` on a real
-          # release; on an ordinary main push (no release) HEAD carries no
-          # openflows-* tag, so `--points-at HEAD` resolves to nothing and we
-          # skip instead of republishing the previous release's Docker tags.
-          TAG="$(git tag --points-at HEAD 'openflows-*' --sort=-creatordate \
+          # Release PRs are merged into main with a merge commit. release-plz
+          # tags the release PR tip (HEAD^2), not the merge commit (HEAD).
+          # Ordinary main pushes have no release tag on their second parent.
+          if ! git rev-parse --verify 'HEAD^2' >/dev/null 2>&1; then
+            echo "::notice::This push is not a merge commit. Skipping docker-publish dispatch."
+            exit 0
+          fi
+          TAG="$(git tag --points-at 'HEAD^2' 'openflows-*' --sort=-creatordate \
             --format='%(refname:short)' | head -1)"
           if [ -z "${TAG}" ]; then
-            echo "::notice::No openflows-* tag on HEAD — this push did not create a release. Skipping docker-publish dispatch."
+            echo "::notice::No openflows-* tag on the merged branch tip — this push did not create a release. Skipping docker-publish dispatch."
             exit 0
           fi
           VERSION="${TAG#openflows-}"
