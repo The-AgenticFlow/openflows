@@ -290,3 +290,4 @@ jobs:
           fi
           echo "Dispatching docker-publish.yml for version ${VERSION}"
           gh workflow run docker-publish.yml --ref main -f version="${VERSION}"
+          gh workflow run docker-publish-manager.yml --ref main -f ref="refs/tags/${TAG}" -f tag="${VERSION}"

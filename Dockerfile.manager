@@ -1,0 +1,35 @@
+# Manager server image. Separate from Dockerfile: a server needs no Node, Claude Code CLI or git.
+# The AWS SDK crates need rustc 1.94.1 (the controller image pins 1.88).
+FROM rust:1.94.1-bookworm AS builder
+
+WORKDIR /app
+
+# Whole workspace before `cargo fetch`: cargo loads every member to resolve the graph.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY binary ./binary
+COPY orchestration ./orchestration
+
+RUN cargo fetch
+
+RUN cargo build --release --bin openflows-manager
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r openflows && useradd -r -g openflows -m -d /home/openflows openflows
+
+COPY --from=builder /app/target/release/openflows-manager /usr/local/bin/openflows-manager
+
+USER openflows
+WORKDIR /home/openflows
+
+# The binary binds 127.0.0.1:3002 by default; a container must listen on all interfaces.
+ENV OPENFLOWS_MANAGER_ADDR=0.0.0.0:3002
+EXPOSE 3002
+
+ENTRYPOINT ["openflows-manager"]
+CMD ["serve"]

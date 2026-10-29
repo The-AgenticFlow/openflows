@@ -1,0 +1,79 @@
+name: Docker Publish Manager
+
+# Pushes ghcr.io/the-agenticflow/openflows-manager:<tag> (linux/amd64). release.yml dispatches it per release.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag or SHA)'
+        required: true
+        default: main
+      tag:
+        description: 'Image tag to push, e.g. 1.8.1'
+        required: true
+
+concurrency:
+  group: docker-publish-manager-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: the-agenticflow/openflows-manager
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Resolve built commit
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6
+        with:
+          context: .
+          file: Dockerfile.manager
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.title=openflows-manager
+            org.opencontainers.image.description=OpenFlows Manager service
+            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/The-AgenticFlow/openflows
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=openflows-manager-docker
+          cache-to: type=gha,mode=max,scope=openflows-manager-docker
+          provenance: false
+
+      - name: Print the image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "### Published"
+            echo "\`${REGISTRY}/${IMAGE_NAME}:${TAG}\`"
+            echo "\`${REGISTRY}/${IMAGE_NAME}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
