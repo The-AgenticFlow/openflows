@@ -112,6 +112,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
+          persist-credentials: false
 
       - name: Override Rust builder version
         if: inputs.rust_version != ''
@@ -125,7 +126,6 @@ jobs:
           fi
           sed -i -E "s|^FROM rust:[^ ]+ AS builder$|FROM rust:${RUST_VERSION}-bookworm AS builder|" Dockerfile
           grep -q "^FROM rust:${RUST_VERSION}-bookworm AS builder$" Dockerfile
-          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
