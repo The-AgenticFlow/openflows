@@ -31,7 +31,9 @@ Manager runtime API. The Manager must reach each tenant's Nexus hook server.
 Give the Manager IAM role `secretsmanager:CreateSecret`, `GetSecretValue`,
 `PutSecretValue`, `DeleteSecret`, and `DescribeSecret` on **its environment's
 prefix only**. Add KMS decrypt/data-key permissions if using a customer-managed
-key. Seed the GitHub client secret, App private key, webhook secret, and the
+key. Where IAM decides by tag, set
+`OPENFLOWS_AWS_SECRETS_TAGS=Key=Value,Key=Value`: the Manager sends those tags in
+`CreateSecret`, so its role also needs `secretsmanager:TagResource`. Seed the GitHub client secret, App private key, webhook secret, and the
 Coder hook secret under that prefix. Configure Coder with the **same** hook
 secret before startup. Use a private HTTPS `OPENFLOWS_HOOK_URL` that both Coder
 and Manager share; the signed hook JWT audience must match it exactly. Do not

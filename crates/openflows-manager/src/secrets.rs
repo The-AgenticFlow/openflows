@@ -69,6 +69,27 @@ mod reference_tests {
         assert!(provider.canonical_reference("../outside").is_err());
     }
 
+    #[test]
+    fn secret_tags_parse_and_reject_invalid_input() {
+        assert_eq!(
+            parse_secret_tags(" Project = openflows ,Environment=staging,").unwrap(),
+            vec![
+                ("Project".to_owned(), "openflows".to_owned()),
+                ("Environment".to_owned(), "staging".to_owned())
+            ]
+        );
+        assert!(parse_secret_tags("").unwrap().is_empty());
+        for bad in ["Project", "=x", "aws:Reserved=x", "A=1,A=2"] {
+            assert!(parse_secret_tags(bad).is_err(), "{bad}");
+        }
+        let many = (0..51)
+            .map(|i| format!("k{i}=v"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_secret_tags(&many).is_err());
+        assert!(parse_secret_tags(&format!("{}=v", "k".repeat(129))).is_err());
+    }
+
     #[tokio::test]
     async fn aws_provider_round_trips_binary_secrets_without_a_live_account() {
         use axum::{extract::State, http::HeaderMap, routing::any, Json, Router};
@@ -94,6 +115,13 @@ mod reference_tests {
             let mut values = values.lock().unwrap();
             match action {
                 "CreateSecret" => {
+                    assert_eq!(
+                        body["Tags"],
+                        json!([
+                            {"Key": "Project", "Value": "openflows"},
+                            {"Key": "Environment", "Value": "staging"}
+                        ])
+                    );
                     let name = body["Name"].as_str().unwrap().to_owned();
                     values.insert(name.clone(), body["SecretBinary"].as_str().unwrap().into());
                     Json(
@@ -139,7 +167,8 @@ mod reference_tests {
             aws_sdk_secretsmanager::Client::from_conf(config),
             "openflows/staging",
         )
-        .unwrap();
+        .unwrap()
+        .with_tags(parse_secret_tags("Project=openflows, Environment=staging").unwrap());
         let reference = provider
             .put("coder-operator-token", b"first")
             .await
@@ -151,6 +180,32 @@ mod reference_tests {
         provider.delete(&reference).await.unwrap();
         server.abort();
     }
+}
+
+/// Parse `Key=Value,Key=Value` into AWS Secrets Manager tags.
+pub fn parse_secret_tags(value: &str) -> Result<Vec<(String, String)>, SecretError> {
+    let mut tags: Vec<(String, String)> = Vec::new();
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (key, val) = entry
+            .split_once('=')
+            .ok_or_else(|| SecretError::Rejected("secret tags must be Key=Value pairs".into()))?;
+        let (key, val) = (key.trim(), val.trim());
+        if key.is_empty()
+            || key.len() > 128
+            || val.len() > 256
+            || key.to_ascii_lowercase().starts_with("aws:")
+        {
+            return Err(SecretError::Rejected("invalid secret tag".into()));
+        }
+        if tags.iter().any(|(k, _)| k == key) {
+            return Err(SecretError::Rejected("duplicate secret tag key".into()));
+        }
+        tags.push((key.to_owned(), val.to_owned()));
+    }
+    if tags.len() > 50 {
+        return Err(SecretError::Rejected("at most 50 secret tags".into()));
+    }
+    Ok(tags)
 }
 
 /// The interface for storing and retrieving secrets.
@@ -204,6 +259,7 @@ pub const AWS_SECRETS_MANAGER_PROVIDER: &str = "aws-secrets-manager";
 pub struct AwsSecretsManagerSecretProvider {
     client: aws_sdk_secretsmanager::Client,
     prefix: String,
+    tags: Vec<aws_sdk_secretsmanager::types::Tag>,
 }
 
 impl AwsSecretsManagerSecretProvider {
@@ -226,7 +282,22 @@ impl AwsSecretsManagerSecretProvider {
         Ok(Self {
             client,
             prefix: prefix.to_owned(),
+            tags: Vec::new(),
         })
+    }
+
+    /// Tag every secret this provider creates, for deployments whose IAM decides by tag.
+    pub fn with_tags(mut self, tags: Vec<(String, String)>) -> Self {
+        self.tags = tags
+            .into_iter()
+            .map(|(key, value)| {
+                aws_sdk_secretsmanager::types::Tag::builder()
+                    .key(key)
+                    .value(value)
+                    .build()
+            })
+            .collect();
+        self
     }
 
     fn name(&self, reference: &str) -> Result<String, SecretError> {
@@ -260,6 +331,7 @@ impl SecretProvider for AwsSecretsManagerSecretProvider {
         self.client
             .create_secret()
             .name(&name)
+            .set_tags((!self.tags.is_empty()).then(|| self.tags.clone()))
             .secret_binary(aws_sdk_secretsmanager::primitives::Blob::new(value))
             .send()
             .await

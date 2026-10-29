@@ -170,10 +170,15 @@ pub async fn resolve_secret_provider(
                 ));
             }
             let client = aws_sdk_secretsmanager::Client::new(&sdk_config);
-            Ok(Box::new(
-                crate::secrets::AwsSecretsManagerSecretProvider::new(client, prefix)
-                    .map_err(|e| ManagerError::Config(e.to_string()))?,
-            ))
+            let mut provider = crate::secrets::AwsSecretsManagerSecretProvider::new(client, prefix)
+                .map_err(|e| ManagerError::Config(e.to_string()))?;
+            if let Ok(tags) = std::env::var(crate::config::AWS_SECRETS_TAGS_ENV) {
+                let tags = crate::secrets::parse_secret_tags(&tags).map_err(|e| {
+                    ManagerError::Config(format!("{}: {e}", crate::config::AWS_SECRETS_TAGS_ENV))
+                })?;
+                provider = provider.with_tags(tags);
+            }
+            Ok(Box::new(provider))
         }
         other => Err(ManagerError::Config(format!(
             "secret provider '{other}' is not implemented; refusing to start"

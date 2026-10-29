@@ -163,6 +163,8 @@ pub const DATABASE_URL_ENV: &str = "OPENFLOWS_DATABASE_URL";
 /// The environment variable selecting the secret-provider adapter.
 pub const SECRET_PROVIDER_ENV: &str = "OPENFLOWS_SECRET_PROVIDER";
 pub const AWS_SECRETS_PREFIX_ENV: &str = "OPENFLOWS_AWS_SECRETS_PREFIX";
+/// Optional `Key=Value,Key=Value` tags applied to every secret the Manager creates in AWS.
+pub const AWS_SECRETS_TAGS_ENV: &str = "OPENFLOWS_AWS_SECRETS_TAGS";
 /// The default secret-provider adapter name for local mode and tests.
 pub const DEFAULT_SECRET_PROVIDER: &str = "in-memory";
 
