@@ -154,8 +154,10 @@ cargo test -p openflows-manager provisioning::source
 
 `ghcr.io/the-agenticflow/openflows-manager:<tag>` runs `openflows-manager serve`
 as a non-root user and listens on `0.0.0.0:3002` (`OPENFLOWS_MANAGER_ADDR`).
-`GET /health` is the liveness and readiness probe. The other subcommands run in
-the same image: `setup`, `doctor`, `repair-runtime` and `set-coder-hook-secret`.
+`GET /health` is the liveness probe and `GET /ready` the readiness probe. The
+other subcommands run in the same image: `setup`, `doctor`, `repair-runtime` and
+`set-coder-hook-secret`. The image has no Docker CLI, so the `docker` provisioner
+backend is not supported in it.
 
 All settings come from the environment, as listed in `.env.openflows.example`;
 the image holds no configuration or secrets. It is built from

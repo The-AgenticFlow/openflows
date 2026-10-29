@@ -23,12 +23,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd -r openflows && useradd -r -g openflows -m -d /home/openflows openflows
 
 COPY --from=builder /app/target/release/openflows-manager /usr/local/bin/openflows-manager
+COPY --from=builder /app/crates/coder-client/templates /opt/openflows/templates
 
 USER openflows
 WORKDIR /home/openflows
 
 # The binary binds 127.0.0.1:3002 by default; a container must listen on all interfaces.
 ENV OPENFLOWS_MANAGER_ADDR=0.0.0.0:3002
+# The default local template source reads this directory; hosted setups select the GitHub source.
+ENV OPENFLOWS_TEMPLATE_SOURCE_DIR=/opt/openflows/templates
 EXPOSE 3002
 
 ENTRYPOINT ["openflows-manager"]
