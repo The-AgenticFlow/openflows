@@ -155,12 +155,7 @@ cargo test -p openflows-manager provisioning::source
 `ghcr.io/the-agenticflow/openflows-manager:<tag>` runs `openflows-manager serve`
 as a non-root user and listens on `0.0.0.0:3002` (`OPENFLOWS_MANAGER_ADDR`).
 `GET /health` is the liveness and readiness probe. The other subcommands run in
-the same image:
-
-```sh
-openflows-manager setup
-openflows-manager doctor
-```
+the same image: `setup`, `doctor`, `repair-runtime` and `set-coder-hook-secret`.
 
 All settings come from the environment, as listed in `.env.openflows.example`;
 the image holds no configuration or secrets. It is built from
