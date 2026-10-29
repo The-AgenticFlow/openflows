@@ -133,6 +133,7 @@ Names below are proposed new configuration keys, to be added centrally in the co
 | Key | Scope and purpose |
 |---|---|
 | `OPENFLOWS_MODE` | `local` or `hosted`; explicit precedence with CLI profile |
+| `OPENFLOWS_CONNECTED_LOCAL_ENABLED` | Strict boolean, default `false`; enables connected-local enrollment/client capability without changing the deployment role |
 | `OPENFLOWS_API_URL` | CLI/runtime manager origin |
 | `OPENFLOWS_PUBLIC_URL` | Manager callback/verification origin |
 | `OPENFLOWS_DATABASE_URL` | Manager product PostgreSQL credential |
