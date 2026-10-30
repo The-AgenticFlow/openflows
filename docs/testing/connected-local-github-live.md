@@ -9,9 +9,9 @@ date, and pass/fail results, but never record access or refresh tokens.
 
 - The App has **Device flow** enabled and is installed on the disposable repo
   with Contents read/write permission. The tester has write access to that repo.
-- Set `OPENFLOWS_GITHUB_AUTH_MODE=connected-local`,
-  `OPENFLOWS_GITHUB_CLIENT_ID` (the public client ID, not the App ID), and
-  `OPENFLOWS_GITHUB_APP_SLUG` in the local `.env`. Do not add an App secret.
+- Use an official OpenFlows release or deployment image that already supplies
+  the team App's public client ID and slug. Do not add either setting to a
+  contributor's `.env`, and do not add an App secret.
 - Docker, Rust, and the local setup prerequisites in [Quick Start](../../quick_start.md)
   are available. Work from the repository root.
 

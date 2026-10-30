@@ -19,7 +19,12 @@ services:
       OPENFLOWS_MODE: local
       OPENFLOWS_CONNECTED_LOCAL_ENABLED: "true"
       OPENFLOWS_AUTH_ALLOW_LOOPBACK: "true"
-      OPENFLOWS_GITHUB_CLIENT_ID: ${OPENFLOWS_GITHUB_CLIENT_ID:?}
+      # Official OpenFlows releases supply the team App's public client ID.
+      # An unconfigured development build still starts the console, which
+      # reports the missing release configuration without asking contributors
+      # to create or configure an App.
+      OPENFLOWS_GITHUB_CLIENT_ID: ${OPENFLOWS_GITHUB_CLIENT_ID:-}
+      OPENFLOWS_GITHUB_APP_SLUG: ${OPENFLOWS_GITHUB_APP_SLUG:-}
       OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE: /run/openflows-local/github-user.json
       OPENFLOWS_MANAGER_ADDR: 0.0.0.0:3002
       REDIS_URL: redis://redis:6379

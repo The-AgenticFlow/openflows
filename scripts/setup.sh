@@ -424,21 +424,7 @@ stage_github_app() {
         env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     fi
     if [ "$auth_mode" = connected-local ]; then
-        local client_id slug secret_dir repos
-        client_id="$(env_get OPENFLOWS_GITHUB_CLIENT_ID)"
-        if is_placeholder "$client_id"; then
-            is_tty || die "Set OPENFLOWS_GITHUB_CLIENT_ID to the team's public GitHub App client ID."
-            client_id="$(ask 'OpenFlows GitHub App client ID')"
-            [ -n "$client_id" ] || die "GitHub App client ID is required."
-            env_set OPENFLOWS_GITHUB_CLIENT_ID "$client_id"
-        fi
-        slug="$(env_get OPENFLOWS_GITHUB_APP_SLUG)"
-        if is_placeholder "$slug"; then
-            is_tty || die "Set OPENFLOWS_GITHUB_APP_SLUG to the team's public GitHub App slug."
-            slug="$(ask 'OpenFlows GitHub App slug')"
-            [ -n "$slug" ] || die "GitHub App slug is required."
-            env_set OPENFLOWS_GITHUB_APP_SLUG "$slug"
-        fi
+        local secret_dir
         secret_dir="${HOME}/.config/openflows"
         env_set OPENFLOWS_MODE local
         env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
@@ -451,17 +437,7 @@ stage_github_app() {
         env_set TF_VAR_connected_local_broker_secret_host_path "$secret_dir/github-broker-key"
         env_set TF_VAR_connected_local_helper_host_path "$ROOT/scripts/connected-local-github.py"
         env_set TF_VAR_connected_local_manager_url "http://openflows-local-manager:3002"
-        info "Install the OpenFlows App on ${REPO}: https://github.com/apps/${slug}/installations/new"
-        is_tty && pause "Install the App on the selected repository, then continue"
-        if ! repos="$(cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-repos 2>/dev/null)"; then
-            (cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-login) \
-                || die "GitHub device authorization failed."
-            repos="$(cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-repos)" \
-                || die "Could not list repositories available to your GitHub account and the App."
-        fi
-        printf '%s\n' "$repos" | awk -F '\t' -v repo="$REPO" 'tolower($2) == tolower(repo) {found=1} END {exit !found}' \
-            || die "${REPO} is not accessible to both your GitHub account and the OpenFlows App."
-        ok "GitHub user authorization ready for ${REPO}"
+        info "GitHub connection continues in the local OpenFlows console after the stack starts."
         return
     fi
     [ "$auth_mode" = self-managed ] || die "OPENFLOWS_GITHUB_AUTH_MODE must be connected-local or self-managed."
@@ -505,6 +481,38 @@ stage_docker() {
     spin $! "Waiting for Coder to become healthy" \
         || die "Coder did not become healthy in 3 minutes." "Check logs: docker compose logs coder"
     ok "Coder is up at ${B}$(coder_url)${N}"
+}
+
+# stage_connected_local_authorization — the team App is configured by the
+# OpenFlows release. Contributors install it, approve their own GitHub account,
+# and choose the requested repository in the local browser console.
+stage_connected_local_authorization() {
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] || return 0
+    step "Connect GitHub"
+    local manager_url="http://localhost:3002" status repos
+    ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
+    spin $! "Waiting for the local OpenFlows console" \
+        || die "The local OpenFlows console did not become ready." "Check logs: docker compose logs openflows-local-manager"
+    status="$(curl -fs -m 5 "${manager_url}/api/v1/local/github" 2>/dev/null || true)"
+    printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
+        || die "This OpenFlows distribution does not include the team GitHub App configuration." \
+               "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
+    panel "$C" "Connect GitHub in your browser" \
+        "Open the local console, install the OpenFlows App on ${REPO}, approve GitHub, then select ${REPO}." \
+        "${manager_url}"
+    open_url "$manager_url"
+    is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
+    pause "Complete GitHub connection in the local console, then continue"
+    repos="$(curl -fs -m 15 "${manager_url}/api/v1/local/github/repositories" 2>/dev/null || true)"
+    printf '%s' "$repos" | python3 -c '
+import json, sys
+target = sys.argv[1].casefold()
+items = json.load(sys.stdin)
+sys.exit(0 if any(item.get("full_name", "").casefold() == target for item in items) else 1)
+' "$REPO" \
+        || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
+               "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
+    ok "GitHub user authorization ready for ${REPO}"
 }
 
 # ── stage 5: Coder admin + token ────────────────────────────────────────────
@@ -911,6 +919,7 @@ main() {
     env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
     stage_github_app
     stage_docker
+    stage_connected_local_authorization
     stage_coder_token
     stage_llm
     stage_bootstrap

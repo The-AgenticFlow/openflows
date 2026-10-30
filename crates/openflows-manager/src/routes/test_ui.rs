@@ -29,7 +29,22 @@ pub async fn index() -> Html<&'static str> {
 <body>
 <main>
   <h1>OpenFlows Manager Console</h1>
-  <p>Test sign-in, GitHub connections, and tenant provisioning.</p>
+  <p>Test connected-local GitHub authorization and tenant provisioning.</p>
+
+  <section id="local-github-section">
+    <h2>Connect GitHub for this computer</h2>
+    <p id="local-github-help">Checking connected-local GitHub availability…</p>
+    <button id="install-app" disabled>Install OpenFlows App</button>
+    <button id="connect-local-github" disabled>Connect GitHub</button>
+    <button class="secondary" id="refresh-local-github">Refresh</button>
+    <button class="danger" id="logout-local-github" disabled>Disconnect</button>
+    <pre id="local-github-output">No GitHub authorization yet.</pre>
+    <label>Repository available to you and the App
+      <select id="local-repositories" disabled><option value="">Connect GitHub first</option></select>
+    </label>
+    <button class="secondary" id="use-local-repository" disabled>Use selected repository</button>
+    <p>The OpenFlows App is owned by OpenFlows. You approve access for your GitHub account and choose a repository that you can access.</p>
+  </section>
 
   <section>
     <h2>1. Sign in</h2>
@@ -102,6 +117,9 @@ let operationGeneration = 0;
 let busy = false;
 let signedIn = false;
 let selectedOrg = null;
+let localGithub = null;
+let localDevice = null;
+let localDeviceTimer = null;
 
 function controls() {
   for (const id of ['create-org', 'refresh-orgs']) $(id).disabled = busy || !signedIn;
@@ -114,6 +132,12 @@ function controls() {
   $('stop-tenant').disabled = busy || !tenantId;
   $('delete-tenant').disabled = busy || !tenantId || ['deleting', 'deleted'].includes(selectedTenant?.desired_state);
   $('tenant-status').disabled = busy || !tenantId;
+  const connected = localGithub?.configured && localGithub?.authorized;
+  $('install-app').disabled = busy || !localGithub?.installation_url;
+  $('connect-local-github').disabled = busy || !localGithub?.configured || connected;
+  $('logout-local-github').disabled = busy || !connected;
+  $('local-repositories').disabled = busy || !connected;
+  $('use-local-repository').disabled = busy || !connected || !$('local-repositories').value;
 }
 function cancelOperation() { clearTimeout(operationTimer); operationGeneration++; }
 async function action(work, output) {
@@ -205,6 +229,75 @@ function log(message, error = false) {
   $('log').className = error ? 'error' : '';
 }
 function show(id, value) { $(id).textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+function clearLocalDevicePoll() {
+  if (localDeviceTimer) clearTimeout(localDeviceTimer);
+  localDeviceTimer = null;
+  localDevice = null;
+}
+function setLocalRepositories(repositories) {
+  const select = $('local-repositories');
+  select.replaceChildren(); option(select, '', 'Select a repository');
+  for (const repository of repositories) {
+    option(select, repository.full_name, repository.full_name + (repository.private ? ' (private)' : ''));
+  }
+  controls();
+}
+async function refreshLocalGithub() {
+  try {
+    localGithub = await request('/api/v1/local/github');
+    if (!localGithub.enabled) {
+      show('local-github-help', 'Connected-local mode is disabled for this deployment.');
+      show('local-github-output', 'This Manager is running the hosted or self-managed path.');
+      controls(); return;
+    }
+    if (!localGithub.configured) {
+      show('local-github-help', 'This build has no OpenFlows App configuration. Install an official OpenFlows release or ask the deployment operator to configure the team App.');
+      show('local-github-output', 'Contributors do not enter a client ID or App slug here.');
+      controls(); return;
+    }
+    if (!localGithub.authorized) {
+      show('local-github-help', 'Install the OpenFlows App on a repository, then connect your GitHub account.');
+      show('local-github-output', 'No GitHub authorization is saved on this computer.');
+      setLocalRepositories([]); controls(); return;
+    }
+    show('local-github-help', 'GitHub is connected for this computer. Choose a repository shared by you and the OpenFlows App.');
+    const repositories = await request('/api/v1/local/github/repositories');
+    setLocalRepositories(repositories);
+    show('local-github-output', `${repositories.length} ${repositories.length === 1 ? 'repository' : 'repositories'} available to your GitHub account and the App.`);
+  } catch (error) {
+    show('local-github-help', 'GitHub connection needs attention.');
+    show('local-github-output', error.message);
+  }
+  controls();
+}
+async function pollLocalGithub() {
+  if (!localDevice) return;
+  if (Date.now() >= localDevice.expiresAt) {
+    clearLocalDevicePoll();
+    show('local-github-output', 'The GitHub code expired. Select Connect GitHub to start again.');
+    controls(); return;
+  }
+  try {
+    const response = await request('/api/v1/local/github/device/poll', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ device_code: localDevice.deviceCode })
+    });
+    if (response.status === 'authorized') {
+      clearLocalDevicePoll();
+      log('GitHub authorization completed.');
+      await refreshLocalGithub();
+      return;
+    }
+    if (response.status === 'slow_down') {
+      localDevice.interval = Math.max(response.interval || 0, localDevice.interval + 5);
+    }
+    localDeviceTimer = setTimeout(pollLocalGithub, localDevice.interval * 1000);
+  } catch (error) {
+    clearLocalDevicePoll();
+    show('local-github-output', `GitHub authorization did not complete: ${error.message}`);
+    controls();
+  }
+}
 function showConnection(value) {
   const output = $('connection-output');
   output.textContent = '';
@@ -347,12 +440,48 @@ $('retry-operation').onclick = () => action(async () => {
   const result = await mutate(`/api/v1/operations/${encodeURIComponent(id)}/retry`);
   watchOperation(result.operation_id);
 }, 'operation-output');
+$('install-app').onclick = () => {
+  if (localGithub?.installation_url) window.open(localGithub.installation_url, '_blank', 'noopener');
+};
+$('refresh-local-github').onclick = () => action(refreshLocalGithub, 'local-github-output');
+$('connect-local-github').onclick = () => action(async () => {
+  clearLocalDevicePoll();
+  const device = await request('/api/v1/local/github/device', { method: 'POST' });
+  localDevice = {
+    deviceCode: device.device_code,
+    interval: device.interval,
+    expiresAt: Date.now() + device.expires_in * 1000,
+  };
+  const output = $('local-github-output');
+  output.replaceChildren();
+  const link = document.createElement('a');
+  link.href = device.verification_uri; link.target = '_blank'; link.rel = 'noopener';
+  link.textContent = 'Open GitHub to approve';
+  output.append(link, document.createTextNode(`\nEnter this code: ${device.user_code}\nWaiting for approval…`));
+  window.open(device.verification_uri, '_blank', 'noopener');
+  localDeviceTimer = setTimeout(pollLocalGithub, device.interval * 1000);
+}, 'local-github-output');
+$('logout-local-github').onclick = () => action(async () => {
+  await request('/api/v1/local/github/logout', { method: 'POST' });
+  clearLocalDevicePoll();
+  await refreshLocalGithub();
+  log('Local GitHub authorization removed.');
+}, 'local-github-output');
+$('local-repositories').onchange = controls;
+$('use-local-repository').onclick = () => {
+  const repository = $('local-repositories').value;
+  if (!repository) return;
+  $('repository-url').value = `https://github.com/${repository}`;
+  $('tenant-name').value = repository.split('/').pop();
+  show('tenant-help', `Selected ${repository}. Sign in and select an organization before creating its tenant.`);
+};
 window.addEventListener('pagehide', cancelOperation);
+window.addEventListener('pagehide', clearLocalDevicePoll);
 for (const id of ['create-org', 'start', 'status', 'me']) {
   const handler = $(id).onclick;
   $(id).onclick = () => action(handler);
 }
-controls(); refreshSession();
+controls(); refreshSession(); refreshLocalGithub();
 </script>
 </body>
 </html>"###,

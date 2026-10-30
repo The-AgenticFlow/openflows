@@ -2,7 +2,7 @@
 
 Most people only need the [Quick Start](../quick_start.md) (`./scripts/setup.sh` does everything below automatically). Use this page to understand what the script does, run the steps by hand, or look up hooks, roles, configuration and troubleshooting.
 
-The manual GitHub App instructions below describe `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`. In the default connected-local mode, install the team-owned App on the repository, set its public `OPENFLOWS_GITHUB_CLIENT_ID` and `OPENFLOWS_GITHUB_APP_SLUG`, and run `./scripts/setup.sh owner/repo`. The local Manager handles device authorization and token renewal. To sign out, run `cargo run -p openflows-manager -- --config .env github-logout` and stop the local workspaces.
+The manual GitHub App instructions below describe `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`. In the default connected-local mode, OpenFlows supplies the team-owned App configuration. After the local stack starts, use the Manager console at <http://localhost:3002> to install the App, authorize GitHub, and select a repository. Contributors do not provide a client ID, App slug, private key, or client secret.
 
 > **Working directory:** run all commands from the **project root** (the directory containing `docker-compose.yml`).
 

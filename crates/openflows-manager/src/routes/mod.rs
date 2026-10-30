@@ -53,6 +53,7 @@ fn api_v1_router() -> Router<AppState> {
         .route("/auth/coder/start", post(coder_identity::start))
         .route("/auth/refresh", post(auth::refresh))
         .route("/local/github-credential", post(local_github::credential))
+        .nest("/local", local_github::router())
         .route("/auth/csrf", get(auth::csrf_token))
         .route("/invitations/accept", post(invitations::accept_json))
         .route("/auth/logout", post(auth::logout))
