@@ -227,7 +227,12 @@ In a separate terminal:
 
 Setup remembers the mode in `.env`, so later runs without a flag keep using the images.
 
-Compose installs use your own GitHub App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`, the steps above). The team's shared App (`connected-local`) still builds and runs the local Manager from source, so it needs Rust and is not available with `--compose` yet.
+Compose installs use your own GitHub App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`, the steps above). The team's shared App (`connected-local`) still builds and runs the local Manager from source, so it needs Rust and is not available with `--compose` yet. `.env.example` sets `connected-local`, so before the first `--compose` run, create `.env` from it and set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`:
+
+```bash
+cp .env.example .env
+sed -i 's/^OPENFLOWS_GITHUB_AUTH_MODE=.*/OPENFLOWS_GITHUB_AUTH_MODE=self-managed/' .env
+```
 
 ### Settings
 
