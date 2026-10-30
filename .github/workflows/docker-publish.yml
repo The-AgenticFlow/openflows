@@ -178,6 +178,8 @@ jobs:
     permissions:
       packages: write
       id-token: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
@@ -207,3 +209,44 @@ jobs:
             "${IMAGE}:${VERSION}-amd64" \
             "${IMAGE}:${VERSION}-arm64"
           echo "Merged multi-platform manifest for ${VERSION}"
+
+      - name: Resolve the image digest
+        id: digest
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published"
+            echo "\`${IMAGE}:${VERSION}\`"
+            echo "\`${IMAGE}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Shares its concurrency group with docker-publish-manager.yml so the two
+  # workflows never edit the same release notes at once.
+  record-digest:
+    name: Record digest in release notes
+    needs: [resolve, merge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-notes-${{ needs.resolve.outputs.version }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout: scripts/record-image-digest.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Record the image digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: scripts/record-image-digest.sh "${VERSION}" "${REGISTRY}/${IMAGE_NAME}" "${DIGEST}"
