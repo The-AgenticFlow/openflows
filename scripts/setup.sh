@@ -587,11 +587,13 @@ stage_github_app() {
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i args=(-f docker-compose.yml)
+    local out i args=()
     # connected-local adds the local Manager; the images file copies the programs into
-    # .dev-binaries before Coder starts.
+    # .dev-binaries before Coder starts. Without either, run plain `docker compose` so
+    # Compose keeps picking up docker-compose.override.yml or COMPOSE_FILE.
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
     [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
+    [ "${#args[@]}" -gt 0 ] && args=(-f docker-compose.yml "${args[@]}")
     args+=(up -d)
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
     if ! out="$(cd "$ROOT" && docker compose "${args[@]}" 2>&1)"; then
