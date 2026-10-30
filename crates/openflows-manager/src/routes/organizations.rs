@@ -190,12 +190,13 @@ pub async fn list_orgs(
     ))
 }
 
-/// `GET /organizations/{org}` — organization detail.
+/// `GET /organizations/{org}` — organization detail. While not ready it also
+/// carries a `provisioning` summary of the latest `org.provision` operation.
 pub async fn get_org(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
-) -> Result<Json<crate::dto::OrganizationDto>, ManagerError> {
+) -> Result<Json<serde_json::Value>, ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -205,7 +206,35 @@ pub async fn get_org(
         .orgs_service
         .get_org(principal.user_id, org_id)
         .await?;
-    Ok(Json(dto))
+    let mut body = serde_json::to_value(&dto).map_err(|e| ManagerError::Service(e.into()))?;
+    // While the organization is not ready, expose its latest provisioning
+    // operation so clients can show a failure and offer a retry instead of
+    // waiting forever. Only the operation id, state, step and a stable error
+    // code are returned, never upstream error bodies.
+    if dto.status != "ready" {
+        let row: Option<(uuid::Uuid, String, Option<String>, i32, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, state, current_step, attempt_count, error_code
+                   FROM operations
+                  WHERE organization_id = $1 AND kind = 'org.provision'
+                  ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(org_id.0)
+            .fetch_optional(services.db.pool())
+            .await
+            .map_err(ManagerError::from)?;
+        body["provisioning"] = match row {
+            Some((id, state, step, attempts, error_code)) => serde_json::json!({
+                "operation_id": id.to_string(),
+                "state": state,
+                "current_step": step,
+                "attempt_count": attempts,
+                "error_code": error_code,
+            }),
+            None => serde_json::Value::Null,
+        };
+    }
+    Ok(Json(body))
 }
 
 #[derive(Deserialize)]
