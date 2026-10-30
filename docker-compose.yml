@@ -48,6 +48,37 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Copies the released OpenFlows programs out of the published image into
+  # ./.dev-binaries, the folder Coder workspaces read them from. Runs only with
+  # `--profile images`; the source install fills the same folder by compiling.
+  # Create ./.dev-binaries first so it stays owned by your user.
+  openflows-binaries:
+    image: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+    profiles: ["images"]
+    user: "${OPENFLOWS_HOST_UID:-1000}:${OPENFLOWS_HOST_GID:-1000}"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if ! touch /out/.write-test 2>/dev/null; then
+          echo "Cannot write to .dev-binaries as user $$(id -u):$$(id -g)." >&2
+          echo "Set OPENFLOWS_HOST_UID / OPENFLOWS_HOST_GID in .env to the output of 'id -u' / 'id -g'" >&2
+          echo "(and create .dev-binaries yourself), or run ./scripts/setup.sh --compose." >&2
+          exit 1
+        fi
+        rm -f /out/.write-test
+        for bin in openflows openflows-doctor openflows-harness; do
+          cp "/usr/local/bin/$$bin" "/out/$$bin.tmp"
+          chmod 0755 "/out/$$bin.tmp"
+          mv "/out/$$bin.tmp" "/out/$$bin"
+        done
+        printf '%s\n' "$$OPENFLOWS_IMAGE_REF" > /out/IMAGE
+        echo "Installed OpenFlows programs from $$OPENFLOWS_IMAGE_REF"
+    environment:
+      OPENFLOWS_IMAGE_REF: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+    volumes:
+      - ./.dev-binaries:/out
+    restart: "no"
+
   coder:
     image: ghcr.io/coder/coder:${CODER_IMAGE_TAG:-v2.37.3}
     user: "0:0"
@@ -110,13 +141,17 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)
+      # OpenFlows programs: compiled locally, or copied from the published
+      # image by the openflows-binaries service (`--profile images`).
       - ./.dev-binaries:/opt/openflows-dev:ro
       # Persist the Terraform provider cache across restarts.
       - tf_plugin_cache:/root/.terraform.d/plugin-cache
     depends_on:
       coder-db:
         condition: service_healthy
+      openflows-binaries:
+        condition: service_completed_successfully
+        required: false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${CODER_INTERNAL_PORT:-7080}/api/v2/buildinfo"]
       interval: 5s
