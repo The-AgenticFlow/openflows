@@ -64,6 +64,10 @@ fn auth_failed() -> ManagerError {
     ManagerError::api("GITHUB_REAUTH_REQUIRED", "GitHub authorization is required")
 }
 
+fn github_unavailable() -> ManagerError {
+    ManagerError::api("GITHUB_UNAVAILABLE", "GitHub is temporarily unavailable").retryable(true)
+}
+
 pub struct LocalGithubAuth {
     client: reqwest::Client,
     client_id: String,
@@ -280,11 +284,14 @@ impl LocalGithubAuth {
             ])
             .send()
             .await
-            .map_err(|_| auth_failed())?;
+            .map_err(|_| github_unavailable())?;
+        if response.status().is_server_error() || response.status().as_u16() == 429 {
+            return Err(github_unavailable());
+        }
         if !response.status().is_success() {
             return Err(auth_failed());
         }
-        let reply: TokenReply = response.json().await.map_err(|_| auth_failed())?;
+        let reply: TokenReply = response.json().await.map_err(|_| github_unavailable())?;
         if reply.error.is_some() {
             return Err(auth_failed());
         }
@@ -302,11 +309,14 @@ pub enum PollResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::local_credentials::LocalCredentials;
     use axum::extract::{Form, Path};
     use axum::http::HeaderMap;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn device_refresh_and_repository_access_use_public_client_and_user_token() {
@@ -392,6 +402,232 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].id, 123);
         assert_eq!(repos[0].full_name, "acme/backend");
+        server.abort();
+    }
+
+    fn challenge(interval: u64, expires_in: u64) -> DeviceChallenge {
+        DeviceChallenge {
+            device_code: "challenge".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            expires_in,
+            interval,
+        }
+    }
+
+    async fn mock_token_endpoint(
+        replies: Vec<serde_json::Value>,
+    ) -> (
+        LocalGithubAuth,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/login/oauth/access_token",
+            post(move || {
+                let replies = replies.clone();
+                let observed = observed.clone();
+                async move {
+                    let index = observed.fetch_add(1, Ordering::SeqCst);
+                    Json(replies[index.min(replies.len() - 1)].clone())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut github = LocalGithubAuth::new("public-id".into()).unwrap();
+        github.token_url = format!("{base}/login/oauth/access_token");
+        (github, calls, server)
+    }
+
+    #[tokio::test]
+    async fn polling_handles_pending_and_slow_down_without_exceeding_rate() {
+        let (github, calls, server) = mock_token_endpoint(vec![
+            serde_json::json!({"error": "authorization_pending"}),
+            serde_json::json!({"error": "slow_down", "interval": 6}),
+            serde_json::json!({
+                "access_token": "access", "refresh_token": "refresh",
+                "expires_in": 28800, "refresh_token_expires_in": 15897600
+            }),
+        ])
+        .await;
+        let start = tokio::time::Instant::now();
+        let token = github.await_authorization(&challenge(1, 20)).await.unwrap();
+        assert_eq!(token.access_token, "access");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(start.elapsed() >= Duration::from_secs(8));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn denial_and_expiry_require_new_device_authorization() {
+        let (github, calls, server) =
+            mock_token_endpoint(vec![serde_json::json!({"error": "access_denied"})]).await;
+        let error = github
+            .await_authorization(&challenge(1, 20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("GITHUB_REAUTH_REQUIRED"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+
+        let (github, calls, server) =
+            mock_token_endpoint(vec![serde_json::json!({"error": "expired_token"})]).await;
+        let error = github
+            .await_authorization(&challenge(1, 20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("GITHUB_REAUTH_REQUIRED"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+
+        let (github, calls, server) =
+            mock_token_endpoint(vec![serde_json::json!({"error": "authorization_pending"})]).await;
+        let error = github
+            .await_authorization(&challenge(1, 1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("GITHUB_REAUTH_REQUIRED"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_rotates_once_and_survives_restart() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/login/oauth/access_token",
+            post(move |Form(form): Form<HashMap<String, String>>| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(form.get("client_id").map(String::as_str), Some("public-id"));
+                    assert_eq!(
+                        form.get("grant_type").map(String::as_str),
+                        Some("refresh_token")
+                    );
+                    assert_eq!(
+                        form.get("refresh_token").map(String::as_str),
+                        Some("refresh-1")
+                    );
+                    assert!(!form.contains_key("client_secret"));
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "access_token": "access-2", "refresh_token": "refresh-2",
+                        "expires_in": 28800, "refresh_token_expires_in": 15897600
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut github = LocalGithubAuth::new("public-id".into()).unwrap();
+        github.token_url = format!("{base}/login/oauth/access_token");
+        let github = Arc::new(github);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/github.json");
+        let first = Arc::new(LocalCredentials::new(path.clone(), github.clone()).unwrap());
+        first
+            .save_authorization(LocalUserToken {
+                access_token: "access-1".into(),
+                refresh_token: "refresh-1".into(),
+                expires_in: 0,
+                refresh_token_expires_in: 86400,
+            })
+            .await
+            .unwrap();
+        let second = Arc::new(LocalCredentials::new(path.clone(), github.clone()).unwrap());
+        let (left, right) = tokio::join!(first.access_token(), second.access_token());
+        assert_eq!(left.unwrap(), "access-2");
+        assert_eq!(right.unwrap(), "access-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["access_token"], "access-2");
+        assert_eq!(stored["refresh_token"], "refresh-2");
+        let restarted = LocalCredentials::new(path, github).unwrap();
+        assert_eq!(restarted.access_token().await.unwrap(), "access-2");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_or_expired_refresh_requires_reauthorization() {
+        let (github, calls, server) =
+            mock_token_endpoint(vec![serde_json::json!({"error": "bad_refresh_token"})]).await;
+        let github = Arc::new(github);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/github.json");
+        let credentials = LocalCredentials::new(path, github).unwrap();
+        credentials
+            .save_authorization(LocalUserToken {
+                access_token: "access".into(),
+                refresh_token: "revoked".into(),
+                expires_in: 0,
+                refresh_token_expires_in: 86400,
+            })
+            .await
+            .unwrap();
+        assert!(credentials
+            .access_token()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("GITHUB_REAUTH_REQUIRED"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        credentials
+            .save_authorization(LocalUserToken {
+                access_token: "access".into(),
+                refresh_token: "expired".into(),
+                expires_in: 0,
+                refresh_token_expires_in: 0,
+            })
+            .await
+            .unwrap();
+        assert!(credentials
+            .access_token()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("GITHUB_REAUTH_REQUIRED"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn temporary_github_failure_does_not_discard_local_authorization() {
+        let app = Router::new().route(
+            "/login/oauth/access_token",
+            post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut github = LocalGithubAuth::new("public-id".into()).unwrap();
+        github.token_url = format!("{base}/login/oauth/access_token");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private/github.json");
+        let credentials = LocalCredentials::new(path.clone(), Arc::new(github)).unwrap();
+        credentials
+            .save_authorization(LocalUserToken {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_in: 0,
+                refresh_token_expires_in: 86400,
+            })
+            .await
+            .unwrap();
+        let error = credentials.access_token().await.unwrap_err();
+        assert!(
+            matches!(error, ManagerError::Api(ref api) if api.code == "GITHUB_UNAVAILABLE" && api.retryable)
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "refresh");
         server.abort();
     }
 }

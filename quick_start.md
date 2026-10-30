@@ -29,6 +29,8 @@ It will:
 
 To use your own GitHub App instead, set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed` in `.env` before setup. This keeps the existing Coder external-auth flow; see [manual setup](docs/setup-reference.md).
 
+Maintainers validating the team-owned App can follow the [connected-local live test](docs/testing/connected-local-github-live.md) with a disposable repository.
+
 ## Testing the Manager's organization provisioning locally
 
 The Manager needs its own Coder API token in the local development secrets
