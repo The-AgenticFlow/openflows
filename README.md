@@ -10,7 +10,7 @@
 ## Operator Quick Path
 
 ```bash
-./scripts/setup.sh owner/repo --compose   # published images, no compiling (Linux)
+./scripts/setup.sh owner/repo --compose   # published images, no compiling (x86-64 Linux)
 ./scripts/setup.sh owner/repo --source    # compile from this checkout (default)
 ```
 

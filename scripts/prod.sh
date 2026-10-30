@@ -23,6 +23,12 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     set +a
 fi
 
+# A compose install (setup.sh --compose) has no Rust toolchain: run the programs
+# copied from the published image instead of building them.
+if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ] && [ -z "${OPENFLOWS_BIN:-}" ]; then
+    OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
+fi
+
 # Track whether the caller explicitly pinned a binary (env var or --bin flag).
 # When explicit, we respect it as-is and never touch it. Otherwise we always
 # rebuild the in-repo release binary from source before every invocation, so
@@ -36,6 +42,9 @@ else
     OPENFLOWS_BIN_EXPLICIT=0
 fi
 SKIP_BUILD=false
+if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ]; then
+    SKIP_BUILD=true   # also skips the dev-sync build in `bootstrap`
+fi
 BUILD_DONE=false
 
 usage() {

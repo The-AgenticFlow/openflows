@@ -258,10 +258,26 @@ install_coder() {
 stage_preflight() {
     step "Checking your machine"
     local missing=()
-    if [ "$MODE" = compose ] && [ "$(uname -s)" != Linux ]; then
-        die "--compose currently needs a Linux host." \
-            "The published programs are Linux binaries that setup runs on this machine." \
-            "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+    if [ "$MODE" = compose ]; then
+        # Setup runs the image's x86-64 glibc programs on this machine as well as in the workspaces.
+        if [ "$(uname -s)" != Linux ]; then
+            die "--compose currently needs a Linux host." \
+                "The published programs are Linux binaries that setup runs on this machine." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        fi
+        case "$(uname -m)" in
+            x86_64|amd64) ;;
+            *) die "--compose currently needs an x86-64 (amd64) host, not $(uname -m)." \
+                   "Workspaces run linux/amd64 programs, which setup also runs on this machine." \
+                   "Use the source install instead:  ./scripts/setup.sh ${REPO} --source" ;;
+        esac
+        local glibc
+        glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')"
+        if [ -z "$glibc" ] || [ "$(printf '%s\n' 2.34 "$glibc" | sort -V | head -1)" != 2.34 ]; then
+            die "--compose needs glibc 2.34 or newer on this machine (found: ${glibc:-none})." \
+                "The published programs are built against glibc (e.g. Ubuntu 22.04+, Debian 12+)." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        fi
     fi
     have curl    || missing+=("curl      → install with your package manager")
     have python3 || missing+=("python3   → install with your package manager")
@@ -349,12 +365,12 @@ stage_image() {
 
     pinned="$(env_get OPENFLOWS_IMAGE_DIGEST)"
     if [ -n "$pinned" ]; then
-        docker pull -q "${IMAGE_REPO}@${pinned}" >"$LOG_FILE" 2>&1 \
+        docker pull -q --platform linux/amd64 "${IMAGE_REPO}@${pinned}" >"$LOG_FILE" 2>&1 \
             || die "Image ${IMAGE_REPO}@${pinned} was not found." \
                 "Check OPENFLOWS_IMAGE_DIGEST in .env against the release notes, or clear it to use ${version}'s current image."
         digest="$pinned"
     else
-        docker pull -q "${IMAGE_REPO}:${version}" >"$LOG_FILE" 2>&1 \
+        docker pull -q --platform linux/amd64 "${IMAGE_REPO}:${version}" >"$LOG_FILE" 2>&1 \
             || die "No published image for OpenFlows ${version}." \
                 "Pick a version that has one: https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows"
         digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE_REPO}:${version}" \
@@ -571,13 +587,11 @@ stage_github_app() {
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i args=()
-    # connected-local adds the local Manager; the images profile copies the programs into
+    local out i args=(-f docker-compose.yml)
+    # connected-local adds the local Manager; the images file copies the programs into
     # .dev-binaries before Coder starts.
-    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
-        args=(-f docker-compose.yml -f docker-compose.connected-local.yml)
-    fi
-    [ "$MODE" = compose ] && args+=(--profile images)
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
+    [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
     args+=(up -d)
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
     if ! out="$(cd "$ROOT" && docker compose "${args[@]}" 2>&1)"; then
@@ -590,7 +604,11 @@ stage_docker() {
     if [ "$MODE" = compose ]; then
         [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
             || die "The OpenFlows programs were not copied from $(image_ref)." \
-                "Check logs: docker compose --profile images logs openflows-binaries"
+                "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
+        "${BIN_DIR}/openflows" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs from the image do not run on this machine." \
+                "They need an x86-64 Linux with glibc 2.34 or newer." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
         ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
     fi
     ok "Coder is up at ${B}$(coder_url)${N}"

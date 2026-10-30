@@ -16,11 +16,11 @@ Turn GitHub issues into reviewed pull requests, on your own machine. For what Op
 | How | Uses the published OpenFlows images | Compiles OpenFlows from this checkout |
 | Needs Rust | No | Yes |
 | First run | A few minutes | About 10 minutes |
-| Host | Linux | Linux or macOS |
+| Host | x86-64 Linux, glibc 2.34+ (e.g. Ubuntu 22.04+) | Linux or macOS |
 | Version | Any release, latest by default | This checkout |
 | GitHub App | Your own App | The team's shared App (or your own) |
 
-`--compose` currently needs a Linux host; on macOS use `--source` ([why](docs/setup-reference.md#install-from-published-images---compose)).
+`--compose` currently needs an x86-64 Linux host with glibc 2.34 or newer; elsewhere use `--source` ([why](docs/setup-reference.md#host-requirements)).
 
 ## Run
 
