@@ -384,6 +384,24 @@ pub async fn create_invitation(
     }))
 }
 
+/// `GET /organizations/{org}/invitations` — outstanding invitations (admin only).
+pub async fn list_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<serde_json::Value>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    let org_id = parse_org(&org)?;
+    let items = services
+        .orgs_service
+        .list_invitations(principal.user_id, org_id)
+        .await?;
+    Ok(Json(serde_json::json!({"items": items})))
+}
+
 /// `DELETE /organizations/{org}/invitations/{id}` — revoke (admin only).
 pub async fn revoke_invitation(
     State(state): State<AppState>,

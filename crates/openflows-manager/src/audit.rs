@@ -128,3 +128,88 @@ pub async fn insert_in_tx(
 pub async fn insert_with_pool(pool: &PgPool, event: &AuditEvent) -> Result<(), ManagerError> {
     insert(pool, event).await
 }
+
+/// One audit row as returned to organization admins. Actor names come from the
+/// user record; no credentials or raw upstream bodies are ever stored here.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEntry {
+    pub id: uuid::Uuid,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub actor_type: String,
+    pub actor_id: Option<uuid::Uuid>,
+    pub actor_name: Option<String>,
+    pub action: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<uuid::Uuid>,
+    pub result: String,
+    pub request_id: Option<String>,
+}
+
+type AuditTuple = (
+    uuid::Uuid,
+    chrono::DateTime<chrono::Utc>,
+    String,
+    Option<uuid::Uuid>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<uuid::Uuid>,
+    String,
+    Option<String>,
+);
+
+/// List an organization's audit events, newest first, with keyset pagination
+/// on `(occurred_at, id)`. The caller must already have been authorized as an
+/// organization admin; this function only enforces the organization scope.
+pub async fn list_for_org(
+    pool: &PgPool,
+    organization_id: OrganizationId,
+    limit: crate::pagination::PageLimit,
+    after: Option<crate::pagination::Cursor>,
+) -> Result<crate::pagination::Page<AuditEntry>, ManagerError> {
+    let (after_at, after_id) = match after {
+        Some(c) => (
+            Some(c.created_at),
+            Some(
+                c.tiebreaker
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?,
+            ),
+        ),
+        None => (None, None),
+    };
+    let rows = sqlx::query_as::<_, AuditTuple>(
+        "SELECT a.id, a.occurred_at, a.actor_type, a.actor_id, u.display_name,
+                a.action, a.resource_type, a.resource_id, a.result, a.request_id
+           FROM audit_events a LEFT JOIN users u ON u.id = a.actor_id
+          WHERE a.organization_id = $1
+            AND ($2::timestamptz IS NULL OR (a.occurred_at, a.id) < ($2, $3))
+          ORDER BY a.occurred_at DESC, a.id DESC
+          LIMIT $4",
+    )
+    .bind(organization_id.0)
+    .bind(after_at)
+    .bind(after_id)
+    .bind(i64::from(limit.get()) + 1)
+    .fetch_all(pool)
+    .await
+    .map_err(ManagerError::from)?;
+    let items: Vec<AuditEntry> = rows
+        .into_iter()
+        .map(|r| AuditEntry {
+            id: r.0,
+            occurred_at: r.1,
+            actor_type: r.2,
+            actor_id: r.3,
+            actor_name: r.4,
+            action: r.5,
+            resource_type: r.6,
+            resource_id: r.7,
+            result: r.8,
+            request_id: r.9,
+        })
+        .collect();
+    Ok(crate::pagination::Page::from_fetch(items, limit, |e| {
+        crate::pagination::cursor_for(e.occurred_at, e.id)
+    }))
+}

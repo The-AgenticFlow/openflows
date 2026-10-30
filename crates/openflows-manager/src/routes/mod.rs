@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 
+pub mod audit;
 pub mod auth;
 pub mod coder_hooks;
 pub mod coder_identity;
@@ -15,6 +16,7 @@ pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod organizations;
+pub mod platform;
 pub mod platform_releases;
 pub mod runtime;
 pub mod tenants;
@@ -76,7 +78,7 @@ fn api_v1_router() -> Router<AppState> {
         )
         .route(
             "/organizations/{org}/invitations",
-            post(organizations::create_invitation),
+            get(organizations::list_invitations).post(organizations::create_invitation),
         )
         .route(
             "/organizations/{org}/invitations/{id}",
@@ -86,6 +88,8 @@ fn api_v1_router() -> Router<AppState> {
             "/organizations/{org}/transfer-ownership",
             post(organizations::transfer_ownership),
         )
+        .route("/organizations/{org}/audit", get(audit::list_audit))
+        .route("/platform/overview", get(platform::overview))
         .route("/operations/{id}", get(organizations::get_operation))
         .route(
             "/operations/{id}/retry",
@@ -130,6 +134,10 @@ fn api_v1_router() -> Router<AppState> {
         .route(
             "/organizations/{org}/github/connections",
             get(connections::list_connections),
+        )
+        .route(
+            "/organizations/{org}/github/connections/{id}/repositories",
+            get(connections::list_repositories),
         )
         .route(
             "/organizations/{org}/github/connections/{id}/reconcile",

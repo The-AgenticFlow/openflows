@@ -38,6 +38,20 @@ pub struct ConnectionsResponse {
     pub items: Vec<ConnectionDto>,
 }
 
+/// A repository the installation can access. Visibility is not stored, so it
+/// is not reported.
+#[derive(Serialize)]
+pub struct RepositoryDto {
+    pub id: i64,
+    pub full_name: String,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+pub struct RepositoriesResponse {
+    pub items: Vec<RepositoryDto>,
+}
+
 #[derive(Deserialize)]
 pub struct OauthCallbackQuery {
     pub code: Option<String>,
@@ -160,6 +174,34 @@ pub async fn list_connections(
         )
         .await?;
     Ok(Json(ConnectionsResponse { items }))
+}
+
+/// GET /api/v1/organizations/{org}/github/connections/{id}/repositories
+/// (member view): repositories the installation can currently access.
+pub async fn list_repositories(
+    State(state): State<crate::server::AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<Json<RepositoriesResponse>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    let org_id = parse_org(&org)?;
+    let connection_id = parse_connection_id(&id)?;
+    let rows = services
+        .connections_service
+        .list_repositories(principal.user_id, org_id, connection_id)
+        .await?;
+    let items = rows
+        .into_iter()
+        .map(|r| RepositoryDto {
+            id: r.github_repository_id,
+            full_name: r.full_name,
+            last_seen_at: r.last_seen_at,
+        })
+        .collect();
+    Ok(Json(RepositoriesResponse { items }))
 }
 
 /// POST /api/v1/organizations/{org}/github/connections/{id}/reconcile (admin).

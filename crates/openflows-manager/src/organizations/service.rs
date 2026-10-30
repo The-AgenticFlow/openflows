@@ -574,6 +574,61 @@ impl OrganizationService {
         Ok(())
     }
 
+    /// List an organization's outstanding invitations (admin only). Accepted and
+    /// revoked invitations are excluded. An invitation past its expiry is still
+    /// listed, flagged `expired`, so an admin can revoke it and issue a new one.
+    /// Never returns the token or its hash.
+    pub async fn list_invitations(
+        &self,
+        caller: UserId,
+        org_id: OrganizationId,
+    ) -> Result<Vec<serde_json::Value>, ManagerError> {
+        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
+        Policy::require_admin_view(membership.as_ref(), org_state.as_ref())?;
+        type Row = (
+            uuid::Uuid,
+            i64,
+            Option<String>,
+            String,
+            Option<uuid::Uuid>,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT i.id, i.invitee_github_user_id, idn.login_snapshot, i.role,
+                    i.invited_by, i.created_at, i.expires_at
+               FROM invitations i
+               LEFT JOIN identities idn
+                 ON idn.provider = 'github' AND idn.subject = i.invitee_github_user_id::text
+              WHERE i.organization_id = $1
+                AND i.accepted_at IS NULL AND i.revoked_at IS NULL
+              ORDER BY i.created_at DESC, i.id DESC
+              LIMIT 100",
+        )
+        .bind(org_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(ManagerError::from)?;
+        let now = chrono::Utc::now();
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, github_user_id, login, role, invited_by, created_at, expires_at)| {
+                    json!({
+                        "invitation_id": id.to_string(),
+                        "invitee_github_user_id": github_user_id,
+                        "invitee_login": login,
+                        "role": role,
+                        "invited_by": invited_by.map(|u| u.to_string()),
+                        "created_at": created_at,
+                        "expires_at": expires_at,
+                        "status": if expires_at <= now { "expired" } else { "pending" },
+                    })
+                },
+            )
+            .collect())
+    }
+
     /// Accept an invitation by token. Requires the caller's authenticated
     /// GitHub identity to match the invitee.
     pub async fn accept_invitation(

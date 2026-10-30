@@ -470,6 +470,24 @@ impl ConnectionService {
         Ok(rows.into_iter().map(ConnectionDto::from).collect())
     }
 
+    /// List the repositories a connection can access (any active member). The
+    /// connection must belong to the organization, else 404.
+    pub async fn list_repositories(
+        &self,
+        caller: UserId,
+        org_id: OrganizationId,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<crate::connections::repository::RepositoryRow>, ManagerError> {
+        self.require_active_member(caller, org_id).await?;
+        self.repo
+            .get_connection_scoped(org_id, connection_id)
+            .await?
+            .ok_or_else(|| ManagerError::not_found("connection"))?;
+        self.repo
+            .list_repositories_for_connection(org_id, connection_id)
+            .await
+    }
+
     /// Enqueue a reconciliation operation (admin only).
     pub async fn reconcile_connection(
         &self,

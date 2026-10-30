@@ -159,6 +159,7 @@ fn api_status(code: &str) -> u16 {
         | "INVITATION_WRONG_USER"
         | "REAUTH_REQUIRED"
         | "ORG_UNAVAILABLE"
+        | "PLATFORM_OPERATOR_REQUIRED"
         | "TENANT_UNAVAILABLE"
         | "WORKSPACE_UNAVAILABLE"
         | "CONNECTION_UNAVAILABLE"
