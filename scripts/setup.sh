@@ -337,7 +337,7 @@ latest_release_version() { # latest published release, e.g. 1.8.1
 
 stage_image() {
     step "OpenFlows image (no compiling)"
-    local version digest pinned label differ
+    local version digest pinned label
     version="$(env_get OPENFLOWS_VERSION)"
     if [ -z "$version" ]; then
         version="$(latest_release_version)"
@@ -375,33 +375,6 @@ stage_image() {
     env_set OPENFLOWS_HOST_GID "$(id -g)"
     mkdir -p "$BIN_DIR"   # created by us, not by Docker, so it stays owned by this user
     ok "OpenFlows ${B}${version}${N} · ${digest:0:19}…"
-
-    differ="$(templates_differ_from "$version")" || {
-        info "Could not compare this folder's templates with ${version} (offline?)."
-        return
-    }
-    if [ -n "$differ" ]; then
-        warn "This folder's templates differ from ${version}'s: ${differ}"
-        info "Workspaces may not match the programs. For a matching install, use the source archive of ${version}:"
-        info "  https://github.com/The-AgenticFlow/openflows/releases/tag/openflows-${version}"
-    fi
-}
-
-# templates_differ_from VERSION — prints the roles whose template differs from that release's; fails when offline.
-# Compares file contents, not version numbers: develop carries the previous version number between releases.
-templates_differ_from() {
-    local version="$1" role tmp differ=()
-    tmp="$(mktemp)"
-    for role in forge lore nexus sentinel vessel; do
-        if ! curl -fsS -m 20 -o "$tmp" \
-            "https://raw.githubusercontent.com/The-AgenticFlow/openflows/openflows-${version}/crates/coder-client/templates/openflows-${role}/main.tf" 2>/dev/null; then
-            rm -f "$tmp"
-            return 1
-        fi
-        cmp -s "$tmp" "${ROOT}/crates/coder-client/templates/openflows-${role}/main.tf" || differ+=("$role")
-    done
-    rm -f "$tmp"
-    printf '%s' "${differ[*]}"
 }
 
 # ── stage 3: GitHub App ─────────────────────────────────────────────────────
