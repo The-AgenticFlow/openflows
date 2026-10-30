@@ -15,7 +15,7 @@
 //! Scope (task 2 of the Sentinel↔Forge delegated verification plan,
 //! issue #143).
 
-mod http_server;
+pub(crate) mod http_server;
 mod routing;
 mod verify_handler;
 

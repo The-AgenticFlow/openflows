@@ -10,6 +10,7 @@ pub mod dto;
 pub mod error;
 pub mod id;
 pub mod idempotency;
+pub mod openapi;
 pub mod operations;
 pub mod operator;
 pub mod organizations;
