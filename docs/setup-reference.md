@@ -262,9 +262,9 @@ cat .dev-binaries/IMAGE
 
 Rolling back is the same with an older version.
 
-### Templates and programs must match
+### Templates always match the programs
 
-The templates come from your checkout, the programs from the image. Setup compares this folder's templates with the ones in the chosen release and warns when they differ. For a matching install, download the release's source archive (`openflows-<version>` on the [releases page](https://github.com/The-AgenticFlow/openflows/releases)) and run setup from it.
+The workspace templates are built into the `openflows` program, so the image's program pushes that release's templates, whatever the checkout contains. Programs and templates always come from the same release.
 
 ### Switching between source and compose
 
@@ -477,10 +477,6 @@ You changed `OPENFLOWS_VERSION` but kept the old digest. Clear `OPENFLOWS_IMAGE_
 ### "Image … was not found" (`--compose`)
 
 The digest in `OPENFLOWS_IMAGE_DIGEST` does not exist. Check it against the release notes, or clear it to use the version's current image.
-
-### "This folder's templates differ from X's" (`--compose`)
-
-Your checkout's templates are not the ones released with that version, so workspaces may not match the programs. Run setup from the release's source archive, or pick the version that matches your checkout. See [Templates and programs must match](#templates-and-programs-must-match).
 
 ### "Cannot write to .dev-binaries as user X" (`--compose`)
 

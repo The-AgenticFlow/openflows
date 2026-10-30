@@ -12,14 +12,17 @@ check (`openflows-doctor`), and stores its configuration in `.env`.
 
 ## Install modes
 
-| Mode | Flag | Programs come from | Templates come from | Host |
-| --- | --- | --- | --- | --- |
-| Source | `--source` (default) | `cargo build` of this checkout | This checkout | Linux, macOS |
-| Compose | `--compose` | `ghcr.io/the-agenticflow/openflows:<version>`, copied into `.dev-binaries/` | This checkout | Linux |
-| Binary | `--binary` (planned) | The release's binary archives | The release | Linux, macOS |
+| Mode | Flag | Programs come from | Host |
+| --- | --- | --- | --- |
+| Source | `--source` (default) | `cargo build` of this checkout | Linux, macOS |
+| Compose | `--compose` | `ghcr.io/the-agenticflow/openflows:<version>`, copied into `.dev-binaries/` | Linux |
+| Binary | `--binary` (planned) | The release's binary archives | Linux, macOS |
 
-In every mode, workspaces read the programs from `.dev-binaries/`, so the
-templates and the workspace startup are identical across modes. Setup saves the
+The workspace templates are built into the `openflows` program
+(`crates/coder-client/build.rs` packs them; bootstrap embeds them), so in every
+mode the templates pushed to Coder come from the same build as the programs.
+Workspaces read the programs from `.dev-binaries/`, so the workspace startup is
+identical across modes. Setup saves the
 mode as `OPENFLOWS_SETUP_MODE` and reuses it when run without a flag; the first
 run without a flag uses `--source` and prints a hint about `--compose`.
 
@@ -74,7 +77,6 @@ Compose installs therefore default to the custom App, and setup rejects
 | Version with no published image | Rejected, with a link to the available versions |
 | `OPENFLOWS_IMAGE_DIGEST` that does not exist | Rejected |
 | `OPENFLOWS_IMAGE_DIGEST` from another version | Rejected (checked against the image's version label) |
-| Checkout templates differ from the release's | Allowed, with a warning naming the differing templates |
 | Second install on the same machine without its own `COMPOSE_PROJECT_NAME` | Takes over the first install's containers; must be avoided (documented) |
 
 ## Open items
@@ -89,8 +91,6 @@ Compose installs therefore default to the custom App, and setup rejects
   attached to a draft before publishing. `release-assets.yml` has not run since
   v1.2.0, because tags created by the release workflow's `GITHUB_TOKEN` do not
   trigger other workflows (the Docker workflows are dispatched explicitly).
-- **Templates in the image:** shipping templates inside the image would remove
-  the need for a matching source archive in compose mode.
 
 See also: [setup reference](../setup-reference.md#install-from-published-images---compose),
 [shared GitHub App for local runs](shared-github-app-local-runs.md).
