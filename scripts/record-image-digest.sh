@@ -41,11 +41,15 @@ image, line = sys.argv[1], sys.argv[2]
 header = "### Docker images"
 intro = "Pin a Compose install to an exact image with `OPENFLOWS_IMAGE_DIGEST`."
 body = sys.stdin.read().rstrip()
-head, _, section = body.partition(header)
-entries = [l for l in section.splitlines()
+head, _, after = body.partition(header)
+# The section ends at the next heading; anything after it is kept unchanged.
+lines = after.splitlines()
+end = next((i for i, l in enumerate(lines) if i > 0 and l.startswith("#")), len(lines))
+section, rest = lines[:end], "\n".join(lines[end:]).strip()
+entries = [l for l in section
            if l.startswith("- `") and not l.startswith(f"- `{image}:")]
 entries.append(line)
-parts = [head.rstrip(), "\n".join([header, "", intro, "", *sorted(entries)])]
+parts = [head.rstrip(), "\n".join([header, "", intro, "", *sorted(entries)]), rest]
 print("\n\n".join(p for p in parts if p))
 ' "${IMAGE}" "${LINE}" >"${NOTES_FILE}"
 

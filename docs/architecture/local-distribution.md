@@ -15,7 +15,7 @@ check (`openflows-doctor`), and stores its configuration in `.env`.
 | Mode | Flag | Programs come from | Host |
 | --- | --- | --- | --- |
 | Source | `--source` (default) | `cargo build` of this checkout | Linux, macOS |
-| Compose | `--compose` | `ghcr.io/the-agenticflow/openflows:<version>`, copied into `.dev-binaries/` | Linux |
+| Compose | `--compose` | `ghcr.io/the-agenticflow/openflows:<version>` (`linux/amd64`), copied into `.dev-binaries/` by `docker-compose.images.yml` | x86-64 Linux, glibc 2.34+ |
 | Binary | `--binary` (planned) | The release's binary archives | Linux, macOS |
 
 The workspace templates are built into the `openflows` program
@@ -26,7 +26,7 @@ identical across modes. Setup saves the
 mode as `OPENFLOWS_SETUP_MODE` and reuses it when run without a flag; the first
 run without a flag uses `--source` and prints a hint about `--compose`.
 
-### Why compose is Linux-only
+### Why compose needs an x86-64 Linux host
 
 OpenFlows programs run in two places, and each needs a build for its own
 operating system:
@@ -34,11 +34,13 @@ operating system:
 | Where | Runs | Source install provides | Compose install provides |
 | --- | --- | --- | --- |
 | Workspaces (Docker containers, always Linux) | `openflows`, `openflows-harness` | Linux build (`dev-sync.sh` cross-compiles in Docker) | Linux build from the image |
-| The host, during setup | `openflows bootstrap`, `tenant add`, `doctor` | Native build (`cargo build` for the host) | Nothing native: the image contains only Linux programs |
+| The host, during setup | `openflows bootstrap`, `tenant add`, `doctor` | Native build (`cargo build` for the host) | Nothing native: the image's x86-64 glibc programs |
 
-On a Linux host the image's programs serve both places. On macOS the host
-cannot run them, so setup would fail midway; it stops before starting anything
-and suggests `--source`. The open items below list two ways to lift this.
+Workspaces always run `linux/amd64`, so the copy is pinned to that platform. On
+an x86-64 Linux host with glibc 2.34+ the same programs also run on the host. On
+macOS, ARM64 hosts or older glibc they cannot, so setup stops before starting
+anything and suggests `--source`; it also test-runs the copied program before
+bootstrap. The open items below list two ways to lift this.
 
 ## GitHub App modes
 
@@ -71,7 +73,7 @@ Compose installs therefore default to the custom App, and setup rejects
 | Configuration | Result |
 | --- | --- |
 | `--source` and `--compose` together | Rejected before anything starts |
-| `--compose` on a non-Linux host | Rejected; suggests `--source` |
+| `--compose` on a non-Linux, non-x86-64 or pre-2.34 glibc host | Rejected; suggests `--source` |
 | `--compose` with `OPENFLOWS_GITHUB_AUTH_MODE=connected-local` | Rejected; suggests `self-managed` or `--source` |
 | `OPENFLOWS_VERSION` not in `X.Y.Z` form | Rejected |
 | Version with no published image | Rejected, with a link to the available versions |
@@ -81,7 +83,7 @@ Compose installs therefore default to the custom App, and setup rejects
 
 ## Open items
 
-- **Compose on macOS:** run setup's `openflows` commands inside the image
+- **Compose on macOS and ARM64:** run setup's `openflows` commands inside the image
   (`docker run`), which needs the container to reach Coder and the project
   folder; or use macOS release binaries once #484 publishes them.
 - **Shared App with compose:** run the Manager's GitHub login from the published

@@ -222,7 +222,7 @@ In a separate terminal:
 `./scripts/setup.sh owner/repo --compose` installs OpenFlows without Rust or compiling. Every step above stays the same except where the programs come from:
 
 1. Setup picks the version (`OPENFLOWS_VERSION`, or the latest release when empty), pulls `ghcr.io/the-agenticflow/openflows:<version>` and saves the image's digest in `.env`.
-2. `docker compose --profile images up` runs the `openflows-binaries` service, which copies `openflows`, `openflows-doctor` and `openflows-harness` from the image into `.dev-binaries/` (owned by your user) and records the exact image in `.dev-binaries/IMAGE`.
+2. Setup starts the stack with `docker-compose.images.yml` added (`docker compose -f docker-compose.yml -f docker-compose.images.yml up -d`), whose `openflows-binaries` service which copies `openflows`, `openflows-doctor` and `openflows-harness` from the image into `.dev-binaries/` (owned by your user) and records the exact image in `.dev-binaries/IMAGE`.
 3. Bootstrap pushes the templates without building (`prod.sh --skip-build bootstrap`), and the workspaces load the programs from `.dev-binaries/` as they do for a source install.
 
 Setup remembers the mode in `.env`, so later runs without a flag keep using the images.
@@ -270,9 +270,9 @@ The workspace templates are built into the `openflows` program, so the image's p
 
 Run setup with the other flag. `--source` rebuilds the programs from the checkout and replaces the ones copied from an image; `--compose` replaces compiled programs with the image's. Accept setup's offer to restart the workspaces, or restart them afterwards.
 
-### Linux only for now
+### Host requirements
 
-The image contains Linux programs. Workspaces always run Linux, but setup also runs `openflows` directly on your machine to push templates, add the tenant and run the health check. A source install builds a native copy for that; a compose install has only the Linux one, so on macOS `--compose` stops and suggests `--source`.
+Compose needs an **x86-64 Linux host with glibc 2.34 or newer** (e.g. Ubuntu 22.04+, Debian 12+). The image's programs are x86-64 Linux builds linked against glibc. Workspaces always run `linux/amd64`, and setup also runs `openflows` directly on your machine to push templates, add the tenant and run the health check. A source install builds a native copy for that; a compose install has only the image's, so on macOS, ARM64 hosts or older glibc `--compose` stops before starting anything and suggests `--source`.
 
 ### Two installs on one machine
 
@@ -480,15 +480,19 @@ The digest in `OPENFLOWS_IMAGE_DIGEST` does not exist. Check it against the rele
 
 ### "Cannot write to .dev-binaries as user X" (`--compose`)
 
-The image's programs are copied as `OPENFLOWS_HOST_UID:OPENFLOWS_HOST_GID` (1000:1000 when unset), so the files stay owned by you. Setup fills these in for you; when running `docker compose --profile images` by hand, set them to the output of `id -u` / `id -g` and create `.dev-binaries/` yourself first (if Docker creates it, it is owned by root).
+The image's programs are copied as `OPENFLOWS_HOST_UID:OPENFLOWS_HOST_GID` (1000:1000 when unset), so the files stay owned by you. Setup fills these in for you; when running `docker compose -f docker-compose.yml -f docker-compose.images.yml` by hand, set them to the output of `id -u` / `id -g` and create `.dev-binaries/` yourself first (if Docker creates it, it is owned by root).
 
 ### "The shared OpenFlows GitHub App (connected-local) does not work with --compose yet"
 
 `.env` has `OPENFLOWS_GITHUB_AUTH_MODE=connected-local`, which needs Rust today. Set it to `self-managed` to use your own App, or install with `--source`.
 
-### "--compose currently needs a Linux host"
+### "--compose currently needs a Linux host" / "an x86-64 (amd64) host" / "glibc 2.34 or newer"
 
-Use `--source` on macOS. See [Linux only for now](#linux-only-for-now).
+The host cannot run the image's programs. Use `--source`. See [Host requirements](#host-requirements).
+
+### "The OpenFlows programs from the image do not run on this machine" (`--compose`)
+
+The copied `.dev-binaries/openflows` failed to start on the host, usually because the system's glibc is older than the image needs. Use `--source`. See [Host requirements](#host-requirements).
 
 ### Setup waits at "Connecting owner/repo" and never finishes
 
