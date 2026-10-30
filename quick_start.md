@@ -29,6 +29,15 @@ Turn GitHub issues into reviewed pull requests, on your own machine. For what Op
 ./scripts/setup.sh owner/repo --source      # compile from this checkout
 ```
 
+> **Using `--compose`?** The team's shared GitHub App (`connected-local`, the default in `.env.example`) does not work with `--compose` yet. Before the first run, create `.env` and switch to your own App:
+>
+> ```bash
+> cp .env.example .env
+> sed -i 's/^OPENFLOWS_GITHUB_AUTH_MODE=.*/OPENFLOWS_GITHUB_AUTH_MODE=self-managed/' .env
+> ```
+>
+> If you skip this, setup stops at the GitHub step and asks you to make this change.
+
 Without a flag, setup uses the mode of your last run, or `--source` the first time. That is the whole setup. The script is safe to re-run: it checks what is already done and continues from there. If something is missing, it stops and tells you exactly what to do.
 
 It will:
