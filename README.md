@@ -5,12 +5,13 @@
 
 **OpenFlows is an autonomous AI software team that turns GitHub issues into reviewed, production-ready pull requests inside your self-hosted Coder environment.** For developers, it handles planning, coding, testing, and adversarial review while keeping them in control of architecture and final decisions. For companies, it brings governed, auditable AI delivery into existing engineering workflows without exposing LLM keys or weakening security boundaries. For stakeholders, it creates a faster, more transparent path from product intent to shipped software.
 
-> **Getting started?** Run `./scripts/setup.sh owner/repo` — see [**quick_start.md**](quick_start.md). Manual steps and troubleshooting: [setup-reference](docs/setup-reference.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
+> **Getting started?** Run `./scripts/setup.sh owner/repo` (add `--compose` on Linux to use the published images instead of compiling) — see [**quick_start.md**](quick_start.md). Manual steps and troubleshooting: [setup-reference](docs/setup-reference.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
 
 ## Operator Quick Path
 
 ```bash
-./scripts/setup.sh owner/repo
+./scripts/setup.sh owner/repo --compose   # published images, no compiling (x86-64 Linux)
+./scripts/setup.sh owner/repo --source    # compile from this checkout (default)
 ```
 
 One script: creates `.env` and the GitHub App, starts Coder and Redis, configures the LLM, pushes templates and connects your repo. Each tenant's nexus workspace runs its own controller scoped to that repo. Re-run it any time; it skips what is done. Details in [quick_start.md](quick_start.md).

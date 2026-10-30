@@ -23,6 +23,12 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     set +a
 fi
 
+# A compose install (setup.sh --compose) has no Rust toolchain: run the programs
+# copied from the published image instead of building them.
+if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ] && [ -z "${OPENFLOWS_BIN:-}" ]; then
+    OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
+fi
+
 # Track whether the caller explicitly pinned a binary (env var or --bin flag).
 # When explicit, we respect it as-is and never touch it. Otherwise we always
 # rebuild the in-repo release binary from source before every invocation, so
@@ -36,6 +42,9 @@ else
     OPENFLOWS_BIN_EXPLICIT=0
 fi
 SKIP_BUILD=false
+if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ]; then
+    SKIP_BUILD=true   # also skips the dev-sync build in `bootstrap`
+fi
 BUILD_DONE=false
 
 usage() {
@@ -49,9 +58,10 @@ Usage:
 
 Options:
   --bin PATH     Use this exact openflows binary and skip auto-rebuild
-  --skip-build   Skip the automatic `cargo build --release` before running
-                 (uses whatever binary find_binary() resolves to, which may
-                 be stale — only use this if you know what you're doing)
+  --skip-build   Skip the automatic `cargo build --release` before running,
+                 and the dev-binary sync in `bootstrap` (uses whatever binary
+                 find_binary() resolves to and the programs already in
+                 .dev-binaries — only use this if you know what you're doing)
 
 Note: by default, every invocation rebuilds ./target/release/openflows from
 current source first (cargo build is incremental, so this is fast when
@@ -177,7 +187,9 @@ case "$CMD" in
         echo "═══════════════════════════════════════"
         echo ""
         echo "Step 1: Syncing dev binary..."
-        if [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
+        if [ "$SKIP_BUILD" = "true" ]; then
+            echo "  → Skipping (--skip-build): using the programs already in .dev-binaries"
+        elif [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
             "${SCRIPT_DIR}/dev-sync.sh"
         else
             echo "⚠ dev-sync.sh not found, skipping..."

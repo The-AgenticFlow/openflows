@@ -1,0 +1,38 @@
+# Apply after docker-compose.yml for installs from the published images:
+#   docker compose -f docker-compose.yml -f docker-compose.images.yml up -d
+# `setup.sh --compose` does this. It copies the released OpenFlows programs out
+# of the image into ./.dev-binaries, the folder Coder workspaces read them from,
+# before Coder starts. Create ./.dev-binaries first so it stays owned by your user.
+services:
+  openflows-binaries:
+    image: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+    # Workspaces run linux/amd64, so their programs must too, whatever the host.
+    platform: linux/amd64
+    user: "${OPENFLOWS_HOST_UID:-1000}:${OPENFLOWS_HOST_GID:-1000}"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if ! touch /out/.write-test 2>/dev/null; then
+          echo "Cannot write to .dev-binaries as user $$(id -u):$$(id -g)." >&2
+          echo "Set OPENFLOWS_HOST_UID / OPENFLOWS_HOST_GID in .env to the output of 'id -u' / 'id -g'" >&2
+          echo "(and create .dev-binaries yourself), or run ./scripts/setup.sh --compose." >&2
+          exit 1
+        fi
+        rm -f /out/.write-test
+        for bin in openflows openflows-doctor openflows-harness; do
+          cp "/usr/local/bin/$$bin" "/out/$$bin.tmp"
+          chmod 0755 "/out/$$bin.tmp"
+          mv "/out/$$bin.tmp" "/out/$$bin"
+        done
+        printf '%s\n' "$$OPENFLOWS_IMAGE_REF" > /out/IMAGE
+        echo "Installed OpenFlows programs from $$OPENFLOWS_IMAGE_REF"
+    environment:
+      OPENFLOWS_IMAGE_REF: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+    volumes:
+      - ./.dev-binaries:/out
+    restart: "no"
+
+  coder:
+    depends_on:
+      openflows-binaries:
+        condition: service_completed_successfully

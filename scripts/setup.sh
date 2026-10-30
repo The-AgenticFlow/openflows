@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # OpenFlows one-command setup.
 #
-#   ./scripts/setup.sh [owner/repo] [--name TEAM] [--fleet N]   (N = FORGE-SENTINEL pairs; asked when omitted)
+#   ./scripts/setup.sh [owner/repo] [--source | --compose] [--name TEAM] [--fleet N]
+#
+#   --source   compile OpenFlows from this checkout (default; needs Rust)
+#   --compose  use the published images, no compiling (Linux hosts);
+#              OPENFLOWS_VERSION in .env picks the version (empty = latest release)
+#   N = FORGE-SENTINEL pairs; asked when omitted
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
-# Stages: preflight → .env → GitHub App → Docker → Coder admin/token →
+# Stages: preflight → .env → [image] → GitHub App → Docker → Coder admin/token →
 #         LLM model → bootstrap → tenant → doctor.
 #
 # Non-interactive use: pass owner/repo, and set OPENFLOWS_LLM_PROVIDER /
@@ -16,6 +21,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
+IMAGE_REPO="ghcr.io/the-agenticflow/openflows"
+BIN_DIR="${ROOT}/.dev-binaries"
 TOTAL=8
 STEP=0
 
@@ -251,9 +258,32 @@ install_coder() {
 stage_preflight() {
     step "Checking your machine"
     local missing=()
+    if [ "$MODE" = compose ]; then
+        # Setup runs the image's x86-64 glibc programs on this machine as well as in the workspaces.
+        if [ "$(uname -s)" != Linux ]; then
+            die "--compose currently needs a Linux host." \
+                "The published programs are Linux binaries that setup runs on this machine." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        fi
+        case "$(uname -m)" in
+            x86_64|amd64) ;;
+            *) die "--compose currently needs an x86-64 (amd64) host, not $(uname -m)." \
+                   "Workspaces run linux/amd64 programs, which setup also runs on this machine." \
+                   "Use the source install instead:  ./scripts/setup.sh ${REPO} --source" ;;
+        esac
+        local glibc
+        glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')"
+        if [ -z "$glibc" ] || [ "$(printf '%s\n' 2.34 "$glibc" | sort -V | head -1)" != 2.34 ]; then
+            die "--compose needs glibc 2.34 or newer on this machine (found: ${glibc:-none})." \
+                "The published programs are built against glibc (e.g. Ubuntu 22.04+, Debian 12+)." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        fi
+    fi
     have curl    || missing+=("curl      → install with your package manager")
     have python3 || missing+=("python3   → install with your package manager")
-    have cargo   || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh")
+    if [ "$MODE" = source ]; then
+        have cargo || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh   (or skip compiling: --compose)")
+    fi
     if ! have docker; then
         missing+=("docker    → https://docs.docker.com/get-docker/")
     elif ! docker info >/dev/null 2>&1; then
@@ -286,7 +316,11 @@ stage_preflight() {
             fi
         done
     fi
-    ok "docker, compose, cargo, coder, python3, curl"
+    if [ "$MODE" = source ]; then
+        ok "docker, compose, cargo, coder, python3, curl"
+    else
+        ok "docker, compose, coder, python3, curl"
+    fi
 }
 
 # ── stage 2: .env ───────────────────────────────────────────────────────────
@@ -305,6 +339,58 @@ stage_env() {
         env_set CODER_SESSION_TOKEN ""
     fi
     ok ".env ready"
+}
+
+# ── stage 2b: published image (--compose) ───────────────────────────────────
+image_ref() { # image_ref → the exact image the stack runs, e.g. ghcr.io/…/openflows:1.8.1@sha256:…
+    printf '%s:%s@%s' "$IMAGE_REPO" "$(env_get OPENFLOWS_VERSION)" "$(env_get OPENFLOWS_IMAGE_DIGEST)"
+}
+
+latest_release_version() { # latest published release, e.g. 1.8.1
+    curl -fsS -m 20 "https://api.github.com/repos/The-AgenticFlow/openflows/releases/latest" 2>/dev/null \
+        | json tag_name | sed -n 's/^openflows-\([0-9][0-9.]*\)$/\1/p'
+}
+
+stage_image() {
+    step "OpenFlows image (no compiling)"
+    local version digest pinned label
+    version="$(env_get OPENFLOWS_VERSION)"
+    if [ -z "$version" ]; then
+        version="$(latest_release_version)"
+        [ -n "$version" ] || die "Could not look up the latest OpenFlows release." \
+            "Check your connection, or set OPENFLOWS_VERSION in .env (e.g. 1.8.1)."
+        info "No OPENFLOWS_VERSION set — using the latest release, ${version}"
+    fi
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "OPENFLOWS_VERSION must look like 1.8.1 (got '${version}')."
+
+    pinned="$(env_get OPENFLOWS_IMAGE_DIGEST)"
+    if [ -n "$pinned" ]; then
+        docker pull -q --platform linux/amd64 "${IMAGE_REPO}@${pinned}" >"$LOG_FILE" 2>&1 \
+            || die "Image ${IMAGE_REPO}@${pinned} was not found." \
+                "Check OPENFLOWS_IMAGE_DIGEST in .env against the release notes, or clear it to use ${version}'s current image."
+        digest="$pinned"
+    else
+        docker pull -q --platform linux/amd64 "${IMAGE_REPO}:${version}" >"$LOG_FILE" 2>&1 \
+            || die "No published image for OpenFlows ${version}." \
+                "Pick a version that has one: https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows"
+        digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE_REPO}:${version}" \
+            | sed -n "s|^${IMAGE_REPO}@||p" | head -1)"
+        [ -n "$digest" ] || die "Could not read the digest of ${IMAGE_REPO}:${version}."
+    fi
+    # Docker ignores the tag when a digest is given, so a digest left over from
+    # another version would otherwise install that version silently.
+    label="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${IMAGE_REPO}@${digest}" 2>/dev/null || true)"
+    if [ -n "$label" ] && [ "$label" != "$version" ]; then
+        die "OPENFLOWS_IMAGE_DIGEST is for version ${label}, not ${version}." \
+            "Clear OPENFLOWS_IMAGE_DIGEST in .env, or set OPENFLOWS_VERSION=${label}."
+    fi
+
+    env_set OPENFLOWS_VERSION "$version"
+    env_set OPENFLOWS_IMAGE_DIGEST "$digest"
+    env_set OPENFLOWS_HOST_UID "$(id -u)"
+    env_set OPENFLOWS_HOST_GID "$(id -g)"
+    mkdir -p "$BIN_DIR"   # created by us, not by Docker, so it stays owned by this user
+    ok "OpenFlows ${B}${version}${N} · ${digest:0:19}…"
 }
 
 # ── stage 3: GitHub App ─────────────────────────────────────────────────────
@@ -416,12 +502,20 @@ stage_github_app() {
     local auth_mode
     auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     if [ -z "$auth_mode" ]; then
-        if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
+        # connected-local still builds and runs the Manager from source, so --compose
+        # (no Rust) defaults to the user's own App.
+        if [ "$MODE" = compose ] || { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; }; then
             auth_mode=self-managed
         else
             auth_mode=connected-local
         fi
         env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
+    fi
+    if [ "$auth_mode" = connected-local ] && [ "$MODE" = compose ]; then
+        die "The shared OpenFlows GitHub App (connected-local) does not work with --compose yet." \
+            "It still builds the local Manager from source, which needs Rust." \
+            "Use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env," \
+            "or install from source:  ./scripts/setup.sh ${REPO} --source"
     fi
     if [ "$auth_mode" = connected-local ]; then
         local client_id slug secret_dir repos
@@ -493,17 +587,32 @@ stage_github_app() {
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i
-    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
-        out="$(cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml up -d --build 2>&1)" \
-            || { printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; die "connected-local docker compose up failed"; }
-    elif ! out="$(cd "$ROOT" && docker compose up -d 2>&1)"; then
+    local out i args=()
+    # connected-local adds the local Manager; the images file copies the programs into
+    # .dev-binaries before Coder starts. Without either, run plain `docker compose` so
+    # Compose keeps picking up docker-compose.override.yml or COMPOSE_FILE.
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
+    [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
+    [ "${#args[@]}" -gt 0 ] && args=(-f docker-compose.yml "${args[@]}")
+    args+=(up -d)
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
+    if ! out="$(cd "$ROOT" && docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
     ( for ((i = 0; i < 90; i++)); do curl -fs -m 3 "$(coder_url)/api/v2/buildinfo" >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1 ) &
     spin $! "Waiting for Coder to become healthy" \
         || die "Coder did not become healthy in 3 minutes." "Check logs: docker compose logs coder"
+    if [ "$MODE" = compose ]; then
+        [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
+            || die "The OpenFlows programs were not copied from $(image_ref)." \
+                "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
+        "${BIN_DIR}/openflows" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs from the image do not run on this machine." \
+                "They need an x86-64 Linux with glibc 2.34 or newer." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
+    fi
     ok "Coder is up at ${B}$(coder_url)${N}"
 }
 
@@ -733,12 +842,18 @@ stage_llm() {
 }
 
 # ── stage 7: bootstrap (templates) ──────────────────────────────────────────
-# templates_ready — true when all five openflows-* templates exist and the dev binary is newer than every source file
+# templates_ready — true when all five openflows-* templates exist and the programs are current:
+# --source: the dev binary is newer than every source file; --compose: the templates were pushed for this image.
 templates_ready() {
-    local bin="${ROOT}/.dev-binaries/openflows"
+    local bin="${BIN_DIR}/openflows"
     [ -x "$bin" ] || return 1
+    if [ "$MODE" = compose ]; then
+        [ "$(env_get OPENFLOWS_SETUP_TEMPLATES_IMAGE)" = "$(image_ref)" ] || return 1
+    # Programs copied from an image (IMAGE marker) must be rebuilt from this checkout.
+    elif [ -f "${BIN_DIR}/IMAGE" ]; then
+        return 1
     # Rebuild when any source or template is newer than the built binary.
-    if [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
         return 1
     fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
@@ -747,9 +862,58 @@ names = {t.get("name") for t in json.load(sys.stdin)}
 sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
 }
 
+# running_workspaces — names of this user's running OpenFlows workspaces, one per line
+running_workspaces() {
+    api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null | python3 -c '
+import sys, json
+for w in json.load(sys.stdin).get("workspaces") or []:
+    if w.get("template_name", "").startswith("openflows-") and w["latest_build"]["status"] == "running":
+        print(w["name"])' 2>/dev/null || true
+}
+
+# offer_restart — workspaces copy the programs when they start, so the ones already running
+# when bootstrap replaced the programs (STALE_WORKSPACES) keep the old version until restarted.
+offer_restart() {
+    [ -n "${STALE_WORKSPACES:-}" ] || return 0
+    local names ws
+    names="$(printf '%s' "$STALE_WORKSPACES" | tr '\n' ' ')"
+    if ! is_tty; then
+        info "Restart these workspaces to load the new programs: ${names}"
+        info "  coder restart <workspace> --yes"
+        return
+    fi
+    warn "Running workspaces still use the old programs: ${names}"
+    if [[ ! "$(ask 'Restart them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
+        info "Restart them later with:  coder restart <workspace> --yes"
+        return
+    fi
+    for ws in $STALE_WORKSPACES; do
+        if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+            coder restart "$ws" --yes >>"$LOG_FILE" 2>&1; then
+            ok "restarted ${ws}"
+        else
+            warn "could not restart ${ws} — see ${LOG_FILE}"
+        fi
+    done
+}
+
 stage_bootstrap() {
-    step "Workspace templates (first run takes ~10 min)"
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
+    if [ "$MODE" = compose ]; then
+        step "Workspace templates"
+        if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
+           [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
+            ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+            return
+        fi
+        run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+        env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(image_ref)"
+        env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
+        STALE_WORKSPACES="$(running_workspaces)"
+        ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+        return
+    fi
+    step "Workspace templates (first run takes ~10 min)"
     if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
        [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
         ok "binaries and 5 templates already in place"
@@ -759,6 +923,8 @@ stage_bootstrap() {
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
+    rm -f "${BIN_DIR}/IMAGE"
+    STALE_WORKSPACES="$(running_workspaces)"
     ok "binaries built, 5 templates pushed"
 }
 
@@ -858,12 +1024,15 @@ stage_tenant() {
 
 # ── main ────────────────────────────────────────────────────────────────────
 main() {
-    REPO=""; NAME=""; FLEET=""
+    REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --source|--compose)
+                [ -z "$MODE" ] || [ "$MODE" = "${1#--}" ] || die "Choose one install mode: --source or --compose, not both."
+                MODE="${1#--}"; shift ;;
             --name) NAME="${2:?--name needs a value}"; shift 2 ;;
             --fleet) FLEET="${2:?--fleet needs a value}"; shift 2 ;;
-            -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
             -*) die "Unknown option: $1" ;;
             *) REPO="$1"; shift ;;
         esac
@@ -906,21 +1075,45 @@ main() {
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."
 
+    # Install mode: the flag, else the mode of the previous run, else source.
+    if [ -z "$MODE" ]; then
+        MODE="$(env_get OPENFLOWS_SETUP_MODE)"
+        if [ -z "$MODE" ]; then
+            MODE=source
+            printf '  %sInstall mode: source (compiles OpenFlows). To use the published images instead: --compose%s\n' "$D" "$N"
+        fi
+    fi
+    case "$MODE" in
+        source) ;;
+        compose)
+            TOTAL=9
+            # prod.sh rebuilds from source before each command unless given a binary to run.
+            export OPENFLOWS_BIN="${BIN_DIR}/openflows" ;;
+        *) die "Unknown install mode '${MODE}' in OPENFLOWS_SETUP_MODE (use source or compose)." ;;
+    esac
+
     stage_preflight
     stage_env
     env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
+    env_set OPENFLOWS_SETUP_MODE "$MODE"
+    [ "$MODE" = compose ] && stage_image
     stage_github_app
     stage_docker
     stage_coder_token
     stage_llm
+    STALE_WORKSPACES=""
     stage_bootstrap
     stage_tenant
+    offer_restart
 
     close_step
     printf '\n'
     RAIL_OPEN=0
+    local installed="source (compiled from this checkout)"
+    [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
+        "Installed    ${installed}" \
         "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \
