@@ -2,6 +2,23 @@
 
 Turn GitHub issues into reviewed pull requests, on your own machine. For what OpenFlows is, see the [README](README.md).
 
+## Choose the GitHub authorization mode
+
+The default is `connected-local`: OpenFlows supplies the team-owned GitHub App,
+and the local Manager guides you through installing it, approving your GitHub
+account, and selecting a repository. You do not create an App or enter a client
+ID, App slug, client secret, or private key.
+
+If you want to use your own GitHub App, set this before running setup:
+
+```bash
+OPENFLOWS_GITHUB_AUTH_MODE=self-managed ./scripts/setup.sh owner/repo
+```
+
+That keeps the existing Coder external-auth flow. Follow the [self-managed App
+setup instructions](docs/setup-reference.md) for its credentials and
+installation.
+
 ## You need
 
 - Docker (running), Rust (`cargo`), `curl`, `python3`
@@ -26,8 +43,6 @@ It will:
 6. Add your **LLM** provider and model (asks for the API key).
 7. Build binaries and push the workspace templates (first run takes about 10 minutes).
 8. Connect your repo. The local Manager renews your GitHub App user token when needed and supplies it to the workspaces.
-
-To use your own GitHub App instead, set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed` in `.env` before setup. This keeps the existing Coder external-auth flow; see [manual setup](docs/setup-reference.md).
 
 For connected-local mode, open the Manager console at <http://localhost:3002> after setup. The console handles App installation, GitHub approval, and repository selection.
 
