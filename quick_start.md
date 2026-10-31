@@ -35,16 +35,57 @@ Maintainers validating the team-owned App can follow the [connected-local live t
 
 ## Testing the Manager's organization provisioning locally
 
-The Manager needs its own Coder API token in the local development secrets
-file. After the local Coder setup has created a Coder credential and
-`.env.prod` contains `CODER_URL`,
-`OPENFLOWS_CODER_OPERATOR_TOKEN_REF`, and
-`OPENFLOWS_DEV_SECRETS_FILE`, run:
+This is only needed when testing the Manager's organization provisioning
+directly. Normal `./scripts/setup.sh owner/repo` setup does this work through
+the local stack.
 
-```bash
-python3 scripts/bootstrap-manager-coder-token.py
-cargo run -p openflows-manager
-```
+The Manager uses a separate Coder API token so it can provision organizations
+without reusing your personal token. You choose the local secrets-file path
+and the label under which that token is stored; the helper creates the token.
+It never prints the token value.
+
+1. Run `./scripts/setup.sh owner/repo` first. It starts Coder and stores your
+   Coder session token in `.env`.
+2. Create a private local secrets file. This file is ignored by Git:
+
+   ```bash
+   mkdir -p .openflows/local
+   printf '{}\n' > .openflows/local/manager-secrets.json
+   chmod 600 .openflows/local/manager-secrets.json
+   ```
+
+3. Copy the example and set these three values in `.env.prod`:
+
+   ```bash
+   cp .env.prod.example .env.prod
+   ```
+
+   ```dotenv
+   # The local Coder instance started by setup.
+   CODER_URL=http://127.0.0.1:7080
+
+   # A name we choose for the Manager's token inside the JSON file.
+   OPENFLOWS_CODER_OPERATOR_TOKEN_REF=coder-operator-token
+
+   # An absolute path to the file created in step 2.
+   OPENFLOWS_DEV_SECRETS_FILE=/absolute/path/to/openflows/.openflows/local/manager-secrets.json
+   ```
+
+   `CODER_URL` is the address of your local Coder instance. The token reference
+   is only a JSON key, so keep the default value. Replace the last value with
+   the real absolute path on your machine; it is not a token.
+
+4. Create the Manager token and start the Manager:
+
+   ```bash
+   python3 scripts/bootstrap-manager-coder-token.py
+   cargo run -p openflows-manager
+   ```
+
+If `.env` has no valid `CODER_SESSION_TOKEN`, sign in at
+<http://localhost:7080>, create a token at **Settings → Tokens**, save it in
+`.env`, and run the helper again. The helper mints a separate token for the
+Manager and writes it to the secrets file with `0600` permissions.
 
 With the Docker backend, creating an organization now automatically creates
 its Coder provisioner key and starts its provisioner container. Keep Docker
