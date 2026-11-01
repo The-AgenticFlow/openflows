@@ -46,10 +46,10 @@ pub async fn index() -> Html<&'static str> {
     <p>The OpenFlows App is owned by OpenFlows. You approve access for your GitHub account and choose a repository that you can access.</p>
   </section>
 
-  <section>
+  <section id="browser-signin-section">
     <h2>1. Sign in</h2>
     <p id="session">Checking browser session…</p>
-    <button id="login">Sign in with GitHub</button>
+    <button id="login" disabled>Sign in with GitHub</button>
     <button class="secondary" id="me">Refresh session</button>
     <button class="secondary" id="link-coder">Connect my GitHub-backed Coder account</button>
     <button class="secondary" id="coder-status">Check Coder account</button>
@@ -134,7 +134,8 @@ function controls() {
   $('tenant-status').disabled = busy || !tenantId;
   const connected = localGithub?.configured && localGithub?.authorized;
   $('install-app').disabled = busy || !localGithub?.installation_url;
-  $('connect-local-github').disabled = busy || !localGithub?.configured || connected;
+  $('connect-local-github').disabled = busy || !localGithub?.configured || (connected && signedIn);
+  $('connect-local-github').textContent = connected ? 'Sign in to Manager' : 'Connect GitHub';
   $('logout-local-github').disabled = busy || !connected;
   $('local-repositories').disabled = busy || !connected;
   $('use-local-repository').disabled = busy || !connected || !$('local-repositories').value;
@@ -245,6 +246,11 @@ function setLocalRepositories(repositories) {
 async function refreshLocalGithub() {
   try {
     localGithub = await request('/api/v1/local/github');
+    $('login').disabled = !!localGithub.enabled;
+    $('login').hidden = !!localGithub.enabled;
+    if (localGithub.enabled) {
+      show('session', 'Local GitHub uses the device code above. Browser sign-in is unavailable in this mode.');
+    }
     if (!localGithub.enabled) {
       show('local-github-help', 'Connected-local mode is disabled for this deployment.');
       show('local-github-output', 'This Manager is running the hosted or self-managed path.');
@@ -286,6 +292,7 @@ async function pollLocalGithub() {
       clearLocalDevicePoll();
       log('GitHub authorization completed.');
       await refreshLocalGithub();
+      await refreshSession();
       return;
     }
     if (response.status === 'slow_down') {
@@ -336,14 +343,19 @@ async function refreshSession() {
     log('Browser session is valid.');
     await refreshOrganizations();
   } catch (error) {
-    show('session', 'Not signed in. Click “Sign in with GitHub”.');
+    show('session', localGithub?.enabled
+      ? 'GitHub is connected, but this browser needs a Manager session. Select Sign in to Manager above.'
+      : 'Not signed in. Click “Sign in with GitHub”.');
     $('session').className = 'error';
     signedIn = false; organizationId = null; tenantId = null; selectedOrg = null; cancelOperation();
     log(error.message, true);
   }
   controls();
 }
-$('login').onclick = () => { window.location.href = '/auth/github/start?next=%2F'; };
+$('login').onclick = () => {
+  if (localGithub?.enabled) return;
+  window.location.href = '/auth/github/start?next=%2F';
+};
 $('me').onclick = refreshSession;
 $('link-coder').onclick = async () => {
   try {

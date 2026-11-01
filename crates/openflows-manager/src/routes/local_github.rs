@@ -187,7 +187,7 @@ async fn start_device_authorization(
 async fn poll_device_authorization(
     State(state): State<AppState>,
     Json(body): Json<DevicePollRequest>,
-) -> Result<Json<DevicePollResponse>, ManagerError> {
+) -> Result<(HeaderMap, Json<DevicePollResponse>), ManagerError> {
     if body.device_code.trim().is_empty() || body.device_code.len() > 256 {
         return Err(ManagerError::InvalidInput("invalid device code".into()));
     }
@@ -200,21 +200,36 @@ async fn poll_device_authorization(
         interval: 0,
     };
     match github.poll(&challenge).await? {
-        PollResult::Pending => Ok(Json(DevicePollResponse {
+        PollResult::Pending => Ok((HeaderMap::new(), Json(DevicePollResponse {
             status: "authorization_pending",
             interval: None,
-        })),
-        PollResult::SlowDown(interval) => Ok(Json(DevicePollResponse {
+        }))),
+        PollResult::SlowDown(interval) => Ok((HeaderMap::new(), Json(DevicePollResponse {
             status: "slow_down",
             interval,
-        })),
+        }))),
         PollResult::Authorized(token) => {
+            let services = state.services().ok_or_else(|| {
+                ManagerError::api("SERVICE_UNAVAILABLE", "Manager session service is unavailable")
+            })?;
+            let user = services.github.fetch_user(&token.access_token).await?;
+            let display_name = user.display_name.clone().unwrap_or_else(|| user.login.clone());
+            let (user_id, _) = services.users.find_or_create_user(
+                services.db.pool(), "github", &user.id.to_string(), &user.login, &display_name,
+            ).await?;
+            let session = services.sessions.create_browser_session(user_id).await?;
+            services.session_manager.record_recent_auth(session.session_id).await?;
             credentials.save_authorization(token).await?;
             crate::auth::local_credentials::ensure_broker_key()?;
-            Ok(Json(DevicePollResponse {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::SET_COOKIE, crate::routes::auth::session_cookie_header(
+                crate::routes::auth::SESSION_COOKIE, &session.access_token,
+                services.auth_config.cookie_secure, 12 * 3600,
+            ).parse().map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid session cookie")))?);
+            Ok((headers, Json(DevicePollResponse {
                 status: "authorized",
                 interval: None,
-            }))
+            })))
         }
     }
 }

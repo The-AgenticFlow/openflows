@@ -267,6 +267,12 @@ pub async fn github_start(
     headers: HeaderMap,
     Query(q): Query<LoginQuery>,
 ) -> Result<Response, ManagerError> {
+    if state.connected_local_enabled() {
+        return Err(ManagerError::api(
+            "FORBIDDEN",
+            "Use the local GitHub device connection instead",
+        ));
+    }
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
