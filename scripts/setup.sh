@@ -872,21 +872,24 @@ sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lor
 }
 
 # openflows_workspaces — this user's OpenFlows workspaces, one
-# "<name> <status> <outdated> <id> <active template version id>" per line
+# "<name> <status> <outdated> <id> <active template version id>" per line; fails when Coder
+# doesn't answer, so callers never mistake that for "no workspaces"
 openflows_workspaces() {
-    api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null | python3 -c '
+    local body
+    body="$(api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null)" || return 1
+    python3 -c '
 import sys, json
 for w in json.load(sys.stdin).get("workspaces") or []:
     if w.get("template_name", "").startswith("openflows-"):
         print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no",
-              w["id"], w["template_active_version_id"])' 2>/dev/null || true
+              w["id"], w["template_active_version_id"])' <<<"$body" 2>/dev/null
 }
 
 # mark_pending_restart — add the running workspaces to OPENFLOWS_SETUP_PENDING_RESTART
 # (comma-separated: .env is sourced by prod.sh)
 mark_pending_restart() {
     local names
-    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; openflows_workspaces | awk '$2 == "running" {print $1}'; } \
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; { openflows_workspaces || true; } | awk '$2 == "running" {print $1}'; } \
         | awk 'NF && !seen[$1]++' | paste -sd, -)"
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
 }
@@ -903,7 +906,7 @@ update_stopped() {
         else
             warn "could not update ${name} — see ${LOG_FILE}"
         fi
-    done <<<"$(openflows_workspaces)"
+    done <<<"$(openflows_workspaces || true)"
 }
 
 # offer_update — a workspace keeps its template version until it is updated (a restart reuses
@@ -916,14 +919,18 @@ update_stopped() {
 offer_update() {
     local all update restart ws
     update_stopped
-    all="$(openflows_workspaces)"
+    if ! all="$(openflows_workspaces)"; then
+        warn "Could not check the workspaces: Coder did not answer"
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
     update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
     restart="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
         $2 == "running" && $3 == "no" && ($1 in was) {print $1}' <<<"$all")"
     # Stopped or deleted workspaces copy the new programs when they next start.
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$(paste -sd, - <<<"$restart")"
     if [ -n "$update$restart" ]; then
-        warn "Running workspaces still use the old version: $(printf '%s\n' $update $restart | paste -sd' ' -)"
+        warn "Running workspaces still use the old version: $(printf '%s\n' "$update" "$restart" | awk NF | paste -sd' ' -)"
         if is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
             for ws in $update; do
                 if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
@@ -946,7 +953,11 @@ offer_update() {
         fi
     fi
     # Includes outdated workspaces that were starting, stopping or failed, so not updated above.
-    UPGRADE_PENDING="$( { openflows_workspaces | awk '$3 == "yes" {print $1}'; env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } \
+    if ! all="$(openflows_workspaces)"; then
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
+    UPGRADE_PENDING="$( { awk '$3 == "yes" {print $1}' <<<"$all"; env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } \
         | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
     return 0
 }
