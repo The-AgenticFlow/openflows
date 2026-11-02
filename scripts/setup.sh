@@ -428,8 +428,8 @@ stage_github_app() {
         else
             auth_mode=connected-local
         fi
-        env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     fi
+    env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     if [ "$auth_mode" = connected-local ]; then
         local secret_dir
         secret_dir="${HOME}/.config/openflows"

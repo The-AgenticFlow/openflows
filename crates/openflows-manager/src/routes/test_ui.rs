@@ -34,6 +34,7 @@ pub async fn index() -> Html<&'static str> {
   <section id="local-github-section">
     <h2>Connect GitHub for this computer</h2>
     <p id="local-github-help">Checking connected-local GitHub availability…</p>
+    <label>Local console key <input id="local-console-key" type="password" autocomplete="off" placeholder="Paste the key from ~/.config/openflows/console-key"></label>
     <button id="install-app" disabled>Install OpenFlows App</button>
     <button id="connect-local-github" disabled>Connect GitHub</button>
     <button class="secondary" id="refresh-local-github">Refresh</button>
@@ -120,11 +121,17 @@ let selectedOrg = null;
 let localGithub = null;
 let localDevice = null;
 let localDeviceTimer = null;
-const consoleKey = new URLSearchParams(window.location.hash.slice(1)).get('console-key') || sessionStorage.getItem('openflows-console-key');
+let consoleKey = new URLSearchParams(window.location.hash.slice(1)).get('console-key') || sessionStorage.getItem('openflows-console-key');
 if (consoleKey) {
   sessionStorage.setItem('openflows-console-key', consoleKey);
   if (window.location.hash) history.replaceState(null, '', window.location.pathname + window.location.search);
 }
+$('local-console-key').value = consoleKey || '';
+$('local-console-key').onchange = () => {
+  consoleKey = $('local-console-key').value.trim();
+  if (consoleKey) sessionStorage.setItem('openflows-console-key', consoleKey);
+  else sessionStorage.removeItem('openflows-console-key');
+};
 
 function controls() {
   for (const id of ['create-org', 'refresh-orgs']) $(id).disabled = busy || !signedIn;
@@ -342,7 +349,7 @@ function showConnection(value) {
   output.append(details);
 }
 async function request(url, options = {}) {
-  if (url === '/api/v1/local/github/device' || url === '/api/v1/local/github/device/poll') {
+  if (url.startsWith('/api/v1/local/github/') && url !== '/api/v1/local/github/') {
     options.headers = { ...options.headers, 'X-OpenFlows-Console-Key': consoleKey || '' };
   }
   const response = await fetch(url, { credentials: 'include', ...options });

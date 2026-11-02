@@ -292,6 +292,7 @@ pub(crate) async fn repositories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RepositoryResponse>>, ManagerError> {
+    require_console_key(&headers)?;
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -315,6 +316,7 @@ pub(crate) async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(), ManagerError> {
+    require_console_key(&headers)?;
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
