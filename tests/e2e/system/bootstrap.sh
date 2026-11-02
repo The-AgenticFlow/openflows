@@ -104,4 +104,4 @@ export OPENFLOWS_E2E_TENANT="ci-$(printf '%s' "$project" | sha256sum | cut -c1-1
 driver="$PWD/tests/e2e/system/$driver"
 # Avoid loading the developer's .env or persisted bootstrap credentials.
 cd "$scratch"
-timeout 1500 python3 "$driver" 2>&1 | tee "$artifacts/test.log"
+timeout 1500 python3 "$driver" </dev/null 2>&1 | tee "$artifacts/test.log"

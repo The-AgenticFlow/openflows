@@ -67,6 +67,8 @@ class ScriptedModel:
                     continue
                 if isinstance(item, dict) and 'phase' in item and 'review_round' in item:
                     values.update(revision=item['revision'], round=item['review_round'], head=item.get('head'))
+                    if item.get('pr_number'):
+                        values['pr_number'] = item['pr_number']
                 if isinstance(item, dict) and 'number' in item and 'head' in item:
                     values['pr_number'] = item['number']
         return values
@@ -96,8 +98,16 @@ class ScriptedModel:
                 users = [(i, content) for i, content in users if any(
                     phrase in self.text(content) for phrase in script['turn_contains'])]
             def matches(route):
-                phrases = route['contains'] if isinstance(route['contains'], list) else [route['contains']]
                 candidates = users[-1:] if script.get('turn_contains') else users
+                if 'not_contains' in route:
+                    excluded = route['not_contains'] if isinstance(route['not_contains'], list) else [route['not_contains']]
+                    if any(phrase in self.text(content) for _, content in candidates for phrase in excluded):
+                        return False
+                if 'contains_all' in route:
+                    phrases = route['contains_all']
+                    return any(all(phrase in self.text(content) for phrase in phrases)
+                        for _, content in candidates)
+                phrases = route['contains'] if isinstance(route['contains'], list) else [route['contains']]
                 return any(phrase in self.text(content) for _, content in candidates for phrase in phrases)
             routes = [(i, route) for i, route in enumerate(script['routes'])
                 if matches(route)]
