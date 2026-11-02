@@ -451,6 +451,9 @@ impl OrganizationService {
                 caller,
             )
             .await?;
+        self.repo
+            .set_invitee_login_in_tx(&mut tx, id, &lookup.login)
+            .await?;
 
         audit::insert_in_tx(
             &mut tx,
@@ -517,6 +520,8 @@ impl OrganizationService {
                             &hash,
                             caller,
                         )
+                        .await?;
+                    repo.set_invitee_login_in_tx(conn, id, &lookup.login)
                         .await?;
                     audit::insert(
                         &mut *conn,
@@ -595,7 +600,7 @@ impl OrganizationService {
             chrono::DateTime<chrono::Utc>,
         );
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT i.id, i.invitee_github_user_id, idn.login_snapshot, i.role,
+            "SELECT i.id, i.invitee_github_user_id, COALESCE(idn.login_snapshot, i.invitee_login), i.role,
                     i.invited_by, i.created_at, i.expires_at
                FROM invitations i
                LEFT JOIN identities idn

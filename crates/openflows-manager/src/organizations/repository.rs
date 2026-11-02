@@ -423,6 +423,23 @@ impl OrganizationRepository {
         Ok(id)
     }
 
+    /// Record the GitHub login an invitation was created for (display only;
+    /// acceptance always matches the immutable GitHub user id).
+    pub async fn set_invitee_login_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        id: InvitationId,
+        login: &str,
+    ) -> Result<(), ManagerError> {
+        sqlx::query("UPDATE invitations SET invitee_login = $1 WHERE id = $2")
+            .bind(login)
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
+        Ok(())
+    }
+
     /// Revoke a live invitation by id within the org scope.
     pub async fn revoke_invitation(
         &self,

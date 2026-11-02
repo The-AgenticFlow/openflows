@@ -230,6 +230,20 @@ async fn pending_invitations_list_for_admins_and_hide_revoked() {
         body["items"].as_array().unwrap().is_empty(),
         "revoked hidden"
     );
+
+    // Someone who has never signed in still shows by the login they were
+    // invited as (stored at creation), not just a numeric GitHub id.
+    let (status, _) = app
+        .send(
+            "POST",
+            &path,
+            &alice,
+            Some(serde_json::json!({ "github_login": "carol", "role": "viewer" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = app.get(&path, &alice).await;
+    assert_eq!(body["items"][0]["invitee_login"], "carol");
 }
 
 #[tokio::test]
