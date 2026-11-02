@@ -1,6 +1,9 @@
 # Apply after docker-compose.yml only for connected-local development.
 # The local Manager brokers Alice's GitHub App user token to her workspaces.
 services:
+  openflows-db:
+    profiles: !reset []
+
   coder:
     environment:
       CODER_EXTERNAL_AUTH_0_ID: !reset null
@@ -11,6 +14,8 @@ services:
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: !reset null
 
   openflows-local-manager:
+    ports:
+      - "127.0.0.1:3002:3002"
     build:
       context: .
       dockerfile: Dockerfile.manager
@@ -19,12 +24,14 @@ services:
       OPENFLOWS_MODE: local
       OPENFLOWS_CONNECTED_LOCAL_ENABLED: "true"
       OPENFLOWS_AUTH_ALLOW_LOOPBACK: "true"
-      # Official OpenFlows releases supply the team App's public client ID.
-      # An unconfigured development build still starts the console, which
-      # reports the missing release configuration without asking contributors
-      # to create or configure an App.
-      OPENFLOWS_GITHUB_CLIENT_ID: ${OPENFLOWS_GITHUB_CLIENT_ID:-}
-      OPENFLOWS_GITHUB_APP_SLUG: ${OPENFLOWS_GITHUB_APP_SLUG:-}
+      OPENFLOWS_AUTH_COOKIE_SECURE: "false"
+      OPENFLOWS_PUBLIC_URL: http://127.0.0.1:3002
+      OPENFLOWS_DATABASE_URL: postgres://openflows:${OPENFLOWS_PG_PASSWORD:-openflows}@openflows-db:5432/openflows_control_plane
+      OPENFLOWS_SECRET_PROVIDER: filesystem
+      OPENFLOWS_SECRET_DIR: /run/openflows-local/secrets
+      # Public identifiers for the team App; local contributors need no App secret.
+      OPENFLOWS_GITHUB_CLIENT_ID: Iv23liSR6TsW7SxvgRLH
+      OPENFLOWS_GITHUB_APP_SLUG: openflows-apps
       OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE: /run/openflows-local/github-user.json
       OPENFLOWS_MANAGER_ADDR: 0.0.0.0:3002
       REDIS_URL: redis://redis:6379
@@ -32,4 +39,5 @@ services:
       - ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}:/run/openflows-local
     depends_on:
       - redis
+      - openflows-db
     restart: unless-stopped

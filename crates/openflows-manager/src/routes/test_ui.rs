@@ -134,7 +134,7 @@ function controls() {
   $('tenant-status').disabled = busy || !tenantId;
   const connected = localGithub?.configured && localGithub?.authorized;
   $('install-app').disabled = busy || !localGithub?.installation_url;
-  $('connect-local-github').disabled = busy || !localGithub?.configured || (connected && signedIn);
+  $('connect-local-github').disabled = busy || !!localDevice || !localGithub?.configured || (connected && signedIn);
   $('connect-local-github').textContent = connected ? 'Sign in to Manager' : 'Connect GitHub';
   $('logout-local-github').disabled = busy || !connected;
   $('local-repositories').disabled = busy || !connected;
@@ -235,6 +235,17 @@ function clearLocalDevicePoll() {
   localDeviceTimer = null;
   localDevice = null;
 }
+function continueLocalSignIn() {
+  const next = new URLSearchParams(window.location.search).get('next');
+  if (!next) return;
+  try {
+    const url = new URL(next, window.location.origin);
+    const allowed = ['/auth/cli/verify', '/invitations/accept', '/api/v1/me'];
+    if (next.startsWith('/') && !next.startsWith('//') && url.origin === window.location.origin && allowed.includes(url.pathname)) {
+      window.location.assign(url.pathname + url.search);
+    }
+  } catch { /* Ignore invalid return paths. */ }
+}
 function setLocalRepositories(repositories) {
   const select = $('local-repositories');
   select.replaceChildren(); option(select, '', 'Select a repository');
@@ -278,7 +289,8 @@ async function refreshLocalGithub() {
 }
 async function pollLocalGithub() {
   if (!localDevice) return;
-  if (Date.now() >= localDevice.expiresAt) {
+  const challenge = localDevice;
+  if (Date.now() >= challenge.expiresAt) {
     clearLocalDevicePoll();
     show('local-github-output', 'The GitHub code expired. Select Connect GitHub to start again.');
     controls(); return;
@@ -286,20 +298,23 @@ async function pollLocalGithub() {
   try {
     const response = await request('/api/v1/local/github/device/poll', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ device_code: localDevice.deviceCode })
+      body: JSON.stringify({ device_code: challenge.deviceCode })
     });
+    if (localDevice !== challenge) return;
     if (response.status === 'authorized') {
       clearLocalDevicePoll();
       log('GitHub authorization completed.');
       await refreshLocalGithub();
       await refreshSession();
+      continueLocalSignIn();
       return;
     }
     if (response.status === 'slow_down') {
-      localDevice.interval = Math.max(response.interval || 0, localDevice.interval + 5);
+      challenge.interval = Math.max(response.interval || 0, challenge.interval + 5);
     }
-    localDeviceTimer = setTimeout(pollLocalGithub, localDevice.interval * 1000);
+    localDeviceTimer = setTimeout(pollLocalGithub, challenge.interval * 1000);
   } catch (error) {
+    if (localDevice !== challenge) return;
     clearLocalDevicePoll();
     show('local-github-output', `GitHub authorization did not complete: ${error.message}`);
     controls();
@@ -342,6 +357,7 @@ async function refreshSession() {
     await csrf();
     log('Browser session is valid.');
     await refreshOrganizations();
+    continueLocalSignIn();
   } catch (error) {
     show('session', localGithub?.enabled
       ? 'GitHub is connected, but this browser needs a Manager session. Select Sign in to Manager above.'
@@ -472,9 +488,10 @@ $('connect-local-github').onclick = () => action(async () => {
   output.append(link, document.createTextNode(`\nEnter this code: ${device.user_code}\nWaiting for approval…`));
   window.open(device.verification_uri, '_blank', 'noopener');
   localDeviceTimer = setTimeout(pollLocalGithub, device.interval * 1000);
+  controls();
 }, 'local-github-output');
 $('logout-local-github').onclick = () => action(async () => {
-  await request('/api/v1/local/github/logout', { method: 'POST' });
+  await mutate('/api/v1/local/github/logout');
   clearLocalDevicePoll();
   await refreshLocalGithub();
   log('Local GitHub authorization removed.');

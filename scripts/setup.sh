@@ -426,6 +426,8 @@ stage_github_app() {
     if [ "$auth_mode" = connected-local ]; then
         local secret_dir
         secret_dir="${HOME}/.config/openflows"
+        mkdir -p "$secret_dir" || die "Cannot create local GitHub credential directory."
+        chmod 700 "$secret_dir" || die "Cannot make local GitHub credential directory private."
         env_set OPENFLOWS_MODE local
         env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
         env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
@@ -489,7 +491,7 @@ stage_docker() {
 stage_connected_local_authorization() {
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] || return 0
     step "Connect GitHub"
-    local manager_url="http://localhost:3002" status repos
+    local manager_url="http://127.0.0.1:3002" status
     ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
     spin $! "Waiting for the local OpenFlows console" \
         || die "The local OpenFlows console did not become ready." "Check logs: docker compose logs openflows-local-manager"
@@ -497,19 +499,17 @@ stage_connected_local_authorization() {
     printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
         || die "This OpenFlows distribution does not include the team GitHub App configuration." \
                "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
+    if (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+        ok "GitHub user authorization ready for ${REPO}"
+        return
+    fi
     panel "$C" "Connect GitHub in your browser" \
         "Open the local console, install the OpenFlows App on ${REPO}, approve GitHub, then select ${REPO}." \
         "${manager_url}"
     open_url "$manager_url"
     is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
     pause "Complete GitHub connection in the local console, then continue"
-    repos="$(curl -fs -m 15 "${manager_url}/api/v1/local/github/repositories" 2>/dev/null || true)"
-    printf '%s' "$repos" | python3 -c '
-import json, sys
-target = sys.argv[1].casefold()
-items = json.load(sys.stdin)
-sys.exit(0 if any(item.get("full_name", "").casefold() == target for item in items) else 1)
-' "$REPO" \
+    (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
         || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
                "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
     ok "GitHub user authorization ready for ${REPO}"

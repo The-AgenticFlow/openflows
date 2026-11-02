@@ -200,43 +200,80 @@ async fn poll_device_authorization(
         interval: 0,
     };
     match github.poll(&challenge).await? {
-        PollResult::Pending => Ok((HeaderMap::new(), Json(DevicePollResponse {
-            status: "authorization_pending",
-            interval: None,
-        }))),
-        PollResult::SlowDown(interval) => Ok((HeaderMap::new(), Json(DevicePollResponse {
-            status: "slow_down",
-            interval,
-        }))),
+        PollResult::Pending => Ok((
+            HeaderMap::new(),
+            Json(DevicePollResponse {
+                status: "authorization_pending",
+                interval: None,
+            }),
+        )),
+        PollResult::SlowDown(interval) => Ok((
+            HeaderMap::new(),
+            Json(DevicePollResponse {
+                status: "slow_down",
+                interval,
+            }),
+        )),
         PollResult::Authorized(token) => {
             let services = state.services().ok_or_else(|| {
-                ManagerError::api("SERVICE_UNAVAILABLE", "Manager session service is unavailable")
+                ManagerError::api(
+                    "SERVICE_UNAVAILABLE",
+                    "Manager session service is unavailable",
+                )
             })?;
             let user = services.github.fetch_user(&token.access_token).await?;
-            let display_name = user.display_name.clone().unwrap_or_else(|| user.login.clone());
-            let (user_id, _) = services.users.find_or_create_user(
-                services.db.pool(), "github", &user.id.to_string(), &user.login, &display_name,
-            ).await?;
+            let display_name = user
+                .display_name
+                .clone()
+                .unwrap_or_else(|| user.login.clone());
+            let (user_id, _) = services
+                .users
+                .find_or_create_user(
+                    services.db.pool(),
+                    "github",
+                    &user.id.to_string(),
+                    &user.login,
+                    &display_name,
+                )
+                .await?;
             let session = services.sessions.create_browser_session(user_id).await?;
-            services.session_manager.record_recent_auth(session.session_id).await?;
+            services
+                .session_manager
+                .record_recent_auth(session.session_id)
+                .await?;
             credentials.save_authorization(token).await?;
             crate::auth::local_credentials::ensure_broker_key()?;
             let mut headers = HeaderMap::new();
-            headers.insert(header::SET_COOKIE, crate::routes::auth::session_cookie_header(
-                crate::routes::auth::SESSION_COOKIE, &session.access_token,
-                services.auth_config.cookie_secure, 12 * 3600,
-            ).parse().map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid session cookie")))?);
-            Ok((headers, Json(DevicePollResponse {
-                status: "authorized",
-                interval: None,
-            })))
+            headers.insert(
+                header::SET_COOKIE,
+                crate::routes::auth::session_cookie_header(
+                    crate::routes::auth::SESSION_COOKIE,
+                    &session.access_token,
+                    services.auth_config.cookie_secure,
+                    12 * 3600,
+                )
+                .parse()
+                .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid session cookie")))?,
+            );
+            Ok((
+                headers,
+                Json(DevicePollResponse {
+                    status: "authorized",
+                    interval: None,
+                }),
+            ))
         }
     }
 }
 
 async fn repositories(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<RepositoryResponse>>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    crate::routes::organizations::authenticated_user(&headers, &services.session_manager).await?;
     let (credentials, github) = local_github(&state)?;
     let token = credentials.access_token().await?;
     let repositories = github
@@ -252,7 +289,14 @@ async fn repositories(
     Ok(Json(repositories))
 }
 
-async fn logout(State(state): State<AppState>) -> Result<(), ManagerError> {
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<(), ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal =
+        crate::routes::organizations::authenticated_user(&headers, &services.session_manager)
+            .await?;
+    crate::routes::organizations::require_csrf_for_browser(&principal, &headers).await?;
     let (credentials, _) = local_github(&state)?;
     credentials.sign_out().await
 }
