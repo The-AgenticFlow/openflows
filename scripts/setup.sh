@@ -604,7 +604,7 @@ stage_docker() {
         "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
         "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
-    if ! out="$(cd "$ROOT" && env "${image_env[@]}" docker compose "${args[@]}" 2>&1)"; then
+    if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
@@ -879,16 +879,27 @@ for w in json.load(sys.stdin).get("workspaces") or []:
         print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no")' 2>/dev/null || true
 }
 
+# mark_pending_restart — add the running workspaces to OPENFLOWS_SETUP_PENDING_RESTART
+# (comma-separated: .env is sourced by prod.sh)
+mark_pending_restart() {
+    local names
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; openflows_workspaces | awk '$2 == "running" {print $1}'; } \
+        | awk 'NF && !seen[$1]++' | paste -sd, -)"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
+}
+
 # offer_update — a workspace keeps its template version until `coder update` (a restart
 # reuses it) and copies the programs only when it starts. Bootstrap pushes a new template
-# version only when a template changed, and records in PROGRAMS_REPLACED the workspaces
-# running when it replaced the programs: outdated ones need `coder update`, the others a restart.
+# version only when a template changed, and saves the workspaces running when it replaced the
+# programs (OPENFLOWS_SETUP_PENDING_RESTART, kept until shown, so a failed run doesn't lose them):
+# outdated ones need `coder update`, the others a restart.
 offer_update() {
     local all update restart stopped ws
     all="$(openflows_workspaces)"
     update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
-    restart="$(PREV="${PROGRAMS_REPLACED:-}" awk 'BEGIN {n = split(ENVIRON["PREV"], p); for (i = 1; i <= n; i++) was[p[i]] = 1}
+    restart="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
         $2 == "running" && $3 == "no" && ($1 in was) {print $1}' <<<"$all")"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART ""
     stopped="$(awk '$2 != "running" && $3 == "yes" {print $1}' <<<"$all")"
     if [ -n "$stopped" ]; then
         info "Stopped workspaces still use the old templates: $(tr '\n' ' ' <<<"$stopped")"
@@ -937,7 +948,7 @@ stage_bootstrap() {
         run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
         env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(image_ref)"
         env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
-        PROGRAMS_REPLACED="$(openflows_workspaces | awk '$2 == "running" {print $1}')"
+        mark_pending_restart
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
         return
     fi
@@ -954,7 +965,7 @@ stage_bootstrap() {
     rm -f "${BIN_DIR}/IMAGE"
     # The next --compose run must push the image's templates again, even for the same image.
     env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
-    PROGRAMS_REPLACED="$(openflows_workspaces | awk '$2 == "running" {print $1}')"
+    mark_pending_restart
     ok "binaries built, 5 templates pushed"
 }
 
@@ -1131,7 +1142,6 @@ main() {
     stage_docker
     stage_coder_token
     stage_llm
-    PROGRAMS_REPLACED=""
     stage_bootstrap
     stage_tenant
     offer_update
