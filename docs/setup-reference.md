@@ -260,7 +260,7 @@ cat .dev-binaries/IMAGE
    OPENFLOWS_IMAGE_DIGEST=
    ```
 3. Re-run `./scripts/setup.sh`. It pulls that version, pins its digest, copies the programs and pushes the templates.
-4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress) and lists stopped ones that need an update. To do it later:
+4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup updates stopped workspaces right away (they stay stopped) and offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress). Until all are done, setup ends with **Upgrade not complete** and offers them again on the next run. To do it yourself:
    ```bash
    coder update openflows-nexus-<tenant>
    ```

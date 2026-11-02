@@ -36,6 +36,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then FANCY=1; else FANCY=0; fi   # animat
 LOG_FILE="${ROOT}/.setup.log"
 START_TIME=$SECONDS
 RAIL_OPEN=0
+UPGRADE_PENDING=""
 STEP_START=0
 PW=66   # panel inner width
 
@@ -870,13 +871,15 @@ names = {t.get("name") for t in json.load(sys.stdin)}
 sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
 }
 
-# openflows_workspaces — this user's OpenFlows workspaces, one "<name> <status> <outdated>" per line
+# openflows_workspaces — this user's OpenFlows workspaces, one
+# "<name> <status> <outdated> <id> <active template version id>" per line
 openflows_workspaces() {
     api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null | python3 -c '
 import sys, json
 for w in json.load(sys.stdin).get("workspaces") or []:
     if w.get("template_name", "").startswith("openflows-"):
-        print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no")' 2>/dev/null || true
+        print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no",
+              w["id"], w["template_active_version_id"])' 2>/dev/null || true
 }
 
 # mark_pending_restart — add the running workspaces to OPENFLOWS_SETUP_PENDING_RESTART
@@ -888,52 +891,64 @@ mark_pending_restart() {
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
 }
 
-# offer_update — a workspace keeps its template version until `coder update` (a restart
-# reuses it) and copies the programs only when it starts. Bootstrap pushes a new template
-# version only when a template changed, and saves the workspaces running when it replaced the
-# programs (OPENFLOWS_SETUP_PENDING_RESTART, kept until shown, so a failed run doesn't lose them):
-# outdated ones need `coder update`, the others a restart.
+# update_stopped — move stopped outdated workspaces to the active template version with a
+# stop build, so they stay stopped (`coder update` would start them)
+update_stopped() {
+    local name status outdated id version
+    while read -r name status outdated id version; do
+        if [ "$status" != stopped ] || [ "$outdated" != yes ]; then continue; fi
+        if api POST "/api/v2/workspaces/${id}/builds" \
+            "{\"transition\":\"stop\",\"template_version_id\":\"${version}\"}" >>"$LOG_FILE" 2>&1; then
+            ok "updated ${name} to the new templates (still stopped)"
+        else
+            warn "could not update ${name} — see ${LOG_FILE}"
+        fi
+    done <<<"$(openflows_workspaces)"
+}
+
+# offer_update — a workspace keeps its template version until it is updated (a restart reuses
+# it) and copies the programs only when it starts. Bootstrap pushes a new template version only
+# when a template changed, and saves the workspaces running when it replaced the programs
+# (OPENFLOWS_SETUP_PENDING_RESTART). Stopped workspaces are updated right away; running ones
+# are updated (outdated) or restarted (programs only) once the user agrees, since that pauses
+# their work. Whatever is left stays pending — outdated in Coder, restarts in .env — and is
+# offered again on the next run; UPGRADE_PENDING tells main the upgrade is not complete.
 offer_update() {
-    local all update restart stopped ws
+    local all update restart ws
+    update_stopped
     all="$(openflows_workspaces)"
     update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
     restart="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
         $2 == "running" && $3 == "no" && ($1 in was) {print $1}' <<<"$all")"
-    env_set OPENFLOWS_SETUP_PENDING_RESTART ""
-    stopped="$(awk '$2 != "running" && $3 == "yes" {print $1}' <<<"$all")"
-    if [ -n "$stopped" ]; then
-        info "Stopped workspaces still use the old templates: $(tr '\n' ' ' <<<"$stopped")"
-        info "  update each before using it:  coder update <workspace>"
-    fi
-    [ -n "$update$restart" ] || return 0
-    if ! is_tty; then
-        info "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
-        [ -n "$update" ] && info "  new templates:  coder update <workspace>"
-        [ -n "$restart" ] && info "  new programs only:  coder restart <workspace> --yes"
-        return 0
-    fi
-    warn "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
-    if [[ ! "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
-        [ -n "$update" ] && info "Later, for new templates:  coder update <workspace>"
-        [ -n "$restart" ] && info "Later, for new programs:  coder restart <workspace> --yes"
-        return 0
-    fi
-    for ws in $update; do
-        if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
-            coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
-            ok "updated ${ws} to the new templates"
-        else
-            warn "could not update ${ws} — see ${LOG_FILE}"
+    # Stopped or deleted workspaces copy the new programs when they next start.
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(paste -sd, - <<<"$restart")"
+    if [ -n "$update$restart" ]; then
+        warn "Running workspaces still use the old version: $(printf '%s\n' $update $restart | paste -sd' ' -)"
+        if is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
+            for ws in $update; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "updated ${ws} to the new templates"
+                else
+                    warn "could not update ${ws} — see ${LOG_FILE}"
+                fi
+            done
+            for ws in $restart; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "restarted ${ws} with the new programs"
+                    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(env_get OPENFLOWS_SETUP_PENDING_RESTART \
+                        | WS="$ws" awk -v RS=, -v ORS=, 'NF && $1 != ENVIRON["WS"]' | sed 's/,$//')"
+                else
+                    warn "could not restart ${ws} — see ${LOG_FILE}"
+                fi
+            done
         fi
-    done
-    for ws in $restart; do
-        if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
-            coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
-            ok "restarted ${ws} with the new programs"
-        else
-            warn "could not restart ${ws} — see ${LOG_FILE}"
-        fi
-    done
+    fi
+    # Includes outdated workspaces that were starting, stopping or failed, so not updated above.
+    UPGRADE_PENDING="$( { openflows_workspaces | awk '$3 == "yes" {print $1}'; env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } \
+        | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
+    return 0
 }
 
 stage_bootstrap() {
@@ -1151,6 +1166,16 @@ main() {
     RAIL_OPEN=0
     local installed="source (compiled from this checkout)"
     [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
+    if [ -n "$UPGRADE_PENDING" ]; then
+        panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
+            "These workspaces still use the old version:" \
+            "  ${UPGRADE_PENDING}" "" \
+            "Re-run ./scripts/setup.sh to update them, or per workspace:" \
+            "  coder update <workspace>         (new templates)" \
+            "  coder restart <workspace> --yes  (new programs)" ""
+        printf '\n'
+        return 0
+    fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
         "Installed    ${installed}" \

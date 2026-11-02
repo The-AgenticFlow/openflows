@@ -68,10 +68,12 @@ mode is unset (installs from before #493), setup picks `self-managed` for compos
   rebuilt and moved; a digest always names the same image. Each release's notes
   record the digests of its images under **Docker images**.
 - Upgrade and rollback: change `OPENFLOWS_VERSION`, clear the digest and re-run
-  setup. Workspaces keep their template version until updated, so setup offers
-  `coder update` for running workspaces with new templates and a restart for the
-  others (default no, since it pauses work in progress), and lists stopped
-  workspaces that need an update.
+  setup. Workspaces keep their template version until updated. Setup moves
+  stopped workspaces to the new templates right away (they stay stopped) and
+  offers `coder update` for running workspaces with new templates and a restart
+  for the others (default no, since it pauses work in progress). Until every
+  workspace is updated, setup reports the upgrade as not complete and offers the
+  rest again on each run.
 
 ## Valid and invalid configurations
 
