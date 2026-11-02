@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 pub mod a2a;
 pub mod hooks;
+pub mod openapi;
 pub mod runtime_control;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
