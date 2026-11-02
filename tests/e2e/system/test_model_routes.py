@@ -15,7 +15,7 @@ class ModelRoutesTest(fixture_helpers.FixtureCase):
                     {'contains': 'Write a short title', 'text': '{"title":"Test journey"}'},
                     {'contains': 'Write a status label', 'text': '{"label":"Working"}'},
                 ],
-                'turn_contains': ['FORGE task', 'SENTINEL review', 'Continue after gate approval'],
+                'turn_contains': ['FORGE task', 'SENTINEL review', 'Continue after gate approval', '/address_review'],
                 'routes': [
                     {'contains': ['FORGE task', 'Continue after gate approval'], 'steps': [
                         {'tool': 'execute', 'arguments': {'command': 'forge-step'}},
@@ -23,9 +23,15 @@ class ModelRoutesTest(fixture_helpers.FixtureCase):
                     {'contains': 'SENTINEL review', 'steps': [
                         {'tool': 'execute', 'arguments': {'command': 'sentinel-step'}},
                         {'requires': {'contains': 'SENTINEL_OK'}, 'text': 'Sentinel finished.'}]},
+                    {'contains_all': ['/address_review', 'ROUND_1'], 'steps': [
+                        {'tool': 'execute', 'arguments': {'command': 'rework-round-1'}},
+                        {'requires': {'contains': 'ROUND_1_OK'}, 'text': 'Round 1 finished.'}]},
+                    {'contains_all': ['/address_review', 'ROUND_2'], 'steps': [
+                        {'tool': 'execute', 'arguments': {'command': 'rework-round-2'}},
+                        {'requires': {'contains': 'ROUND_2_OK'}, 'text': 'Round 2 finished.'}]},
                 ]}, 'variables': [
                     {'tool': 'execute', 'arguments': {'command': 'inspect'}},
-                    {'tool': 'execute', 'arguments': {'command': 'decide {revision} {round} {head} {chat_plan}'}},
+                    {'tool': 'execute', 'arguments': {'command': 'decide {revision} {round} {head} {chat_plan} {pr_number}'}},
                 ], 'truncated': [
                     {'tool': 'execute', 'arguments': {'command': 'inspect'}},
                     {'tool': 'execute', 'arguments': {'command': 'inspect-again'}},
@@ -95,13 +101,13 @@ class ModelRoutesTest(fixture_helpers.FixtureCase):
         code, body, _ = self.request('/v1/chat/completions', request)
         self.assertEqual(code, 200, body)
         call = json.loads(body)['choices'][0]['message']['tool_calls'][0]
-        state = {'phase': 'testing', 'revision': 4, 'review_round': 7, 'head': 'a' * 40}
+        state = {'phase': 'testing', 'revision': 4, 'review_round': 7, 'head': 'a' * 40, 'pr_number': 2}
         request['messages'].extend([{'role': 'assistant', 'tool_calls': [call]},
             {'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps({'output': json.dumps(state)})}])
         code, body, _ = self.request('/v1/chat/completions', request)
         self.assertEqual(code, 200, body)
         arguments = json.loads(json.loads(body)['choices'][0]['message']['tool_calls'][0]['function']['arguments'])
-        self.assertEqual(arguments['command'], 'decide 4 7 ' + 'a' * 40 + ' ' + plan)
+        self.assertEqual(arguments['command'], 'decide 4 7 ' + 'a' * 40 + ' ' + plan + ' 2')
 
     def test_truncated_current_status_cannot_reuse_a_previous_review_round(self):
         request = self.turn('Inspect the current candidate')
@@ -120,3 +126,17 @@ class ModelRoutesTest(fixture_helpers.FixtureCase):
              'content': '{"phase":"submit","review_round":4,"head": ... [truncated]'}])
         code, body, _ = self.request('/v1/chat/completions', request)
         self.assertEqual(code, 400, body)
+
+    def test_contains_all_disambiguates_multiple_rework_rounds(self):
+        r1 = self.turn('/address_review\nreason: ROUND_1')
+        code, body, _ = self.request('/v1/chat/completions', r1)
+        self.assertEqual(code, 200, body)
+        call1 = json.loads(body)['choices'][0]['message']['tool_calls'][0]
+        self.assertEqual(json.loads(call1['function']['arguments'])['command'], 'rework-round-1')
+        self.assertEqual(self.complete_tool(r1, call1, 'ROUND_1_OK'), 'Round 1 finished.')
+        r1['messages'].append({'role': 'user', 'content': '/address_review\nreason: ROUND_2'})
+        code, body, _ = self.request('/v1/chat/completions', r1)
+        self.assertEqual(code, 200, body)
+        call2 = json.loads(body)['choices'][0]['message']['tool_calls'][0]
+        self.assertEqual(json.loads(call2['function']['arguments'])['command'], 'rework-round-2')
+        self.assertEqual(self.complete_tool(r1, call2, 'ROUND_2_OK'), 'Round 2 finished.')

@@ -652,7 +652,27 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     };
     info!("  → Pushing template '{}' ({})", name, reason);
 
-    match client.push_template(name, data).await {
+    let mut push_result = Err(anyhow::anyhow!("template push not attempted"));
+    for attempt in 1..=5u32 {
+        match client.push_template(name, data).await {
+            Ok(t) => {
+                push_result = Ok(t);
+                break;
+            }
+            Err(e) => {
+                if attempt < 5 {
+                    warn!(
+                        attempt,
+                        "  ⚠ Template '{}' push attempt failed ({}); retrying...", name, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 3)).await;
+                }
+                push_result = Err(e);
+            }
+        }
+    }
+
+    match push_result {
         Ok(t) => {
             let after_templates = match client.list_templates().await {
                 Ok(templates) => templates,
