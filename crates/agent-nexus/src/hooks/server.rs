@@ -762,7 +762,7 @@ fn invokes_coder_lifecycle(cmd: &str) -> bool {
 /// shell word may be a bare name or an absolute/relative path, and may carry
 /// options (`/bin/sh -c …`, `bash -l -c …`).
 fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
-    const CONTROL: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
+    const CONTROL: &[char] = SHELL_CONTROL;
     let mut tokens: Vec<(String, bool)> = Vec::new();
     let mut at_start = true;
     let mut cur = String::new();
@@ -846,6 +846,21 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
             has_cur = true;
             continue;
         }
+        if !has_cur && !c.is_whitespace() && !CONTROL.contains(&c) && quote_follows_shell_c(&tokens)
+        {
+            // A word right after a shell `-c` is its command string. Bash joins
+            // every adjacent quoted, unquoted, and escaped part into that one
+            // word (`bash -c 'co'"der delete ws"`, `bash -c coder\ delete\ ws`),
+            // so read the whole word before parsing it as a fresh command
+            // (Review "Quoted parts bypass the guard").
+            let inner = collect_shell_word(&mut it, c);
+            let mut inner_tokens = tokenize_shell(&inner);
+            tokens.append(&mut inner_tokens);
+            // The command string is an argument to the outer command, not a new
+            // command of its own.
+            at_start = false;
+            continue;
+        }
         match c {
             '\'' | '"' => {
                 // Preserve adjacent quoted/unquoted parts as one word: the shell
@@ -858,15 +873,16 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
                     has_cur = false;
                     at_start = false;
                 }
-                if quote_follows_shell_c(&tokens) {
-                    // This quoted argument is a shell/`su` `-c` command string.
-                    // The outer shell removes quote-type-specific escapes before
-                    // the inner shell runs the string, so extract and unescape
-                    // it, then parse it as a fresh command (Review "Escapes hide
-                    // workspace commands"): e.g. `bash -c "echo \`coder delete
-                    // ws\`"` really runs `coder delete ws` inside the string even
-                    // though the backtick was escaped at the outer level.
-                    let inner = collect_quoted(&mut it, c);
+                if !has_cur && quote_follows_shell_c(&tokens) {
+                    // This quoted argument is a shell/`su` `-c` command string
+                    // attached directly to `-c`. The outer shell removes
+                    // quote-type-specific escapes before the inner shell runs the
+                    // string, so extract and unescape the whole word, then parse
+                    // it as a fresh command (Review "Escapes hide workspace
+                    // commands"): e.g. `bash -c "echo \`coder delete ws\`"`
+                    // really runs `coder delete ws` inside the string even though
+                    // the backtick was escaped at the outer level.
+                    let inner = collect_shell_word(&mut it, c);
                     let mut inner_tokens = tokenize_shell(&inner);
                     tokens.append(&mut inner_tokens);
                     // The command string is an argument to the outer command, not
@@ -911,6 +927,43 @@ fn tokenize_shell(cmd: &str) -> Vec<(String, bool)> {
         tokens.push((cur, at_start));
     }
     tokens
+}
+
+/// Shell control operators that end a word and start a new command when they
+/// appear outside quotes.
+const SHELL_CONTROL: &[char] = &[';', '&', '|', '(', ')', '{', '}', '`'];
+
+/// Read one complete shell word starting with `first`, the way the shell builds
+/// the argument it passes on: adjacent quoted and unquoted parts are joined
+/// (`'co'"der delete ws"` → `coder delete ws`), each quoted part is unescaped
+/// per its quote type, and an unquoted backslash escapes the next character
+/// (`coder\ delete\ ws` → `coder delete ws`; a backslash-newline is removed).
+/// The word ends at the first unquoted whitespace or control operator, which is
+/// left unconsumed.
+fn collect_shell_word(it: &mut std::iter::Peekable<std::str::Chars<'_>>, first: char) -> String {
+    let mut s = String::new();
+    let mut c = first;
+    loop {
+        match c {
+            '\'' | '"' => s.push_str(&collect_quoted(it, c)),
+            '\\' => {
+                if let Some(nc) = it.next() {
+                    if nc != '\n' {
+                        s.push(nc);
+                    }
+                }
+            }
+            _ => s.push(c),
+        }
+        match it.peek() {
+            Some(&nc) if !nc.is_whitespace() && !SHELL_CONTROL.contains(&nc) => {
+                c = nc;
+                it.next();
+            }
+            _ => break,
+        }
+    }
+    s
 }
 
 /// Read a quoted argument up to its matching close, applying the quote type's
@@ -1056,8 +1109,10 @@ fn is_wrapper_argument(tokens: &[(String, bool)], j: usize) -> bool {
         return true;
     }
     // A bare value may be the argument consumed by a preceding flag
-    // (e.g. `exec -a name coder`, `sudo -u admin coder`).
-    j > 0 && tokens[j - 1].0.starts_with('-')
+    // (e.g. `exec -a name coder`, `sudo -u admin coder`). The word after a
+    // shell `-c` is not such a value: it is the command word of the `-c`
+    // string, so `bash -c 'echo coder delete ws'` only prints text.
+    j > 0 && tokens[j - 1].0.starts_with('-') && tokens[j - 1].0 != "-c"
 }
 
 /// True when `tok` names the `coder` CLI binary (`coder`, `sudo coder`,
@@ -1608,6 +1663,47 @@ mod tests {
         // double-quoted command string is still caught.
         assert!(invokes_coder_lifecycle(
             r#"bash -c 'echo "`date`" && coder stop ws'"#
+        ));
+    }
+
+    #[test]
+    fn test_shell_c_word_joins_adjacent_parts() {
+        // P1 "Quoted parts bypass the guard": the shell joins every adjacent
+        // quoted/unquoted part of the `-c` argument into one command string.
+        assert!(invokes_coder_lifecycle(r#"bash -c 'co'"der delete ws""#));
+        assert!(invokes_coder_lifecycle(r#"bash -c "co"'der delete ws'"#));
+        assert!(invokes_coder_lifecycle(r#"sh -c 'coder '"stop ws""#));
+        assert!(invokes_coder_lifecycle(r#"bash -c 'cod'er' start ws'"#));
+        assert!(invokes_coder_lifecycle(r#"bash -c co'der delete ws'"#));
+        assert!(invokes_coder_lifecycle(r#"bash -c co"der delete ws""#));
+        assert!(invokes_coder_lifecycle(r#"bash -c coder\ delete\ ws"#));
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo ok;'"coder delete ws""#
+        ));
+        assert!(invokes_coder_lifecycle(
+            r#"su -c 'co'"der delete ws" admin"#
+        ));
+        assert!(invokes_coder_lifecycle(
+            r#"/bin/bash -l -c 'co'der\ stop\ ws"#
+        ));
+        // The `-c` word ends at an unquoted separator; what follows is a new
+        // command in the outer shell.
+        assert!(invokes_coder_lifecycle(
+            r#"bash -c 'echo ok';coder delete ws"#
+        ));
+
+        // Benign: the joined command string does not run a lifecycle subcommand.
+        assert!(!invokes_coder_lifecycle(r#"bash -c 'co'"der version""#));
+        assert!(!invokes_coder_lifecycle(
+            r#"bash -c 'echo '"coder delete ws""#
+        ));
+        assert!(!invokes_coder_lifecycle(r#"bash -c 'ls' coder delete"#));
+        assert!(!invokes_coder_lifecycle(
+            r#"bash -c 'echo coder delete ws'"#
+        ));
+        // Printed examples (the shell word is not a command) stay allowed.
+        assert!(!invokes_coder_lifecycle(
+            r#"echo bash -c 'co'"der delete ws""#
         ));
     }
 }
