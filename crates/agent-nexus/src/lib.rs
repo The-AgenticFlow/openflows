@@ -520,13 +520,29 @@ Before significant work, read the relevant skill file to understand the workflow
             .collect();
 
         let mut new_prs = Vec::new();
+        let mut tracked_prs_updated = false;
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
 
         for pr in &gh_prs {
             if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref()).await {
                 continue;
             }
-            if !known_numbers.contains(&pr.number) {
+            if known_numbers.contains(&pr.number) {
+                if let Some(existing) = pending_prs
+                    .iter_mut()
+                    .find(|p| p["number"].as_u64() == Some(pr.number))
+                {
+                    if existing["head_sha"].as_str() != Some(pr.head_sha.as_str())
+                        || existing["mergeable"].as_bool() != pr.mergeable
+                        || existing["has_conflicts"].as_bool() != Some(pr.has_conflicts())
+                    {
+                        existing["head_sha"] = json!(pr.head_sha);
+                        existing["mergeable"] = json!(pr.mergeable);
+                        existing["has_conflicts"] = json!(pr.has_conflicts());
+                        tracked_prs_updated = true;
+                    }
+                }
+            } else {
                 if let Some(ref tid) = pr.ticket_id {
                     let already_tracked = pending_prs
                         .iter()
@@ -664,12 +680,23 @@ Before significant work, read the relevant skill file to understand the workflow
                             }
                         }
                         if matches!(ticket.status, TicketStatus::InProgress { .. }) {
+                            let lifecycle_in_submit = store
+                                .lifecycle(tid)
+                                .await
+                                .is_ok_and(|state| state.phase == config::lifecycle::Phase::Submit);
+                            if !lifecycle_in_submit {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                );
+                                continue;
+                            }
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                "Ticket is InProgress and lifecycle has returned to Submit — re-adding PR to pending_prs"
                             );
-                            continue;
                         }
                     }
                 }
@@ -750,8 +777,9 @@ Before significant work, read the relevant skill file to understand the workflow
             still_open
         });
 
-        let prs_changed =
-            pending_prs.len() != known_numbers.len() || pending_prs.len() != before_count;
+        let prs_changed = pending_prs.len() != known_numbers.len()
+            || pending_prs.len() != before_count
+            || tracked_prs_updated;
 
         if prs_changed {
             store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
@@ -810,11 +838,28 @@ Before significant work, read the relevant skill file to understand the workflow
                                 tickets_changed = true;
                             }
                             TicketStatus::InProgress { .. } => {
-                                info!(
-                                    ticket_id = tid,
-                                    pr_number = pr.number,
-                                    "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
-                                );
+                                let lifecycle_in_submit =
+                                    store.lifecycle(tid).await.is_ok_and(|state| {
+                                        state.phase == config::lifecycle::Phase::Submit
+                                    });
+                                if lifecycle_in_submit {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket returned to Submit after rework — marking Completed(pr_opened)"
+                                    );
+                                    ticket.status = TicketStatus::Completed {
+                                        worker_id: String::from("nexus-reconciliation"),
+                                        outcome: "pr_opened".to_string(),
+                                    };
+                                    tickets_changed = true;
+                                } else {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
+                                    );
+                                }
                             }
                             _ => {}
                         }
