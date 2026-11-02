@@ -1,11 +1,17 @@
 //! Versioned HTTP route composition for the OpenFlows Manager API.
+//!
+//! The router is built from a single route table ([`ApiRoute`]) so that route
+//! registration and the OpenAPI documentation share one source of truth: a
+//! route cannot be registered without also being documented, and vice versa.
 
+use crate::openapi::Auth;
 use crate::server::AppState;
 use axum::{
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, MethodRouter},
     Json, Router,
 };
 use serde::Serialize;
+use utoipa_swagger_ui::SwaggerUi;
 
 pub mod auth;
 pub mod coder_hooks;
@@ -22,154 +28,743 @@ pub mod tenants;
 pub mod test_ui;
 pub mod webhooks;
 
-pub fn router() -> Router<AppState> {
-    // Keep platform-oriented probes at the root because orchestrators and load
-    // balancers generally expect stable, version-independent health URLs.
-    Router::new()
-        .route("/", get(test_ui::index))
-        .route("/health", get(health::health))
-        .route("/ready", get(health::ready))
-        // Product/API routes are versioned from the start so future public
-        // endpoints can evolve without moving operational probes.
-        .nest("/api/v1", api_v1_router())
-        // Browser pages are served outside the versioned API path.
-        .route("/auth/login", get(auth::login_page))
-        .route("/auth/github/start", get(auth::github_start))
-        .route("/auth/github/callback", get(auth::github_callback))
-        .route("/auth/coder/callback", get(coder_identity::callback))
-        .route("/auth/cli/verify", get(device::device_verify_page))
-        .route("/auth/cli/approve", post(device::device_approve))
-        .route(
-            "/invitations/accept",
-            get(invitations::accept_page).post(invitations::accept),
-        )
+/// A single route: its HTTP methods, documentation metadata, and the axum
+/// handler router. This is the single source of truth for both registration
+/// (via [`router`]) and the OpenAPI document (via `crate::openapi`).
+pub(crate) struct ApiRoute {
+    /// HTTP methods served by this route, e.g. `&["GET"]` or `&["GET", "POST"]`.
+    pub methods: &'static [&'static str],
+    /// Path. For API routes this is relative to `/api/v1` (the router nests them).
+    pub path: &'static str,
+    /// Functional tag used to group operations in the reference UI.
+    pub tag: &'static str,
+    /// One-line human summary.
+    pub summary: &'static str,
+    /// Authentication/visibility model for this route.
+    pub auth: Auth,
+    /// Whether this route is a JSON API route (gets the shared `ApiError`
+    /// envelope documented on its error responses).
+    pub is_json: bool,
+    /// The HTTP status code returned on success.
+    pub success: u16,
+    /// Optional per-route note (e.g. how to authenticate).
+    pub description: Option<&'static str>,
+    /// The axum handler(s) for this path.
+    pub router: MethodRouter<AppState>,
 }
 
-fn api_v1_router() -> Router<AppState> {
-    Router::new()
-        .route("/", get(api_index))
-        .route("/me", get(auth::me))
-        .route("/auth/coder", get(coder_identity::status))
-        .route("/auth/coder/start", post(coder_identity::start))
-        .route("/auth/refresh", post(auth::refresh))
-        .route("/local/github-credential", post(local_github::credential))
-        .route("/auth/csrf", get(auth::csrf_token))
-        .route("/invitations/accept", post(invitations::accept_json))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/cli/start", post(device::device_start))
-        .route("/auth/cli/token", post(device::device_token))
-        .route(
-            "/organizations",
-            get(organizations::list_orgs).post(organizations::create_org),
-        )
-        .route(
-            "/organizations/{org}",
-            get(organizations::get_org)
-                .patch(organizations::update_org)
-                .delete(organizations::delete_org),
-        )
-        .route(
-            "/organizations/{org}/members",
-            get(organizations::list_members),
-        )
-        .route(
-            "/organizations/{org}/members/{user}",
-            patch(organizations::update_member).delete(organizations::remove_member),
-        )
-        .route(
-            "/organizations/{org}/invitations",
-            post(organizations::create_invitation),
-        )
-        .route(
-            "/organizations/{org}/invitations/{id}",
-            delete(organizations::revoke_invitation),
-        )
-        .route(
-            "/organizations/{org}/transfer-ownership",
-            post(organizations::transfer_ownership),
-        )
-        .route("/operations/{id}", get(organizations::get_operation))
-        .route(
-            "/operations/{id}/retry",
-            post(organizations::retry_operation),
-        )
-        .route(
-            "/platform/organizations/{org}/template-release/promote-configured",
-            post(platform_releases::promote_configured_release),
-        )
-        // Authorized organization-scoped tenant lifecycle.
-        .route(
-            "/organizations/{org}/tenants",
-            get(tenants::list_tenants).post(tenants::create_tenant),
-        )
-        .route(
-            "/organizations/{org}/tenants/{tenant}",
-            get(tenants::get_tenant).delete(tenants::delete_tenant),
-        )
-        .route(
-            "/organizations/{org}/tenants/{tenant}/start",
-            post(tenants::start_tenant),
-        )
-        .route(
-            "/organizations/{org}/tenants/{tenant}/stop",
-            post(tenants::stop_tenant),
-        )
-        .route(
-            "/organizations/{org}/tenants/{tenant}/clean",
-            post(tenants::clean_tenant),
-        )
-        .route(
-            "/organizations/{org}/tenants/{tenant}/status",
-            get(tenants::tenant_status),
-        )
-        // GitHub connection lifecycle.
-        .route(
-            "/organizations/{org}/github/connect",
-            post(connections::connect),
-        )
-        .route("/github/oauth/callback", get(connections::oauth_callback))
-        .route("/github/setup", get(connections::setup_callback))
-        .route(
-            "/organizations/{org}/github/connections",
-            get(connections::list_connections),
-        )
-        .route(
-            "/organizations/{org}/github/connections/{id}/reconcile",
-            post(connections::reconcile_connection),
-        )
-        .route(
-            "/organizations/{org}/github/connections/{id}",
-            delete(connections::disconnect),
-        )
-        // Public signed webhook ingress.
-        .route("/webhooks/github", post(webhooks::receive_webhook))
-        .route("/hooks/coder/chat", post(coder_hooks::receive))
-        // Runtime credential broker: authenticated by a workspace runtime
-        // credential, never by a human session.
-        .route(
-            "/runtime/github-credentials",
-            post(runtime::github_credentials),
-        )
-        // Runtime worker provisioning and workspace lifecycle:
-        // authenticated by a workspace runtime credential (the tenant Nexus).
-        .route("/runtime/workspaces", post(runtime::request_worker))
-        .route("/runtime/chats", post(runtime::create_chat))
-        .route(
-            "/runtime/chats/{chat}/messages",
-            post(runtime::send_chat_message),
-        )
-        .route(
-            "/runtime/workspaces/{workspace}",
-            get(runtime::get_workspace).delete(runtime::delete_workspace),
-        )
-        .route(
-            "/runtime/workspaces/{workspace}/stop",
-            post(runtime::stop_workspace),
-        )
-        .route("/runtime/register", post(runtime::register))
-        .route("/runtime/heartbeat", post(runtime::heartbeat))
-        .route("/runtime/refresh", post(runtime::refresh))
-        .route("/runtime/revoke", post(runtime::revoke))
+/// Routes served at the root (health probes, browser pages, OAuth callbacks).
+pub(crate) fn root_routes() -> Vec<ApiRoute> {
+    vec![
+        ApiRoute {
+            methods: &["GET"],
+            path: "/",
+            tag: "root",
+            summary: "Browser test console / capability marker",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(test_ui::index),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/health",
+            tag: "health",
+            summary: "Liveness probe",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(health::health),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/ready",
+            tag: "health",
+            summary: "Readiness probe (store + database)",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(health::ready),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/login",
+            tag: "browser",
+            summary: "Login page",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(auth::login_page),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/github/start",
+            tag: "browser",
+            summary: "Start GitHub OAuth login",
+            auth: Auth::None,
+            is_json: false,
+            success: 307,
+            description: Some("Redirects the browser to GitHub's authorization endpoint."),
+            router: get(auth::github_start),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/github/callback",
+            tag: "browser",
+            summary: "GitHub OAuth callback",
+            auth: Auth::None,
+            is_json: false,
+            success: 307,
+            description: Some(
+                "Browser redirect callback from GitHub; exchanges the code for a session.",
+            ),
+            router: get(auth::github_callback),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/coder/callback",
+            tag: "browser",
+            summary: "Coder identity callback",
+            auth: Auth::None,
+            is_json: false,
+            success: 307,
+            description: Some("Browser redirect callback from Coder."),
+            router: get(coder_identity::callback),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/cli/verify",
+            tag: "browser",
+            summary: "Device-flow verification page",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(device::device_verify_page),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/cli/approve",
+            tag: "browser",
+            summary: "Approve a device-flow request",
+            auth: Auth::Session,
+            is_json: false,
+            success: 200,
+            description: Some("Requires an authenticated browser session."),
+            router: post(device::device_approve),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/invitations/accept",
+            tag: "browser",
+            summary: "Invitation accept page",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: get(invitations::accept_page),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/invitations/accept",
+            tag: "browser",
+            summary: "Accept an invitation (browser form)",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: None,
+            router: post(invitations::accept),
+        },
+    ]
+}
+
+/// Routes served under the `/api/v1` prefix (product/API surface).
+pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
+    vec![
+        ApiRoute {
+            methods: &["GET"],
+            path: "/",
+            tag: "api",
+            summary: "API capability marker",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(api_index),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/me",
+            tag: "auth",
+            summary: "Current user + memberships",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(auth::me),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/coder",
+            tag: "auth",
+            summary: "Coder identity link status",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(coder_identity::status),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/coder/start",
+            tag: "auth",
+            summary: "Start Coder identity link",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: post(coder_identity::start),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/refresh",
+            tag: "auth",
+            summary: "Refresh session tokens",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Provide the refresh_token in the JSON body; no bearer header is used."),
+            router: post(auth::refresh),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/local/github-credential",
+            tag: "auth",
+            summary: "Exchange a local GitHub credential",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Local-mode GitHub credential exchange; no bearer header is used."),
+            router: post(local_github::credential),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/auth/csrf",
+            tag: "auth",
+            summary: "Fetch CSRF token",
+            auth: Auth::Session,
+            is_json: true,
+            success: 200,
+            description: Some("Requires a browser session cookie (not a bearer token). Returns a CSRF token."),
+            router: get(auth::csrf_token),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/invitations/accept",
+            tag: "invitations",
+            summary: "Accept an invitation (JSON)",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: post(invitations::accept_json),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/logout",
+            tag: "auth",
+            summary: "End the session",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 204,
+            description: Some("Accepts either a browser session cookie or a CLI bearer token. CSRF is only required for browser sessions."),
+            router: post(auth::logout),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/cli/start",
+            tag: "device",
+            summary: "Start a device (CLI) login flow",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Public device-flow start; no prior authentication."),
+            router: post(device::device_start),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/auth/cli/token",
+            tag: "device",
+            summary: "Exchange a device code for tokens",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Public device-flow token exchange; no prior authentication."),
+            router: post(device::device_token),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations",
+            tag: "organizations",
+            summary: "List organizations",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(organizations::list_orgs),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations",
+            tag: "organizations",
+            summary: "Create an organization",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Returns 202 with an operation that completes asynchronously."),
+            router: post(organizations::create_org),
+        },
+        ApiRoute {
+            methods: &["GET", "PATCH"],
+            path: "/organizations/{org}",
+            tag: "organizations",
+            summary: "Get or update an organization",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(organizations::get_org).patch(organizations::update_org),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/organizations/{org}",
+            tag: "organizations",
+            summary: "Delete an organization",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Returns 202 with an operation that completes asynchronously."),
+            router: delete(organizations::delete_org),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/members",
+            tag: "organizations",
+            summary: "List organization members",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(organizations::list_members),
+        },
+        ApiRoute {
+            methods: &["PATCH"],
+            path: "/organizations/{org}/members/{user}",
+            tag: "organizations",
+            summary: "Update a member's role/status",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: patch(organizations::update_member),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/organizations/{org}/members/{user}",
+            tag: "organizations",
+            summary: "Remove a member",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 204,
+            description: None,
+            router: delete(organizations::remove_member),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/invitations",
+            tag: "organizations",
+            summary: "Invite a user to the organization",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: post(organizations::create_invitation),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/organizations/{org}/invitations/{id}",
+            tag: "organizations",
+            summary: "Revoke an invitation",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 204,
+            description: None,
+            router: delete(organizations::revoke_invitation),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/transfer-ownership",
+            tag: "organizations",
+            summary: "Transfer organization ownership",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 204,
+            description: None,
+            router: post(organizations::transfer_ownership),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/operations/{id}",
+            tag: "operations",
+            summary: "Get an operation",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(organizations::get_operation),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/operations/{id}/retry",
+            tag: "operations",
+            summary: "Retry an operation",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Returns 202 with an operation that completes asynchronously."),
+            router: post(organizations::retry_operation),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/platform/organizations/{org}/template-release/promote-configured",
+            tag: "platform",
+            summary: "Promote the operator-configured template release",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: post(platform_releases::promote_configured_release),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/tenants",
+            tag: "tenants",
+            summary: "List tenants",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(tenants::list_tenants),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/tenants",
+            tag: "tenants",
+            summary: "Create a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Returns 202 with an operation that completes asynchronously."),
+            router: post(tenants::create_tenant),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/tenants/{tenant}",
+            tag: "tenants",
+            summary: "Get a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(tenants::get_tenant),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/organizations/{org}/tenants/{tenant}",
+            tag: "tenants",
+            summary: "Delete a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Returns 202 with an operation that completes asynchronously."),
+            router: delete(tenants::delete_tenant),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/tenants/{tenant}/start",
+            tag: "tenants",
+            summary: "Start a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: post(tenants::start_tenant),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/tenants/{tenant}/stop",
+            tag: "tenants",
+            summary: "Stop a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: post(tenants::stop_tenant),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/tenants/{tenant}/clean",
+            tag: "tenants",
+            summary: "Clean a tenant",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: post(tenants::clean_tenant),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/tenants/{tenant}/status",
+            tag: "tenants",
+            summary: "Tenant status",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(tenants::tenant_status),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/github/connect",
+            tag: "github",
+            summary: "Connect a GitHub App installation to the organization",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: post(connections::connect),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/github/oauth/callback",
+            tag: "github",
+            summary: "GitHub App OAuth callback",
+            auth: Auth::None,
+            is_json: false,
+            success: 307,
+            description: Some("Browser redirect callback from GitHub's OAuth flow."),
+            router: get(connections::oauth_callback),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/github/setup",
+            tag: "github",
+            summary: "GitHub App setup callback",
+            auth: Auth::None,
+            is_json: false,
+            success: 307,
+            description: Some("Browser redirect callback from GitHub App setup."),
+            router: get(connections::setup_callback),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/github/connections",
+            tag: "github",
+            summary: "List GitHub connections",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(connections::list_connections),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/organizations/{org}/github/connections/{id}/reconcile",
+            tag: "github",
+            summary: "Reconcile a GitHub connection",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: post(connections::reconcile_connection),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/organizations/{org}/github/connections/{id}",
+            tag: "github",
+            summary: "Disconnect a GitHub connection",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: None,
+            router: delete(connections::disconnect),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/webhooks/github",
+            tag: "webhooks",
+            summary: "GitHub signed webhook ingress",
+            auth: Auth::Webhook,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by the GitHub webhook signature."),
+            router: post(webhooks::receive_webhook),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/hooks/coder/chat",
+            tag: "webhooks",
+            summary: "Coder lifecycle hook webhook",
+            auth: Auth::Webhook,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by the Coder hook JWT."),
+            router: post(coder_hooks::receive),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/github-credentials",
+            tag: "runtime",
+            summary: "Broker short-lived GitHub credentials for a workspace",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential, never a human session."),
+            router: post(runtime::github_credentials),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/workspaces",
+            tag: "runtime",
+            summary: "Request a worker workspace",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::request_worker),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/runtime/workspaces/{workspace}",
+            tag: "runtime",
+            summary: "Get a worker workspace",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: get(runtime::get_workspace),
+        },
+        ApiRoute {
+            methods: &["DELETE"],
+            path: "/runtime/workspaces/{workspace}",
+            tag: "runtime",
+            summary: "Delete a worker workspace",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: delete(runtime::delete_workspace),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/workspaces/{workspace}/stop",
+            tag: "runtime",
+            summary: "Stop a worker workspace",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 202,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::stop_workspace),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/chats",
+            tag: "runtime",
+            summary: "Create a Coder chat",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::create_chat),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/chats/{chat}/messages",
+            tag: "runtime",
+            summary: "Send a chat message",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::send_chat_message),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/register",
+            tag: "runtime",
+            summary: "Register a runtime credential",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Bootstrap handshake: provide the bootstrap token in the JSON body; no bearer header is used."),
+            router: post(runtime::register),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/heartbeat",
+            tag: "runtime",
+            summary: "Runtime heartbeat",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::heartbeat),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/refresh",
+            tag: "runtime",
+            summary: "Refresh a runtime credential",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::refresh),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/runtime/revoke",
+            tag: "runtime",
+            summary: "Revoke a runtime credential",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 204,
+            description: Some("Authenticated by a workspace runtime credential."),
+            router: post(runtime::revoke),
+        },
+    ]
+}
+
+/// Build an axum router from a list of routes (one `route()` per entry).
+fn build_routes(router: Router<AppState>, routes: Vec<ApiRoute>) -> Router<AppState> {
+    routes
+        .into_iter()
+        .fold(router, |r, rt| r.route(rt.path, rt.router))
+}
+
+pub fn router() -> Router<AppState> {
+    let root = build_routes(Router::new(), root_routes());
+    let api = build_routes(Router::new(), api_v1_routes());
+    // OpenAPI reference: generated spec served at `/openapi.json` and a
+    // browsable Swagger UI at `/swagger-ui/`. Public by design; the document
+    // contains no credentials or runtime tokens.
+    root.nest("/api/v1", api).merge(
+        SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
+    )
 }
 
 #[derive(Serialize)]

@@ -1273,6 +1273,11 @@ async fn request_context(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let is_test_console = request.uri().path() == "/";
+    // The browsable OpenAPI reference (Swagger UI) loads same-origin JS/CSS and
+    // fetches the spec from `/openapi.json`, so it needs a permissive-enough
+    // CSP scoped to this documentation route only. Every other route keeps the
+    // strict, network-restricted CSP below; no external origin is ever allowed.
+    let is_swagger_ui = request.uri().path().starts_with("/swagger-ui");
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -1319,7 +1324,12 @@ async fn request_context(
     response
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
-    let csp = if is_test_console {
+    let csp = if is_swagger_ui {
+        // Scoped, same-origin-only policy for the Swagger UI documentation page.
+        // Allows the bundled UI to load its own JS/CSS and fetch `/openapi.json`
+        // from `self`; blocks all external origins.
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+    } else if is_test_console {
         "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     } else {
         "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"

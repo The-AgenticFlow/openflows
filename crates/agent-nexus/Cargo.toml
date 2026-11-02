@@ -35,6 +35,8 @@ futures = { workspace = true }
 jsonwebtoken = { workspace = true }
 sha2 = "0.10"
 reqwest = { workspace = true }
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
 
 [dev-dependencies]
 mockito = "1"
+tower = { version = "0.5.3", features = ["util"] }
