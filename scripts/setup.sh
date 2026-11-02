@@ -952,6 +952,8 @@ stage_bootstrap() {
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     rm -f "${BIN_DIR}/IMAGE"
+    # The next --compose run must push the image's templates again, even for the same image.
+    env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
     PROGRAMS_REPLACED="$(openflows_workspaces | awk '$2 == "running" {print $1}')"
     ok "binaries built, 5 templates pushed"
 }
