@@ -14,6 +14,7 @@ pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
+pub mod operations;
 pub mod organizations;
 pub mod platform_releases;
 pub mod runtime;
@@ -85,6 +86,10 @@ fn api_v1_router() -> Router<AppState> {
         .route(
             "/organizations/{org}/transfer-ownership",
             post(organizations::transfer_ownership),
+        )
+        .route(
+            "/organizations/{org}/operations",
+            get(operations::list_operations),
         )
         .route("/operations/{id}", get(organizations::get_operation))
         .route(
