@@ -899,13 +899,13 @@ offer_update() {
         info "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
         [ -n "$update" ] && info "  new templates:  coder update <workspace>"
         [ -n "$restart" ] && info "  new programs only:  coder restart <workspace> --yes"
-        return
+        return 0
     fi
     warn "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
     if [[ ! "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
         [ -n "$update" ] && info "Later, for new templates:  coder update <workspace>"
         [ -n "$restart" ] && info "Later, for new programs:  coder restart <workspace> --yes"
-        return
+        return 0
     fi
     for ws in $update; do
         if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
