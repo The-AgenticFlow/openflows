@@ -193,7 +193,7 @@ except Exception:
 # ── .env helpers ────────────────────────────────────────────────────────────
 env_get() {
     local key="$1"
-    if [ "${!key+x}" = x ]; then
+    if [ "$key" = OPENFLOWS_GITHUB_AUTH_MODE ] && [ "${!key+x}" = x ]; then
         printf '%s' "${!key}"
     elif [ -f "$ENV_FILE" ]; then
         sed -n "s/^${key}=//p" "$ENV_FILE" | tail -1
@@ -435,6 +435,10 @@ stage_github_app() {
         secret_dir="${HOME}/.config/openflows"
         mkdir -p "$secret_dir" || die "Cannot create local GitHub credential directory."
         chmod 700 "$secret_dir" || die "Cannot make local GitHub credential directory private."
+        if [ ! -f "$secret_dir/console-key" ]; then
+            python3 -c 'import secrets,sys; print(secrets.token_hex(32), file=open(sys.argv[1], "x"))' "$secret_dir/console-key" || die "Cannot create local console key."
+        fi
+        chmod 600 "$secret_dir/console-key" || die "Cannot make local console key private."
         env_set OPENFLOWS_MODE local
         env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
         env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
@@ -513,7 +517,9 @@ stage_connected_local_authorization() {
     panel "$C" "Connect GitHub in your browser" \
         "Open the local console, install the OpenFlows App on ${REPO}, approve GitHub, then select ${REPO}." \
         "${manager_url}"
-    open_url "$manager_url"
+    local console_key
+    console_key="$(<"$(env_get OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR)/console-key")"
+    open_url "${manager_url}/#console-key=${console_key}"
     is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
     pause "Complete GitHub connection in the local console, then continue"
     (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \

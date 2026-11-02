@@ -152,7 +152,7 @@ fn local_github(
     Ok((credentials, github))
 }
 
-async fn status(State(state): State<AppState>) -> Json<LocalGithubStatus> {
+pub(crate) async fn status(State(state): State<AppState>) -> Json<LocalGithubStatus> {
     let enabled = state.connected_local_enabled();
     let configured = state.local_github().is_some();
     let authorized = match state.local_github() {
@@ -170,9 +170,11 @@ async fn status(State(state): State<AppState>) -> Json<LocalGithubStatus> {
     })
 }
 
-async fn start_device_authorization(
+pub(crate) async fn start_device_authorization(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<DeviceAuthorization>, ManagerError> {
+    require_console_key(&headers)?;
     let (_, github) = local_github(&state)?;
     let challenge = github.start().await?;
     Ok(Json(DeviceAuthorization {
@@ -184,10 +186,12 @@ async fn start_device_authorization(
     }))
 }
 
-async fn poll_device_authorization(
+pub(crate) async fn poll_device_authorization(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<DevicePollRequest>,
 ) -> Result<(HeaderMap, Json<DevicePollResponse>), ManagerError> {
+    require_console_key(&headers)?;
     if body.device_code.trim().is_empty() || body.device_code.len() > 256 {
         return Err(ManagerError::InvalidInput("invalid device code".into()));
     }
@@ -266,7 +270,25 @@ async fn poll_device_authorization(
     }
 }
 
-async fn repositories(
+fn require_console_key(headers: &HeaderMap) -> Result<(), ManagerError> {
+    let path = std::env::var("OPENFLOWS_LOCAL_CONSOLE_KEY_FILE")
+        .map_err(|_| ManagerError::api("SERVICE_UNAVAILABLE", "local console key unavailable"))?;
+    let expected = std::fs::read_to_string(path)
+        .map_err(|_| ManagerError::api("SERVICE_UNAVAILABLE", "local console key unavailable"))?;
+    let supplied = headers
+        .get("x-openflows-console-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !crate::auth::crypto::ct_eq(supplied.as_bytes(), expected.trim().as_bytes()) {
+        return Err(ManagerError::api(
+            "UNAUTHORIZED",
+            "local console authorization required",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn repositories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RepositoryResponse>>, ManagerError> {
@@ -289,7 +311,10 @@ async fn repositories(
     Ok(Json(repositories))
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<(), ManagerError> {
+pub(crate) async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(), ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;

@@ -251,6 +251,11 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             description: Some("Local-mode GitHub credential exchange; no bearer header is used."),
             router: post(local_github::credential),
         },
+        ApiRoute { methods: &["GET"], path: "/local/github", tag: "local GitHub", summary: "Local GitHub connection status", auth: Auth::None, is_json: true, success: 200, description: Some("Available only in connected local mode."), router: get(local_github::status) },
+        ApiRoute { methods: &["POST"], path: "/local/github/device", tag: "local GitHub", summary: "Start local GitHub device authorization", auth: Auth::None, is_json: true, success: 200, description: Some("Requires trusted local console access."), router: post(local_github::start_device_authorization) },
+        ApiRoute { methods: &["POST"], path: "/local/github/device/poll", tag: "local GitHub", summary: "Poll local GitHub device authorization", auth: Auth::None, is_json: true, success: 200, description: Some("Requires trusted local console access."), router: post(local_github::poll_device_authorization) },
+        ApiRoute { methods: &["GET"], path: "/local/github/repositories", tag: "local GitHub", summary: "List accessible local GitHub repositories", auth: Auth::Session, is_json: true, success: 200, description: None, router: get(local_github::repositories) },
+        ApiRoute { methods: &["POST"], path: "/local/github/logout", tag: "local GitHub", summary: "Disconnect local GitHub account", auth: Auth::Session, is_json: true, success: 204, description: Some("Requires a browser session and CSRF token."), router: post(local_github::logout) },
         ApiRoute {
             methods: &["GET"],
             path: "/auth/csrf",
@@ -762,11 +767,9 @@ pub fn router() -> Router<AppState> {
     // OpenAPI reference: generated spec served at `/openapi.json` and a
     // browsable Swagger UI at `/swagger-ui/`. Public by design; the document
     // contains no credentials or runtime tokens.
-    root.nest("/api/v1", api)
-        .nest("/api/v1/local", local_github::router())
-        .merge(
-            SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
-        )
+    root.nest("/api/v1", api).merge(
+        SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
+    )
 }
 
 #[derive(Serialize)]

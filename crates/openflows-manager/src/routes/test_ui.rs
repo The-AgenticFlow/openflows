@@ -120,6 +120,11 @@ let selectedOrg = null;
 let localGithub = null;
 let localDevice = null;
 let localDeviceTimer = null;
+const consoleKey = new URLSearchParams(window.location.hash.slice(1)).get('console-key') || sessionStorage.getItem('openflows-console-key');
+if (consoleKey) {
+  sessionStorage.setItem('openflows-console-key', consoleKey);
+  if (window.location.hash) history.replaceState(null, '', window.location.pathname + window.location.search);
+}
 
 function controls() {
   for (const id of ['create-org', 'refresh-orgs']) $(id).disabled = busy || !signedIn;
@@ -337,6 +342,9 @@ function showConnection(value) {
   output.append(details);
 }
 async function request(url, options = {}) {
+  if (url === '/api/v1/local/github/device' || url === '/api/v1/local/github/device/poll') {
+    options.headers = { ...options.headers, 'X-OpenFlows-Console-Key': consoleKey || '' };
+  }
   const response = await fetch(url, { credentials: 'include', ...options });
   const text = await response.text();
   let data; try { data = text ? JSON.parse(text) : {}; } catch { data = text; }

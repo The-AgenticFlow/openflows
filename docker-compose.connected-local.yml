@@ -33,6 +33,7 @@ services:
       OPENFLOWS_GITHUB_CLIENT_ID: Iv23liSR6TsW7SxvgRLH
       OPENFLOWS_GITHUB_APP_SLUG: openflows-apps
       OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE: /run/openflows-local/github-user.json
+      OPENFLOWS_LOCAL_CONSOLE_KEY_FILE: /run/openflows-local/console-key
       OPENFLOWS_MANAGER_ADDR: 0.0.0.0:3002
       REDIS_URL: redis://redis:6379
     volumes:
