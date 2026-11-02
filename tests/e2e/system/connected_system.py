@@ -153,24 +153,51 @@ def wait_for_reworked_pr_review(nexus, pr_number, previous_head, label):
         reworked, seconds=360)
 
 
-def verify_security_boundaries(nexus):
-    hook_body = '{"type":"pre_tool_use","meta":{"dispatch_id":"d1","chat_id":"c1"},"data":{}}'
-    a2a_body = '{"jsonrpc":"2.0","id":1,"method":"tasks/claim","params":{"executor":{"role":"forge","worker":"forge-1","workspace":"w1","ticket":"T-001","pair_token":"forged"}}}'
-    probe = (
-        "set -eu; "
-        f"code1=$(curl -s -o /dev/null -w '%{{http_code}}' -X POST http://localhost:3001/experimental/hooks/chat "
-        f"-H 'Content-Type: application/json' -d '{hook_body}'); "
-        f"code2=$(curl -s -o /dev/null -w '%{{http_code}}' -X POST http://localhost:3001/experimental/hooks/chat "
-        f"-H 'Authorization: Bearer forged.invalid.jwt' -H 'Content-Type: application/json' -d '{hook_body}'); "
-        f"rpc=$(curl -fsS -X POST http://localhost:3000/rpc "
-        f"-H 'Content-Type: application/json' -d '{a2a_body}'); "
-        "printf '%s %s %s\\n' \"$code1\" \"$code2\" \"$rpc\""
-    )
-    out = bootstrap.ssh(nexus, probe).strip()
-    code1, code2, rpc_raw = out.split(' ', 2)
-    assert code1 == '401' and code2 == '401', f'Hook server did not reject unsigned/forged JWTs: {out}'
-    rpc = json.loads(rpc_raw)
-    assert 'error' in rpc, f'A2A relay did not reject forged pair_token: {rpc}'
+def verify_security_boundaries(nexus, pair_id='T-001'):
+    probe = f"""python3 - <<'PY'
+import hashlib, json, os, urllib.error, urllib.request
+
+def post(url, body, headers=None):
+    req_headers = {{'Content-Type': 'application/json'}}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=req_headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as err:
+        return err.code, None
+
+hook_body = {{'type': 'pre_tool_use', 'meta': {{'dispatch_id': 'd1', 'chat_id': 'c1'}}, 'data': {{}}}}
+code1, _ = post('http://localhost:3001/experimental/hooks/chat', hook_body)
+code2, _ = post('http://localhost:3001/experimental/hooks/chat', hook_body, {{'Authorization': 'Bearer forged.invalid.jwt'}})
+
+secret = os.environ['CODER_CHAT_HOOK_SECRET']
+valid_token = hashlib.sha256(b'openflows-a2a-pair-token-v1\\0' + secret.encode() + b'\\0{pair_id}').hexdigest()
+
+claim_params = {{'pair_id': '{pair_id}', 'role': 'forge', 'checkout_version': 3}}
+_, forged_rpc = post('http://localhost:3000/rpc', {{
+    'jsonrpc': '2.0',
+    'id': 1,
+    'method': 'tasks/claim',
+    'params': {{**claim_params, 'pair_token': 'forged'}},
+}})
+_, valid_rpc = post('http://localhost:3000/rpc', {{
+    'jsonrpc': '2.0',
+    'id': 2,
+    'method': 'tasks/claim',
+    'params': {{**claim_params, 'pair_token': valid_token}},
+}})
+print(json.dumps({{'code1': code1, 'code2': code2, 'forged_rpc': forged_rpc, 'valid_rpc': valid_rpc}}))
+PY"""
+    result = json.loads(bootstrap.ssh(nexus, probe).strip().splitlines()[-1])
+    assert result['code1'] == 401 and result['code2'] == 401, \
+        f'Hook server did not reject unsigned/forged JWTs: {result}'
+    forged_rpc = result['forged_rpc']
+    assert 'error' in forged_rpc, f'A2A relay did not reject forged pair_token: {forged_rpc}'
+    valid_rpc = result['valid_rpc']
+    assert 'error' not in valid_rpc and 'result' in valid_rpc and valid_rpc['result'] is None, \
+        f'A2A relay did not accept valid pair_token for registered pair {pair_id}: {valid_rpc}'
 
 
 def restart_controller(nexus, expected_head):
@@ -205,7 +232,6 @@ def restart_controller(nexus, expected_head):
 def run():
     workspace, templates, organization, nexus = bootstrap.setup_tenant('system-e2e')
     try:
-        verify_security_boundaries(nexus)
         original_main = docker('git', '--git-dir=/tmp/github/repo.git', 'rev-parse', 'refs/heads/main')
         issue = github('/issues', {'title': 'Fix answer.txt to return 42',
             'body': 'The committed answer is 41. Change it to 42, preserve the CI workflow, '
@@ -237,6 +263,7 @@ def run():
                 decision.get('head') == head_1 and
                 bool(state.get('pr_delivery'))) else False
         state = bootstrap.wait('SENTINEL did not approve its initial PR review', reviewed_initial, seconds=240)
+        verify_security_boundaries(nexus, 'T-001')
         assert state['revision'] == 2, f'Expected plan revision 2 after rejection/revision loop, got {state["revision"]}'
         assert state['head'] == head_1 and state['verified_head'] == head_1
         assert state['plan_decision']['approved'] and state['test_decision']['approved']
