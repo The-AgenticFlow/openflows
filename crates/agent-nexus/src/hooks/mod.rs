@@ -23,7 +23,7 @@ mod guard;
 mod jwt;
 mod kick;
 mod sentinel;
-mod server;
+pub(crate) mod server;
 mod simulate;
 mod stop;
 mod types;
