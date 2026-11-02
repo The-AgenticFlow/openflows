@@ -709,7 +709,7 @@ impl TenantService {
         org_id: OrganizationId,
         tenant_id: TenantId,
     ) -> Result<serde_json::Value, ManagerError> {
-        self.get_tenant(actor, org_id, tenant_id).await?;
+        let tenant = self.get_tenant(actor, org_id, tenant_id).await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT observed_state, count(*) FROM workspaces
               WHERE organization_id = $1 AND tenant_id = $2
@@ -732,13 +732,79 @@ impl TenantService {
         .bind(tenant_id.0)
         .fetch_optional(&self.inputs.pool)
         .await?;
+        let runtime = self
+            .runtime_health(org_id, tenant_id, &tenant.observed_state)
+            .await?;
         Ok(json!({
             "tenant_id": tenant_id,
             "workspaces": rows.into_iter().map(|(state, count)| json!({"state": state, "count": count})).collect::<Vec<_>>(),
             "latest_operation": latest.map(|(id, state, error_code)| json!({"id": id, "state": state, "error_code": error_code})),
+            "runtime": runtime,
+        }))
+    }
+
+    /// Liveness of the tenant's Nexus runtime, from its own check-ins. A
+    /// tenant can be `running` in Manager's records while its runtime has gone
+    /// silent (host asleep, network loss, crashed agent), so clients need this
+    /// to tell "running" from "running and responding".
+    ///
+    /// `health` is one of:
+    /// - `inactive`: the tenant is not meant to be running;
+    /// - `starting`: running, but the runtime has not registered yet;
+    /// - `healthy`: a heartbeat arrived within the last two minutes;
+    /// - `unresponsive`: registered, heartbeats stopped, session still valid
+    ///   (it may come back on its own);
+    /// - `restart_required`: heartbeats stopped and the runtime's refresh
+    ///   session has expired or been revoked, so it can never re-authenticate;
+    ///   stopping and starting the tenant issues a fresh bootstrap.
+    async fn runtime_health(
+        &self,
+        org_id: OrganizationId,
+        tenant_id: TenantId,
+        observed_state: &str,
+    ) -> Result<serde_json::Value, ManagerError> {
+        // (registered_at, last_heartbeat_at, heartbeat_fresh, refresh_session_valid)
+        type NexusLiveness = (Option<Timestamp>, Option<Timestamp>, bool, bool);
+        let nexus: Option<NexusLiveness> = sqlx::query_as(
+            "SELECT w.registered_at, w.last_heartbeat_at,
+                    COALESCE(w.last_heartbeat_at > clock_timestamp() - interval '2 minutes', false),
+                    EXISTS (
+                        SELECT 1 FROM runtime_credentials rc
+                         WHERE rc.workspace_id = w.id
+                           AND rc.audience = 'openflows-workspace-refresh'
+                           AND rc.generation = w.credential_generation
+                           AND rc.revoked_at IS NULL AND rc.expires_at > clock_timestamp())
+               FROM workspaces w
+              WHERE w.organization_id = $1 AND w.tenant_id = $2 AND w.role = 'nexus'
+                AND w.desired_state <> 'deleted'
+              ORDER BY w.created_at DESC LIMIT 1",
+        )
+        .bind(org_id.0)
+        .bind(tenant_id.0)
+        .fetch_optional(&self.inputs.pool)
+        .await?;
+        let (registered_at, last_heartbeat_at, fresh, session_valid) =
+            nexus.unwrap_or((None, None, false, false));
+        let health = if observed_state != "running" {
+            "inactive"
+        } else if fresh {
+            "healthy"
+        } else if registered_at.is_none() {
+            "starting"
+        } else if session_valid {
+            "unresponsive"
+        } else {
+            "restart_required"
+        };
+        Ok(json!({
+            "health": health,
+            "registered_at": registered_at,
+            "last_heartbeat_at": last_heartbeat_at,
         }))
     }
 }
+
+type Timestamp = chrono::DateTime<chrono::Utc>;
 
 /// Parse a `tenant_id:operation_id:status` reference back into a response.
 fn parse_reference(reference: &str) -> TenantOperationResponse {
