@@ -46,7 +46,9 @@ It will:
 
 For connected-local mode, open the Manager console at <http://localhost:3002> after setup. The console handles App installation, GitHub approval, and repository selection.
 
-Maintainers validating the team-owned App can follow the [connected-local live test](docs/testing/connected-local-github-live.md) with a disposable repository.
+Maintainers can verify the team App with a disposable repository: approve the
+device code, confirm the repository appears in the console, and run one test
+push. Never record or share local credential files or token values.
 
 ## Testing the Manager's organization provisioning locally
 
