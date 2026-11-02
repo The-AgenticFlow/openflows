@@ -173,17 +173,36 @@ fn response_schema(path: &str, method: &str) -> Option<&'static str> {
     match (method, path) {
         ("GET", "/api/v1/me") => Some("User"),
         ("GET", "/api/v1/organizations") => Some("OrganizationList"),
-        ("POST", "/api/v1/organizations") => Some("Operation"),
+        ("POST", "/api/v1/organizations") => Some("OperationResponse"),
         ("GET", "/api/v1/organizations/{org}") => Some("Organization"),
         ("PATCH", "/api/v1/organizations/{org}") => Some("Organization"),
-        ("DELETE", "/api/v1/organizations/{org}") => Some("Operation"),
+        ("DELETE", "/api/v1/organizations/{org}") => Some("OperationResponse"),
         ("GET", "/api/v1/organizations/{org}/members") => Some("MembershipList"),
         ("PATCH", "/api/v1/organizations/{org}/members/{user}") => Some("Membership"),
         ("GET", "/api/v1/operations/{id}") => Some("Operation"),
         ("GET", "/api/v1/organizations/{org}/tenants") => Some("TenantList"),
+        ("POST", "/api/v1/organizations/{org}/tenants") => Some("TenantOperationResponse"),
         ("GET", "/api/v1/organizations/{org}/tenants/{tenant}") => Some("Tenant"),
-        ("GET", "/api/v1/organizations/{org}/tenants/{tenant}/status") => Some("Tenant"),
+        ("DELETE", "/api/v1/organizations/{org}/tenants/{tenant}") => {
+            Some("TenantOperationResponse")
+        }
+        ("POST", "/api/v1/organizations/{org}/tenants/{tenant}/start") => {
+            Some("TenantOperationResponse")
+        }
+        ("POST", "/api/v1/organizations/{org}/tenants/{tenant}/stop") => {
+            Some("TenantOperationResponse")
+        }
+        ("POST", "/api/v1/organizations/{org}/tenants/{tenant}/clean") => {
+            Some("TenantOperationResponse")
+        }
+        ("GET", "/api/v1/organizations/{org}/tenants/{tenant}/status") => Some("TenantStatus"),
         ("GET", "/api/v1/organizations/{org}/github/connections") => Some("ConnectionsResponse"),
+        ("POST", "/api/v1/organizations/{org}/github/connections/{id}/reconcile") => {
+            Some("OperationResponse")
+        }
+        ("DELETE", "/api/v1/organizations/{org}/github/connections/{id}") => {
+            Some("OperationResponse")
+        }
         ("GET", "/api/v1/runtime/workspaces/{workspace}") => Some("WorkspaceStatus"),
         ("POST", "/api/v1/auth/refresh") => Some("RefreshResponse"),
         ("POST", "/api/v1/auth/cli/start") => Some("DeviceStartResponse"),
@@ -391,10 +410,19 @@ fn build_components() -> utoipa::openapi::schema::ComponentsBuilder {
         .schema("SendChatMessageRequest", send_chat_message_schema())
         .schema("CredentialRequest", credential_request_schema())
         // ---- Response bodies ----
+        .schema("OperationResponse", operation_response_schema())
+        .schema(
+            "TenantOperationResponse",
+            tenant_operation_response_schema(),
+        )
+        .schema("UserOrganization", user_organization_schema())
+        .schema("OrgMember", org_member_schema())
         .schema("Membership", membership_schema())
-        .schema("OrganizationList", list_schema("Organization"))
-        .schema("MembershipList", list_schema("Membership"))
+        .schema("OrganizationList", list_schema("UserOrganization"))
+        .schema("MembershipList", list_schema("OrgMember"))
         .schema("TenantList", list_schema("Tenant"))
+        .schema("TenantWorkspaceCount", tenant_workspace_count_schema())
+        .schema("TenantStatus", tenant_status_schema())
         .schema("ConnectionsResponse", connections_schema())
         .schema("WorkspaceStatus", workspace_status_schema())
         .schema("RefreshResponse", refresh_response_schema())
@@ -578,14 +606,24 @@ fn create_tenant_schema() -> ObjectBuilder {
             ObjectBuilder::new().schema_type(Type::Integer),
         )
         .property("name", ObjectBuilder::new().schema_type(Type::String))
+        .property(
+            "fleet",
+            ObjectBuilder::new()
+                .schema_type(Type::Integer)
+                .description(Some("Fleet size (worker slots). Defaults to 1.")),
+        )
         .required("name")
 }
 
 fn clean_tenant_schema() -> ObjectBuilder {
-    ObjectBuilder::new()
-        .schema_type(Type::Object)
-        .property("reset_all", ObjectBuilder::new().schema_type(Type::Boolean))
-        .required("reset_all")
+    ObjectBuilder::new().schema_type(Type::Object).property(
+        "reset_all",
+        ObjectBuilder::new()
+            .schema_type(Type::Boolean)
+            .description(Some(
+                "Reset all state including configuration. Defaults to false.",
+            )),
+    )
 }
 
 fn connect_schema() -> ObjectBuilder {
@@ -667,6 +705,108 @@ fn credential_request_schema() -> ObjectBuilder {
         .schema_type(Type::Object)
         .property("repository", ObjectBuilder::new().schema_type(Type::String))
         .required("repository")
+}
+
+fn operation_response_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "Durable operation reference returned for 202 async actions",
+        ))
+        .property("operation_id", string())
+        .property("resource_id", string())
+        .property("status", string())
+        .required("operation_id")
+        .required("resource_id")
+        .required("status")
+}
+
+fn tenant_operation_response_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "Durable operation reference returned for tenant mutations",
+        ))
+        .property("operation_id", string())
+        .property("tenant_id", string())
+        .property("status", string())
+        .required("operation_id")
+        .required("tenant_id")
+        .required("status")
+}
+
+fn user_organization_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "An organization as returned in the caller's membership list",
+        ))
+        .property("organization_id", string())
+        .property("slug", string())
+        .property("display_name", string())
+        .property("role", string())
+        .property("status", string())
+        .required("organization_id")
+        .required("slug")
+        .required("display_name")
+        .required("role")
+        .required("status")
+}
+
+fn org_member_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "An organization member as returned in the membership list",
+        ))
+        .property("user_id", string())
+        .property("display_name", string())
+        .property("role", string())
+        .property("status", string())
+        .required("user_id")
+        .required("display_name")
+        .required("role")
+        .required("status")
+}
+
+fn tenant_workspace_count_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some("Workspace breakdown by observed state"))
+        .property("state", string())
+        .property("count", ObjectBuilder::new().schema_type(Type::Integer))
+        .required("state")
+        .required("count")
+}
+
+fn tenant_status_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "Runtime status of a tenant with workspace breakdown and latest operation",
+        ))
+        .property("tenant_id", string())
+        .property(
+            "workspaces",
+            ArrayBuilder::new().items(Ref::from_schema_name("TenantWorkspaceCount")),
+        )
+        .property(
+            "latest_operation",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::Array(vec![Type::Object, Type::Null]))
+                .property("id", string())
+                .property("state", string())
+                .property("error_code", nullable_string())
+                .description(Some("Latest operation on this tenant, or null if none")),
+        )
+        .required("tenant_id")
+        .required("workspaces")
 }
 
 fn membership_schema() -> ObjectBuilder {
@@ -1052,5 +1192,56 @@ mod tests {
             content.is_some(),
             "GET /organizations/{{org}} success response must declare JSON content"
         );
+
+        // Success response body schema on POST /organizations references OperationResponse.
+        let resp_202 = create_org
+            .responses
+            .responses
+            .get("202")
+            .expect("202 response");
+        let resp_ref = match resp_202 {
+            RefOr::T(r) => r.content.get("application/json").and_then(|c| match c {
+                RefOr::T(c) => match c.schema.as_ref() {
+                    Some(RefOr::Ref(rf)) => Some(rf.ref_location.clone()),
+                    _ => None,
+                },
+                RefOr::Ref(_) => None,
+            }),
+            RefOr::Ref(_) => None,
+        }
+        .expect("202 schema ref");
+        assert!(
+            resp_ref.contains("OperationResponse"),
+            "expected OperationResponse ref, got {resp_ref}"
+        );
+
+        // Tenant status endpoint references TenantStatus.
+        let tenant_status = paths
+            .get("/api/v1/organizations/{org}/tenants/{tenant}/status")
+            .and_then(|pi| pi.get.as_ref())
+            .expect("GET tenant status");
+        let status_ref = match tenant_status.responses.responses.get("200").unwrap() {
+            RefOr::T(r) => r.content.get("application/json").and_then(|c| match c {
+                RefOr::T(c) => match c.schema.as_ref() {
+                    Some(RefOr::Ref(rf)) => Some(rf.ref_location.clone()),
+                    _ => None,
+                },
+                RefOr::Ref(_) => None,
+            }),
+            RefOr::Ref(_) => None,
+        }
+        .expect("200 tenant status ref");
+        assert!(
+            status_ref.contains("TenantStatus"),
+            "expected TenantStatus ref, got {status_ref}"
+        );
+
+        // Components contain updated models.
+        let comps = doc.components.as_ref().unwrap();
+        assert!(comps.schemas.contains_key("UserOrganization"));
+        assert!(comps.schemas.contains_key("OrgMember"));
+        assert!(comps.schemas.contains_key("OperationResponse"));
+        assert!(comps.schemas.contains_key("TenantOperationResponse"));
+        assert!(comps.schemas.contains_key("TenantStatus"));
     }
 }

@@ -183,6 +183,30 @@ fn build_openapi(routes: &[DocRoute], title: &str) -> OpenApi {
         .build()
 }
 
+fn hook_meta_schema() -> ObjectBuilder {
+    let string = || ObjectBuilder::new().schema_type(Type::String);
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .description(Some(
+            "Identifiers attached to every Coder lifecycle dispatch",
+        ))
+        .property("dispatch_id", string())
+        .property(
+            "schema_version",
+            ObjectBuilder::new().schema_type(Type::Integer),
+        )
+        .property("chat_id", string())
+        .property("owner_id", string())
+        .property("workspace_id", nullable_string())
+        .property("turn_id", nullable_string())
+        .property("parent_chat_id", nullable_string())
+        .property("root_chat_id", nullable_string())
+        .property("client", nullable_string())
+        .required("dispatch_id")
+        .required("chat_id")
+        .required("owner_id")
+}
+
 /// Reusable component schemas for Agent Nexus.
 fn components() -> utoipa::openapi::schema::Components {
     let string = || ObjectBuilder::new().schema_type(Type::String);
@@ -201,6 +225,7 @@ fn components() -> utoipa::openapi::schema::Components {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("Authorization"))),
         )
         // ---- Lifecycle hook payload ----
+        .schema("HookMeta", hook_meta_schema())
         .schema(
             "HookPayload",
             ObjectBuilder::new()
@@ -209,9 +234,23 @@ fn components() -> utoipa::openapi::schema::Components {
                     "A Coder lifecycle-hook dispatch, signed with the shared secret",
                 ))
                 .property("type", string())
-                .property("meta", ObjectBuilder::new().schema_type(Type::Object))
-                .property("data", ObjectBuilder::new().schema_type(Type::Object))
-                .required("type"),
+                .property("meta", Ref::from_schema_name("HookMeta"))
+                .property(
+                    "data",
+                    ObjectBuilder::new()
+                        .description(Some("Event-specific payload (any JSON value)"))
+                        .schema_type(SchemaType::Array(vec![
+                            Type::Object,
+                            Type::Array,
+                            Type::String,
+                            Type::Integer,
+                            Type::Number,
+                            Type::Boolean,
+                            Type::Null,
+                        ])),
+                )
+                .required("type")
+                .required("meta"),
         )
         // ---- A2A JSON-RPC envelope ----
         .schema(
@@ -522,5 +561,16 @@ mod tests {
             has_scheme,
             "components must declare the coderHookJwt security scheme"
         );
+
+        let comps = doc.components.as_ref().unwrap();
+        assert!(comps.schemas.contains_key("HookMeta"));
+        let payload = comps.schemas.get("HookPayload").unwrap();
+        match payload {
+            RefOr::T(Schema::Object(o)) => {
+                assert!(o.required.contains(&"meta".to_string()));
+                assert!(o.required.contains(&"type".to_string()));
+            }
+            _ => panic!("expected Schema::Object for HookPayload"),
+        }
     }
 }
