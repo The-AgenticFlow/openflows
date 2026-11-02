@@ -762,9 +762,11 @@ pub fn router() -> Router<AppState> {
     // OpenAPI reference: generated spec served at `/openapi.json` and a
     // browsable Swagger UI at `/swagger-ui/`. Public by design; the document
     // contains no credentials or runtime tokens.
-    root.nest("/api/v1", api).merge(
-        SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
-    )
+    root.nest("/api/v1", api)
+        .nest("/api/v1/local", local_github::router())
+        .merge(
+            SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
+        )
 }
 
 #[derive(Serialize)]

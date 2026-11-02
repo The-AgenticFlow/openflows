@@ -357,7 +357,6 @@ async function refreshSession() {
     await csrf();
     log('Browser session is valid.');
     await refreshOrganizations();
-    continueLocalSignIn();
   } catch (error) {
     show('session', localGithub?.enabled
       ? 'GitHub is connected, but this browser needs a Manager session. Select Sign in to Manager above.'

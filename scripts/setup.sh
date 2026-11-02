@@ -191,7 +191,14 @@ except Exception:
     pass' "$1"; }
 
 # ── .env helpers ────────────────────────────────────────────────────────────
-env_get() { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 || true; }
+env_get() {
+    local key="$1"
+    if [ "${!key+x}" = x ]; then
+        printf '%s' "${!key}"
+    elif [ -f "$ENV_FILE" ]; then
+        sed -n "s/^${key}=//p" "$ENV_FILE" | tail -1
+    fi
+}
 env_set() { # env_set KEY VALUE — replace the line or append
     local key="$1" val="$2" tmp
     tmp="$(mktemp)"
