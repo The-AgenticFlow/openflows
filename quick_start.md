@@ -65,7 +65,7 @@ OPENFLOWS_VERSION=1.8.1
 OPENFLOWS_IMAGE_DIGEST=
 ```
 
-Your stack and workspaces must be running when you re-run setup. At the end, setup offers to restart the running workspaces so they load the new programs (or later: `coder restart <workspace> --yes`). Details: [upgrade and rollback](docs/setup-reference.md#upgrade-and-rollback).
+Your stack and workspaces must be running when you re-run setup. At the end, setup offers to update the running workspaces so they load the new templates and programs (or later: `coder update <workspace>`). Details: [upgrade and rollback](docs/setup-reference.md#upgrade-and-rollback).
 
 ## Testing the Manager's organization provisioning locally
 

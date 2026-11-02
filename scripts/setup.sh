@@ -596,7 +596,15 @@ stage_docker() {
     [ "${#args[@]}" -gt 0 ] && args=(-f docker-compose.yml "${args[@]}")
     args+=(up -d)
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
-    if ! out="$(cd "$ROOT" && docker compose "${args[@]}" 2>&1)"; then
+    # Compose prefers shell variables over .env; pass the image from .env so a leftover
+    # export (e.g. from an earlier upgrade) cannot copy a different version.
+    local image_env=()
+    [ "$MODE" = compose ] && image_env=(
+        "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
+        "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
+        "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
+        "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    if ! out="$(cd "$ROOT" && env "${image_env[@]}" docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
@@ -862,35 +870,55 @@ names = {t.get("name") for t in json.load(sys.stdin)}
 sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
 }
 
-# running_workspaces — names of this user's running OpenFlows workspaces, one per line
-running_workspaces() {
+# openflows_workspaces — this user's OpenFlows workspaces, one "<name> <status> <outdated>" per line
+openflows_workspaces() {
     api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null | python3 -c '
 import sys, json
 for w in json.load(sys.stdin).get("workspaces") or []:
-    if w.get("template_name", "").startswith("openflows-") and w["latest_build"]["status"] == "running":
-        print(w["name"])' 2>/dev/null || true
+    if w.get("template_name", "").startswith("openflows-"):
+        print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no")' 2>/dev/null || true
 }
 
-# offer_restart — workspaces copy the programs when they start, so the ones already running
-# when bootstrap replaced the programs (STALE_WORKSPACES) keep the old version until restarted.
-offer_restart() {
-    [ -n "${STALE_WORKSPACES:-}" ] || return 0
-    local names ws
-    names="$(printf '%s' "$STALE_WORKSPACES" | tr '\n' ' ')"
+# offer_update — a workspace keeps its template version until `coder update` (a restart
+# reuses it) and copies the programs only when it starts. Bootstrap pushes a new template
+# version only when a template changed, and records in PROGRAMS_REPLACED the workspaces
+# running when it replaced the programs: outdated ones need `coder update`, the others a restart.
+offer_update() {
+    local all update restart stopped ws
+    all="$(openflows_workspaces)"
+    update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
+    restart="$(PREV="${PROGRAMS_REPLACED:-}" awk 'BEGIN {n = split(ENVIRON["PREV"], p); for (i = 1; i <= n; i++) was[p[i]] = 1}
+        $2 == "running" && $3 == "no" && ($1 in was) {print $1}' <<<"$all")"
+    stopped="$(awk '$2 != "running" && $3 == "yes" {print $1}' <<<"$all")"
+    if [ -n "$stopped" ]; then
+        info "Stopped workspaces still use the old templates: $(tr '\n' ' ' <<<"$stopped")"
+        info "  update each before using it:  coder update <workspace>"
+    fi
+    [ -n "$update$restart" ] || return 0
     if ! is_tty; then
-        info "Restart these workspaces to load the new programs: ${names}"
-        info "  coder restart <workspace> --yes"
+        info "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
+        [ -n "$update" ] && info "  new templates:  coder update <workspace>"
+        [ -n "$restart" ] && info "  new programs only:  coder restart <workspace> --yes"
         return
     fi
-    warn "Running workspaces still use the old programs: ${names}"
-    if [[ ! "$(ask 'Restart them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
-        info "Restart them later with:  coder restart <workspace> --yes"
+    warn "Running workspaces still use the old version: $(tr '\n' ' ' <<<"$update $restart")"
+    if [[ ! "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
+        [ -n "$update" ] && info "Later, for new templates:  coder update <workspace>"
+        [ -n "$restart" ] && info "Later, for new programs:  coder restart <workspace> --yes"
         return
     fi
-    for ws in $STALE_WORKSPACES; do
+    for ws in $update; do
         if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
-            coder restart "$ws" --yes >>"$LOG_FILE" 2>&1; then
-            ok "restarted ${ws}"
+            coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
+            ok "updated ${ws} to the new templates"
+        else
+            warn "could not update ${ws} — see ${LOG_FILE}"
+        fi
+    done
+    for ws in $restart; do
+        if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+            coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
+            ok "restarted ${ws} with the new programs"
         else
             warn "could not restart ${ws} — see ${LOG_FILE}"
         fi
@@ -909,7 +937,7 @@ stage_bootstrap() {
         run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
         env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(image_ref)"
         env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
-        STALE_WORKSPACES="$(running_workspaces)"
+        PROGRAMS_REPLACED="$(openflows_workspaces | awk '$2 == "running" {print $1}')"
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
         return
     fi
@@ -924,7 +952,7 @@ stage_bootstrap() {
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     rm -f "${BIN_DIR}/IMAGE"
-    STALE_WORKSPACES="$(running_workspaces)"
+    PROGRAMS_REPLACED="$(openflows_workspaces | awk '$2 == "running" {print $1}')"
     ok "binaries built, 5 templates pushed"
 }
 
@@ -1101,10 +1129,10 @@ main() {
     stage_docker
     stage_coder_token
     stage_llm
-    STALE_WORKSPACES=""
+    PROGRAMS_REPLACED=""
     stage_bootstrap
     stage_tenant
-    offer_restart
+    offer_update
 
     close_step
     printf '\n'

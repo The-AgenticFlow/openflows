@@ -32,7 +32,7 @@ trap 'rm -f "${NOTES_FILE}"' EXIT
 
 # Callers serialize writes per release (a shared `release-notes-<version>`
 # concurrency group), so a read-modify-write here cannot drop another image's line.
-# Rerunning replaces this image's previous line instead of adding a second one.
+# Rerunning replaces this image's previous line in place; every other line is kept.
 # shellcheck disable=SC2016 # Python source; the backticks are literal Markdown.
 gh release view "${TAG}" --repo "${REPO}" --json body --jq '.body // ""' |
     python3 -c '
@@ -40,17 +40,27 @@ import sys
 image, line = sys.argv[1], sys.argv[2]
 header = "### Docker images"
 intro = "Pin a Compose install to an exact image with `OPENFLOWS_IMAGE_DIGEST`."
-body = sys.stdin.read().rstrip()
-head, _, after = body.partition(header)
-# The section ends at the next heading; anything after it is kept unchanged.
-lines = after.splitlines()
-end = next((i for i, l in enumerate(lines) if i > 0 and l.startswith("#")), len(lines))
-section, rest = lines[:end], "\n".join(lines[end:]).strip()
-entries = [l for l in section
-           if l.startswith("- `") and not l.startswith(f"- `{image}:")]
-entries.append(line)
-parts = [head.rstrip(), "\n".join([header, "", intro, "", *sorted(entries)]), rest]
-print("\n\n".join(p for p in parts if p))
+lines = sys.stdin.read().rstrip().splitlines()
+if header not in lines:
+    print("\n".join([*lines, *([""] if lines else []), header, "", intro, "", line]))
+    sys.exit()
+start = lines.index(header) + 1
+end = next((i for i in range(start, len(lines)) if lines[i].startswith("#")), len(lines))
+mine = [i for i in range(start, end) if lines[i].startswith(f"- `{image}:")]
+if mine:
+    lines[mine[0]] = line
+    for i in reversed(mine[1:]):
+        del lines[i]
+else:
+    entries = [i for i in range(start, end) if lines[i].startswith("- `")]
+    intros = [i for i in range(start, end) if lines[i] == intro]
+    if entries:
+        lines.insert(entries[-1] + 1, line)
+    elif intros:
+        lines[intros[0] + 1:intros[0] + 1] = ["", line]
+    else:
+        lines[start:start] = ["", intro, "", line]
+print("\n".join(lines))
 ' "${IMAGE}" "${LINE}" >"${NOTES_FILE}"
 
 gh release edit "${TAG}" --repo "${REPO}" --notes-file "${NOTES_FILE}" >/dev/null

@@ -260,9 +260,9 @@ cat .dev-binaries/IMAGE
    OPENFLOWS_IMAGE_DIGEST=
    ```
 3. Re-run `./scripts/setup.sh`. It pulls that version, pins its digest, copies the programs and pushes the templates.
-4. Restart the workspaces. Each one copies the programs when it starts, so running workspaces keep the old version until restarted. Setup lists them and offers to restart them (default: no, since a restart briefly pauses work in progress). To do it later:
+4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress) and lists stopped ones that need an update. To do it later:
    ```bash
-   coder restart openflows-nexus-<tenant> --yes
+   coder update openflows-nexus-<tenant>
    ```
 
 Rolling back is the same with an older version.
@@ -273,7 +273,7 @@ The workspace templates are built into the `openflows` program, so the image's p
 
 ### Switching between source and compose
 
-Run setup with the other flag. `--source` rebuilds the programs from the checkout and replaces the ones copied from an image; `--compose` replaces compiled programs with the image's. Accept setup's offer to restart the workspaces, or restart them afterwards.
+Run setup with the other flag. `--source` rebuilds the programs from the checkout and replaces the ones copied from an image; `--compose` replaces compiled programs with the image's. Accept setup's offer to update the workspaces, or run `coder update <workspace>` afterwards.
 
 ### Host requirements
 
