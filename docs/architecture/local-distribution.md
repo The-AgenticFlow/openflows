@@ -71,9 +71,10 @@ mode is unset (installs from before #493), setup picks `self-managed` for compos
   setup. Workspaces keep their template version until updated. Setup moves
   stopped workspaces to the new templates right away (they stay stopped) and
   offers `coder update` for running workspaces with new templates and a restart
-  for the others (default no, since it pauses work in progress). Until every
-  workspace is updated, setup reports the upgrade as not complete and offers the
-  rest again on each run.
+  for the others (default no, since it pauses work in progress;
+  `--update-workspaces` skips the question). Setup waits for each build. Until
+  every workspace is updated, setup reports the upgrade as not complete, exits
+  with status 3 and offers the rest again on each run.
 
 ## Valid and invalid configurations
 

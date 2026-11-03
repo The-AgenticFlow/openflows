@@ -65,7 +65,7 @@ OPENFLOWS_VERSION=1.8.1
 OPENFLOWS_IMAGE_DIGEST=
 ```
 
-Your stack and workspaces must be running when you re-run setup. At the end, setup updates stopped workspaces and offers to update the running ones so they load the new templates and programs. If you skip that, setup reports **Upgrade not complete** and offers again on the next run (or: `coder update <workspace>`). Details: [upgrade and rollback](docs/setup-reference.md#upgrade-and-rollback).
+Your stack and workspaces must be running when you re-run setup. At the end, setup updates stopped workspaces and offers to update the running ones so they load the new templates and programs. If you skip that, setup reports **Upgrade not complete** (exit status 3) and offers again on the next run. From a script, add `--update-workspaces` to update them without asking. Details: [upgrade and rollback](docs/setup-reference.md#upgrade-and-rollback).
 
 ## Testing the Manager's organization provisioning locally
 

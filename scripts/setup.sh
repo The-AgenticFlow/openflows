@@ -2,11 +2,15 @@
 # OpenFlows one-command setup.
 #
 #   ./scripts/setup.sh [owner/repo] [--source | --compose] [--name TEAM] [--fleet N]
+#                      [--update-workspaces]
 #
 #   --source   compile OpenFlows from this checkout (default; needs Rust)
 #   --compose  use the published images, no compiling (Linux hosts);
 #              OPENFLOWS_VERSION in .env picks the version (empty = latest release)
+#   --update-workspaces  after an upgrade, update running workspaces without asking
 #   N = FORGE-SENTINEL pairs; asked when omitted
+#
+# Exit status: 0 done, 3 upgrade not complete (workspaces still on the old version), else failed.
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
@@ -37,6 +41,7 @@ LOG_FILE="${ROOT}/.setup.log"
 START_TIME=$SECONDS
 RAIL_OPEN=0
 UPGRADE_PENDING=""
+UPDATE_WORKSPACES=0
 STEP_START=0
 PW=66   # panel inner width
 
@@ -585,16 +590,33 @@ stage_github_app() {
     fi
 }
 
+# compose_base_files — "-f FILE" for each Compose file this project normally uses. Passing
+# any -f stops Compose from reading COMPOSE_FILE and docker-compose.override.yml on its own,
+# so they are added back here before setup's own files. Prints one argument per line.
+compose_base_files() {
+    local files="${COMPOSE_FILE:-$(env_get COMPOSE_FILE)}" f
+    if [ -z "$files" ]; then
+        files=docker-compose.yml
+        for f in docker-compose.override.yml docker-compose.override.yaml; do
+            if [ -f "${ROOT}/${f}" ]; then files+=":${f}"; break; fi
+        done
+    fi
+    tr "${COMPOSE_PATH_SEPARATOR:-:}" '\n' <<<"$files" | awk 'NF {print "-f"; print}'
+}
+
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
 stage_docker() {
     step "Starting Redis + Coder"
     local out i args=()
     # connected-local adds the local Manager; the images file copies the programs into
-    # .dev-binaries before Coder starts. Without either, run plain `docker compose` so
-    # Compose keeps picking up docker-compose.override.yml or COMPOSE_FILE.
+    # .dev-binaries before Coder starts. Without either, run plain `docker compose`.
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
     [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
-    [ "${#args[@]}" -gt 0 ] && args=(-f docker-compose.yml "${args[@]}")
+    if [ "${#args[@]}" -gt 0 ]; then
+        local base=() line
+        while IFS= read -r line; do base+=("$line"); done < <(compose_base_files)
+        args=("${base[@]}" "${args[@]}")
+    fi
     args+=(up -d)
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
     # Compose prefers shell variables over .env; pass the image from .env so a leftover
@@ -886,25 +908,43 @@ for w in json.load(sys.stdin).get("workspaces") or []:
 }
 
 # mark_pending_restart — add the running workspaces to OPENFLOWS_SETUP_PENDING_RESTART
-# (comma-separated: .env is sourced by prod.sh)
+# (comma-separated: .env is sourced by prod.sh). When Coder doesn't answer it saves "*":
+# every running workspace then needs a restart, since the programs were replaced anyway.
 mark_pending_restart() {
-    local names
-    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; { openflows_workspaces || true; } | awk '$2 == "running" {print $1}'; } \
+    local names running
+    running="$(openflows_workspaces)" && running="$(awk '$2 == "running" {print $1}' <<<"$running")" || running="*"
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; printf '%s\n' "$running"; } \
         | awk 'NF && !seen[$1]++' | paste -sd, -)"
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
+}
+
+# wait_build BUILD_ID — wait until a workspace build finishes; succeeds only if it succeeded.
+# Times out after OPENFLOWS_SETUP_BUILD_TIMEOUT seconds (default 600).
+wait_build() {
+    local id="$1" deadline=$((SECONDS + ${OPENFLOWS_SETUP_BUILD_TIMEOUT:-600})) status
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        status="$(api GET "/api/v2/workspacebuilds/${id}" 2>/dev/null | json job.status)"
+        case "$status" in
+            succeeded) return 0 ;;
+            failed|canceled|canceling) return 1 ;;
+        esac
+        sleep 3
+    done
+    return 1
 }
 
 # update_stopped — move stopped outdated workspaces to the active template version with a
 # stop build, so they stay stopped (`coder update` would start them)
 update_stopped() {
-    local name status outdated id version
+    local name status outdated id version build
     while read -r name status outdated id version; do
         if [ "$status" != stopped ] || [ "$outdated" != yes ]; then continue; fi
-        if api POST "/api/v2/workspaces/${id}/builds" \
-            "{\"transition\":\"stop\",\"template_version_id\":\"${version}\"}" >>"$LOG_FILE" 2>&1; then
+        if build="$(api POST "/api/v2/workspaces/${id}/builds" \
+                "{\"transition\":\"stop\",\"template_version_id\":\"${version}\"}" 2>>"$LOG_FILE" | json id)" \
+            && [ -n "$build" ] && wait_build "$build"; then
             ok "updated ${name} to the new templates (still stopped)"
         else
-            warn "could not update ${name} — see ${LOG_FILE}"
+            warn "could not update ${name} — see Build History in the Coder dashboard"
         fi
     done <<<"$(openflows_workspaces || true)"
 }
@@ -913,9 +953,10 @@ update_stopped() {
 # it) and copies the programs only when it starts. Bootstrap pushes a new template version only
 # when a template changed, and saves the workspaces running when it replaced the programs
 # (OPENFLOWS_SETUP_PENDING_RESTART). Stopped workspaces are updated right away; running ones
-# are updated (outdated) or restarted (programs only) once the user agrees, since that pauses
-# their work. Whatever is left stays pending — outdated in Coder, restarts in .env — and is
-# offered again on the next run; UPGRADE_PENDING tells main the upgrade is not complete.
+# are updated (outdated) or restarted (programs only) with --update-workspaces or once the user
+# agrees, since that pauses their work. Whatever is left stays pending — outdated or failed in
+# Coder, restarts in .env — and is offered again on the next run; UPGRADE_PENDING tells main
+# the upgrade is not complete.
 offer_update() {
     local all update restart ws
     update_stopped
@@ -926,12 +967,13 @@ offer_update() {
     fi
     update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
     restart="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
-        $2 == "running" && $3 == "no" && ($1 in was) {print $1}' <<<"$all")"
+        $2 == "running" && $3 == "no" && (($1 in was) || ("*" in was)) {print $1}' <<<"$all")"
     # Stopped or deleted workspaces copy the new programs when they next start.
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$(paste -sd, - <<<"$restart")"
     if [ -n "$update$restart" ]; then
         warn "Running workspaces still use the old version: $(printf '%s\n' "$update" "$restart" | awk NF | paste -sd' ' -)"
-        if is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; then
+        if [ "$UPDATE_WORKSPACES" = 1 ] || \
+           { is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; }; then
             for ws in $update; do
                 if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
                     coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
@@ -950,15 +992,17 @@ offer_update() {
                     warn "could not restart ${ws} — see ${LOG_FILE}"
                 fi
             done
+        elif ! is_tty; then
+            info "Not updated: no terminal to ask. Pass --update-workspaces to update them automatically."
         fi
     fi
-    # Includes outdated workspaces that were starting, stopping or failed, so not updated above.
     if ! all="$(openflows_workspaces)"; then
         UPGRADE_PENDING="(not checked — Coder did not answer)"
         return 0
     fi
-    UPGRADE_PENDING="$( { awk '$3 == "yes" {print $1}' <<<"$all"; env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } \
-        | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
+    # Outdated, failed or still building (a failed or timed-out update leaves one of these).
+    UPGRADE_PENDING="$( { awk '$3 == "yes" || ($2 != "running" && $2 != "stopped") {print $1}' <<<"$all"
+        env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
     return 0
 }
 
@@ -1099,7 +1143,8 @@ main() {
                 MODE="${1#--}"; shift ;;
             --name) NAME="${2:?--name needs a value}"; shift 2 ;;
             --fleet) FLEET="${2:?--fleet needs a value}"; shift 2 ;;
-            -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            --update-workspaces) UPDATE_WORKSPACES=1; shift ;;
+            -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
             -*) die "Unknown option: $1" ;;
             *) REPO="$1"; shift ;;
         esac
@@ -1181,11 +1226,12 @@ main() {
         panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
             "These workspaces still use the old version:" \
             "  ${UPGRADE_PENDING}" "" \
-            "Re-run ./scripts/setup.sh to update them, or per workspace:" \
+            "Re-run ./scripts/setup.sh (add --update-workspaces to skip the" \
+            "question), or per workspace:" \
             "  coder update <workspace>         (new templates)" \
             "  coder restart <workspace> --yes  (new programs)" ""
         printf '\n'
-        return 0
+        exit 3
     fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \

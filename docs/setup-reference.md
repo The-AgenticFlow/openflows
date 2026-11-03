@@ -222,7 +222,7 @@ In a separate terminal:
 `./scripts/setup.sh owner/repo --compose` installs OpenFlows without Rust or compiling. Every step above stays the same except where the programs come from:
 
 1. Setup picks the version (`OPENFLOWS_VERSION`, or the latest release when empty), pulls `ghcr.io/the-agenticflow/openflows:<version>` and saves the image's digest in `.env`.
-2. Setup starts the stack with `docker-compose.images.yml` added (`docker compose -f docker-compose.yml -f docker-compose.images.yml up -d`), whose `openflows-binaries` service which copies `openflows`, `openflows-doctor` and `openflows-harness` from the image into `.dev-binaries/` (owned by your user) and records the exact image in `.dev-binaries/IMAGE`.
+2. Setup starts the stack with `docker-compose.images.yml` added on top of your usual Compose files (`COMPOSE_FILE`, or `docker-compose.yml` plus `docker-compose.override.yml` when present, so your own ports, mounts and storage settings stay). Its `openflows-binaries` service copies `openflows`, `openflows-doctor` and `openflows-harness` from the image into `.dev-binaries/` (owned by your user) and records the exact image in `.dev-binaries/IMAGE`.
 3. Bootstrap pushes the templates without building (`prod.sh --skip-build bootstrap`), and the workspaces load the programs from `.dev-binaries/` as they do for a source install.
 
 Setup remembers the mode in `.env`, so later runs without a flag keep using the images.
@@ -260,7 +260,7 @@ cat .dev-binaries/IMAGE
    OPENFLOWS_IMAGE_DIGEST=
    ```
 3. Re-run `./scripts/setup.sh`. It pulls that version, pins its digest, copies the programs and pushes the templates.
-4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup updates stopped workspaces right away (they stay stopped) and offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress). Until all are done, setup ends with **Upgrade not complete** and offers them again on the next run. To do it yourself:
+4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup updates stopped workspaces right away (they stay stopped) and offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress). `--update-workspaces` does it without asking, which is how to finish an upgrade from a script or CI. Setup waits for each build; until every workspace is updated, it ends with **Upgrade not complete**, exits with status `3` and offers the rest again on the next run. To do it yourself:
    ```bash
    coder update openflows-nexus-<tenant>
    ```
