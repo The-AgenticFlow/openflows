@@ -595,13 +595,15 @@ stage_github_app() {
 # so they are added back here before setup's own files. Prints one argument per line.
 compose_base_files() {
     local files="${COMPOSE_FILE:-$(env_get COMPOSE_FILE)}" f
-    if [ -z "$files" ]; then
-        files=docker-compose.yml
-        for f in docker-compose.override.yml docker-compose.override.yaml; do
-            if [ -f "${ROOT}/${f}" ]; then files+=":${f}"; break; fi
-        done
+    local sep="${COMPOSE_PATH_SEPARATOR:-$(env_get COMPOSE_PATH_SEPARATOR)}"
+    if [ -n "$files" ]; then
+        tr "${sep:-:}" '\n' <<<"$files" | awk 'NF {print "-f"; print}'
+        return
     fi
-    tr "${COMPOSE_PATH_SEPARATOR:-:}" '\n' <<<"$files" | awk 'NF {print "-f"; print}'
+    printf '%s\n' -f docker-compose.yml
+    for f in docker-compose.override.yml docker-compose.override.yaml; do
+        if [ -f "${ROOT}/${f}" ]; then printf '%s\n' -f "$f"; break; fi
+    done
 }
 
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
