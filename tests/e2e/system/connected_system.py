@@ -317,7 +317,7 @@ def run():
         for ws in bootstrap.coder('/workspaces')['workspaces']:
             if ws['id'] == workspace['id']:
                 continue
-            name = 'ci/' + ws['name']
+            name = ws['owner_name'] + '/' + ws['name']
             if 'forge' in ws['name']:
                 (ARTIFACTS / 'forge-verify.log').write_text(bootstrap.ssh(name,
                     'cat /home/coder/.local/state/openflows/verify.log'))

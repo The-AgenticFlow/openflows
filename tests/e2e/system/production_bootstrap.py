@@ -16,6 +16,7 @@ ARTIFACTS = Path(os.environ['OPENFLOWS_E2E_ARTIFACTS'])
 CODER = os.environ['CODER_URL']
 TENANT = os.environ['OPENFLOWS_E2E_TENANT']
 TOKEN = None
+TENANT_LINKED = False  # The link persists across `tenant add` retries.
 
 
 def request(base, path, body=None, token=None, coder=False):
@@ -85,6 +86,50 @@ def wait_for_chat(chat_id, seconds=180):
         save_chat_diagnostics(chat_id)
 
 
+def link_github(token):
+    """Link the `primary-github` external auth for the user behind `token`."""
+    def call(path, body=None):
+        return request(CODER, '/api/v2' + path, body, token, coder=True)
+    device = call('/external-auth/primary-github/device')
+    request(os.environ['OPENFLOWS_E2E_OAUTH_URL'], '/approve',
+        {'user_code': device['user_code']}, 'ci-operator-token')
+    call('/external-auth/primary-github/device', {'device_code': device['device_code']})
+    assert call('/external-auth/primary-github')['authenticated'] is True
+
+
+def link_tenant_github():
+    """Once `tenant add` has created the tenant's own Coder user, link GitHub as
+    that tenant. Each tenant links its own account; the operator's link is not
+    shared. Returns False while the tenant user does not exist yet."""
+    users = coder('/users')['users']
+    tenant = next((u for u in users if u['username'] != 'ci'
+        and u['email'].endswith('@openflows.local')), None)
+    if tenant is None:
+        return False
+    key = coder('/users/' + tenant['id'] + '/keys/tokens',
+        {'token_name': 'e2e-github-link', 'lifetime': 3600 * 10**9})['key']
+    link_github(key)
+    print(f"Tenant Coder user '{tenant['username']}' linked its own GitHub account.", flush=True)
+    return True
+
+
+def run_tenant_add(log):
+    """Run `openflows tenant add`, linking the tenant's GitHub account while the
+    CLI waits for it. Returns the CLI exit code."""
+    proc = subprocess.Popen(['openflows', 'tenant', 'add', 'test/repo', '--name', TENANT, '--fleet', '1'],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    global TENANT_LINKED
+    deadline = time.monotonic() + 600
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            proc.kill()
+            raise TimeoutError('openflows tenant add did not finish')
+        if not TENANT_LINKED:
+            TENANT_LINKED = link_tenant_github()
+        time.sleep(2)
+    return proc.returncode
+
+
 def setup_tenant(model_name='bootstrap-canary'):
     global TOKEN
     def server_ready():
@@ -98,11 +143,7 @@ def setup_tenant(model_name='bootstrap-canary'):
     coder('/users/first', credentials)  # Fails if this is an existing deployment.
     TOKEN = coder('/users/login', credentials)['session_token']
     os.environ['CODER_SESSION_TOKEN'] = TOKEN
-    device = coder('/external-auth/primary-github/device')
-    request(os.environ['OPENFLOWS_E2E_OAUTH_URL'], '/approve',
-        {'user_code': device['user_code']}, 'ci-operator-token')
-    coder('/external-auth/primary-github/device', {'device_code': device['device_code']})
-    assert coder('/external-auth/primary-github')['authenticated'] is True
+    link_github(TOKEN)
     print('Disposable Coder account linked through approved device flow.', flush=True)
     provider = coder('/ai/providers', {'type': 'openai-compat', 'name': 'ci-model',
         'base_url': 'http://model:8080/v1', 'enabled': True, 'api_keys': ['ci-model-key']})
@@ -113,13 +154,12 @@ def setup_tenant(model_name='bootstrap-canary'):
     with (ARTIFACTS / 'tenant-add.log').open('w') as log:
         print('Running the public tenant CLI with production templates.', flush=True)
         for attempt in range(1, 4):
-            res = subprocess.run(['openflows', 'tenant', 'add', 'test/repo', '--name', TENANT, '--fleet', '1'],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=600)
-            if res.returncode == 0:
+            returncode = run_tenant_add(log)
+            if returncode == 0:
                 break
             if attempt == 3:
-                res.check_returncode()
-            print(f'openflows tenant add attempt {attempt} exited with {res.returncode}; retrying after transient error...', flush=True)
+                raise subprocess.CalledProcessError(returncode, ['openflows', 'tenant', 'add'])
+            print(f'openflows tenant add attempt {attempt} exited with {returncode}; retrying after transient error...', flush=True)
             time.sleep(5)
     templates = coder('/organizations/' + organization['id'] + '/templates')
     assert {t['name'] for t in templates} == {
@@ -129,7 +169,8 @@ def setup_tenant(model_name='bootstrap-canary'):
     fleet = json.loads(parameters['registry_json'])
     assert {a['id']: a['max_instances'] for a in fleet['team'] if a['id'] in ('forge', 'sentinel')} == {'forge': 1, 'sentinel': 1}
     assert parameters['start_controller'] == 'true'
-    name = 'ci/' + workspace['name']
+    # The Nexus workspace belongs to the tenant's own Coder user, not `ci`.
+    name = workspace['owner_name'] + '/' + workspace['name']
     def ready():
         try:
             return ssh(name, "set -eu; curl -fsS http://localhost:3001/experimental/hooks/health; test -d .git; test \"$(cat answer.txt)\" = 41")

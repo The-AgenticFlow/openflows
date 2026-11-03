@@ -1,3 +1,4 @@
 [default.extend-words]
 gitar = "gitar"
-elete = "delete"
+# Guard tests split shell words on purpose (`coder d"elete" ws`).
+elete = "elete"
