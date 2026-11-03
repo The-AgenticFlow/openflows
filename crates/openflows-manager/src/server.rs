@@ -898,7 +898,6 @@ pub struct AppState {
     /// configured. `None` in pure-local test mode.
     services: Option<Arc<ManagerServices>>,
     local_github: Option<Arc<crate::auth::local_credentials::LocalCredentials>>,
-    local_broker_key: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -946,23 +945,22 @@ impl AppState {
             store: store.clone(),
         });
 
-        let (local_github, local_broker_key) =
-            if config.mode == crate::config::Mode::Local && config.connected_local_enabled {
-                let github = Arc::new(
-                    crate::auth::local_github::LocalGithubAuth::new(config.auth.client_id.clone())?
-                        .with_api_base(config.auth.github_api_base.clone()),
-                );
-                let credentials = crate::auth::local_credentials::LocalCredentials::new(
-                    crate::auth::local_credentials::credential_path_from_env()?,
-                    github,
-                )?;
-                (
-                    Some(Arc::new(credentials)),
-                    Some(Arc::new(crate::auth::local_credentials::read_broker_key()?)),
-                )
-            } else {
-                (None, None)
-            };
+        let local_github = if config.mode == crate::config::Mode::Local
+            && config.connected_local_enabled
+            && !config.auth.client_id.trim().is_empty()
+        {
+            let github = Arc::new(
+                crate::auth::local_github::LocalGithubAuth::new(config.auth.client_id.clone())?
+                    .with_api_base(config.auth.github_api_base.clone()),
+            );
+            let credentials = crate::auth::local_credentials::LocalCredentials::new(
+                crate::auth::local_credentials::credential_path_from_env()?,
+                github,
+            )?;
+            Some(Arc::new(credentials))
+        } else {
+            None
+        };
 
         Ok(Self {
             store,
@@ -970,7 +968,6 @@ impl AppState {
             config,
             services,
             local_github,
-            local_broker_key,
         })
     }
 
@@ -989,8 +986,32 @@ impl AppState {
             config,
             services: None,
             local_github: None,
-            local_broker_key: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_local_github_for_tests(
+        store: SharedStore,
+        credential_path: std::path::PathBuf,
+        github: Arc<crate::auth::local_github::LocalGithubAuth>,
+        app_slug: &str,
+    ) -> Result<Self, ManagerError> {
+        let readiness = Arc::new(StoreReadiness {
+            store: store.clone(),
+        });
+        let mut config = crate::config::local_test_config();
+        config.connected_local_enabled = true;
+        config.auth.client_id = "test-public-client-id".into();
+        config.github_app.app_slug = Some(app_slug.into());
+        Ok(Self {
+            store,
+            readiness,
+            config,
+            services: None,
+            local_github: Some(Arc::new(
+                crate::auth::local_credentials::LocalCredentials::new(credential_path, github)?,
+            )),
+        })
     }
 
     pub fn with_readiness_check(store: SharedStore, readiness: Arc<dyn ReadinessCheck>) -> Self {
@@ -1000,7 +1021,6 @@ impl AppState {
             config: crate::config::local_test_config(),
             services: None,
             local_github: None,
-            local_broker_key: None,
         }
     }
 
@@ -1018,7 +1038,6 @@ impl AppState {
             config,
             services: Some(Arc::new(services)),
             local_github: None,
-            local_broker_key: None,
         }
     }
 
@@ -1034,14 +1053,18 @@ impl AppState {
         self.local_github.as_ref()
     }
 
-    pub fn local_broker_key(&self) -> Option<&str> {
-        self.local_broker_key.as_deref().map(String::as_str)
-    }
-
     pub fn local_github_client_id(&self) -> Option<&str> {
         self.local_github
             .as_ref()
             .map(|_| self.config.auth.client_id.as_str())
+    }
+
+    pub fn connected_local_enabled(&self) -> bool {
+        self.config.mode == crate::config::Mode::Local && self.config.connected_local_enabled
+    }
+
+    pub fn local_github_app_slug(&self) -> Option<&str> {
+        self.config.github_app.app_slug.as_deref()
     }
 
     pub fn github_api_base(&self) -> &str {

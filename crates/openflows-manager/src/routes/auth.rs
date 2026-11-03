@@ -267,6 +267,14 @@ pub async fn github_start(
     headers: HeaderMap,
     Query(q): Query<LoginQuery>,
 ) -> Result<Response, ManagerError> {
+    if state.connected_local_enabled() {
+        let next =
+            crate::auth::oauth::safe_redirect_target(q.next.as_deref().unwrap_or("/api/v1/me"))?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("next", &next)
+            .finish();
+        return Ok(Redirect::temporary(&format!("/?{query}")).into_response());
+    }
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
