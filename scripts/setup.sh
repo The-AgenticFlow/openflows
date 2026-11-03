@@ -909,15 +909,22 @@ for w in json.load(sys.stdin).get("workspaces") or []:
               w["id"], w["template_active_version_id"])' <<<"$body" 2>/dev/null
 }
 
-# mark_pending_restart — add the running workspaces to OPENFLOWS_SETUP_PENDING_RESTART
-# (comma-separated: .env is sourced by prod.sh). When Coder doesn't answer it saves "*":
-# every running workspace then needs a restart, since the programs were replaced anyway.
+# mark_pending_restart — add every workspace that isn't stopped to OPENFLOWS_SETUP_PENDING_RESTART
+# (comma-separated: .env is sourced by prod.sh): one that is starting may already have copied the
+# old programs. When Coder doesn't answer it saves "*": every workspace not stopped then needs a
+# restart, since the programs were replaced anyway.
 mark_pending_restart() {
-    local names running
-    running="$(openflows_workspaces)" && running="$(awk '$2 == "running" {print $1}' <<<"$running")" || running="*"
-    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; printf '%s\n' "$running"; } \
+    local names active
+    active="$(openflows_workspaces)" && active="$(awk '$2 != "stopped" {print $1}' <<<"$active")" || active="*"
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; printf '%s\n' "$active"; } \
         | awk 'NF && !seen[$1]++' | paste -sd, -)"
     env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
+}
+
+# unmark_pending_restart NAME — drop a workspace that restarted with the new programs.
+unmark_pending_restart() {
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(env_get OPENFLOWS_SETUP_PENDING_RESTART \
+        | WS="$1" awk -v RS=, -v ORS=, 'NF && $1 != ENVIRON["WS"]' | sed 's/,$//')"
 }
 
 # wait_build BUILD_ID — wait until a workspace build finishes; succeeds only if it succeeded.
@@ -953,14 +960,14 @@ update_stopped() {
 
 # offer_update — a workspace keeps its template version until it is updated (a restart reuses
 # it) and copies the programs only when it starts. Bootstrap pushes a new template version only
-# when a template changed, and saves the workspaces running when it replaced the programs
+# when a template changed, and saves the workspaces not stopped when it replaced the programs
 # (OPENFLOWS_SETUP_PENDING_RESTART). Stopped workspaces are updated right away; running ones
 # are updated (outdated) or restarted (programs only) with --update-workspaces or once the user
 # agrees, since that pauses their work. Whatever is left stays pending — outdated or failed in
 # Coder, restarts in .env — and is offered again on the next run; UPGRADE_PENDING tells main
 # the upgrade is not complete.
 offer_update() {
-    local all update restart ws
+    local all update restart pending ws
     update_stopped
     if ! all="$(openflows_workspaces)"; then
         warn "Could not check the workspaces: Coder did not answer"
@@ -968,10 +975,12 @@ offer_update() {
         return 0
     fi
     update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
-    restart="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
-        $2 == "running" && $3 == "no" && (($1 in was) || ("*" in was)) {print $1}' <<<"$all")"
-    # Stopped or deleted workspaces copy the new programs when they next start.
-    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(paste -sd, - <<<"$restart")"
+    # Stopped or deleted workspaces copy the new programs when they next start; the others
+    # (running or still starting/stopping) stay pending until they restart.
+    pending="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
+        (($1 in was) || ("*" in was)) && $2 != "stopped" && $2 != "deleted" {print $1, $2, $3}' <<<"$all")"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(awk '{print $1}' <<<"$pending" | paste -sd, -)"
+    restart="$(awk '$2 == "running" && $3 == "no" {print $1}' <<<"$pending")"
     if [ -n "$update$restart" ]; then
         warn "Running workspaces still use the old version: $(printf '%s\n' "$update" "$restart" | awk NF | paste -sd' ' -)"
         if [ "$UPDATE_WORKSPACES" = 1 ] || \
@@ -980,6 +989,7 @@ offer_update() {
                 if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
                     coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
                     ok "updated ${ws} to the new templates"
+                    unmark_pending_restart "$ws"
                 else
                     warn "could not update ${ws} — see ${LOG_FILE}"
                 fi
@@ -988,8 +998,7 @@ offer_update() {
                 if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
                     coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
                     ok "restarted ${ws} with the new programs"
-                    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(env_get OPENFLOWS_SETUP_PENDING_RESTART \
-                        | WS="$ws" awk -v RS=, -v ORS=, 'NF && $1 != ENVIRON["WS"]' | sed 's/,$//')"
+                    unmark_pending_restart "$ws"
                 else
                     warn "could not restart ${ws} — see ${LOG_FILE}"
                 fi
