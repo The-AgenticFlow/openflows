@@ -227,7 +227,7 @@ In a separate terminal:
 
 Setup remembers the mode in `.env`, so later runs without a flag keep using the images.
 
-Compose installs use your own GitHub App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`, the steps above). The team's shared App (`connected-local`) still builds and runs the local Manager from source, so it needs Rust and is not available with `--compose` yet. `.env.example` sets `connected-local`, so before the first `--compose` run, create `.env` from it and set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`:
+Compose installs use your own GitHub App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`, the steps above). The team's shared App (`connected-local`) still compiles the local Manager from source (`docker compose --build`), so it is not available with `--compose` yet. `.env.example` sets `connected-local`, so before the first `--compose` run, create `.env` from it and set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`:
 
 ```bash
 cp .env.example .env
@@ -489,7 +489,7 @@ The image's programs are copied as `OPENFLOWS_HOST_UID:OPENFLOWS_HOST_GID` (1000
 
 ### "The shared OpenFlows GitHub App (connected-local) does not work with --compose yet"
 
-`.env` has `OPENFLOWS_GITHUB_AUTH_MODE=connected-local`, which needs Rust today. Set it to `self-managed` to use your own App, or install with `--source`.
+`.env` has `OPENFLOWS_GITHUB_AUTH_MODE=connected-local`, which still compiles the local Manager. Set it to `self-managed` to use your own App, or install with `--source`.
 
 ### "--compose currently needs a Linux host" / "an x86-64 (amd64) host" / "glibc 2.34 or newer"
 

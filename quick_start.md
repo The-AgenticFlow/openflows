@@ -64,7 +64,7 @@ It will:
 3. With `--compose`: pick the OpenFlows version and pin its image digest in `.env`.
 4. Set up GitHub access:
    - `--source`: open the local OpenFlows console, install the team-owned **OpenFlows GitHub App** on a repository, authorize your GitHub account using its device code, then choose that repository. No personal App, App secret, client ID, or App slug is needed.
-   - `--compose`: create **your own GitHub App** — your browser opens, you click **Create GitHub App**, then install it on your repo. (The shared App still needs Rust, so it does not work with `--compose` yet.)
+   - `--compose`: create **your own GitHub App** — your browser opens, you click **Create GitHub App**, then install it on your repo. (The shared App still compiles the local Manager, so it does not work with `--compose` yet.)
 5. Start Redis and Coder in Docker (plus the local Manager when using the shared App).
 6. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
 7. Add your **LLM** provider and model (asks for the API key).

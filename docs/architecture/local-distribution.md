@@ -51,9 +51,9 @@ bootstrap. The open items below list two ways to lift this.
 | Shared | `connected-local` | The OpenFlows team's App; no App secret on the user's machine | Default | Not yet |
 | Custom | `self-managed` | The user: their own App, credentials only in their `.env` | Explicit choice | Required |
 
-The shared mode currently runs the local Manager from source (`cargo run` for
-the GitHub login, `docker compose --build` for its container), which needs Rust.
-Compose installs therefore need the custom App. `.env.example` sets
+The shared mode runs the GitHub login inside the local Manager container, but
+that container is still compiled from source (`docker compose --build`). Compose
+installs, which compile nothing, therefore need the custom App. `.env.example` sets
 `connected-local`, so compose users set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed`
 in `.env` before the first run (documented in the quick start); setup rejects
 `connected-local` together with `--compose` with a message saying so. When the
@@ -94,9 +94,8 @@ mode is unset (installs from before #493), setup picks `self-managed` for compos
 - **Compose on macOS and ARM64:** run setup's `openflows` commands inside the image
   (`docker run`), which needs the container to reach Coder and the project
   folder; or use macOS release binaries once #484 publishes them.
-- **Shared App with compose:** run the Manager's GitHub login from the published
-  `openflows-manager` image and use that image instead of `--build`, so
-  `connected-local` needs no Rust.
+- **Shared App with compose:** use the published `openflows-manager` image
+  instead of `--build`, so `connected-local` compiles nothing.
 - **Release binaries (#484):** releases are immutable, so binaries must be
   attached to a draft before publishing. `release-assets.yml` has not run since
   v1.2.0, because tags created by the release workflow's `GITHUB_TOKEN` do not

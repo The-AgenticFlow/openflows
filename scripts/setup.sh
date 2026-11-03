@@ -515,8 +515,8 @@ stage_github_app() {
     local auth_mode
     auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     if [ -z "$auth_mode" ]; then
-        # connected-local still builds and runs the Manager from source, so --compose
-        # (no Rust) defaults to the user's own App.
+        # connected-local still compiles the local Manager (docker compose --build), so
+        # --compose (no compiling) defaults to the user's own App.
         if [ "$MODE" = compose ] || { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; }; then
             auth_mode=self-managed
         else
@@ -525,7 +525,7 @@ stage_github_app() {
     fi
     if [ "$auth_mode" = connected-local ] && [ "$MODE" = compose ]; then
         die "The shared OpenFlows GitHub App (connected-local) does not work with --compose yet." \
-            "It still builds the local Manager from source, which needs Rust." \
+            "It still compiles the local Manager from source (docker compose --build)." \
             "Use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env," \
             "or install from source:  ./scripts/setup.sh ${REPO} --source"
     fi
