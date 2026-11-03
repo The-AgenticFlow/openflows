@@ -888,10 +888,17 @@ impl CoderClient {
         // Now that a replacement exists, revoke stale tokens (exact-name or the
         // legacy `name-*` suffix) that are not the token we just minted. Run as
         // the fresh credential so we never revoke the credential in use.
-        let privileged = self.with_token(new_key.key.clone());
-        privileged
-            .revoke_stale_tokens_excluding(user_id, name, Some(&new_key.id))
-            .await;
+        // Without the fresh token's id it cannot be told apart from stale
+        // tokens of the same name, so skip the cleanup rather than risk
+        // revoking the credential just minted.
+        if new_key.id.is_empty() {
+            warn!(key_name = %name, "Could not determine new API token id; skipping stale token cleanup");
+        } else {
+            let privileged = self.with_token(new_key.key.clone());
+            privileged
+                .revoke_stale_tokens_excluding(user_id, name, Some(&new_key.id))
+                .await;
+        }
 
         Ok(new_key)
     }
@@ -2418,11 +2425,21 @@ async fn parse_api_token_response(
         .and_then(|v| v.as_str())
         .context("No 'key' field in API token response")?
         .to_string();
+    // Coder's create-token response carries only `key` (formatted
+    // `<id>-<secret>`), not a separate `id`. Derive the id from the key so the
+    // caller can tell the fresh token apart from stale ones; without it the
+    // stale-token cleanup revokes the token that was just minted.
     let key_id = body
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| {
+            key_value
+                .split_once('-')
+                .map(|(id, _)| id.to_string())
+                .filter(|id| !id.is_empty())
+        })
+        .unwrap_or_default();
     let name_value = body
         .get("token_name")
         .or_else(|| body.get("name"))
@@ -3476,13 +3493,15 @@ mod http_mock {
                     return match method {
                         "GET" => (
                             "200 OK",
-                            r#"[{"id":"tok-1","token_name":"openflows-tenant"},{"id":"tok-2","token_name":"openflows-tenant-deadbeef"}]"#
+                            r#"[{"id":"tok1","token_name":"openflows-tenant"},{"id":"tok2","token_name":"openflows-tenant-deadbeef"},{"id":"toknew1234","token_name":"openflows-tenant"}]"#
                                 .to_string(),
                         ),
+                        // Like real Coder, the create response carries only
+                        // `key` (`<id>-<secret>`), and the listing above already
+                        // includes the freshly minted token.
                         "POST" => (
                             "201 Created",
-                            r#"{"id":"tok-new","key":"sekret-token","token_name":"openflows-tenant"}"#
-                                .to_string(),
+                            r#"{"key":"toknew1234-sekret"}"#.to_string(),
                         ),
                         _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
                     };
@@ -3942,7 +3961,8 @@ mod tests {
             .create_api_token("tenant-1", "openflows-tenant")
             .await
             .expect("create_api_token should converge against mock");
-        assert_eq!(key.key, "sekret-token");
+        assert_eq!(key.key, "toknew1234-sekret");
+        assert_eq!(key.id, "toknew1234");
         assert_eq!(key.name, "openflows-tenant");
 
         let requests = server.requests().await;
@@ -3955,6 +3975,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(deletes.len(), 2, "both stale tokens must be revoked");
+        assert!(
+            deletes
+                .iter()
+                .all(|r| !r.path.ends_with("/keys/toknew1234")),
+            "the freshly minted token must never be revoked"
+        );
 
         let creates = requests
             .iter()
