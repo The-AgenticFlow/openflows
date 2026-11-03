@@ -75,6 +75,7 @@ pub struct TenantDto {
     pub desired_state: String,
     pub observed_state: String,
     pub fleet_size: i32,
+    pub error_code: Option<String>,
 }
 
 /// An operation within its organization (sanitized: no raw upstream bodies).

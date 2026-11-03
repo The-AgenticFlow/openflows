@@ -22,6 +22,7 @@ pub struct TenantRow {
     pub desired_state: String,
     pub observed_state: String,
     pub fleet_size: i32,
+    pub error_code: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -53,8 +54,9 @@ impl TenantsRepository {
     ) -> Result<TenantId, ManagerError> {
         let mut tx = self.pool.begin().await?;
         let id = self
-            .create_in_tx(
+            .create_with_id_in_tx(
                 &mut tx,
+                TenantId::new(),
                 scope,
                 slug,
                 connection_id,
@@ -67,10 +69,36 @@ impl TenantsRepository {
     }
 
     /// Use the caller's transaction so the tenant, operation, audit, outbox,
-    /// and idempotency result commit or roll back together.
+    /// and idempotency result commit or roll back together. The tenant `id` is
+    /// supplied by the caller so it can be referenced by the co-committed
+    /// operation and audit records.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_in_tx(
         &self,
         conn: &mut PgConnection,
+        scope: OrgScope,
+        slug: &str,
+        connection_id: crate::id::ConnectionId,
+        github_repository_id: GithubId,
+        fleet_size: i32,
+    ) -> Result<TenantId, ManagerError> {
+        self.create_with_id_in_tx(
+            conn,
+            TenantId::new(),
+            scope,
+            slug,
+            connection_id,
+            github_repository_id,
+            fleet_size,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_id_in_tx(
+        &self,
+        conn: &mut PgConnection,
+        id: TenantId,
         scope: OrgScope,
         slug: &str,
         connection_id: crate::id::ConnectionId,
@@ -96,7 +124,6 @@ impl TenantsRepository {
             return Err(ManagerError::not_found("repository"));
         }
 
-        let id = TenantId::new();
         let result = sqlx::query(
             "INSERT INTO tenants
                 (id, organization_id, slug, connection_id, github_repository_id, fleet_size, desired_state, observed_state)
@@ -127,7 +154,7 @@ impl TenantsRepository {
     ) -> Result<Option<TenantRow>, ManagerError> {
         let row = sqlx::query_as::<_, TenantRow>(
             "SELECT id, organization_id, slug, github_repository_id, desired_state,
-                    observed_state, fleet_size, created_at
+                    observed_state, fleet_size, error_code, created_at
                FROM tenants
               WHERE id = $1 AND organization_id = $2",
         )
@@ -159,9 +186,10 @@ impl TenantsRepository {
                     .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?;
                 sqlx::query_as::<_, TenantRow>(
                     "SELECT id, organization_id, slug, github_repository_id, desired_state,
-                            observed_state, fleet_size, created_at
+                            observed_state, fleet_size, error_code, created_at
                        FROM tenants
                       WHERE organization_id = $1
+                        AND desired_state <> 'deleted'
                         AND (created_at, id) > ($2, $3)
                       ORDER BY created_at ASC, id ASC
                       LIMIT $4",
@@ -176,9 +204,10 @@ impl TenantsRepository {
             }
             None => sqlx::query_as::<_, TenantRow>(
                 "SELECT id, organization_id, slug, github_repository_id, desired_state,
-                            observed_state, fleet_size, created_at
+                            observed_state, fleet_size, error_code, created_at
                        FROM tenants
                       WHERE organization_id = $1
+                        AND desired_state <> 'deleted'
                       ORDER BY created_at ASC, id ASC
                       LIMIT $2",
             )
@@ -227,7 +256,32 @@ impl TenantsRepository {
             desired_state: row.desired_state.clone(),
             observed_state: row.observed_state.clone(),
             fleet_size: row.fleet_size,
+            error_code: row.error_code.clone(),
         }
+    }
+
+    /// Set a tenant's desired state, scoped. Used by stop/delete requests to
+    /// record the intended lifecycle transition; returns false when the tenant
+    /// is not in scope.
+    pub async fn set_desired_state(
+        &self,
+        scope: OrgScope,
+        id: TenantId,
+        desired_state: &str,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE tenants
+                SET desired_state = $1, updated_at = now()
+              WHERE id = $2 AND organization_id = $3",
+        )
+        .bind(desired_state)
+        .bind(id.0)
+        .bind(scope.organization_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
     }
 }
 

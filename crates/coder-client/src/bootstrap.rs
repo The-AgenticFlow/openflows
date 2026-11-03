@@ -34,8 +34,45 @@ struct TenantProvision {
     hook_url: String,
 }
 
+/// Prefix of the per-tenant Nexus workspace name. `scripts/setup.sh` looks the
+/// workspace up by the same `openflows-nexus-<tenant>` name.
+const NEXUS_WORKSPACE_PREFIX: &str = "openflows-nexus-";
+
+/// Coder rejects workspace names longer than this.
+const CODER_WORKSPACE_NAME_MAX: usize = 32;
+
+/// Longest tenant name whose Nexus workspace name still fits in Coder's limit.
+pub const MAX_TENANT_NAME_LEN: usize = CODER_WORKSPACE_NAME_MAX - NEXUS_WORKSPACE_PREFIX.len();
+
+/// Build the Nexus workspace name for a tenant, checking it against Coder's
+/// workspace name rule (letters, digits and single hyphens, at most 32
+/// characters) so a bad name fails before any Coder call instead of as a
+/// 400 from workspace creation.
+pub fn nexus_workspace_name(tenant_name: &str) -> Result<String> {
+    anyhow::ensure!(
+        tenant_name.len() <= MAX_TENANT_NAME_LEN,
+        "tenant name '{tenant_name}' is {} characters; Coder limits workspace names to {CODER_WORKSPACE_NAME_MAX}, \
+         so with the '{NEXUS_WORKSPACE_PREFIX}' prefix the tenant name can be at most {MAX_TENANT_NAME_LEN}. \
+         Pass a shorter --name",
+        tenant_name.len()
+    );
+    anyhow::ensure!(
+        !tenant_name.is_empty()
+            && tenant_name
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "tenant name '{tenant_name}' is not a valid Coder workspace name: use only ASCII letters, digits and \
+         single hyphens, not starting or ending with a hyphen. Pass a different --name"
+    );
+    Ok(format!("{NEXUS_WORKSPACE_PREFIX}{tenant_name}"))
+}
+
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
+
+fn is_connected_local(auth_mode: Option<&str>, template_mode: Option<&str>) -> bool {
+    auth_mode == Some("connected-local") && template_mode == Some("true")
+}
 
 /// Check whether a password meets Coder's minimum security requirements.
 ///
@@ -301,11 +338,12 @@ impl CoderBootstrapper {
         // 2. Save to file for subsequent process restarts
         std::env::set_var("CODER_SESSION_TOKEN", &session_token);
 
-        if let Ok(home) = std::env::var("HOME") {
-            let session_file = format!("{}/.openflows/coder-session-token", home);
-            if std::fs::create_dir_all(format!("{}/.openflows", home)).is_ok() {
+        if let Ok(tenant) = config::TenantConfig::init_from_env() {
+            let directory = tenant.openflows_home();
+            let session_file = directory.join("coder-session-token");
+            if std::fs::create_dir_all(&directory).is_ok() {
                 let _ = std::fs::write(&session_file, &session_token);
-                info!(session_file = %session_file, "Session token persisted to file");
+                info!(session_file = %session_file.display(), "Session token persisted to file");
             }
         }
 
@@ -503,9 +541,9 @@ impl CoderBootstrapper {
         registry_json: &str,
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
+        let nexus_workspace_name = nexus_workspace_name(tenant_name)?;
 
         let tenant_username = resolve_tenant_username(client, tenant_name).await?;
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
 
         // Resolve the administrator's username up front so the legacy-workspace
         // migration can be evaluated regardless of which owner we find below.
@@ -752,12 +790,14 @@ impl CoderBootstrapper {
         registry_json: &str,
         provision: &TenantProvision,
     ) -> Result<String> {
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
+        let nexus_workspace_name = nexus_workspace_name(tenant_name)?;
         let tenant_client = &provision.tenant_client;
 
-        // Check the tenant user's GitHub external-auth grant until linked. The
-        // device flow / status query runs as the tenant user, so each tenant
-        // links its own GitHub account independently of the admin.
+        // Connected-local workspaces use the local Manager's GitHub user-token
+        // broker, so Coder intentionally has no external-auth provider.
+        let auth_mode = std::env::var("OPENFLOWS_GITHUB_AUTH_MODE").ok();
+        let template_mode = std::env::var("TF_VAR_connected_local").ok();
+        let connected_local = is_connected_local(auth_mode.as_deref(), template_mode.as_deref());
         let coder_url = client.base_url();
         let external_auth_id = self
             .env
@@ -765,94 +805,98 @@ impl CoderBootstrapper {
             .and_then(|e| e.coder.external_auth_id.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "primary-github".to_string());
-        eprintln!();
-        eprintln!("  ─── GitHub Link Required ───");
-        eprintln!();
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(300);
-        let mut link_shown = false;
-        loop {
-            match tenant_client.get_external_auth(&external_auth_id).await {
-                Ok(auth) if auth.authenticated => {
-                    let linked_user = auth
-                        .user
-                        .as_ref()
-                        .map(|u| u.login.as_str())
-                        .unwrap_or("(unknown account)");
-                    info!(
-                        "  ✓ GitHub link confirmed for account '{}' (provider: {})",
-                        linked_user, external_auth_id
-                    );
-                    break;
-                }
-                Ok(auth) => {
-                    if !link_shown {
-                        eprintln!("  Your GitHub account is not linked yet. To connect it:");
-                        if !auth.app_install_url.is_empty() {
-                            eprintln!(
-                                "    1. Install/grant the OpenFlows GitHub App: {}",
-                                auth.app_install_url
-                            );
-                        }
-                        // Kick off a device flow for self-serve linking. This
-                        // must run as the *tenant* user so the resulting GitHub
-                        // external-auth grant binds to the tenant's Coder user,
-                        // not the administrator's (the tenant independently
-                        // links its own account).
-                        match tenant_client
-                            .get_external_auth_device(&external_auth_id)
-                            .await
-                        {
-                            Ok(device) => {
-                                let target = if !device.verification_uri_complete.is_empty() {
-                                    device.verification_uri_complete.clone()
-                                } else {
-                                    device.verification_uri.clone()
-                                };
-                                if !target.is_empty() {
-                                    eprintln!("    2. Authorize at: {}", target);
-                                }
-                                if !device.user_code.is_empty() {
-                                    eprintln!("       and enter code: {}", device.user_code);
-                                }
-                            }
-                            Err(_) => {
+        if !connected_local {
+            // Check the tenant user's GitHub external-auth grant until linked.
+            // The device flow / status query runs as the tenant user, so each
+            // tenant links its own GitHub account independently of the admin.
+            eprintln!();
+            eprintln!("  ─── GitHub Link Required ───");
+            eprintln!();
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(300);
+            let mut link_shown = false;
+            loop {
+                match tenant_client.get_external_auth(&external_auth_id).await {
+                    Ok(auth) if auth.authenticated => {
+                        let linked_user = auth
+                            .user
+                            .as_ref()
+                            .map(|u| u.login.as_str())
+                            .unwrap_or("(unknown account)");
+                        info!(
+                            "  ✓ GitHub link confirmed for account '{}' (provider: {})",
+                            linked_user, external_auth_id
+                        );
+                        break;
+                    }
+                    Ok(auth) => {
+                        if !link_shown {
+                            eprintln!("  Your GitHub account is not linked yet. To connect it:");
+                            if !auth.app_install_url.is_empty() {
                                 eprintln!(
+                                    "    1. Install/grant the OpenFlows GitHub App: {}",
+                                    auth.app_install_url
+                                );
+                            }
+                            // Kick off a device flow for self-serve linking. This
+                            // must run as the *tenant* user so the resulting GitHub
+                            // external-auth grant binds to the tenant's Coder user,
+                            // not the administrator's.
+                            match tenant_client
+                                .get_external_auth_device(&external_auth_id)
+                                .await
+                            {
+                                Ok(device) => {
+                                    let target = if !device.verification_uri_complete.is_empty() {
+                                        device.verification_uri_complete.clone()
+                                    } else {
+                                        device.verification_uri.clone()
+                                    };
+                                    if !target.is_empty() {
+                                        eprintln!("    2. Authorize at: {}", target);
+                                    }
+                                    if !device.user_code.is_empty() {
+                                        eprintln!("       and enter code: {}", device.user_code);
+                                    }
+                                }
+                                Err(_) => {
+                                    eprintln!(
                                     "    2. Sign in as the tenant at {}/login and complete the link in the dashboard: {}/external-auth/{}",
                                     coder_url.trim_end_matches('/'),
                                     coder_url.trim_end_matches('/'),
                                     external_auth_id
                                 );
+                                }
                             }
+                            eprintln!();
+                            eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
+                            link_shown = true;
                         }
-                        eprintln!();
-                        eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
-                        link_shown = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Could not query external-auth status for '{}'; retrying",
+                            external_auth_id
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Could not query external-auth status for '{}'; retrying",
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "Timed out waiting for the GitHub link (provider '{}'). \
+                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
+                        external_auth_id,
+                        coder_url.trim_end_matches('/'),
                         external_auth_id
                     );
                 }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            if start.elapsed() >= timeout {
-                anyhow::bail!(
-                    "Timed out waiting for the GitHub link (provider '{}'). \
-                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
-                    external_auth_id,
-                    coder_url.trim_end_matches('/'),
-                    external_auth_id
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
         // Create the nexus workspace under the tenant user.
         let redis_url = "redis://redis:6379".to_string();
-        let repo_url = format!("https://github.com/{}.git", github_repo);
+        let repo_url = config::GithubConfig::init_from_env()?.repository_clone_url(github_repo);
         let workspace = tenant_client
             .create_workspace_for_user(
                 &tenant_user.id,
@@ -892,11 +936,14 @@ impl CoderBootstrapper {
     }
 }
 
-/// Compute a hex SHA-256 fingerprint of the template archive bytes.
+/// Fingerprint both the archive and the variables stored by server-side Terraform.
 fn template_hash(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
+    let variables = serde_json::to_vec(&crate::template_variable_values())
+        .expect("template variable strings are JSON serializable");
+    hasher.update(variables);
     hex_encode(&hasher.finalize())
 }
 
@@ -914,10 +961,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Load the persisted template hash store from `~/.openflows/template-hashes.json`.
 /// Returns an empty map if the file doesn't exist or can't be parsed.
 fn load_template_hashes() -> std::collections::HashMap<String, String> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(tenant) = config::TenantConfig::init_from_env() else {
         return Default::default();
     };
-    let path = format!("{}/.openflows/template-hashes.json", home);
+    let path = tenant.openflows_home().join("template-hashes.json");
     match std::fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => Default::default(),
@@ -926,12 +973,12 @@ fn load_template_hashes() -> std::collections::HashMap<String, String> {
 
 /// Persist the template hash store to `~/.openflows/template-hashes.json`.
 fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(tenant) = config::TenantConfig::init_from_env() else {
         return;
     };
-    let dir = format!("{}/.openflows", home);
+    let dir = tenant.openflows_home();
     let _ = std::fs::create_dir_all(&dir);
-    let path = format!("{}/template-hashes.json", dir);
+    let path = dir.join("template-hashes.json");
     if let Ok(json) = serde_json::to_string_pretty(hashes) {
         let _ = std::fs::write(&path, json);
     }
@@ -973,7 +1020,27 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     };
     info!("  → Pushing template '{}' ({})", name, reason);
 
-    match client.push_template(name, data).await {
+    let mut push_result = Err(anyhow::anyhow!("template push not attempted"));
+    for attempt in 1..=5u32 {
+        match client.push_template(name, data).await {
+            Ok(t) => {
+                push_result = Ok(t);
+                break;
+            }
+            Err(e) => {
+                if attempt < 5 {
+                    warn!(
+                        attempt,
+                        "  ⚠ Template '{}' push attempt failed ({}); retrying...", name, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 3)).await;
+                }
+                push_result = Err(e);
+            }
+        }
+    }
+
+    match push_result {
         Ok(t) => {
             let after_templates = match client.list_templates().await {
                 Ok(templates) => templates,
@@ -1042,5 +1109,46 @@ mod tests {
         assert_ne!(tenant_username("Alpha"), tenant_username("alpha"));
         // A given tenant name maps deterministically.
         assert_eq!(tenant_username("acme"), tenant_username("acme"));
+    }
+
+    #[test]
+    fn only_connected_local_skips_coder_external_auth() {
+        assert!(is_connected_local(Some("connected-local"), Some("true")));
+        assert!(!is_connected_local(Some("self-managed"), Some("true")));
+        assert!(!is_connected_local(Some("connected-local"), Some("false")));
+        assert!(!is_connected_local(None, None));
+    }
+
+    #[test]
+    fn nexus_workspace_name_fits_coder_limit() {
+        assert_eq!(MAX_TENANT_NAME_LEN, 16);
+        let longest = "a".repeat(MAX_TENANT_NAME_LEN);
+        assert_eq!(nexus_workspace_name(&longest).unwrap().len(), 32);
+        assert_eq!(
+            nexus_workspace_name("rustlib").unwrap(),
+            "openflows-nexus-rustlib"
+        );
+        assert_eq!(
+            nexus_workspace_name("Jagoum-rust").unwrap(),
+            "openflows-nexus-Jagoum-rust"
+        );
+    }
+
+    #[test]
+    fn nexus_workspace_name_rejects_names_coder_would_reject() {
+        for bad in [
+            "Jagoum-rust-library", // 35-character workspace name
+            "",
+            "my_team",
+            "my.team",
+            "-team",
+            "team-",
+            "my--team",
+        ] {
+            assert!(
+                nexus_workspace_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }

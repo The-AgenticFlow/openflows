@@ -4,6 +4,68 @@ use tracing::{info, warn};
 
 use crate::bundled::bundled_files;
 
+/// Publish binary-owned hooks into the shared artifacts volume before workers
+/// start. No checkout of the OpenFlows repository is required at runtime.
+pub fn publish_worker_hooks(artifacts_dir: &std::path::Path) -> Result<()> {
+    for file in bundled_files()
+        .into_iter()
+        .filter(|file| file.relative_path.starts_with("plugin/hooks/"))
+    {
+        let target = artifacts_dir.join(file.relative_path);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::write(&target, file.content)
+            .with_context(|| format!("Cannot publish worker hook {}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Publish the complete binary-owned instruction bundle for hosted workers.
+/// Worker templates materialize the role persona, commands, standards and
+/// skills into the customer checkout before emitting their readiness heartbeat.
+pub fn publish_worker_instructions(artifacts_dir: &std::path::Path) -> Result<()> {
+    let files = bundled_files();
+    let registry = files
+        .iter()
+        .find(|file| file.relative_path == "agent/registry.json")
+        .context("Bundled agent registry is missing")?;
+    let registry: serde_json::Value =
+        serde_json::from_str(registry.content).context("Bundled agent registry is invalid")?;
+    for file in files {
+        let target = artifacts_dir.join("orchestration").join(file.relative_path);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::write(&target, file.content)
+            .with_context(|| format!("Cannot publish worker instruction {}", target.display()))?;
+    }
+    // Materialize one tiny manifest per role so startup scripts install only
+    // the skills granted by the registry, without requiring jq or a source
+    // checkout inside the workspace.
+    for role in registry["team"]
+        .as_array()
+        .context("Bundled agent registry has no team array")?
+    {
+        let id = role["id"]
+            .as_str()
+            .context("Bundled agent registry role has no id")?;
+        let skills = role["skills"]
+            .as_array()
+            .context("Bundled agent registry role has no skills")?
+            .iter()
+            .map(|skill| {
+                skill
+                    .as_str()
+                    .context("Bundled agent registry skill is not a string")
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
+        let target = artifacts_dir
+            .join("orchestration/agent/roles")
+            .join(format!("{id}.skills"));
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::write(&target, format!("{skills}\n"))?;
+    }
+    Ok(())
+}
+
 const ORCHESTRATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct BundledFile {
@@ -279,5 +341,50 @@ impl OrchestrationResolver {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod worker_hook_tests {
+    #[test]
+    fn publishes_and_refreshes_hooks_without_a_source_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("PLAN.md");
+        std::fs::write(&plan, "tenant plan").unwrap();
+        super::publish_worker_hooks(dir.path()).unwrap();
+        let hook = dir.path().join("plugin/hooks/forge/session_start.sh");
+        let expected = include_str!("../../orchestration/plugin/hooks/forge/session_start.sh");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), expected);
+        assert!(dir
+            .path()
+            .join("plugin/hooks/sentinel/stop_require_eval.sh")
+            .is_file());
+        std::fs::write(&hook, "outdated hook").unwrap();
+        super::publish_worker_hooks(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(plan).unwrap(), "tenant plan");
+    }
+
+    #[test]
+    fn publishes_complete_worker_instructions_without_a_source_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        super::publish_worker_instructions(dir.path()).unwrap();
+        assert!(dir
+            .path()
+            .join("orchestration/agent/agents/forge.agent.md")
+            .is_file());
+        assert!(dir
+            .path()
+            .join("orchestration/plugin/skills/forge-planning/SKILL.md")
+            .is_file());
+        assert!(dir
+            .path()
+            .join("orchestration/plugin/commands/plan.md")
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("orchestration/agent/roles/sentinel.skills"))
+                .unwrap(),
+            "sentinel-review\nsentinel-criteria\nshared-harness-protocol\n"
+        );
     }
 }

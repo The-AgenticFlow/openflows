@@ -1,4 +1,4 @@
-//! Readiness and liveness behavior for the Manager, including the WP-01
+//! Readiness and liveness behavior for the Manager, including the core
 //! requirement that database unavailability causes a bounded readiness failure
 //! while process liveness remains healthy, and that existing local-mode health
 //! behavior is preserved.
@@ -126,7 +126,7 @@ async fn readiness_is_bounded_and_unavailable_when_database_is_unavailable() {
 async fn local_mode_without_database_stays_healthy() {
     // Criterion 9: the existing local-mode path (no control-plane database)
     // must remain healthy — health and readiness both succeed via the in-memory
-    // store, exactly as before WP-01.
+    // store, exactly as before the manager foundation changes.
     let app = openflows_manager::server::create_router(AppState::for_tests());
 
     let health = app

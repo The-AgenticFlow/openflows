@@ -91,7 +91,7 @@ pub struct ReworkEvidence {
 ///    (`feedback_timestamp <= dispatched_at`). If feedback was submitted *after*
 ///    the dispatch, it represents fresh feedback that the rework commit could not
 ///    have addressed.
-fn is_feedback_addressed(
+pub(crate) fn is_feedback_addressed(
     feedback_commit_id: Option<&str>,
     feedback_timestamp_str: Option<&str>,
     pr_head_sha: &str,

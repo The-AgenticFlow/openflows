@@ -70,8 +70,15 @@ resume autonomously once the blocker clears.
   decides using `gate decide --phase testing --revision <N> --round <R>
   --head <SHA> --verdict approve|reject --report review.md`. Successful A2A verification and SENTINEL approval are required for the current
   head. TODO(human-testing-review): add human approval later; it does not block submit now.
-- **Submit:** After testing approvals, FORGE sets `submit`, opens or updates and
-  records the PR. Read the current round again after PR recording. SENTINEL uses
+- **Submit:** SENTINEL's testing approval atomically enters `submit`; FORGE
+  confirms with `status get` and does not repeat the transition. FORGE pushes
+  the assigned branch. If no PR number is recorded, run `pr create --repo
+  OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a
+  descriptive Markdown body; this creates or finds the GitHub PR and records
+  it. Use the task's target base or the repository default. If a PR is already
+  recorded, push updates to that PR branch instead. `pr opened` is only for
+  recording a PR created externally. Read the current round again after PR
+  recording. SENTINEL uses
   `review submit --revision <N> --round <R> --head <SHA> --verdict
   approve|reject --report final-review.md`. Human PR approval is also required.
 - **Done:** VESSEL requires current-head CI success, SENTINEL and human PR

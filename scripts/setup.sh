@@ -413,6 +413,62 @@ github_app_manual() {
 
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
+    local auth_mode
+    auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
+    if [ -z "$auth_mode" ]; then
+        if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
+            auth_mode=self-managed
+        else
+            auth_mode=connected-local
+        fi
+        env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
+    fi
+    if [ "$auth_mode" = connected-local ]; then
+        local client_id slug secret_dir repos
+        client_id="$(env_get OPENFLOWS_GITHUB_CLIENT_ID)"
+        if is_placeholder "$client_id"; then
+            is_tty || die "Set OPENFLOWS_GITHUB_CLIENT_ID to the team's public GitHub App client ID."
+            client_id="$(ask 'OpenFlows GitHub App client ID')"
+            [ -n "$client_id" ] || die "GitHub App client ID is required."
+            env_set OPENFLOWS_GITHUB_CLIENT_ID "$client_id"
+        fi
+        slug="$(env_get OPENFLOWS_GITHUB_APP_SLUG)"
+        if is_placeholder "$slug"; then
+            is_tty || die "Set OPENFLOWS_GITHUB_APP_SLUG to the team's public GitHub App slug."
+            slug="$(ask 'OpenFlows GitHub App slug')"
+            [ -n "$slug" ] || die "GitHub App slug is required."
+            env_set OPENFLOWS_GITHUB_APP_SLUG "$slug"
+        fi
+        secret_dir="${HOME}/.config/openflows"
+        env_set OPENFLOWS_MODE local
+        env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
+        env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
+        env_set OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR "$secret_dir"
+        env_set OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE "$secret_dir/github-user.json"
+        env_set OPENFLOWS_LOCAL_UID "$(id -u)"
+        env_set OPENFLOWS_LOCAL_GID "$(id -g)"
+        env_set TF_VAR_connected_local true
+        env_set TF_VAR_connected_local_broker_secret_host_path "$secret_dir/github-broker-key"
+        env_set TF_VAR_connected_local_helper_host_path "$ROOT/scripts/connected-local-github.py"
+        env_set TF_VAR_connected_local_manager_url "http://openflows-local-manager:3002"
+        info "Install the OpenFlows App on ${REPO}: https://github.com/apps/${slug}/installations/new"
+        is_tty && pause "Install the App on the selected repository, then continue"
+        if ! repos="$(cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-repos 2>/dev/null)"; then
+            (cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-login) \
+                || die "GitHub device authorization failed."
+            repos="$(cd "$ROOT" && cargo run -q -p openflows-manager -- --config "$ENV_FILE" github-repos)" \
+                || die "Could not list repositories available to your GitHub account and the App."
+        fi
+        printf '%s\n' "$repos" | awk -F '\t' -v repo="$REPO" 'tolower($2) == tolower(repo) {found=1} END {exit !found}' \
+            || die "${REPO} is not accessible to both your GitHub account and the OpenFlows App."
+        ok "GitHub user authorization ready for ${REPO}"
+        return
+    fi
+    [ "$auth_mode" = self-managed ] || die "OPENFLOWS_GITHUB_AUTH_MODE must be connected-local or self-managed."
+    env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED false
+    env_set TF_VAR_connected_local false
+    env_set TF_VAR_connected_local_broker_secret_host_path ""
+    env_set TF_VAR_connected_local_helper_host_path ""
     if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
         ok "already configured"
         return
@@ -438,7 +494,10 @@ stage_github_app() {
 stage_docker() {
     step "Starting Redis + Coder"
     local out i
-    if ! out="$(cd "$ROOT" && docker compose up -d 2>&1)"; then
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
+        out="$(cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml up -d --build 2>&1)" \
+            || { printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; die "connected-local docker compose up failed"; }
+    elif ! out="$(cd "$ROOT" && docker compose up -d 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
@@ -691,18 +750,23 @@ sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lor
 stage_bootstrap() {
     step "Workspace templates (first run takes ~10 min)"
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && templates_ready; then
+    if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
+       [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
         ok "binaries and 5 templates already in place"
         info "Sources unchanged since the last build. Force a rebuild: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
         return
     fi
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
+    env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     ok "binaries built, 5 templates pushed"
 }
 
 # ensure_github_link — Coder only builds workspaces once the OWNING Coder account (the token's user) has linked the GitHub App.
 ensure_github_link() {
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
+        return 0
+    fi
     local linked me user login url
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
     linked="$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)"
@@ -736,6 +800,23 @@ ensure_github_link() {
     spin $! "Waiting for you to link GitHub (up to 10 min)" \
         || die "GitHub was not linked in time." "Make sure the browser is signed in to Coder as '${user}' at ${url}."
     ok "GitHub linked"
+}
+
+# The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
+# (letters, digits, single hyphens), so NAME gets at most 16 of them.
+tenant_name_ok() { [[ "$1" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ && "${#1}" -le 16 ]]; }
+
+# default_tenant_name owner/repo: owner-repo when that is already a valid tenant name, so
+# orgA/backend and orgB/backend do not collide. Otherwise a 9-character prefix plus a hash of the
+# repo, so repos that normalise alike (org/a.b, org/a_b) or share a long prefix stay distinct.
+default_tenant_name() {
+    local raw="${1/\//-}" name
+    name="$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+    if [ "$name" != "$raw" ] || [ "${#name}" -gt 16 ]; then
+        name="$(printf '%s-%06x' "$(printf '%s' "${name:0:9}" | sed 's/-*$//')" \
+            "$(( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 16777216 ))")"
+    fi
+    printf '%s' "$name"
 }
 
 # check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a tenant name already bound
@@ -810,8 +891,10 @@ main() {
         [ -n "$NAME" ] || NAME="$(env_get OPENFLOWS_SETUP_NAME)"
         [ -n "$FLEET" ] || FLEET="$(env_get OPENFLOWS_SETUP_FLEET)"
     fi
-    NAME="${NAME:-${REPO/\//-}}"   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
-    NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+    [ -n "$NAME" ] || NAME="$(default_tenant_name "$REPO")"   # new repo: derived from owner/repo
+    tenant_name_ok "$NAME" \
+        || die "Tenant name '${NAME}' does not fit Coder's workspace name rules." \
+               "Use at most 16 letters, digits and single hyphens:  ./scripts/setup.sh ${REPO} --name <short-name>"
     if [ -z "$FLEET" ] && is_tty; then   # first run, no --fleet given: ask (a re-run reuses the saved value)
         printf '\n  %sFleet = FORGE-SENTINEL pairs (a builder plus its reviewer). 1 pair works one issue at a time;\n  N pairs work N issues in parallel, using more LLM tokens and workspaces. Start small — you can add more later.%s\n' "$D" "$N"
         while true; do

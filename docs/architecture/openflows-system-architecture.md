@@ -1,5 +1,7 @@
 # OpenFlows — Complete System Architecture
 
+> For the hosted Manager control plane, tenant runtime credentials, GitHub broker, controller, hooks, and A2A topology, see [Manager and Hosted Runtime Architecture](manager-hosted-runtime-architecture.md).
+
 **Version:** 1.0
 **Status:** Authoritative reference (mirrors the shipped v1.2.x system)
 **Scope:** Whole-system, end-to-end — from a GitHub issue to a merged PR to deployment, including every subsystem and extension point.

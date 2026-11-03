@@ -1,0 +1,30 @@
+# Apply after docker-compose.yml only for connected-local development.
+# The local Manager brokers Alice's GitHub App user token to her workspaces.
+services:
+  coder:
+    environment:
+      CODER_EXTERNAL_AUTH_0_ID: !reset null
+      CODER_EXTERNAL_AUTH_0_TYPE: !reset null
+      CODER_EXTERNAL_AUTH_0_CLIENT_ID: !reset null
+      CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: !reset null
+      CODER_EXTERNAL_AUTH_0_SCOPES: !reset null
+      CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: !reset null
+
+  openflows-local-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.manager
+    user: "${OPENFLOWS_LOCAL_UID:?}:${OPENFLOWS_LOCAL_GID:?}"
+    environment:
+      OPENFLOWS_MODE: local
+      OPENFLOWS_CONNECTED_LOCAL_ENABLED: "true"
+      OPENFLOWS_AUTH_ALLOW_LOOPBACK: "true"
+      OPENFLOWS_GITHUB_CLIENT_ID: ${OPENFLOWS_GITHUB_CLIENT_ID:?}
+      OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE: /run/openflows-local/github-user.json
+      OPENFLOWS_MANAGER_ADDR: 0.0.0.0:3002
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}:/run/openflows-local
+    depends_on:
+      - redis
+    restart: unless-stopped

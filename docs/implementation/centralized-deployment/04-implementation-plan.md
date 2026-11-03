@@ -72,7 +72,7 @@ Dependencies: WP-00, WP-01.
 - Add explicit organization, owner, template, and version IDs to hosted Coder operations and response verification.
 - Implement deterministic artifact packaging, manifest validation, immutable release records, import job polling, and per-org template publication.
 - Replace host-local template hash cache for hosted mode. Do not infer release identity from names or updated timestamps.
-- Add organization/provisioner/model readiness reconciliation and platform-only approval/promotion.
+- Add organization/provisioner/template readiness reconciliation and platform-only approval/promotion. Model configuration is independent of organization provisioning.
 
 Done: same template names in two organizations cannot collide; failed import prevents ready; duplicate publish retries converge; version pins survive active-pointer changes.
 
@@ -162,7 +162,7 @@ Continue using existing `CODER_URL` configuration where appropriate. Exact secre
 | GH-04 | Missed/reordered webhook | Periodic reconciliation restores correct deny state |
 | PROV-01 | Crash after each upstream create | Retry adopts only exact matching resource, no duplicates |
 | PROV-02 | Template names equal in A/B | Correct org-specific IDs and pinned versions |
-| PROV-03 | No license/provisioner/model | Explicit not-ready status, no default-org fallback |
+| PROV-03 | No license/provisioner or failed template import | Explicit not-ready status, no default-org fallback; absent models do not block org readiness |
 | ISO-01 | Compromised A runtime requests B token/store/chat | Denied by service and infrastructure boundaries |
 | ISO-02 | Inspect hosted parameters/state/logs | No platform or App secrets, no static GitHub token |
 | ISO-03 | Tenant hook signing key used against another tenant | Rejected; global hook key absent from runtimes |

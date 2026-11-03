@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "💬 OpenFlows Discord Community"
+    url: https://discord.gg/gDhK2RQZpY
+    about: Ask questions, share ideas, or get help with setup from the maintainers and community.
+  - name: "📖 OpenFlows Docs"
+    url: https://openflows.dev/docs/getting-started/
+    about: Read the documentation, quick start, and setup guides.

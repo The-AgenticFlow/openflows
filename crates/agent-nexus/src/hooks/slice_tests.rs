@@ -1156,6 +1156,10 @@ async fn planning_reconnaissance_does_not_allow_hidden_source_writes() {
         "git checkout -- src/main.rs >/dev/null 2>&1",
         "dd of=src/main.rs 2>/dev/null",
         r#"python3 -c 'open("src/main.rs", "w").write("bad")' >/dev/null"#,
+        r#"python3 -c 'open("src/main.rs","w")'"#,
+        r#"python3 -c 'import os; os.remove("src/main.rs")'"#,
+        r#"python3 -c 'import pathlib; pathlib.Path("src/main.rs").unlink()'"#,
+        r#"python3 -c 'import json; data=json.load(open("notebooks/demo.ipynb")); print(data.get("nbformat"))'"#,
         "cat README.md 2>&1 > src/main.rs",
         "cat README.md 2> src/main.rs",
         "cat README.md | tee src/main.rs >/dev/null",
@@ -1183,6 +1187,52 @@ async fn planning_reconnaissance_does_not_allow_hidden_source_writes() {
         )
         .await;
         assert!(decision.deny, "must gate native source edits: {tool}");
+    }
+}
+
+#[tokio::test]
+async fn submit_allows_pr_body_mentioning_write_commands_but_denies_real_writes() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-pr-body", "forge", "chat-pr-body").await;
+    seed_status(&store, "T-pr-body", "submit").await;
+
+    for command in [
+        "openflows-harness pr create --body 'Verified with cargo fmt and python3 -c checks'",
+        "openflows-harness pr create --body 'Run `cargo fmt` before merging'",
+        "openflows-harness pr create --body 'Verified; touch src/lib.rs was not needed'",
+        "openflows-harness pr create --body '>'",
+    ] {
+        let decision = phase_guard(
+            &store,
+            "chat-pr-body",
+            "forge",
+            "bash",
+            &json!({"command": command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(!decision.deny, "quoted PR body is data: {command}");
+    }
+
+    for command in [
+        "openflows-harness pr create --body 'Verified' && cargo fmt",
+        "openflows-harness pr create --body 'Verified'; python3 -c 'print(1)'",
+        "openflows-harness pr create --body $(touch src/lib.rs)",
+        "openflows-harness pr create --body 'Verified' | xargs touch src/lib.rs",
+    ] {
+        let decision = phase_guard(
+            &store,
+            "chat-pr-body",
+            "forge",
+            "bash",
+            &json!({"command": command}),
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            decision.deny,
+            "executable write remains forbidden: {command}"
+        );
     }
 }
 

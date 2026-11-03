@@ -6,7 +6,7 @@
 //! and exercise the real migration runner, constraints, and query paths.
 //!
 //! The test server is selected with `OPENFLOWS_TEST_DATABASE_URL`, defaulting to
-//! the local `openflows-db` Postgres provisioned for WP-01:
+//! the local `openflows-db` Postgres instance:
 //! `postgres://openflows:openflows@localhost:5544/openflows_control_plane`. The
 //! test role must be able to create and drop databases (the bundled role is a
 //! superuser).
@@ -319,7 +319,7 @@ pub async fn insert_running_workspace(
 }
 
 // ---------------------------------------------------------------------------
-// WP-02 test fixtures and harness
+// Organization and authorization test fixtures and harness
 // ---------------------------------------------------------------------------
 
 /// A deterministic GitHub user for fixtures.

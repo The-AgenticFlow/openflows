@@ -254,6 +254,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let store =
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
+    let runtime_control = agent_nexus::runtime_control::RuntimeControlClient::from_env()?;
     if reset_store {
         let cleared = reset_tenant_runtime_state(&store).await;
         tracing::info!(
@@ -310,6 +311,13 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
+    if let Some(artifacts_dir) = std::env::var_os("ARTIFACTS_DIR") {
+        let artifacts_dir = std::path::Path::new(&artifacts_dir);
+        openflows::orchestration::publish_worker_hooks(artifacts_dir)
+            .context("Failed to publish hooks to the shared worker artifacts volume")?;
+        openflows::orchestration::publish_worker_instructions(artifacts_dir)
+            .context("Failed to publish instructions to the shared worker artifacts volume")?;
+    }
 
     let registry_path = resolver.registry_path();
     // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
@@ -401,6 +409,9 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
     let mut nexus_node = openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone());
+    if let Some(runtime) = runtime_control.clone() {
+        nexus_node = nexus_node.with_runtime_control(runtime);
+    }
     if let Some(ref relay) = a2a_relay {
         nexus_node = nexus_node.with_a2a_relay(relay.clone());
     }
@@ -516,6 +527,36 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // within ~40 steps instead of burning all 1000.
     let flow = flow.max_steps(1000).max_visits_per_node(20);
 
+    // Report readiness only after controller initialization has succeeded.
+    // Keep the task scoped to this function so exiting the controller also
+    // stops heartbeats, including when initialization or the loop fails.
+    let mut runtime_heartbeats = tokio::task::JoinSet::new();
+    if let Some(runtime) = runtime_control.clone() {
+        let mut retry_delay = std::time::Duration::from_secs(1);
+        loop {
+            match runtime.heartbeat().await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        retry_delay_secs = retry_delay.as_secs(),
+                        "Initial Manager runtime heartbeat failed; retaining session and retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+        runtime_heartbeats.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Err(error) = runtime.heartbeat().await {
+                    tracing::warn!(%error, "Manager runtime heartbeat failed");
+                }
+            }
+        });
+    }
+
     // ── Run controller poll loop ────────────────────────────────────────
     tracing::info!(
         poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
@@ -537,7 +578,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 // Transient errors (Redis drops, Coder API timeouts, GitHub
                 // rate limits) should not stop the orchestration loop.
                 tracing::error!(
-                    error = %e,
+                    error = %format!("{e:#}"),
                     poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
                     "Controller flow pass failed — will retry on next poll (self-healing)"
                 );
@@ -606,6 +647,11 @@ fn validate_tenant_name(name: &str) -> Result<()> {
         "tenant name '{name}' contains characters that are not allowed in Redis namespace operations; use only ASCII letters, numbers, '.', '_' and '-'"
     );
     Ok(())
+}
+
+/// Tenant name for `tenant add`: the explicit `--name`, else the repo owner.
+fn add_tenant_name(repo: &str, name: Option<String>) -> String {
+    name.unwrap_or_else(|| repo.split('/').next().unwrap_or(repo).to_string())
 }
 
 async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
@@ -699,6 +745,12 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     if matches!(action, TenantCommands::Clean { .. }) {
         return run_tenant_clean(&action).await;
     }
+    // Check the new tenant's Coder workspace name before bootstrapping, so a bad name fails here.
+    if let TenantCommands::Add { repo, name, .. } = &action {
+        let tenant_name = add_tenant_name(repo, name.clone());
+        validate_tenant_name(&tenant_name)?;
+        coder_client::bootstrap::nexus_workspace_name(&tenant_name)?;
+    }
 
     let bootstrapper = coder_client::bootstrap::CoderBootstrapper::from_env()
         .context("Failed to create bootstrapper from environment")?;
@@ -716,13 +768,12 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                     fleet
                 );
             }
-            let tenant_name =
-                name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
-            validate_tenant_name(&tenant_name)?;
+            let tenant_name = add_tenant_name(&repo, name);
 
             // Derive the tenant fleet registry with pairs applied to forge/sentinel.
             let resolver = openflows::orchestration::OrchestrationResolver::new()
                 .context("Failed to resolve orchestration registry")?;
+            resolver.ensure_orchestration_dir()?;
             let registry_path = resolver.registry_path();
             let base_registry = config::Registry::load(&registry_path).with_context(|| {
                 format!("cannot load base registry at {}", registry_path.display())

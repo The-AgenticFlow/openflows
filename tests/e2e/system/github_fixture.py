@@ -3,7 +3,7 @@ import subprocess
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from git_repository import Repository
+from git_repository import Repository, git
 
 TOKENS = {'ci-forge-token': 'forge', 'ci-sentinel-token': 'sentinel',
     'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator'}
@@ -50,6 +50,22 @@ class GitHub:
         if parts[:3] != ['repos', 'test', 'repo']:
             self.fail(404, 'Unsupported fixture repository or endpoint')
         route = parts[3:]
+        if method == 'GET' and route == ['contents', '.github', 'workflows']:
+            ref = query.get('ref', ['main'])[0]
+            try:
+                head = self.repo.head(ref)
+                tree = git('--git-dir', str(self.repo.bare), 'ls-tree', '-z', f'{head}:.github/workflows')
+            except subprocess.CalledProcessError:
+                self.fail(404, 'Workflow directory not found at requested ref')
+            entries = []
+            for entry in tree.split('\0'):
+                if not entry:
+                    continue
+                metadata, name = entry.split('\t', 1)
+                _mode, kind, sha = metadata.split()
+                entries.append({'name': name, 'path': f'.github/workflows/{name}',
+                    'sha': sha, 'type': 'file' if kind == 'blob' else 'dir'})
+            return 200, entries
         if method == 'GET' and not route:
             return 200, {'full_name': 'test/repo', 'default_branch': 'main',
                 'clone_url': self.repo.url, 'name': 'repo', 'owner': {'login': 'test'}}
@@ -92,7 +108,7 @@ class GitHub:
                     return 200, self.page(comments, query)
         if route == ['pulls']:
             if method == 'POST':
-                self.require_role(role, ['forge'])
+                self.require_role(role, ['forge', 'vessel'])
                 head, base = body['head'], body['base']
                 if head == base:
                     self.fail(422, 'Head and base must differ')
@@ -101,6 +117,7 @@ class GitHub:
                 pr = {'number': number, 'title': body['title'], 'body': body.get('body', ''),
                     'state': 'open', 'merged': False, 'mergeable': None, 'merge_commit_sha': None,
                     'html_url': f'http://github-fixture/test/repo/pull/{number}',
+                    'user': {'login': role},
                     'head': {'ref': head, 'sha': self.repo.head(head)},
                     'base': {'ref': base, 'sha': self.repo.head(base)}}
                 self.pulls[number] = pr
@@ -119,10 +136,12 @@ class GitHub:
                 if method == 'GET':
                     return 200, self.page(reviews, query)
                 if method == 'POST':
-                    self.require_role(role, ['sentinel', 'operator'])
+                    self.require_role(role, ['sentinel', 'operator', 'vessel'])
                     states = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED'}
                     if body.get('event') not in states or body.get('comments'):
                         self.fail(422, 'Unsupported review event or inline comments')
+                    if role == pr['user']['login'] and body['event'] != 'COMMENT':
+                        self.fail(422, 'PR authors cannot approve or request changes on their own code')
                     sha = body.get('commit_id') or pr['head']['sha']
                     self.repo.require_commit(sha)
                     review = {'id': len(reviews) + 1, 'state': states[body['event']],
@@ -131,6 +150,9 @@ class GitHub:
                         'submitted_at': datetime.now(timezone.utc).isoformat()}
                     reviews.append(review)
                     return 201, review
+            if route[2:] == ['comments'] and method == 'GET':
+                # Inline review creation is unsupported, so this collection is empty.
+                return 200, []
             if route[2:] == ['merge'] and method == 'PUT':
                 self.require_role(role, ['vessel'])
                 if pr['merged'] or pr['state'] != 'open':
@@ -138,17 +160,21 @@ class GitHub:
                 sha = pr['head']['sha']
                 if body.get('sha') != sha:
                     self.fail(409, 'PR head changed')
-                if body.get('merge_method') != 'merge':
-                    self.fail(422, 'Only merge commits are supported by this scenario')
+                if body.get('merge_method') not in ('merge', 'squash'):
+                    self.fail(422, 'Only merge and squash commits are supported')
                 check = self.checks.get(sha)
                 if not check or check['status'] != 'completed' or check['conclusion'] != 'success':
                     self.fail(405, 'Exact-head acceptance check is not successful')
-                relevant = [r for r in self.reviews.get(number, [])
-                    if r['user']['login'] == 'sentinel' and r['state'] != 'COMMENTED']
-                if not relevant or relevant[-1]['state'] != 'APPROVED' or relevant[-1]['commit_id'] != sha:
-                    self.fail(405, 'Current head lacks SENTINEL approval')
+                latest = {}
+                for review in self.reviews.get(number, []):
+                    if review['state'] != 'COMMENTED':
+                        latest[review['user']['login']] = review
+                if any(r['state'] == 'CHANGES_REQUESTED' for r in latest.values()) or not any(
+                        r['state'] == 'APPROVED' and r['commit_id'] == sha and
+                        r['user']['login'] != pr['user']['login'] for r in latest.values()):
+                    self.fail(405, 'Current head lacks an independent authorized approval')
                 merged = self.repo.merge(pr['base']['ref'], pr['head']['ref'], sha, pr['base']['sha'],
-                    body.get('commit_title') or f'Merge PR #{number}')
+                    body.get('commit_title') or f'Merge PR #{number}', body['merge_method'])
                 pr.update(state='closed', merged=True, merge_commit_sha=merged)
                 return 200, {'merged': True, 'sha': merged, 'message': 'Real Git merge completed'}
         if route == ['check-runs'] and method == 'POST':

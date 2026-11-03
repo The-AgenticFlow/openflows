@@ -192,6 +192,17 @@ class GitHubFixtureTest(FixtureCase):
             {'title': 'Fix T-1', 'head': 'fix/T-1', 'base': 'main', 'body': 'Fixes #1'})
         self.pr = pr['number']
 
+    def test_workflow_listing_follows_committed_git_tree(self):
+        code, entries = self.request('GET', '/repos/test/repo/contents/.github/workflows')
+        self.assertEqual(code, 200)
+        self.assertEqual([entry['name'] for entry in entries], ['ci.yml'])
+        self.git('rm', '.github/workflows/ci.yml')
+        self.git('commit', '-m', 'remove CI configuration')
+        self.git('push', 'origin', 'HEAD')
+        code, _ = self.request('GET', '/repos/test/repo/contents/.github/workflows?ref=fix/T-1')
+        self.assertEqual(code, 404)
+        self.assertEqual(self.request('GET', '/repos/test/repo/contents/.github/workflows')[0], 200)
+
     def git(self, *args, cwd=None):
         result = subprocess.run(['git', *args], cwd=cwd or
             (self.checkout if self.checkout.exists() else self.root),
@@ -280,6 +291,41 @@ class GitHubFixtureTest(FixtureCase):
         self.assertEqual(self.merge(malicious)[0], 405)
         self.assertEqual(self.request('GET', '/repos/test/repo/not-implemented')[0], 404)
         self.assertEqual(self.request('GET', '/user', token='unknown')[0], 401)
+
+    def test_squash_merge_has_base_parent_and_the_tested_candidate_tree(self):
+        base = self.git('rev-parse', 'origin/main').strip()
+        (self.checkout / 'answer.txt').write_text('42\n')
+        self.git('add', 'answer.txt')
+        self.git('commit', '-m', 'fix answer')
+        self.git('push', 'origin', 'HEAD')
+        head = self.git('rev-parse', 'HEAD').strip()
+        self.assertEqual(self.ci(head), 0)
+        self.review(head)
+        code, response = self.request('PUT', f'/repos/test/repo/pulls/{self.pr}/merge',
+            {'sha': head, 'merge_method': 'squash', 'commit_title': 'Squash tested change'},
+            token='ci-vessel-token')
+        self.assertEqual(code, 200, response)
+        self.git('fetch', 'origin', 'main')
+        merged = response['sha']
+        self.assertEqual(self.git('rev-parse', merged + '^').strip(), base)
+        self.assertEqual(self.git('rev-parse', merged + '^{tree}'), self.git('rev-parse', head + '^{tree}'))
+        self.assertEqual(self.ci(merged), 0)
+
+    def test_workspace_owner_can_open_pr_but_cannot_approve_its_own_code(self):
+        code, pr = self.request('POST', '/repos/test/repo/pulls',
+            {'title': 'Linked workspace owner', 'head': 'fix/T-1', 'base': 'main'},
+            token='ci-vessel-token')
+        self.assertEqual(code, 201, pr)
+        code, _ = self.request('POST', f'/repos/test/repo/pulls/{pr["number"]}/reviews',
+            {'event': 'APPROVE', 'commit_id': self.broken}, token='ci-vessel-token')
+        self.assertEqual(code, 422)
+        code, _ = self.request('POST', f'/repos/test/repo/pulls/{pr["number"]}/reviews',
+            {'event': 'APPROVE', 'commit_id': self.broken}, token='ci-operator-token')
+        self.assertEqual(code, 201)
+        code, _ = self.request('POST', '/repos/test/repo/check-runs',
+            {'name': 'acceptance', 'head_sha': self.broken, 'status': 'completed', 'conclusion': 'success'},
+            token='ci-vessel-token')
+        self.assertEqual(code, 403)
 
     def test_successful_check_on_old_head_cannot_authorize_a_new_commit(self):
         (self.checkout / 'answer.txt').write_text('42\n')

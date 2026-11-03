@@ -1,4 +1,4 @@
-//! Regression tests for the WP-02 senior review. All database state is isolated.
+//! Regression tests for authorization and organization behavior. All database state is isolated.
 mod common;
 
 use axum::{

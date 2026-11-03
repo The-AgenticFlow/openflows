@@ -12,7 +12,8 @@ use config::{
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
         KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
-        KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -29,6 +30,8 @@ use tracing::{debug, error, info, warn};
 
 pub mod a2a;
 pub mod hooks;
+pub mod openapi;
+pub mod runtime_control;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
 /// (Inlined from the deleted agent-client crate.)
@@ -252,6 +255,7 @@ pub struct NexusNode {
     pub persona_path: PathBuf,
     pub registry_path: PathBuf,
     pub a2a_relay: Option<std::sync::Arc<crate::a2a::A2ARelay>>,
+    runtime_control: Option<runtime_control::RuntimeControlClient>,
 }
 
 impl NexusNode {
@@ -260,6 +264,7 @@ impl NexusNode {
             persona_path: persona_path.into(),
             registry_path: registry_path.into(),
             a2a_relay: None,
+            runtime_control: None,
         }
     }
 
@@ -267,6 +272,11 @@ impl NexusNode {
     /// and surface pending verify tasks in orchestration decisions.
     pub fn with_a2a_relay(mut self, relay: std::sync::Arc<crate::a2a::A2ARelay>) -> Self {
         self.a2a_relay = Some(relay);
+        self
+    }
+
+    pub fn with_runtime_control(mut self, runtime: runtime_control::RuntimeControlClient) -> Self {
+        self.runtime_control = Some(runtime);
         self
     }
 
@@ -284,6 +294,39 @@ impl NexusNode {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    fn managed_worker_request_key(worker_id: &str, ticket_id: &str) -> String {
+        format!("runtime:worker-request:{worker_id}:{ticket_id}")
+    }
+
+    fn managed_rework_message_key(ticket_id: &str, delivery_id: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"openflows-managed-rework-v2\0");
+        hasher.update(ticket_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(delivery_id.as_bytes());
+        format!("rework:{:x}", hasher.finalize())
+    }
+
+    async fn ensure_rework_delivery_id(store: &SharedStore, ticket_id: &str, role: &str) -> String {
+        let key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DELIVERY_ID, role);
+        if let Some(id) = store.get_typed::<String>(&key).await {
+            return id;
+        }
+        // Backward compatibility for directives persisted before delivery ids
+        // existed. Persist before attempting delivery so retries stay stable.
+        let id = uuid::Uuid::new_v4().to_string();
+        store.set(&key, json!(id)).await;
+        id
+    }
+
+    fn rework_prompt(ticket_id: &str, directive: &str) -> String {
+        format!(
+            "You are resuming existing work on ticket {ticket_id}.\n\n{directive}\n\n\
+             Address the rework directive above. Re-check `openflows-harness status get` \
+             and `openflows-harness dispatch read` for context.\n"
+        )
+    }
+
     fn resolve_github_token(&self) -> Result<String> {
         let registry = self.load_registry()?;
         registry.resolve_github_token("nexus")
@@ -296,6 +339,17 @@ impl NexusNode {
             .ok()
             .and_then(|e| e.github.resolve_token())
             .filter(|t| !t.is_empty())
+    }
+
+    async fn github_api_token(&self) -> Result<String> {
+        if let Some(runtime) = &self.runtime_control {
+            return runtime.github_api_token().await;
+        }
+        self.resolve_github_token()
+            .ok()
+            .filter(|token| !token.is_empty())
+            .or_else(|| self.resolve_github_token_from_env_or_file())
+            .context("GitHub token is not configured")
     }
 
     fn load_registry(&self) -> Result<Registry> {
@@ -382,21 +436,15 @@ Before significant work, read the relevant skill file to understand the workflow
             return Ok(());
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => t,
-                None => {
-                    warn!("GitHub token not configured, skipping issue sync");
-                    return Ok(());
-                }
-            },
-        };
+        let token = self.github_api_token().await?;
 
         let client = github::GithubRestClient::new(&token);
         let gh_issues = match client.list_open_issues(owner, repo_name).await {
             Ok(issues) => issues,
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("GitHub issue API request failed"));
+                }
                 warn!(error = %e, "GitHub API request failed during issue sync");
                 return Ok(());
             }
@@ -450,24 +498,15 @@ Before significant work, read the relevant skill file to understand the workflow
             return Ok(());
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) => t,
-            Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => {
-                    info!("Using GitHub token from env / external auth / token file for PR sync");
-                    t
-                }
-                None => {
-                    warn!("GitHub token not configured, skipping PR sync");
-                    return Ok(());
-                }
-            },
-        };
+        let token = self.github_api_token().await?;
 
         let client = github::GithubRestClient::new(&token);
         let gh_prs = match client.list_open_prs(owner, repo_name).await {
             Ok(prs) => prs,
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("GitHub pull request API request failed"));
+                }
                 warn!(error = %e, "Failed to fetch open PRs from GitHub");
                 return Ok(());
             }
@@ -482,13 +521,29 @@ Before significant work, read the relevant skill file to understand the workflow
             .collect();
 
         let mut new_prs = Vec::new();
+        let mut tracked_prs_updated = false;
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
 
         for pr in &gh_prs {
             if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref()).await {
                 continue;
             }
-            if !known_numbers.contains(&pr.number) {
+            if known_numbers.contains(&pr.number) {
+                if let Some(existing) = pending_prs
+                    .iter_mut()
+                    .find(|p| p["number"].as_u64() == Some(pr.number))
+                {
+                    if existing["head_sha"].as_str() != Some(pr.head_sha.as_str())
+                        || existing["mergeable"].as_bool() != pr.mergeable
+                        || existing["has_conflicts"].as_bool() != Some(pr.has_conflicts())
+                    {
+                        existing["head_sha"] = json!(pr.head_sha);
+                        existing["mergeable"] = json!(pr.mergeable);
+                        existing["has_conflicts"] = json!(pr.has_conflicts());
+                        tracked_prs_updated = true;
+                    }
+                }
+            } else {
                 if let Some(ref tid) = pr.ticket_id {
                     let already_tracked = pending_prs
                         .iter()
@@ -626,12 +681,23 @@ Before significant work, read the relevant skill file to understand the workflow
                             }
                         }
                         if matches!(ticket.status, TicketStatus::InProgress { .. }) {
+                            let lifecycle_in_submit = store
+                                .lifecycle(tid)
+                                .await
+                                .is_ok_and(|state| state.phase == config::lifecycle::Phase::Submit);
+                            if !lifecycle_in_submit {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                );
+                                continue;
+                            }
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                "Ticket is InProgress and lifecycle has returned to Submit — re-adding PR to pending_prs"
                             );
-                            continue;
                         }
                     }
                 }
@@ -712,8 +778,9 @@ Before significant work, read the relevant skill file to understand the workflow
             still_open
         });
 
-        let prs_changed =
-            pending_prs.len() != known_numbers.len() || pending_prs.len() != before_count;
+        let prs_changed = pending_prs.len() != known_numbers.len()
+            || pending_prs.len() != before_count
+            || tracked_prs_updated;
 
         if prs_changed {
             store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
@@ -772,11 +839,28 @@ Before significant work, read the relevant skill file to understand the workflow
                                 tickets_changed = true;
                             }
                             TicketStatus::InProgress { .. } => {
-                                info!(
-                                    ticket_id = tid,
-                                    pr_number = pr.number,
-                                    "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
-                                );
+                                let lifecycle_in_submit =
+                                    store.lifecycle(tid).await.is_ok_and(|state| {
+                                        state.phase == config::lifecycle::Phase::Submit
+                                    });
+                                if lifecycle_in_submit {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket returned to Submit after rework — marking Completed(pr_opened)"
+                                    );
+                                    ticket.status = TicketStatus::Completed {
+                                        worker_id: String::from("nexus-reconciliation"),
+                                        outcome: "pr_opened".to_string(),
+                                    };
+                                    tickets_changed = true;
+                                } else {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -813,9 +897,16 @@ Before significant work, read the relevant skill file to understand the workflow
     }
 
     async fn sync_registry(&self, store: &SharedStore) -> Result<()> {
-        let registry = self
+        let mut registry = self
             .load_registry()
             .context("Cannot initialize worker fleet from registry")?;
+        if let Ok(value) = std::env::var("OPENFLOWS_FLEET_SIZE") {
+            let pairs: u32 = value
+                .parse()
+                .context("OPENFLOWS_FLEET_SIZE must be a positive integer")?;
+            anyhow::ensure!(pairs > 0, "OPENFLOWS_FLEET_SIZE must be positive");
+            registry = registry.with_team_fleet(pairs);
+        }
         anyhow::ensure!(
             !registry.forge_slots().is_empty(),
             "Worker fleet has no enabled FORGE slots; check enabled and max_instances in {}",
@@ -906,6 +997,12 @@ Before significant work, read the relevant skill file to understand the workflow
         worker_id: &str,
         ticket_id: &str,
     ) -> Result<Option<String>> {
+        if let Some(runtime) = &self.runtime_control {
+            return self
+                .provision_managed_workspace(store, runtime, worker_id, ticket_id)
+                .await;
+        }
+
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let existing_workspace_id = match slots.get(worker_id) {
@@ -975,7 +1072,9 @@ Before significant work, read the relevant skill file to understand the workflow
             .map(|repo| {
                 // Strip any extra quotes that might have been added during JSON serialization
                 let clean_repo = repo.trim_matches('"');
-                format!("https://github.com/{}.git", clean_repo)
+                config::EnvConfig::from_env()
+                    .map(|e| e.github.repository_clone_url(clean_repo))
+                    .unwrap_or_else(|_| format!("https://github.com/{}.git", clean_repo))
             })
             .unwrap_or_default();
         let template_name = Self::template_name_for_worker(worker_id);
@@ -1006,13 +1105,12 @@ Before significant work, read the relevant skill file to understand the workflow
         // existing PR (CI fix / review rework), this is the PR's `head_branch` from
         // `pending_prs` so the freshly provisioned forge resumes the branch where the
         // work was already done instead of starting afresh on the default branch.
-        // When no PR exists yet, fall back to the conventional `{worker}/{ticket}`
-        // branch the forge creates on first work.
+        // With no PR, an empty branch asks the template to create the task branch.
         let pending_prs: Vec<Value> = store
             .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
             .await
             .unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, worker_id, ticket_id);
+        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
         let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
         store
             .set(
@@ -1182,6 +1280,104 @@ Before significant work, read the relevant skill file to understand the workflow
         Ok(Some(workspace.id))
     }
 
+    /// Hosted workers are created by Manager from the authenticated Nexus
+    /// runtime scope.  The controller supplies only scheduling data; Manager
+    /// resolves the organization, creator-owned Coder identity, release, and
+    /// secret mounts.  This deliberately avoids obtaining any Coder credential
+    /// inside the customer workspace.
+    async fn provision_managed_workspace(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let slot = slots
+            .get(worker_id)
+            .context("worker slot disappeared while provisioning")?;
+
+        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+            let status = runtime.worker_status(workspace_id).await?;
+            if status.desired_state == "running"
+                && status.observed_state == "running"
+                && status.last_heartbeat_at.is_some()
+            {
+                info!(
+                    worker_id,
+                    workspace_id,
+                    role = %status.role,
+                    slot = ?status.slot,
+                    "Managed worker workspace is ready"
+                );
+                return Ok(Some(workspace_id.to_string()));
+            }
+            anyhow::bail!(
+                "managed worker workspace {} is still {} / {} (bootstrap heartbeat: {})",
+                workspace_id,
+                status.desired_state,
+                status.observed_state,
+                if status.last_heartbeat_at.is_some() {
+                    "ready"
+                } else {
+                    "pending"
+                }
+            );
+        }
+
+        let role = Self::worker_role(worker_id);
+        let slot_number = worker_id
+            .rsplit_once('-')
+            .and_then(|(_, value)| value.parse::<i32>().ok());
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
+        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
+            )
+            .await;
+        let idempotency_store_key = Self::managed_worker_request_key(worker_id, ticket_id);
+        let idempotency_key: String = store
+            .get_typed(&idempotency_store_key)
+            .await
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        store
+            .set(&idempotency_store_key, json!(idempotency_key))
+            .await;
+
+        let requested = runtime
+            .request_worker(
+                role,
+                slot_number,
+                Some(ticket_id),
+                (!branch.is_empty()).then_some(branch.as_str()),
+                Some(&a2a_pair_token),
+                &idempotency_key,
+            )
+            .await?;
+        if let Some(slot) = slots.get_mut(worker_id) {
+            slot.workspace_id = Some(requested.workspace_id.clone());
+        }
+        store
+            .set(KEY_WORKER_SLOTS, serde_json::to_value(&slots)?)
+            .await;
+        info!(
+            worker_id,
+            ticket_id,
+            workspace_id = %requested.workspace_id,
+            operation_id = %requested.operation_id,
+            status = %requested.status,
+            "Requested managed worker workspace"
+        );
+        anyhow::bail!(
+            "managed worker workspace {} is queued; it will be adopted after Manager reports it ready",
+            requested.workspace_id
+        );
+    }
+
     /// A persisted workspace ID is not proof that instruction provisioning succeeded.
     async fn ensure_workspace_instructions(
         &self,
@@ -1231,6 +1427,44 @@ Before significant work, read the relevant skill file to understand the workflow
             role, workspace_id, "Workspace instructions provisioned"
         );
         Ok(())
+    }
+
+    /// Destroy a worker through its owning control plane. Hosted slot ids are
+    /// OpenFlows workspace ids and must go through Manager; local ids belong
+    /// to Coder directly.
+    async fn destroy_worker_workspace(
+        &self,
+        store: &SharedStore,
+        workspace_id: &str,
+    ) -> Result<()> {
+        if let Some(runtime) = &self.runtime_control {
+            let request_key = store
+                .get_typed::<HashMap<String, WorkerSlot>>(KEY_WORKER_SLOTS)
+                .await
+                .and_then(|slots| {
+                    slots.into_iter().find_map(|(worker_id, slot)| {
+                        (slot.workspace_id.as_deref() == Some(workspace_id))
+                            .then(|| {
+                                slot.status.ticket_id().map(|ticket_id| {
+                                    Self::managed_worker_request_key(&worker_id, ticket_id)
+                                })
+                            })
+                            .flatten()
+                    })
+                });
+            runtime
+                .delete_worker(workspace_id, &format!("runtime-delete:{workspace_id}"))
+                .await
+                .context("Failed to request managed workspace deletion")?;
+            if let Some(request_key) = request_key {
+                // The key deduplicates retries of one creation attempt. Once
+                // that workspace is successfully deleted, the next assignment
+                // is a replacement attempt and must receive a fresh key.
+                store.del(&request_key).await;
+            }
+            return Ok(());
+        }
+        self.destroy_coder_workspace(store, workspace_id).await
     }
 
     /// Destroy a Coder workspace and archive all associated chats.
@@ -1314,9 +1548,8 @@ Before significant work, read the relevant skill file to understand the workflow
     /// Resolve the git branch a freshly provisioned forge workspace should check out.
     ///
     /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
-    /// rework workspace resumes the branch where the work was already done), falling
-    /// back to the conventional `{worker}/{ticket}` branch for first-time work.
-    fn resolve_workspace_branch(pending_prs: &[Value], worker_id: &str, ticket_id: &str) -> String {
+    /// rework workspace resumes its commits). Empty means create a fresh task branch.
+    fn resolve_workspace_branch(pending_prs: &[Value], ticket_id: &str) -> String {
         pending_prs
             .iter()
             .find(|p| p.get("ticket_id").and_then(|v| v.as_str()) == Some(ticket_id))
@@ -1326,7 +1559,7 @@ Before significant work, read the relevant skill file to understand the workflow
                     .map(String::from)
             })
             .filter(|b| !b.is_empty())
-            .unwrap_or_else(|| format!("{}/{}", worker_id, ticket_id))
+            .unwrap_or_default()
     }
 
     /// Create a Coder Chat for a ticket assignment and store the chat ID in SharedStore.
@@ -1347,6 +1580,33 @@ Before significant work, read the relevant skill file to understand the workflow
         // Generic recovery uses a different chat key and would create a second
         // reviewer (and overwrite its dispatch with builder instructions).
         if Self::worker_role(worker_id) == "sentinel" {
+            return;
+        }
+
+        if let Some(runtime) = &self.runtime_control {
+            // The managed Chat path must provision the required workspace
+            // instructions (AGENTS.md, role persona, skills, command documents)
+            // before starting the Chat, matching the non-managed path. This is a
+            // no-op when the instructions were already provisioned.
+            if let Some(client) = Self::coder_client_from_store(store).await {
+                let slots: HashMap<String, WorkerSlot> =
+                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                if let Some(ws) = slots.get(worker_id).and_then(|s| s.workspace_id.clone()) {
+                    if let Err(error) = self
+                        .ensure_workspace_instructions(store, &client, &ws, worker_id)
+                        .await
+                    {
+                        warn!(worker_id, ticket_id, error = %error, "Managed workspace instructions unavailable; deferring chat");
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = self
+                .create_managed_chat_for_assignment(store, runtime, worker_id, ticket)
+                .await
+            {
+                warn!(worker_id, ticket_id, error = %error, "Managed Chat creation deferred; retrying on next poll");
+            }
             return;
         }
 
@@ -1616,14 +1876,15 @@ Use `openflows-harness` for all coordination:
 | `dispatch read` | Get ticket requirements |
 | `status get` | Check current phase |
 | `status set <phase>` | Update progress phase |
-| `pr opened --pr N --branch B --title T` | Record PR after opening |
+| `pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` | Create/find the GitHub PR and record it; provide a descriptive Markdown body |
+| `pr opened --pr N --branch B --title T` | Record an externally created PR only |
 | `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
 1. Analyze task, write the plan at the current chat's plan path, then upload it with `plan write --file <absolute-plan-path>` and set `status set plan_ready` and wait for SENTINEL approval
 2. `building` → SENTINEL plan approval moves shared state to building; read status and implement
 3. `testing` → Run tests, verify, set `status set testing`
-4. After A2A verification and SENTINEL testing approval (human testing review is TODO), set `status set submit`, open/record PR, and wait for SENTINEL and human PR approval.
+4. After A2A verification and SENTINEL testing approval (human testing review is TODO), read `status get`; approval moves the lifecycle to `submit`. Push the assigned branch. If no PR is recorded, run `pr create` with the task's target base (or repository default), a descriptive title, and a Markdown body explaining the change and verification. That command creates/finds and records the PR. If a PR is already recorded, update its branch. Wait for SENTINEL and human PR approval.
 5. `blocked` → Stuck? Set status and explain
 "#;
 
@@ -1660,12 +1921,7 @@ Use `openflows-harness` for all coordination:
         // full ticket-assignment blast — the agent resumes its existing branch/work.
         let had_rework_directive = rework_directive.is_some();
         let initial_prompt = match rework_directive {
-            Some(directive) => format!(
-                "You are resuming existing work on ticket {}.\n\n{}\n\n\
-                 Address the rework directive above. Re-check `openflows-harness status get` \
-                 and `openflows-harness dispatch read` for context.\n",
-                ticket_id, directive
-            ),
+            Some(directive) => Self::rework_prompt(ticket_id, &directive),
             None => format!(
                 "{}\n\n**Begin work immediately.** Read harness status and dispatch, inspect source files and existing deployment/runtime configuration without modifying source, then write a grounded plan at the exact chat-specific path supplied by Coder or the startup hook. Run `openflows-harness plan write --file <absolute-plan-path>` and `openflows-harness status set plan_ready` and wait for SENTINEL gate approval before implementation.\n",
                 base_prompt
@@ -1682,6 +1938,7 @@ Use `openflows-harness` for all coordination:
 
         let chat_req = CreateChatRequest {
             organization_id,
+            owner_id: None,
             workspace_id: workspace_id.clone(),
             model_config_id,
             content: vec![coder_client::types::ChatInputPart::text(initial_prompt)],
@@ -1825,6 +2082,99 @@ Use `openflows-harness` for all coordination:
         store.set(&ws_key, json!(workspace_id)).await;
     }
 
+    async fn create_managed_chat_for_assignment(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        worker_id: &str,
+        ticket: &Ticket,
+    ) -> Result<()> {
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let workspace_id = slots
+            .get(worker_id)
+            .and_then(|slot| slot.workspace_id.as_deref())
+            .context("worker workspace is not assigned yet")?;
+        let role = Self::worker_role(worker_id);
+        let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, role);
+        let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, role);
+        let rework_key = full_ticket_key(&ticket.id, KEY_TICKET_REWORK_DIRECTIVE, role);
+        let rework_directive = store.get_typed::<String>(&rework_key).await;
+        let rework_delivery_id = match rework_directive.as_ref() {
+            Some(_) => Some(Self::ensure_rework_delivery_id(store, &ticket.id, role).await),
+            None => None,
+        };
+        let prompt = match rework_directive.as_deref() {
+            Some(directive) => Self::rework_prompt(&ticket.id, directive),
+            None => format!(
+                "You are the OpenFlows {role} agent for ticket {id}.\n\nTitle: {title}\n\n{body}\n\nRead /home/coder/workspace/AGENTS.md and /home/coder/workspace/{role}.agent.md if present. Read `openflows-harness dispatch read` and `openflows-harness status get`, then write a plan and report `plan_ready` before implementation.",
+                id=ticket.id, title=ticket.title, body=ticket.body,
+            ),
+        };
+        let chat = runtime
+            .create_chat(workspace_id, &ticket.id, &prompt)
+            .await?;
+        if chat.workspace_id != workspace_id {
+            anyhow::bail!("Manager returned a Chat for a different workspace");
+        }
+        if rework_directive.is_some() {
+            if !chat.created {
+                runtime
+                    .send_chat_message(
+                        &chat.chat_id,
+                        &Self::managed_rework_message_key(
+                            &ticket.id,
+                            rework_delivery_id
+                                .as_deref()
+                                .expect("delivery id exists for a rework directive"),
+                        ),
+                        &prompt,
+                    )
+                    .await?;
+            }
+            // A newly created Chat received the directive as its first prompt;
+            // an existing Chat received it through the durable message API.
+            // Preserve the key on either failure so reconciliation retries it.
+            store.del(&rework_key).await;
+        }
+        store.set(&chat_key, json!(chat.chat_id)).await;
+        // Preserve same-Chat recovery: do not unconditionally mark a returned
+        // Chat as `started`. A Chat in `error`/`requires_action` (which the
+        // Manager resumes on retry) must remain eligible for the existing
+        // resume flow instead of being treated as freshly started.
+        let mut action = "started";
+        if let Some(client) = Self::coder_client_from_store(store).await {
+            if let Ok(Some(live)) = client.get_chat_opt(&chat.chat_id).await {
+                if matches!(
+                    live.status(),
+                    ChatStatus::Error | ChatStatus::RequiresAction | ChatStatus::Waiting
+                ) {
+                    action = "resume_needed";
+                }
+            }
+        }
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, role),
+                json!(action),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role),
+                json!(workspace_id),
+            )
+            .await;
+        let mut dispatch: serde_json::Value = store.get_typed(&dispatch_key).await
+            .unwrap_or_else(|| json!({"ticket_id":ticket.id,"title":ticket.title,"body":ticket.body,"branch":ticket.branch}));
+        if let Some(obj) = dispatch.as_object_mut() {
+            obj.insert("chat_id".into(), json!(chat.chat_id));
+        }
+        store.set(&dispatch_key, dispatch).await;
+        info!(worker_id, ticket_id = %ticket.id, chat_id = %chat.chat_id, "Managed Coder Chat ready");
+        Ok(())
+    }
+
     /// Send a harness-aware resume prompt to a chat that is stuck.
     ///
     /// Reuses the harness-state-driven follow-up so the agent resumes from where
@@ -1896,6 +2246,11 @@ Use `openflows-harness` for all coordination:
         store: &SharedStore,
         tickets: &[Ticket],
     ) {
+        if let Some(runtime) = &self.runtime_control {
+            self.poll_managed_harness_status_and_spawn_agents(store, tickets, runtime)
+                .await;
+            return;
+        }
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -2014,7 +2369,7 @@ Use `openflows-harness` for all coordination:
                                 .await
                             {
                                 let prompt = if testing {
-                                    "Testing review gates passed. Read status get for the approved revision and head; once lifecycle shows submit, open/record the PR and wait for PR review and human approval.".to_string()
+                                    "Testing review gates passed. Read `openflows-harness status get`; proceed only in submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch. Wait for PR review and human approval.".to_string()
                                 } else {
                                     "Review gates passed. Run `openflows-harness status set building`. Read status get for the approved revision and head.".to_string()
                                 };
@@ -2270,6 +2625,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(
@@ -2348,7 +2704,7 @@ Use `openflows-harness` for all coordination:
                                     ))
                                     .await
                                 {
-                                    let prompt = "Testing review gates passed and lifecycle is already submit. Continue work: open or update the PR, record it with `openflows-harness pr opened`, then wait for PR review, human approval, and CI.";
+                                    let prompt = "Testing review gates passed; lifecycle is already submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch. Wait for PR review, human approval, and CI.";
                                     if client
                                         .send_chat_message(
                                             &chat,
@@ -2563,6 +2919,7 @@ Use `openflows-harness` for all coordination:
 
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
+                        owner_id: None,
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(&pr_review_prompt)],
@@ -2873,6 +3230,7 @@ Use `openflows-harness` for all coordination:
 
             let chat_req = coder_client::types::CreateChatRequest {
                 organization_id: Some(organization_id),
+                owner_id: None,
                 workspace_id: workspace_id.clone(),
                 model_config_id: None,
                 content: vec![],
@@ -2910,43 +3268,420 @@ Use `openflows-harness` for all coordination:
         }
     }
 
+    /// Hosted review orchestration. All Coder authority remains in Manager;
+    /// Nexus supplies tenant-scoped scheduling information and durable message
+    /// keys only. This mirrors the direct-Coder lifecycle without requiring an
+    /// operator credential in the Nexus workspace.
+    async fn poll_managed_harness_status_and_spawn_agents(
+        &self,
+        store: &SharedStore,
+        tickets: &[Ticket],
+        runtime: &crate::runtime_control::RuntimeControlClient,
+    ) {
+        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
+            Some(slots) => slots,
+            None => {
+                info!("poll_harness_status: no worker slots stored — cannot spawn reviewers");
+                return;
+            }
+        };
+        info!(
+            total = tickets.len(),
+            active = tickets
+                .iter()
+                .filter(|ticket| matches!(
+                    &ticket.status,
+                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+                ) || matches!(
+                    &ticket.status,
+                    TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+                ))
+                .count(),
+            "poll_harness_status: scanning managed tickets for harness phase"
+        );
+
+        for ticket in tickets {
+            let active = matches!(
+                &ticket.status,
+                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+            ) || matches!(
+                &ticket.status,
+                TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+            );
+            if !active {
+                continue;
+            }
+            let lifecycle = match store.lifecycle(&ticket.id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(ticket_id=%ticket.id, %error, "Cannot load managed ticket lifecycle");
+                    continue;
+                }
+            };
+
+            match lifecycle.phase {
+                config::lifecycle::Phase::Building | config::lifecycle::Phase::PlanRejected => {
+                    // Gate decisions move the shared lifecycle atomically. By the
+                    // next poll it is no longer PlanReady/Testing, so those arms
+                    // cannot wake a Forge chat that stopped at the review gate.
+                    if let Some(feedback) = lifecycle.feedback.as_deref() {
+                        let key = format!(
+                            "review-feedback:{}:{}:{}",
+                            lifecycle.phase.as_str(),
+                            lifecycle.revision,
+                            lifecycle.review_round
+                        );
+                        let prompt = format!(
+                            "Review rejected: {feedback}. Read `openflows-harness status get`. If plan_rejected, return to planning, revise the plan, and request another review. If building, fix the implementation and return through testing."
+                        );
+                        self.notify_managed_forge(store, runtime, ticket, &key, &prompt)
+                            .await;
+                    } else if lifecycle.phase == config::lifecycle::Phase::Building {
+                        if let Some(decision) =
+                            lifecycle.plan_decision.as_ref().filter(|decision| {
+                                decision.approved && decision.revision == lifecycle.revision
+                            })
+                        {
+                            let key =
+                                format!("plan-approved:{}:{}", decision.revision, decision.round);
+                            self.notify_managed_forge(
+                                store,
+                                runtime,
+                                ticket,
+                                &key,
+                                "SENTINEL approved the plan. Shared state is already building. Read `openflows-harness status get`, then implement the approved revision; do not replay the phase transition.",
+                            )
+                            .await;
+                        }
+                    }
+                }
+                config::lifecycle::Phase::PlanReady | config::lifecycle::Phase::Testing => {
+                    let testing = lifecycle.phase == config::lifecycle::Phase::Testing;
+                    let approved = if testing {
+                        lifecycle
+                            .test_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                    } else {
+                        lifecycle
+                            .plan_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                    };
+                    if approved {
+                        let prompt = if testing {
+                            "Testing review gates passed. Read `openflows-harness status get`; proceed only in submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch."
+                        } else {
+                            "Plan review passed. Run `openflows-harness status set building`, read the approved revision with `openflows-harness status get`, and continue implementation."
+                        };
+                        let key = format!(
+                            "gate:{}:{}:{}:{}",
+                            lifecycle.phase.as_str(),
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or("plan"),
+                            lifecycle.review_round
+                        );
+                        self.notify_managed_forge(store, runtime, ticket, &key, prompt)
+                            .await;
+                        continue;
+                    }
+
+                    let namespace = format!(
+                        "{}:{}:{}:{}",
+                        if testing { "testing" } else { "planning_gate" },
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or("plan"),
+                        lifecycle.review_round
+                    );
+                    let prompt = if testing {
+                        format!(
+                            "Testing review for {}. Read `openflows-harness plan read` and `status get`. Verify approved plan revision {} at head {} through the A2A executor. Write review.md and run `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict <approve|reject> --report review.md`.",
+                            ticket.id,
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or(""),
+                            lifecycle.revision,
+                            lifecycle.head.as_deref().unwrap_or(""),
+                            lifecycle.review_round,
+                        )
+                    } else {
+                        format!(
+                            "Review plan revision {} for {}. Read `openflows-harness plan read` and `status get`. Write review.md, then run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict <approve|reject> --report review.md`. Do not modify source.",
+                            lifecycle.revision,
+                            ticket.id,
+                            lifecycle.revision,
+                            lifecycle.review_round,
+                        )
+                    };
+                    self.ensure_managed_sentinel_review(
+                        store,
+                        runtime,
+                        ticket,
+                        &slots,
+                        &namespace,
+                        if testing { "testing" } else { "planning_gate" },
+                        &prompt,
+                        &lifecycle,
+                    )
+                    .await;
+                }
+                config::lifecycle::Phase::Blocked => {
+                    let feedback = lifecycle
+                        .feedback
+                        .as_deref()
+                        .unwrap_or("A blocker was recorded; inspect lifecycle status for details.");
+                    let key = format!("blocked:{}", lifecycle.version);
+                    let prompt = format!(
+                        "Your ticket is BLOCKED. Blocker: {feedback}\n\
+                         Read `openflows-harness status get` for the exact blocker and evidence.\n\
+                         Recovery returns through planning: once the blocker is resolved, run \
+                         `openflows-harness status set planning`, revise/upload the plan, and set \
+                         `plan_ready` for a fresh review."
+                    );
+                    self.notify_managed_forge(store, runtime, ticket, &key, &prompt)
+                        .await;
+                }
+                config::lifecycle::Phase::Submit => {
+                    if lifecycle.pr_number.is_none() {
+                        if lifecycle
+                            .test_decision
+                            .as_ref()
+                            .is_some_and(|decision| decision.approved)
+                        {
+                            let key = format!(
+                                "submit:{}:{}:{}",
+                                lifecycle.revision,
+                                lifecycle.head.as_deref().unwrap_or(""),
+                                lifecycle.review_round
+                            );
+                            self.notify_managed_forge(
+                                store,
+                                runtime,
+                                ticket,
+                                &key,
+                                "Testing is approved and lifecycle is at submit. Push the assigned branch. If no PR is recorded, run `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body BODY` with a descriptive Markdown body; it creates/finds and records the PR. Use the task's target base or repository default. If a PR is already recorded, update its branch.",
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                    if lifecycle.pr_decision.is_some() {
+                        continue;
+                    }
+                    let namespace = pr_review_namespace(
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                        lifecycle.review_round,
+                    );
+                    let prompt = format!(
+                        "PR review for ticket {}. Read `openflows-harness dispatch read`, `plan read`, and `status get`. Review the recorded PR against revision {} at head {}. Write review.md and run `openflows-harness review submit --verdict <approve|reject> --report review.md --revision {} --round {} --head {}`.",
+                        ticket.id,
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                        lifecycle.revision,
+                        lifecycle.review_round,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                    );
+                    self.ensure_managed_sentinel_review(
+                        store,
+                        runtime,
+                        ticket,
+                        &slots,
+                        &namespace,
+                        "pr_review",
+                        &prompt,
+                        &lifecycle,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn notify_managed_forge(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        ticket: &Ticket,
+        message_key: &str,
+        prompt: &str,
+    ) {
+        let Some(chat_id) = store
+            .get_typed::<String>(&full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "forge"))
+            .await
+        else {
+            return;
+        };
+        if let Err(error) = runtime
+            .send_chat_message(&chat_id, message_key, prompt)
+            .await
+        {
+            warn!(ticket_id=%ticket.id, chat_id, %error, "Could not notify managed Forge Chat");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_managed_sentinel_review(
+        &self,
+        store: &SharedStore,
+        runtime: &crate::runtime_control::RuntimeControlClient,
+        ticket: &Ticket,
+        slots_snapshot: &HashMap<String, WorkerSlot>,
+        namespace: &str,
+        review_type: &str,
+        prompt: &str,
+        lifecycle: &config::lifecycle::Lifecycle,
+    ) {
+        let chat_key = review_chat_key(&ticket.id, namespace);
+        if store.get(&chat_key).await.is_some() {
+            return;
+        }
+        let live_slots: HashMap<String, WorkerSlot> = store
+            .get_typed(KEY_WORKER_SLOTS)
+            .await
+            .unwrap_or_else(|| slots_snapshot.clone());
+        let forge_worker_id = match &ticket.status {
+            TicketStatus::Assigned { worker_id }
+            | TicketStatus::InProgress { worker_id }
+            | TicketStatus::Completed { worker_id, .. }
+                if worker_id != "nexus-reconciliation" =>
+            {
+                worker_id.clone()
+            }
+            _ => live_slots
+                .iter()
+                .find(|(id, slot)| {
+                    Self::worker_role(id) == "forge"
+                        && matches!(
+                            &slot.status,
+                            WorkerStatus::Assigned { ticket_id, .. }
+                                | WorkerStatus::Working { ticket_id, .. }
+                                if ticket_id == &ticket.id
+                        )
+                })
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default(),
+        };
+        let Some((sentinel_worker_id, sentinel_slot)) =
+            Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots)
+        else {
+            info!(ticket_id=%ticket.id, "No Sentinel slot available for managed review");
+            return;
+        };
+        let workspace_id = match sentinel_slot.workspace_id {
+            Some(id) => match runtime.worker_status(&id).await {
+                Ok(status)
+                    if status.desired_state == "running"
+                        && status.observed_state == "running"
+                        && status.last_heartbeat_at.is_some() =>
+                {
+                    id
+                }
+                Ok(_) | Err(_) => return,
+            },
+            None => match self
+                .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
+                .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) | Err(_) => return,
+            },
+        };
+
+        let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
+        store
+            .set(
+                &dispatch_key,
+                json!({
+                    "ticket_id": ticket.id,
+                    "title": ticket.title,
+                    "body": ticket.body,
+                    "branch": ticket.branch,
+                    "review_type": review_type,
+                    "plan": lifecycle.plan,
+                    "revision": lifecycle.revision,
+                    "review_round": lifecycle.review_round,
+                    "head": lifecycle.head,
+                }),
+            )
+            .await;
+
+        match runtime.create_chat(&workspace_id, &ticket.id, prompt).await {
+            Ok(chat) => {
+                if !chat.created {
+                    let message_key = format!("sentinel:{namespace}");
+                    if let Err(error) = runtime
+                        .send_chat_message(&chat.chat_id, &message_key, prompt)
+                        .await
+                    {
+                        warn!(ticket_id=%ticket.id, %error, "Could not continue managed Sentinel review");
+                        return;
+                    }
+                }
+                let mut slots: HashMap<String, WorkerSlot> =
+                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                if let Some(slot) = slots.get_mut(&sentinel_worker_id) {
+                    slot.status = WorkerStatus::Assigned {
+                        ticket_id: ticket.id.clone(),
+                        issue_url: ticket.issue_url.clone(),
+                    };
+                    slot.workspace_id = Some(workspace_id);
+                }
+                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                store.set(&chat_key, json!(chat.chat_id.clone())).await;
+                store
+                    .set(
+                        &format!("ticket:{}:sentinel_session", ticket.id),
+                        json!(chat.chat_id),
+                    )
+                    .await;
+                info!(ticket_id=%ticket.id, sentinel_worker_id, review_type, "Managed Sentinel review Chat ready");
+            }
+            Err(error) => {
+                warn!(ticket_id=%ticket.id, sentinel_worker_id, %error, "Managed Sentinel review Chat deferred");
+            }
+        }
+    }
+
     async fn check_ci_readiness(
         &self,
         store: &SharedStore,
         owner: &str,
         repo_name: &str,
-    ) -> CiReadiness {
+    ) -> Result<CiReadiness> {
         if owner.is_empty() || repo_name.is_empty() {
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
         // Check local CI first - supports current directory AND workspace directories
-        if Self::local_repo_matches(owner, repo_name) && Self::local_ci_config_exists() {
+        if self.runtime_control.is_none()
+            && Self::local_repo_matches(owner, repo_name)
+            && Self::local_ci_config_exists()
+        {
             info!("Local CI configuration found for repository — CI is ready");
             store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
         // Also check workspace directories (e.g., ~/Sandbox/{repo}/.github/workflows)
-        if Self::check_workspace_ci_config(owner, repo_name) {
+        if self.runtime_control.is_none() && Self::check_workspace_ci_config(owner, repo_name) {
             info!(
                 workspace_path = %Self::detect_workspace_path(owner, repo_name).display(),
                 "CI configuration found in workspace directory — CI is ready"
             );
             store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-            return CiReadiness::Ready;
+            return Ok(CiReadiness::Ready);
         }
 
-        let token = match self.resolve_github_token() {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
-                Some(t) => t,
-                None => {
-                    warn!("GitHub token not configured, assuming CI is ready");
-                    store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                    return CiReadiness::Ready;
+        let token = match self.github_api_token().await {
+            Ok(token) => token,
+            Err(error) => {
+                if self.runtime_control.is_some() {
+                    return Err(error.context("hosted controller cannot verify CI readiness"));
                 }
-            },
+                warn!(%error, "Cannot verify CI readiness without a GitHub credential");
+                return Ok(CiReadiness::Missing);
+            }
         };
 
         let client = github::GithubRestClient::new(&token);
@@ -2954,16 +3689,19 @@ Use `openflows-harness` for all coordination:
             Ok(true) => {
                 info!("CI workflows found in repository — CI is ready");
                 store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                CiReadiness::Ready
+                Ok(CiReadiness::Ready)
             }
             Ok(false) => {
                 info!("No CI workflows found in repository — CI setup required");
-                CiReadiness::Missing
+                Ok(CiReadiness::Missing)
             }
             Err(e) => {
+                if self.runtime_control.is_some() {
+                    return Err(e.context("hosted controller cannot check GitHub workflows"));
+                }
                 warn!(error = %e, "Failed to check CI workflows, assuming ready");
                 store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                CiReadiness::Ready
+                Ok(CiReadiness::Ready)
             }
         }
     }
@@ -3184,7 +3922,7 @@ Use `openflows-harness` for all coordination:
             .parse()
             .with_context(|| format!("Could not parse issue number from: {}", number_str))?;
 
-        let nexus_token = match self.resolve_github_token() {
+        let nexus_token = match self.github_api_token().await {
             Ok(t) => t,
             Err(e) => {
                 anyhow::bail!("GitHub token not configured for nexus: {}", e);
@@ -3368,7 +4106,7 @@ Use `openflows-harness` for all coordination:
         });
     }
 
-    async fn recover_orphans(store: &SharedStore) -> Result<()> {
+    async fn recover_orphans(&self, store: &SharedStore) -> Result<()> {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
@@ -3421,12 +4159,35 @@ Use `openflows-harness` for all coordination:
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
                     if ticket_done {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete terminal worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
                             "Recovering stale worker — ticket completed, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -3443,6 +4204,28 @@ Use `openflows-harness` for all coordination:
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
 
                     if complete {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete terminal worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
@@ -3458,12 +4241,35 @@ Use `openflows-harness` for all coordination:
                         .iter()
                         .any(|t| t.id == *ticket_id && matches!(t.status, TicketStatus::Open));
                     if ticket_open {
+                        let ticket_id = ticket_id.clone();
+                        if let Some(workspace_id) = slot.workspace_id.as_deref() {
+                            if let Err(error) =
+                                self.destroy_worker_workspace(store, workspace_id).await
+                            {
+                                warn!(
+                                    worker_id = slot.id,
+                                    %ticket_id,
+                                    %workspace_id,
+                                    %error,
+                                    "Failed to delete reset worker workspace; keeping slot reserved"
+                                );
+                                continue;
+                            }
+                            store
+                                .del(&full_ticket_key(
+                                    &ticket_id,
+                                    KEY_TICKET_WORKSPACE,
+                                    Self::worker_role(&slot.id),
+                                ))
+                                .await;
+                        }
                         info!(
                             worker_id = slot.id,
                             ticket_id,
                             "Recovering stale worker — ticket reset to Open, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
                         changed_slots = true;
                     }
                 }
@@ -3481,48 +4287,39 @@ Use `openflows-harness` for all coordination:
         }
 
         // Retry deleting any lingering workspaces for terminal tickets whose deletion failed
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            for ticket in &tickets {
-                if ticket.status.is_terminal()
-                    || store
-                        .lifecycle(&ticket.id)
-                        .await
-                        .ok()
-                        .is_some_and(|s| s.phase == config::lifecycle::Phase::Done)
-                {
-                    for role in ["forge", "sentinel"] {
-                        let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
-                        if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
-                            // Archive all chats associated with this workspace before deletion
-                            if let Ok(chats) = client.list_chats().await {
-                                for chat in chats.iter().filter(|c| c.workspace_id == ws_id) {
-                                    let _ = client.archive_chat(&chat.id).await;
+        for ticket in &tickets {
+            if ticket.status.is_terminal()
+                || store
+                    .lifecycle(&ticket.id)
+                    .await
+                    .ok()
+                    .is_some_and(|s| s.phase == config::lifecycle::Phase::Done)
+            {
+                for role in ["forge", "sentinel"] {
+                    let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
+                    if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                        match self.destroy_worker_workspace(store, &ws_id).await {
+                            Ok(()) => {
+                                info!(
+                                    ticket_id = %ticket.id,
+                                    role,
+                                    workspace_id = %ws_id,
+                                    "Recovered and deleted lingering workspace for terminal ticket"
+                                );
+                                if store.get_typed::<String>(&ws_key).await.as_deref()
+                                    == Some(&ws_id)
+                                {
+                                    store.del(&ws_key).await;
                                 }
                             }
-
-                            match client.delete_workspace(&ws_id).await {
-                                Ok(_) => {
-                                    info!(
-                                        ticket_id = %ticket.id,
-                                        role,
-                                        workspace_id = %ws_id,
-                                        "Recovered and deleted lingering workspace for terminal ticket"
-                                    );
-                                    if store.get_typed::<String>(&ws_key).await.as_deref()
-                                        == Some(&ws_id)
-                                    {
-                                        store.del(&ws_key).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        ticket_id = %ticket.id,
-                                        role,
-                                        workspace_id = %ws_id,
-                                        error = %e,
-                                        "Failed to delete lingering workspace during orphan recovery; will retry"
-                                    );
-                                }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    role,
+                                    workspace_id = %ws_id,
+                                    error = %e,
+                                    "Failed to delete lingering workspace during orphan recovery; will retry"
+                                );
                             }
                         }
                     }
@@ -4024,29 +4821,43 @@ Use `openflows-harness` for all coordination:
     /// Return a worker slot to Idle and detach (best-effort destroy) any
     /// workspace still associated with it.
     async fn release_worker_slot(&self, store: &SharedStore, worker_id: &str) {
-        let mut slots: HashMap<String, WorkerSlot> =
+        let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let Some(slot) = slots.get_mut(worker_id) else {
+        let Some(slot) = slots.get(worker_id) else {
             return;
         };
         if matches!(slot.status, WorkerStatus::Idle) && slot.workspace_id.is_none() {
             return;
         }
-        let workspace_id = slot.workspace_id.take();
-        slot.status = WorkerStatus::Idle;
-        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-        info!(worker_id, workspace_id = ?workspace_id, "Released worker slot back to Idle");
-
-        if let Some(workspace_id) = workspace_id {
-            if let Err(e) = self.destroy_coder_workspace(store, &workspace_id).await {
+        let workspace_id = slot.workspace_id.clone();
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            if let Err(e) = self.destroy_worker_workspace(store, workspace_id).await {
                 warn!(
                     worker_id,
                     workspace_id = %workspace_id,
                     error = %e,
                     "Failed to destroy workspace while releasing worker slot"
                 );
+                return;
             }
         }
+
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        if let Some(slot) = slots.get_mut(worker_id) {
+            // Do not erase a replacement workspace assigned while deletion was
+            // in flight. Direct Coder cleanup has already cleared the old id,
+            // while Manager cleanup leaves it in place until we commit this
+            // slot transition.
+            if slot.workspace_id == workspace_id
+                || (workspace_id.is_some() && slot.workspace_id.is_none())
+            {
+                slot.workspace_id = None;
+                slot.status = WorkerStatus::Idle;
+            }
+        }
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        info!(worker_id, workspace_id = ?workspace_id, "Released worker slot back to Idle");
     }
 
     async fn reset_recovery_attempts(&self, store: &SharedStore, ticket_id: &str) {
@@ -4558,14 +5369,20 @@ impl Node for NexusNode {
         let repo_name = parts.next().unwrap_or("").to_string();
 
         if let Err(e) = self.sync_issues(store, &owner, &repo_name).await {
+            if self.runtime_control.is_some() {
+                return Err(e.context("hosted controller cannot sync GitHub issues"));
+            }
             warn!("Failed to sync issues from GitHub: {}", e);
         }
 
         if let Err(e) = self.sync_open_prs(store, &owner, &repo_name).await {
+            if self.runtime_control.is_some() {
+                return Err(e.context("hosted controller cannot sync GitHub pull requests"));
+            }
             warn!("Failed to sync open PRs from GitHub: {}", e);
         }
 
-        let ci_readiness = self.check_ci_readiness(store, &owner, &repo_name).await;
+        let ci_readiness = self.check_ci_readiness(store, &owner, &repo_name).await?;
         store.set(KEY_CI_READINESS, json!(ci_readiness)).await;
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
@@ -4599,33 +5416,32 @@ impl Node for NexusNode {
 
         let has_assignable = tickets.iter().any(|t| t.is_assignable());
 
-        let mut worker_slots: HashMap<String, WorkerSlot> =
+        let worker_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
-        let mut recycled = false;
         if has_assignable {
-            for slot in worker_slots.values_mut() {
-                let is_done = matches!(slot.status, WorkerStatus::Done { .. });
-                let is_terminal = match &slot.status {
-                    WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. } => tickets
-                        .iter()
-                        .any(|t| t.id == *ticket_id && t.status.is_terminal()),
-                    _ => false,
-                };
-                if is_done || is_terminal {
-                    info!(
-                        worker_id = slot.id,
-                        "Recycling worker to Idle — assignable tickets exist and worker is Done or ticket is terminal"
-                    );
-                    slot.status = WorkerStatus::Idle;
-                    slot.workspace_id = None;
-                    recycled = true;
-                }
+            let recycle: Vec<String> = worker_slots
+                .values()
+                .filter(|slot| {
+                    let is_done = matches!(slot.status, WorkerStatus::Done { .. });
+                    let is_terminal = match &slot.status {
+                        WorkerStatus::Assigned { ticket_id, .. }
+                        | WorkerStatus::Working { ticket_id, .. } => tickets
+                            .iter()
+                            .any(|t| t.id == *ticket_id && t.status.is_terminal()),
+                        _ => false,
+                    };
+                    is_done || is_terminal
+                })
+                .map(|slot| slot.id.clone())
+                .collect();
+            for worker_id in recycle {
+                info!(
+                    worker_id,
+                    "Recycling worker to Idle — assignable tickets exist and worker is Done or ticket is terminal"
+                );
+                self.release_worker_slot(store, &worker_id).await;
             }
-        }
-        if recycled {
-            store.set(KEY_WORKER_SLOTS, json!(worker_slots)).await;
         }
 
         let pending_prs_snapshot = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
@@ -4906,10 +5722,7 @@ impl Node for NexusNode {
                 })
                 .collect();
             if !needs_pr_restore.is_empty() {
-                let token = self
-                    .resolve_github_token()
-                    .ok()
-                    .or_else(|| self.resolve_github_token_from_env_or_file());
+                let token = self.github_api_token().await.ok();
                 if let Some(token) = token {
                     let gh = github::GithubRestClient::new(&token);
                     if let Ok(prs) = gh.list_open_prs(&owner, &repo_name).await {
@@ -4993,12 +5806,25 @@ impl Node for NexusNode {
             .set(KEY_MERGE_READY_PRS, json!(merge_ready_prs.clone()))
             .await;
         let open_prs = json!(merge_ready_prs);
+        let mut review_delivery_pending = false;
+        for ticket in tickets.iter().filter(|ticket| !ticket.status.is_terminal()) {
+            if store
+                .lifecycle(&ticket.id)
+                .await?
+                .deliverable_review()
+                .is_some()
+            {
+                review_delivery_pending = true;
+                break;
+            }
+        }
 
         Ok(json!({
             "tickets": tickets,
             "assignable_tickets": assignable_tickets,
             "worker_slots": store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({})),
             "open_prs": open_prs,
+            "review_delivery_pending": review_delivery_pending,
             "command_gate": command_gate,
             "repository": repository,
             "owner": owner,
@@ -5106,6 +5932,20 @@ impl Node for NexusNode {
                     issue_url: None,
                 }));
             }
+        }
+
+        // Deliver a ready review before VESSEL evaluates merge readiness.
+        if context["review_delivery_pending"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Ok(json!(AgentDecision {
+                action: "sentinel_spawned".to_string(),
+                notes: "Review delivery pending — route to SENTINEL".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
         }
 
         if !pending_prs.is_empty() {
@@ -5225,7 +6065,7 @@ impl Node for NexusNode {
         // while the flow is stuck routing to `sentinel_spawned`; if recycling only
         // ran on `work_assigned` it would never run in that state and the stale
         // binding would churn forever, starving idle forge slots of paired sentinels.
-        Self::recover_orphans(store).await?;
+        self.recover_orphans(store).await?;
 
         if decision.action == ACTION_MERGE_PRS {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
@@ -5333,17 +6173,24 @@ impl Node for NexusNode {
 
                     // Sync assignment to GitHub: assign issue, add comment, and label
                     if let Some(issue_url) = &decision.issue_url {
-                        if let Err(e) = self
-                            .sync_assignment_to_github(worker_id, ticket_id, issue_url)
-                            .await
-                        {
-                            warn!(
-                                worker_id,
-                                ticket_id,
-                                issue_url,
-                                error = %e,
-                                "Failed to sync assignment to GitHub — continuing anyway"
-                            );
+                        // A hosted workspace uses a repository-scoped GitHub App
+                        // installation token. It represents the App, not a
+                        // separate human worker account that can be assigned
+                        // through GitHub's issue assignee API. The internal
+                        // ticket/worker assignment above remains authoritative.
+                        if self.runtime_control.is_none() {
+                            if let Err(e) = self
+                                .sync_assignment_to_github(worker_id, ticket_id, issue_url)
+                                .await
+                            {
+                                warn!(
+                                    worker_id,
+                                    ticket_id,
+                                    issue_url,
+                                    error = %e,
+                                    "Failed to sync assignment to GitHub — continuing anyway"
+                                );
+                            }
                         }
                     }
                 }
@@ -5471,6 +6318,22 @@ fn directive_pr_number(directive: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ready_review_delivery_routes_before_pending_merges() {
+        let node = NexusNode::new("unused", "unused");
+        for (delivery_pending, expected) in [(true, "sentinel_spawned"), (false, ACTION_MERGE_PRS)]
+        {
+            let decision = node
+                .exec(json!({
+                    "open_prs": [{"number": 42}], "review_delivery_pending": delivery_pending,
+                    "worker_slots": {}, "assignable_tickets": [],
+                }))
+                .await
+                .unwrap();
+            assert_eq!(decision["action"], expected);
+        }
+    }
 
     #[tokio::test]
     async fn fleet_one_recovers_empty_slots_and_preserves_busy_workers() {
@@ -5891,7 +6754,7 @@ mod tests {
         let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
         // Rework of an existing PR reuses its real PR branch.
         assert_eq!(
-            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-034"),
+            NexusNode::resolve_workspace_branch(&arr, "T-034"),
             "forge-1/T-034"
         );
     }
@@ -5899,10 +6762,10 @@ mod tests {
     #[test]
     fn resolve_workspace_branch_falls_back_for_new_ticket() {
         let pending_prs: Vec<Value> = Vec::new();
-        // No PR yet — fall back to the conventional worker/ticket branch.
+        // An empty parameter tells the template to create the task branch.
         assert_eq!(
-            NexusNode::resolve_workspace_branch(&pending_prs, "forge-3", "T-099"),
-            "forge-3/T-099"
+            NexusNode::resolve_workspace_branch(&pending_prs, "T-099"),
+            ""
         );
     }
 
@@ -5912,10 +6775,7 @@ mod tests {
             {"number": 7, "ticket_id": "T-007", "head_branch": ""}
         ]);
         let arr: Vec<Value> = serde_json::from_value(pending_prs).unwrap();
-        assert_eq!(
-            NexusNode::resolve_workspace_branch(&arr, "forge-1", "T-007"),
-            "forge-1/T-007"
-        );
+        assert_eq!(NexusNode::resolve_workspace_branch(&arr, "T-007"), "");
     }
 
     #[test]
@@ -6011,6 +6871,278 @@ mod tests {
         ]);
         let (id, _) = NexusNode::review_sentinel_for_ticket("T-10", "forge-2", &slots).unwrap();
         assert_eq!(id, "sentinel-1");
+    }
+
+    #[tokio::test]
+    async fn hosted_plan_approval_wakes_forge_after_atomic_phase_transition() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "message_key":"plan-approved:1:1"
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-003", "title":"Validate notebooks", "body":"CI",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Building,
+            revision: 1,
+            review_round: 1,
+            version: 3,
+            plan: "# Plan".into(),
+            plan_decision: Some(config::lifecycle::Decision {
+                pr_number: None,
+                round: 1,
+                actor: "sentinel".into(),
+                approved: true,
+                report: "approved".into(),
+                revision: 1,
+                head: None,
+            }),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-003", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-003", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn hosted_blocked_ticket_notifies_forge_with_versioned_recovery_key() {
+        let mut server = mockito::Server::new_async().await;
+        let notify = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "message_key":"blocked:7"
+            })))
+            .match_body(mockito::Matcher::Regex(
+                "credential permission.*status set planning".into(),
+            ))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-003", "title":"Update CI", "body":"CI",
+            "priority":0, "branch":"main",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Blocked,
+            version: 7,
+            feedback: Some("credential permission is missing".into()),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-003", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key("T-003", KEY_TICKET_CHAT, "forge"),
+                json!("forge-chat"),
+            )
+            .await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+        node.poll_harness_status_and_spawn_agents(&store, &[ticket])
+            .await;
+        notify.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn managed_existing_chat_receives_and_consumes_rework_directive() {
+        let mut server = mockito::Server::new_async().await;
+        let directive = "/address_review pr: 454\nFix the remaining findings.";
+        let delivery_id = "review-round-2";
+        let prompt = NexusNode::rework_prompt("T-454", directive);
+        let create = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "workspace_id":"managed-workspace",
+                "ticket_id":"T-454",
+                "prompt":prompt,
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"chat_id":"forge-chat","workspace_id":"managed-workspace","created":false}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let message = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .match_body(mockito::Matcher::Json(json!({
+                "message_key":NexusNode::managed_rework_message_key("T-454", delivery_id),
+                "prompt":NexusNode::rework_prompt("T-454", directive),
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-454", "title":"Address review", "body":"Review feedback",
+            "priority":0, "branch":"codex/fix",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".into(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".into()),
+                    }
+                }),
+            )
+            .await;
+        let rework_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        let delivery_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DELIVERY_ID, "forge");
+        store.set(&rework_key, json!(directive)).await;
+        store.set(&delivery_key, json!(delivery_id)).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        node.create_managed_chat_for_assignment(
+            &store,
+            node.runtime_control.as_ref().unwrap(),
+            "forge-1",
+            &ticket,
+        )
+        .await
+        .unwrap();
+
+        create.assert_async().await;
+        message.assert_async().await;
+        assert!(store.get(&rework_key).await.is_none());
+        // Keep the id durable: if deleting the directive itself fails, the next
+        // poll must retry with the same idempotency key rather than creating a
+        // duplicate agent turn.
+        assert_eq!(
+            store.get_typed::<String>(&delivery_key).await.as_deref(),
+            Some(delivery_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_rework_directive_survives_failed_delivery() {
+        let mut server = mockito::Server::new_async().await;
+        let directive = "/ci_fix pr: 454\nRepair CI.";
+        let create = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"chat_id":"forge-chat","workspace_id":"managed-workspace","created":false}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let message = server
+            .mock("POST", "/api/v1/runtime/chats/forge-chat/messages")
+            .with_status(503)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-454", "title":"Fix CI", "body":"CI feedback",
+            "priority":0, "branch":"codex/fix",
+            "status":{"type":"assigned","worker_id":"forge-1"}
+        }))
+        .unwrap();
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".into(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".into()),
+                    }
+                }),
+            )
+            .await;
+        let rework_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DIRECTIVE, "forge");
+        store.set(&rework_key, json!(directive)).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        assert!(node
+            .create_managed_chat_for_assignment(
+                &store,
+                node.runtime_control.as_ref().unwrap(),
+                "forge-1",
+                &ticket,
+            )
+            .await
+            .is_err());
+
+        create.assert_async().await;
+        message.assert_async().await;
+        assert_eq!(
+            store.get_typed::<String>(&rework_key).await.as_deref(),
+            Some(directive)
+        );
+        let delivery_key = full_ticket_key("T-454", KEY_TICKET_REWORK_DELIVERY_ID, "forge");
+        assert!(store.get_typed::<String>(&delivery_key).await.is_some());
+    }
+
+    #[test]
+    fn identical_rework_directives_in_later_rounds_have_distinct_message_keys() {
+        let first = NexusNode::managed_rework_message_key("T-454", "review-round-1");
+        let retry = NexusNode::managed_rework_message_key("T-454", "review-round-1");
+        let later = NexusNode::managed_rework_message_key("T-454", "review-round-2");
+        assert_eq!(first, retry, "retries in one round must be idempotent");
+        assert_ne!(
+            first, later,
+            "identical directives in later rounds must be delivered again"
+        );
     }
 
     #[tokio::test]
@@ -6236,8 +7368,10 @@ mod tests {
             .await;
         let node = NexusNode::new("missing-persona", "missing-registry");
         for _ in 0..3 {
-            node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
-                .await;
+            Box::pin(
+                node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket)),
+            )
+            .await;
             node.create_chat_for_assignment(&store, "sentinel-1", &ticket)
                 .await;
         }
@@ -6348,6 +7482,7 @@ mod tests {
             .await;
         let request = coder_client::types::CreateChatRequest {
             organization_id: None,
+            owner_id: None,
             workspace_id: "ws".into(),
             model_config_id: None,
             content: vec![],
@@ -6397,6 +7532,7 @@ mod tests {
                 .await;
             let req = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "ws".into(),
                 model_config_id: None,
                 content: vec![],
@@ -6550,6 +7686,7 @@ mod tests {
             store.set("ticket:T-1:sentinel_session", json!("old")).await;
             let request = coder_client::types::CreateChatRequest {
                 organization_id: Some("org".into()),
+                owner_id: None,
                 workspace_id: "new-ws".into(),
                 model_config_id: None,
                 content: vec![],
@@ -6730,7 +7867,10 @@ mod tests {
         );
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
-        NexusNode::recover_orphans(&store).await.unwrap();
+        NexusNode::new("missing-persona", "missing-registry")
+            .recover_orphans(&store)
+            .await
+            .unwrap();
 
         let updated_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
@@ -6748,6 +7888,68 @@ mod tests {
             "Sentinel slot must be recycled to Idle when ticket is Merged"
         );
         assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_worker_is_deleted_through_manager_before_slot_release() {
+        let mut server = mockito::Server::new_async().await;
+        let deletion = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/managed-workspace")
+            .match_header("authorization", "Bearer test-access")
+            .match_header("idempotency-key", "runtime-delete:managed-workspace")
+            .with_status(202)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let ticket = Ticket {
+            id: "T-006".to_string(),
+            title: "Task 6".to_string(),
+            body: "Body".to_string(),
+            priority: 1,
+            branch: Some("forge-1/T-006".to_string()),
+            status: TicketStatus::Merged {
+                pr_number: 7,
+                worker_id: "forge-1".to_string(),
+            },
+            issue_url: None,
+            attempts: 0,
+        };
+        store.set(KEY_TICKETS, json!([ticket])).await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": WorkerSlot {
+                        id: "forge-1".to_string(),
+                        status: WorkerStatus::Assigned {
+                            ticket_id: "T-006".to_string(),
+                            issue_url: None,
+                        },
+                        workspace_id: Some("managed-workspace".to_string()),
+                    }
+                }),
+            )
+            .await;
+        let workspace_key = full_ticket_key("T-006", KEY_TICKET_WORKSPACE, "forge");
+        store.set(&workspace_key, json!("managed-workspace")).await;
+        let request_key = NexusNode::managed_worker_request_key("forge-1", "T-006");
+        store.set(&request_key, json!("original-attempt")).await;
+        let node = NexusNode::new("missing-persona", "missing-registry").with_runtime_control(
+            crate::runtime_control::RuntimeControlClient::for_test(server.url()),
+        );
+
+        node.recover_orphans(&store).await.unwrap();
+
+        deletion.assert_async().await;
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert!(matches!(slots["forge-1"].status, WorkerStatus::Idle));
+        assert!(slots["forge-1"].workspace_id.is_none());
+        assert!(store.get(&workspace_key).await.is_none());
+        assert!(
+            store.get(&request_key).await.is_none(),
+            "replacement workspace must receive a fresh idempotency key"
+        );
     }
 
     #[tokio::test]
@@ -6783,7 +7985,10 @@ mod tests {
         );
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
-        NexusNode::recover_orphans(&store).await.unwrap();
+        NexusNode::new("missing-persona", "missing-registry")
+            .recover_orphans(&store)
+            .await
+            .unwrap();
 
         let updated_slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap();

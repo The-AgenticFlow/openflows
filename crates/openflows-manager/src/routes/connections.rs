@@ -1,4 +1,4 @@
-//! HTTP routes for the GitHub connection lifecycle (WP-03).
+//! HTTP routes for the GitHub connection lifecycle.
 //!
 //! Only active Openflows organization admins may initiate, complete, reconcile,
 //! or disconnect a connection. Members may view sanitized connection status.

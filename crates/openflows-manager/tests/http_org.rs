@@ -1,5 +1,5 @@
 //! HTTP-level integration tests for organization authorization and membership
-//! (WP-02). Real handlers + PostgreSQL + fixture GitHub. Mutations use CLI
+//! Real handlers + PostgreSQL + fixture GitHub. Mutations use CLI
 //! Bearer credentials (CSRF-exempt); invitation-acceptance is exercised via the
 //! service (the HTTP accept path requires browser+CSRF and is covered at the
 //! repository level in `org_policy.rs`).

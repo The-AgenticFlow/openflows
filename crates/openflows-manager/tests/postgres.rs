@@ -1,4 +1,4 @@
-//! Isolated PostgreSQL integration tests for the WP-01 manager foundations.
+//! Isolated PostgreSQL integration tests for the manager foundations.
 //!
 //! These tests exercise the real migration runner, database constraints, and
 //! repository/transaction query paths against a real PostgreSQL 16 instance —

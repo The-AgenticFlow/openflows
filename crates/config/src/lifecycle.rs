@@ -1209,6 +1209,31 @@ mod tests {
     }
 
     #[test]
+    fn cleared_review_delivery_still_requires_human_approval_to_merge() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, true);
+        let round = s.review_round;
+        run(&mut s, "sentinel", Event::ReviewDelivered { round });
+        assert!(s.pr_delivery.is_none());
+        assert!(s.pr_human.is_none());
+        assert!(!s.merge_ready("abc"));
+        let begin = Event::BeginMerge { head: "abc".into() };
+        let merged = Event::Merged {
+            number: 42,
+            head: "abc".into(),
+            sha: "merge".into(),
+        };
+        assert!(s.apply("vessel", begin.clone(), 1).is_err());
+        assert!(s.apply("vessel", merged.clone(), 1).is_err());
+
+        decide(&mut s, "human", Phase::Submit, true);
+        assert!(s.merge_ready("abc"));
+        run(&mut s, "vessel", begin);
+        run(&mut s, "vessel", merged);
+        assert_eq!(s.phase, Phase::Done);
+    }
+
+    #[test]
     fn approval_delivery_waits_for_human_and_keeps_original_pr() {
         let mut s = submitted();
         decide(&mut s, "sentinel", Phase::Submit, true);

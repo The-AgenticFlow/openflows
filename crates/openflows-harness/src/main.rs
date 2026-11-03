@@ -11,6 +11,7 @@
 //!   OPENFLOWS_ROLE     — Current role (forge, sentinel, vessel, lore)
 
 use openflows_harness::store;
+mod github_pr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -120,6 +121,19 @@ enum HandoffAction {
 enum PrAction {
     /// Read the recorded PR info for this ticket (empty JSON if unset)
     Get,
+    /// Create (or find) a GitHub PR using the brokered API token; then record it
+    Create {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
     /// Record that a PR was opened
     Opened {
         #[arg(long)]
@@ -245,6 +259,27 @@ enum VerifyAction {
     },
 }
 
+/// Resolve the tenant-authenticated Redis URL from the mounted runtime
+/// credential file (`OPENFLOWS_RUNTIME_CREDENTIAL_FILE`, e.g.
+/// /run/openflows/runtime.json). Returns `Ok(None)` when the variable or file
+/// is absent so callers can fall back to their normal error path.
+fn runtime_file_redis_url() -> Result<Option<String>> {
+    let Ok(path) = std::env::var("OPENFLOWS_RUNTIME_CREDENTIAL_FILE") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("cannot read mounted runtime credential file {path}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse runtime credential file {path}"))?;
+    Ok(value
+        .get("redis_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -269,11 +304,17 @@ async fn main() -> Result<()> {
     }
 
     let env = config::EnvConfig::from_env().context("failed to load environment configuration")?;
-    let redis_url = env
-        .infra
-        .redis_url
-        .clone()
-        .context("REDIS_URL is not set. This must be injected by the workspace template.")?;
+    let redis_url = match env.infra.redis_url.clone() {
+        Some(url) => url,
+        // Hosted workspaces run the harness from a Coder Chat, whose tool
+        // environment does not inherit the startup shell's variables. Fall back
+        // to the tenant runtime credential file mounted at
+        // `OPENFLOWS_RUNTIME_CREDENTIAL_FILE` (e.g. /run/openflows/runtime.json),
+        // which carries the tenant-authenticated Redis URL.
+        None => runtime_file_redis_url()?.context(
+            "REDIS_URL is not set. This must be injected by the workspace template or the mounted runtime file.",
+        )?,
+    };
     let tenant =
         env.tenant.tenant.clone().context(
             "OPENFLOWS_TENANT is not set. This must be injected by the workspace template.",
@@ -341,6 +382,29 @@ async fn main() -> Result<()> {
             store
                 .handoff_write(&ticket, &contract, notes.as_deref())
                 .await?;
+        }
+        Commands::Pr {
+            action:
+                PrAction::Create {
+                    repo,
+                    base,
+                    head,
+                    title,
+                    body,
+                },
+        } => {
+            store.ensure_pr_creation_allowed(&ticket, &role).await?;
+            let pr = github_pr::create_or_find(&repo, &base, &head, &title, &body).await?;
+            store
+                .pr_opened(&ticket, &pr.number, &head, &pr.title)
+                .await
+                .with_context(|| {
+                    format!(
+                        "PR #{} exists at {} but could not be recorded; use `pr opened --pr {} --branch {} --title <title>` after restoring submit phase",
+                        pr.number, pr.url, pr.number, head
+                    )
+                })?;
+            println!("PR #{}: {}", pr.number, pr.url);
         }
         Commands::Pr {
             action: PrAction::Opened { pr, branch, title },

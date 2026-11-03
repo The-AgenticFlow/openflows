@@ -11,6 +11,13 @@ Date: 2026-10-07. Status: implementation specification, not shipped behavior.
 5. [Implementation backlog](04-implementation-plan.md): ordered work packages and release gates.
 6. [Compatibility and integration contract](compatibility-report.md): WP-00 inventory, Coder version/capability matrix, verification harness, open decisions.
 7. [Model handoff](05-model-handoff.md): prompt to start implementation.
+8. [Hosted template releases](06-hosted-template-releases.md): versioned remote release source for production deployments.
+
+Operator instructions are separate from the design specifications: follow the
+[local runbook](operator-local-runbook.md) for a single-host evaluation or the
+[production runbook](operator-production-runbook.md) for the AWS staging and
+production release gates. The [operator deployment index](operator-deployment.md)
+keeps existing links working.
 
 These specifications supersede ambiguous details in the [initial deployment plan](../../architecture/centralized-deployment-plan.md). Requirements marked MUST are acceptance requirements. Proposed technical defaults below may change only with a documented reason, corresponding contract updates, and equivalent acceptance coverage. Do not silently weaken authorization to accommodate an upstream limitation.
 

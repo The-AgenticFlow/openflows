@@ -304,9 +304,21 @@ pub struct GithubConfig {
 
     #[envconfig(from = "GITHUB_API_BASE", default = "https://api.github.com")]
     pub api_base: String,
+
+    /// Git transport origin, independently configurable from the REST API.
+    #[envconfig(from = "GITHUB_GIT_BASE", default = "https://github.com")]
+    pub git_base: String,
 }
 
 impl GithubConfig {
+    pub fn repository_clone_url(&self, repository: &str) -> String {
+        format!(
+            "{}/{}.git",
+            self.git_base.trim_end_matches('/'),
+            repository.trim_matches('"')
+        )
+    }
+
     /// Normalize a Coder external-auth provider id to the injected env suffix:
     /// uppercase, `-`/`.`→`_` (e.g. `primary-github` → `PRIMARY_GITHUB`).
     pub fn normalize_external_auth_id(id: &str) -> String {
@@ -357,6 +369,7 @@ impl fmt::Debug for GithubConfig {
         f.debug_struct("GithubConfig")
             .field("repository", &self.repository)
             .field("api_base", &self.api_base)
+            .field("git_base", &self.git_base)
             .finish()
     }
 }
@@ -410,16 +423,38 @@ fn redact(v: &Option<String>) -> Option<&'static str> {
 }
 
 impl EnvConfig {
+    /// Manager origin exported by current and earlier hosted templates.
+    pub fn runtime_manager_url() -> Option<String> {
+        ["OPENFLOWS_MANAGER_URL", "OF_MANAGER_URL"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|value| !value.trim().is_empty())
+    }
+
     /// Validate the fields required to run the OpenFlows controller (in a
     /// nexus workspace). Returns a clear error naming the first missing value.
     ///
     /// # Errors
     /// Returns an error when a controller-required variable is not set.
     pub fn validate_controller(&self) -> anyhow::Result<()> {
-        if self.coder.effective_token().is_none() {
+        let hosted_runtime = Self::runtime_manager_url().is_some();
+        if hosted_runtime
+            && (!std::env::var("OF_RUNTIME_ACCESS_TOKEN")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+                || !std::env::var("OF_RUNTIME_REFRESH_TOKEN")
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty()))
+        {
+            anyhow::bail!(
+                "OPENFLOWS_MANAGER_URL requires OF_RUNTIME_ACCESS_TOKEN and \
+                 OF_RUNTIME_REFRESH_TOKEN from workspace registration"
+            );
+        }
+        if !hosted_runtime && self.coder.effective_token().is_none() {
             anyhow::bail!(
                 "CODER_SESSION_TOKEN is not set. The Controller must run inside an \
-                 openflows-nexus workspace."
+                 openflows-nexus workspace, or use a registered hosted runtime session."
             );
         }
         if self.tenant.tenant.is_none() {

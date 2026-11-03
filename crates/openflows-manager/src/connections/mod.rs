@@ -1,4 +1,4 @@
-//! GitHub App connection lifecycle (WP-03).
+//! GitHub App connection lifecycle.
 //!
 //! This module implements the complete GitHub App connection lifecycle behind
 //! the Openflows Manager: connection attempts with separate user-OAuth and

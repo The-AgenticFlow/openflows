@@ -16,6 +16,39 @@ use tower_http::trace::TraceLayer;
 
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn coder_operator_token(bytes: Vec<u8>) -> Result<String, ManagerError> {
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| ManagerError::Config("Coder operator token is not UTF-8".into()))?;
+    let token = raw.trim();
+    if token.is_empty()
+        || reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).is_err()
+    {
+        return Err(ManagerError::Config(
+            "Coder operator token is empty or contains invalid header characters".into(),
+        ));
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(test)]
+mod coder_operator_token_tests {
+    use super::coder_operator_token;
+
+    #[test]
+    fn strips_line_ending_from_file_backed_token() {
+        assert_eq!(
+            coder_operator_token(b"operator-key\r\n".to_vec()).unwrap(),
+            "operator-key"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_header_unsafe_token() {
+        assert!(coder_operator_token(b" \n".to_vec()).is_err());
+        assert!(coder_operator_token(b"first\nsecond".to_vec()).is_err());
+    }
+}
+
 /// Async dependency probe used by `/ready`.
 ///
 /// The trait keeps the readiness endpoint decoupled from Redis and gives tests
@@ -45,16 +78,19 @@ impl ReadinessCheck for StoreReadiness {
 ///
 /// Constructed only when the Manager has a control-plane database (hosted mode,
 /// or local development with an explicit database). Repositories and services
-/// expose organization-scoped operations. In addition to the WP-01
+/// expose organization-scoped operations. In addition to the core
 /// repositories, this holds the human-authentication and organization services
-/// added by WP-02.
+/// added by the authorization layer.
 #[derive(Clone)]
 pub struct ManagerServices {
     pub db: Db,
     pub organizations: OrganizationsRepository,
     pub tenants: TenantsRepository,
     pub idempotency: IdempotencyService,
-    // authentication and organization services.
+    /// Central tenant quota enforcement (minimal infrastructure safeguards).
+    pub quotas: crate::quotas::TenantQuotaService,
+    /// Tenant lifecycle service (create/list/detail/delete).
+    pub tenants_service: crate::tenants::TenantService,
     pub users: crate::auth::repository::UsersRepository,
     pub sessions: crate::auth::repository::SessionsRepository,
     pub transactions: crate::auth::repository::AuthTransactionRepository,
@@ -74,23 +110,71 @@ pub struct ManagerServices {
     pub app_signer: std::sync::Arc<dyn crate::connections::AppSigner>,
     pub app_api: std::sync::Arc<dyn crate::connections::GithubAppApi>,
     pub webhook_secret: Option<Vec<u8>>,
-    // WP-04 runtime authentication and GitHub credential broker.
+    pub coder_hook_secret: Option<Vec<u8>>,
+    pub secret_provider: std::sync::Arc<dyn crate::secrets::SecretProvider>,
+    // Runtime authentication and GitHub credential broker.
     pub runtime_repo: crate::runtime::RuntimeRepository,
     pub runtime_credentials: crate::runtime::RuntimeCredentialService,
     pub broker: crate::runtime::CredentialBroker,
+    // Tenant-scoped runtime resources (Redis isolation, hook keys, workspaces).
+    pub tenant_runtime: crate::runtime::tenant::TenantRuntimeRepository,
+    /// Runtime workspace lifecycle (Nexus-requested worker provisioning,
+    /// heartbeat).
+    pub runtime_workspaces: crate::runtime::RuntimeWorkspaceService,
+    // Coder adapter and template releases.
+    pub release_repo: crate::templates::repository::ReleaseRepository,
+    pub release_service: crate::templates::service::ReleaseService,
+    pub release_approvals: crate::releases::ReleaseApprovalService,
+    /// Durable organization-provisioning worker, present when a Coder adapter
+    /// and operator-configured release are available. `None` in pure
+    /// local/test mode (tests build one directly with a mock adapter).
+    pub org_provision: Option<crate::provisioning::OrgProvisionWorker>,
+    /// Durable tenant-provisioning worker, present alongside the org worker
+    /// when a Coder adapter is configured. `None` in pure local/test mode.
+    pub tenant_provision: Option<crate::provisioning::TenantProvisionWorker>,
 }
 
 /// The secret-provider adapter name for the isolated in-memory provider.
 pub const IN_MEMORY_SECRET_PROVIDER: &str = "in-memory";
+pub const FILESYSTEM_SECRET_PROVIDER: &str = "filesystem";
+pub const AWS_SECRETS_MANAGER_SECRET_PROVIDER: &str = "aws-secrets-manager";
 
-/// Resolve a [`SecretProvider`] by adapter name. Only the in-memory provider is
-/// implemented; any other name fails closed (a durable production adapter is a
-/// deployment decision, not something to invent here).
-pub fn resolve_secret_provider(
+/// Resolve the selected deployment backend. AWS credentials come from the SDK
+/// default chain (for example, a workload identity), never user sessions.
+pub async fn resolve_secret_provider(
     name: &str,
 ) -> Result<Box<dyn crate::secrets::SecretProvider>, ManagerError> {
     match name {
         IN_MEMORY_SECRET_PROVIDER => Ok(Box::new(crate::secrets::InMemorySecretProvider::new())),
+        FILESYSTEM_SECRET_PROVIDER => {
+            let root = std::env::var("OPENFLOWS_SECRET_DIR").map_err(|_| {
+                ManagerError::Config(
+                    "filesystem secret provider requires OPENFLOWS_SECRET_DIR".into(),
+                )
+            })?;
+            Ok(Box::new(
+                crate::secrets::FilesystemSecretProvider::new(root)
+                    .map_err(|e| ManagerError::Config(e.to_string()))?,
+            ))
+        }
+        AWS_SECRETS_MANAGER_SECRET_PROVIDER => {
+            let prefix = std::env::var("OPENFLOWS_AWS_SECRETS_PREFIX").map_err(|_| {
+                ManagerError::Config(
+                    "AWS Secrets Manager requires OPENFLOWS_AWS_SECRETS_PREFIX".into(),
+                )
+            })?;
+            let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            if sdk_config.region().is_none() {
+                return Err(ManagerError::Config(
+                    "AWS Secrets Manager requires an AWS region".into(),
+                ));
+            }
+            let client = aws_sdk_secretsmanager::Client::new(&sdk_config);
+            Ok(Box::new(
+                crate::secrets::AwsSecretsManagerSecretProvider::new(client, prefix)
+                    .map_err(|e| ManagerError::Config(e.to_string()))?,
+            ))
+        }
         other => Err(ManagerError::Config(format!(
             "secret provider '{other}' is not implemented; refusing to start"
         ))),
@@ -99,17 +183,63 @@ pub fn resolve_secret_provider(
 
 /// Load a local JSON object mapping secret references to UTF-8 values.
 /// Parse errors deliberately exclude file contents, which contain credentials.
+///
+/// This is deliberately idempotent. A filesystem provider already contains
+/// the values after the first Manager start, so a restart must not fail just
+/// because `put` correctly refuses to overwrite an existing secret.
+///
+/// `master_key_ref` names the secret that holds the envelope master key
+/// (`OPENFLOWS_CRYPTO_MASTER_KEY_REF`). That secret must never be silently
+/// replaced when the seeded value differs from the stored one, otherwise
+/// existing encrypted records become unreadable.
 async fn populate_development_secrets(
     provider: &dyn crate::secrets::SecretProvider,
     contents: &[u8],
+    master_key_ref: &Option<String>,
 ) -> Result<(), ManagerError> {
     let values: std::collections::HashMap<String, String> = serde_json::from_slice(contents)
         .map_err(|_| ManagerError::Config("invalid development secrets file".into()))?;
     for (name, value) in values {
-        provider
-            .put(&name, value.as_bytes())
-            .await
-            .map_err(|_| ManagerError::Config("cannot populate development secrets".into()))?;
+        match provider.put(&name, value.as_bytes()).await {
+            Ok(_) => {}
+            Err(crate::secrets::SecretError::AlreadyExists(_)) => {
+                let current = provider
+                    .get(&name)
+                    .await
+                    .map_err(|_| ManagerError::Config("cannot verify development secret".into()))?;
+                if current != value.as_bytes() {
+                    // Protect the configured master-key reference (not a
+                    // hardcoded filename). When no ref is configured the dev
+                    // key is used, so the legacy `master-key` name is still
+                    // guarded for the local/test seed.
+                    let is_master_key = matches!(
+                        master_key_ref.as_deref(),
+                        Some(ref_name)
+                            if name == ref_name || name.ends_with(&format!("/{ref_name}"))
+                    ) || (master_key_ref.is_none()
+                        && (name == "master-key" || name.ends_with("/master-key")));
+                    if is_master_key {
+                        return Err(ManagerError::Config(
+                            "development master key differs from the existing stored value; refusing to replace it"
+                                .into(),
+                        ));
+                    }
+                    provider
+                        .replace(&name, value.as_bytes())
+                        .await
+                        .map_err(|_| {
+                            ManagerError::Config(format!(
+                                "cannot renew development secret '{name}'"
+                            ))
+                        })?;
+                }
+            }
+            Err(_) => {
+                return Err(ManagerError::Config(
+                    "cannot populate development secrets".into(),
+                ))
+            }
+        }
     }
     Ok(())
 }
@@ -177,7 +307,7 @@ impl ManagerServices {
         )
     }
 
-    /// Build services with an explicit App signer and App API (WP-03). Used by
+    /// Build services with an explicit App signer and App API. Used by
     /// tests and by real configuration resolution.
     #[allow(clippy::too_many_arguments)]
     pub fn from_db_with_app(
@@ -256,6 +386,12 @@ impl ManagerServices {
             app_signer.clone(),
         );
         let runtime_repo = crate::runtime::RuntimeRepository::new(pool.clone());
+        let secret_provider: std::sync::Arc<dyn crate::secrets::SecretProvider> =
+            std::sync::Arc::new(crate::secrets::InMemorySecretProvider::new());
+        let tenant_runtime = crate::runtime::tenant::TenantRuntimeRepository::with_secret_provider(
+            pool.clone(),
+            secret_provider.clone(),
+        );
         let webhooks = crate::connections::WebhookService::new(
             pool.clone(),
             connections.clone(),
@@ -294,7 +430,7 @@ impl ManagerServices {
             runtime_repo.clone(),
         );
 
-        // WP-04 runtime authentication and GitHub credential broker.
+        // Runtime authentication and GitHub credential broker.
         let runtime_credentials =
             crate::runtime::RuntimeCredentialService::new(runtime_repo.clone());
         let broker = crate::runtime::CredentialBroker::new(
@@ -305,11 +441,38 @@ impl ManagerServices {
             auth_config.clone(),
         );
 
+        // Template release infrastructure.
+        let release_repo = crate::templates::repository::ReleaseRepository::new(pool.clone());
+        let release_service =
+            crate::templates::service::ReleaseService::new(pool.clone(), release_repo.clone());
+        let release_approvals = crate::releases::ReleaseApprovalService::new(
+            pool.clone(),
+            release_service.clone(),
+            release_repo.clone(),
+        );
+
+        let quotas = crate::quotas::TenantQuotaService::new(pool.clone(), Default::default());
+        let tenants_service =
+            crate::tenants::TenantService::new(crate::tenants::TenantServiceInputs::new(
+                pool.clone(),
+                tenants.clone(),
+                org_repo.clone(),
+                idempotency.clone(),
+                quotas.clone(),
+            ));
+        let runtime_workspaces = crate::runtime::RuntimeWorkspaceService::new(
+            pool.clone(),
+            tenant_runtime.clone(),
+            quotas.clone(),
+        );
+
         ManagerServices {
             db,
             organizations,
             tenants,
             idempotency,
+            quotas,
+            tenants_service,
             users,
             sessions,
             transactions,
@@ -328,9 +491,18 @@ impl ManagerServices {
             app_signer,
             app_api,
             webhook_secret,
+            coder_hook_secret: None,
+            secret_provider,
             runtime_repo,
             runtime_credentials,
             broker,
+            tenant_runtime,
+            runtime_workspaces,
+            release_repo,
+            release_service,
+            release_approvals,
+            org_provision: None,
+            tenant_provision: None,
         }
     }
 
@@ -341,7 +513,7 @@ impl ManagerServices {
     pub async fn from_db_with_config(
         db: Db,
         config: &crate::config::ManagerConfig,
-        provider: &dyn crate::secrets::SecretProvider,
+        provider: std::sync::Arc<dyn crate::secrets::SecretProvider>,
     ) -> Result<Self, ManagerError> {
         // Resolve the GitHub client secret for the OAuth exchange.
         let client_secret = match &config.github_client_secret_ref {
@@ -353,7 +525,8 @@ impl ManagerServices {
         };
 
         // Resolve the envelope master key.
-        let master_key = resolve_master_key(provider, &config.crypto_master_key_ref).await?;
+        let master_key =
+            resolve_master_key(provider.as_ref(), &config.crypto_master_key_ref).await?;
 
         let mut auth_config = config.auth.clone();
         auth_config.master_key = Some(master_key);
@@ -392,7 +565,7 @@ impl ManagerServices {
             None => None,
         };
 
-        Ok(Self::from_db_with_app_config(
+        let services = Self::from_db_with_app_config(
             db,
             auth_config,
             github,
@@ -401,7 +574,212 @@ impl ManagerServices {
             app_api,
             webhook_secret,
             config.github_app.clone(),
-        ))
+        );
+        let mut services = services;
+        services.coder_hook_secret = match &config.coder_hook_secret_ref {
+            Some(reference) => Some(provider.get(reference).await.map_err(|e| {
+                ManagerError::Config(format!("failed to resolve Coder hook secret: {e}"))
+            })?),
+            None => None,
+        };
+        services.secret_provider = provider.clone();
+        let redis_isolation: std::sync::Arc<dyn crate::runtime::redis::RedisIsolationBackend> =
+            match &config.redis_admin_url {
+                Some(url) => std::sync::Arc::new(
+                    crate::runtime::redis::FredRedisIsolation::connect(url).await?,
+                ),
+                None => {
+                    std::sync::Arc::new(crate::runtime::redis::InMemoryRedisIsolation::default())
+                }
+            };
+        services.tenant_runtime = crate::runtime::tenant::TenantRuntimeRepository::with_backends(
+            services.db.pool().clone(),
+            provider.clone(),
+            redis_isolation,
+        );
+        services.tenant_runtime.restore_redis_credentials().await?;
+        services.runtime_credentials =
+            crate::runtime::RuntimeCredentialService::with_secret_provider(
+                services.runtime_repo.clone(),
+                provider.clone(),
+            );
+        // Bind the operator-configured tenant limits (platform-operator
+        // configuration) into the central quota service.
+        services.quotas = crate::quotas::TenantQuotaService::new(
+            services.db.pool().clone(),
+            config.tenant_limits.clone(),
+        );
+        services.tenants_service =
+            crate::tenants::TenantService::new(crate::tenants::TenantServiceInputs::new(
+                services.db.pool().clone(),
+                services.tenants.clone(),
+                services.org_repo.clone(),
+                services.idempotency.clone(),
+                services.quotas.clone(),
+            ));
+        services.runtime_workspaces = crate::runtime::RuntimeWorkspaceService::new(
+            services.db.pool().clone(),
+            services.tenant_runtime.clone(),
+            services.quotas.clone(),
+        );
+        services.with_org_provision(config, provider).await
+    }
+
+    /// Build and attach the durable organization-provisioning worker using the
+    /// configured Coder adapter and operator-configured release.
+    ///
+    /// When the Coder adapter configuration (URL + operator token ref) is
+    /// absent (pure local/test mode) this returns `self` unchanged with
+    /// `org_provision: None`. When configured, it resolves the platform Coder
+    /// operator token through the secret provider (never logged/persisted),
+    /// imports the operator-configured release, and attaches the worker. A
+    /// broken release source or operator token is a startup error (fail closed),
+    /// so organizations never silently become ready.
+    pub async fn with_org_provision(
+        mut self,
+        config: &crate::config::ManagerConfig,
+        provider: std::sync::Arc<dyn crate::secrets::SecretProvider>,
+    ) -> Result<Self, ManagerError> {
+        let Some(url) = &config.coder_url else {
+            return Ok(self);
+        };
+        let Some(ref_name) = &config.coder_operator_token_ref else {
+            return Ok(self);
+        };
+        crate::config::runtime_hook_url(uuid::Uuid::nil()).map_err(ManagerError::Config)?;
+        let token_bytes = provider.get(ref_name).await.map_err(|e| {
+            ManagerError::Config(format!("failed to resolve Coder operator token: {e}"))
+        })?;
+        let token = coder_operator_token(token_bytes)?;
+
+        let shared_token = std::sync::Arc::new(std::sync::RwLock::new(token.clone()));
+        let mut real_adapter =
+            crate::coder::RealCoderAdapter::from_parts(url, &token, &config.coder_version_baseline)
+                .with_shared_operator_token(shared_token.clone());
+        if let Some(email) = crate::operator::managed_bootstrap_email()
+            .await
+            .map_err(ManagerError::Service)?
+        {
+            let provider = provider.clone();
+            let ref_name = ref_name.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match crate::operator::setup(true, Some(&email)).await {
+                        Ok(()) => match provider.get(&ref_name).await {
+                            Ok(bytes) => match coder_operator_token(bytes) {
+                                Ok(token) => {
+                                    *shared_token.write().unwrap_or_else(|e| e.into_inner()) =
+                                        token;
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "renewed Coder operator key is invalid")
+                                }
+                            },
+                            Err(error) => {
+                                tracing::error!(%error, "cannot reload Coder operator key")
+                            }
+                        },
+                        Err(error) => tracing::warn!(%error, "Coder operator key renewal failed"),
+                    }
+                }
+            });
+        }
+        if config.provisioner_backend == "docker" {
+            let master =
+                resolve_master_key(provider.as_ref(), &config.crypto_master_key_ref).await?;
+            let cipher =
+                crate::auth::crypto::EnvelopeCipher::derive(&master.0, "coder-provisioner", 1);
+            real_adapter = real_adapter.with_docker_provisioner(
+                crate::provisioning::docker::DockerProvisioner::from_env(
+                    self.db.pool().clone(),
+                    cipher,
+                    url,
+                    &config.coder_version_baseline,
+                )?,
+            );
+        }
+        let adapter: std::sync::Arc<dyn crate::coder::CoderAdapter> =
+            std::sync::Arc::new(real_adapter);
+        let template_token = match &config.release_source {
+            crate::config::ReleaseSourceConfig::Github(hosted) => match &hosted.github_token_ref {
+                Some(ref_name) => Some(
+                    String::from_utf8(provider.get(ref_name).await.map_err(|e| {
+                        ManagerError::Config(format!(
+                            "failed to resolve GitHub template token: {e}"
+                        ))
+                    })?)
+                    .map_err(|_| {
+                        ManagerError::Config("GitHub template token is not UTF-8".into())
+                    })?,
+                ),
+                None => None,
+            },
+            crate::config::ReleaseSourceConfig::Local => None,
+        };
+        let source = crate::provisioning::ReleaseSource::from_config(
+            &config.release_source,
+            template_token,
+        )?;
+        let cache = match &config.release_source {
+            crate::config::ReleaseSourceConfig::Github(hosted) => {
+                crate::provisioning::ReleaseCache::from_config(hosted)
+            }
+            crate::config::ReleaseSourceConfig::Local => {
+                crate::provisioning::ReleaseCache::new(std::path::PathBuf::new(), 0, 0)
+            }
+        };
+        let resolved = source.resolve(&cache).await?;
+        let (release_id, _digest) = self
+            .release_service
+            .import_release(resolved.artifacts.clone(), &resolved.source_reference)
+            .await?;
+        // A release supplied through the trusted operator configuration is the
+        // platform-selected release for this deployment. Customer-facing
+        // promotion still requires the platform-operator approval service.
+        self.release_repo
+            .approve_configured_release(release_id)
+            .await?;
+
+        let worker = crate::provisioning::OrgProvisionWorker::new(
+            self.db.pool().clone(),
+            self.organizations.clone(),
+            self.release_service.clone(),
+            self.release_repo.clone(),
+            adapter.clone(),
+            Some(std::sync::Arc::new(resolved.artifacts)),
+            Some(release_id),
+            config.provisioner_backend.clone(),
+            config.coder_version_baseline.clone(),
+        );
+        self.org_provision = Some(worker);
+
+        // Durable tenant-provisioning worker sharing the same platform Coder
+        // adapter, quota service, and tenant runtime repository.
+        let tenant_worker = crate::provisioning::TenantProvisionWorker::new(
+            self.db.pool().clone(),
+            self.organizations.clone(),
+            self.quotas.clone(),
+            self.tenant_runtime.clone(),
+            self.runtime_credentials.clone(),
+            self.release_repo.clone(),
+            adapter,
+        )
+        .with_runtime_endpoints(
+            crate::config::runtime_manager_url(&config.auth.public_url)
+                .map_err(crate::error::ManagerError::Config)?,
+            config
+                .runtime_redis_url
+                .clone()
+                .unwrap_or_else(|| "redis://127.0.0.1:6379".into()),
+        )
+        .with_local_docker_cleanup(
+            config.mode == crate::config::Mode::Local && config.provisioner_backend == "docker",
+        );
+        self.tenant_provision = Some(tenant_worker);
+        Ok(self)
     }
 
     pub fn from_db(db: Db) -> Self {
@@ -519,6 +897,8 @@ pub struct AppState {
     /// Database-backed services, present only when a control-plane database is
     /// configured. `None` in pure-local test mode.
     services: Option<Arc<ManagerServices>>,
+    local_github: Option<Arc<crate::auth::local_credentials::LocalCredentials>>,
+    local_broker_key: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -540,17 +920,23 @@ impl AppState {
         let services = match &config.database_url {
             Some(url) => {
                 let db = Db::connect(url).await?;
-                let provider = resolve_secret_provider(&config.secret_provider)?;
-                if config.secret_provider == IN_MEMORY_SECRET_PROVIDER {
-                    if let Some(path) = std::env::var_os("OPENFLOWS_DEV_SECRETS_FILE") {
-                        let contents = std::fs::read(path).map_err(|_| {
-                            ManagerError::Config("cannot read development secrets file".into())
-                        })?;
-                        populate_development_secrets(provider.as_ref(), &contents).await?;
-                    }
+                let provider = resolve_secret_provider(&config.secret_provider).await?;
+                if let Some(path) = std::env::var_os("OPENFLOWS_DEV_SECRETS_FILE") {
+                    let contents = std::fs::read(path).map_err(|_| {
+                        ManagerError::Config("cannot read development secrets file".into())
+                    })?;
+                    // The development file is a seed for both local providers:
+                    // in-memory for ephemeral tests and filesystem for a local
+                    // Manager that must survive restarts.
+                    populate_development_secrets(
+                        provider.as_ref(),
+                        &contents,
+                        &config.crypto_master_key_ref,
+                    )
+                    .await?;
                 }
                 let services =
-                    ManagerServices::from_db_with_config(db, &config, provider.as_ref()).await?;
+                    ManagerServices::from_db_with_config(db, &config, provider.into()).await?;
                 Some(Arc::new(services))
             }
             None => None,
@@ -560,11 +946,31 @@ impl AppState {
             store: store.clone(),
         });
 
+        let (local_github, local_broker_key) =
+            if config.mode == crate::config::Mode::Local && config.connected_local_enabled {
+                let github = Arc::new(
+                    crate::auth::local_github::LocalGithubAuth::new(config.auth.client_id.clone())?
+                        .with_api_base(config.auth.github_api_base.clone()),
+                );
+                let credentials = crate::auth::local_credentials::LocalCredentials::new(
+                    crate::auth::local_credentials::credential_path_from_env()?,
+                    github,
+                )?;
+                (
+                    Some(Arc::new(credentials)),
+                    Some(Arc::new(crate::auth::local_credentials::read_broker_key()?)),
+                )
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             store,
             readiness,
             config,
             services,
+            local_github,
+            local_broker_key,
         })
     }
 
@@ -582,6 +988,8 @@ impl AppState {
             readiness,
             config,
             services: None,
+            local_github: None,
+            local_broker_key: None,
         }
     }
 
@@ -591,6 +999,8 @@ impl AppState {
             readiness,
             config: crate::config::local_test_config(),
             services: None,
+            local_github: None,
+            local_broker_key: None,
         }
     }
 
@@ -607,6 +1017,8 @@ impl AppState {
             readiness,
             config,
             services: Some(Arc::new(services)),
+            local_github: None,
+            local_broker_key: None,
         }
     }
 
@@ -616,6 +1028,24 @@ impl AppState {
 
     pub fn services(&self) -> Option<&Arc<ManagerServices>> {
         self.services.as_ref()
+    }
+
+    pub fn local_github(&self) -> Option<&Arc<crate::auth::local_credentials::LocalCredentials>> {
+        self.local_github.as_ref()
+    }
+
+    pub fn local_broker_key(&self) -> Option<&str> {
+        self.local_broker_key.as_deref().map(String::as_str)
+    }
+
+    pub fn local_github_client_id(&self) -> Option<&str> {
+        self.local_github
+            .as_ref()
+            .map(|_| self.config.auth.client_id.as_str())
+    }
+
+    pub fn github_api_base(&self) -> &str {
+        &self.config.auth.github_api_base
     }
 
     pub fn mode(&self) -> crate::config::Mode {
@@ -749,11 +1179,63 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    let worker = state
+    let connection_worker = state
         .services()
         .map(|services| services.connection_worker.clone());
-    let worker_loop = async move {
-        match worker {
+    let connection_loop = async move {
+        match connection_worker {
+            Some(worker) => worker.run_forever().await,
+            None => std::future::pending().await,
+        }
+    };
+    // Durable organization-provisioning worker (startup recovery resumes
+    // unfinished org.provision operations). `None` in pure local/test mode.
+    let org_provision = state
+        .services()
+        .and_then(|services| services.org_provision.clone());
+    let promotion_dependencies = state.services().and_then(|services| {
+        services.org_provision.clone().map(|worker| {
+            (
+                services.release_approvals.pool.clone(),
+                services.release_approvals.clone(),
+                worker,
+            )
+        })
+    });
+    let promotion_loop = async move {
+        match promotion_dependencies {
+            Some((pool, approvals, worker)) => {
+                crate::routes::platform_releases::run_promotion_worker(pool, approvals, worker)
+                    .await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    let provisioner_adapter = org_provision.as_ref().map(|worker| worker.adapter.clone());
+    let provisioner_recovery_loop = async move {
+        let Some(adapter) = provisioner_adapter else {
+            return std::future::pending::<Result<(), ManagerError>>().await;
+        };
+        loop {
+            if let Err(error) = adapter.reconcile_provisioners().await {
+                tracing::warn!(%error, "provisioner recovery failed; will retry");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    };
+    let org_provision_loop = async move {
+        match org_provision {
+            Some(worker) => worker.run_forever().await,
+            None => std::future::pending().await,
+        }
+    };
+    // Durable tenant-provisioning worker (startup recovery resumes unfinished
+    // tenant operations). `None` in pure local/test mode.
+    let tenant_provision = state
+        .services()
+        .and_then(|services| services.tenant_provision.clone());
+    let tenant_provision_loop = async move {
+        match tenant_provision {
             Some(worker) => worker.run_forever().await,
             None => std::future::pending().await,
         }
@@ -765,7 +1247,11 @@ pub async fn serve(
     .with_graceful_shutdown(shutdown);
     tokio::select! {
         result = async { server.await } => result?,
-        result = worker_loop => result?,
+        result = connection_loop => result?,
+        result = org_provision_loop => result?,
+        result = promotion_loop => result?,
+        result = provisioner_recovery_loop => result?,
+        result = tenant_provision_loop => result?,
     }
     Ok(())
 }
@@ -787,6 +1273,11 @@ async fn request_context(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let is_test_console = request.uri().path() == "/";
+    // The browsable OpenAPI reference (Swagger UI) loads same-origin JS/CSS and
+    // fetches the spec from `/openapi.json`, so it needs a permissive-enough
+    // CSP scoped to this documentation route only. Every other route keeps the
+    // strict, network-restricted CSP below; no external origin is ever allowed.
+    let is_swagger_ui = request.uri().path().starts_with("/swagger-ui");
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -833,7 +1324,12 @@ async fn request_context(
     response
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
-    let csp = if is_test_console {
+    let csp = if is_swagger_ui {
+        // Scoped, same-origin-only policy for the Swagger UI documentation page.
+        // Allows the bundled UI to load its own JS/CSS and fetch `/openapi.json`
+        // from `self`; blocks all external origins.
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+    } else if is_test_console {
         "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     } else {
         "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -850,10 +1346,13 @@ mod development_secret_tests {
 
     #[tokio::test]
     async fn development_file_populates_oauth_and_master_key_references() {
-        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER)
+            .await
+            .unwrap();
         populate_development_secrets(
             provider.as_ref(),
             br#"{"oauth":"client-secret","master":"01234567890123456789012345678901"}"#,
+            &Some("master".into()),
         )
         .await
         .unwrap();
@@ -863,9 +1362,38 @@ mod development_secret_tests {
             .unwrap();
         assert_eq!(key.0, *b"01234567890123456789012345678901");
         assert!(provider.get("missing").await.is_err());
-        let error = populate_development_secrets(provider.as_ref(), b"private-credential")
+        let error = populate_development_secrets(provider.as_ref(), b"private-credential", &None)
             .await
             .unwrap_err();
         assert!(!error.to_string().contains("private-credential"));
+    }
+
+    #[tokio::test]
+    async fn configured_master_key_ref_is_protected_from_replacement() {
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER)
+            .await
+            .unwrap();
+        let ref_name = "crypto-master-key";
+        // Seed the configured master-key reference.
+        populate_development_secrets(
+            provider.as_ref(),
+            br#"{"crypto-master-key":"01234567890123456789012345678901"}"#,
+            &Some(ref_name.into()),
+        )
+        .await
+        .unwrap();
+        // A restart with a different seed must refuse to replace it, not
+        // silently overwrite the key (which would break existing records).
+        let error = populate_development_secrets(
+            provider.as_ref(),
+            br#"{"crypto-master-key":"99999999999999999999999999999999"}"#,
+            &Some(ref_name.into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to replace"),
+            "expected a refusal, got: {error}"
+        );
     }
 }

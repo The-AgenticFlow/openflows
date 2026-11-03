@@ -1,0 +1,20 @@
+{
+  "_description": [
+    "Requests a real workspace command, then requires its tool-result marker before completing."
+  ],
+  "bootstrap-canary": [
+    {
+      "tool": "execute",
+      "arguments": {
+        "command": "set -eu; test \"$(cat answer.txt)\" = 41; openflows --version; printf 'PRODUCTION_BOOTSTRAP_OK\\n'",
+        "workdir": "/home/coder/workspace"
+      }
+    },
+    {
+      "requires": {
+        "contains": "PRODUCTION_BOOTSTRAP_OK"
+      },
+      "text": "The production workspace executed the bootstrap canary."
+    }
+  ]
+}

@@ -232,6 +232,13 @@ pub const KEY_TICKET_DIFF_STATUS: &str = "diff_status";
 /// Full key: `ticket:{id}:rework_directive:{role}`
 pub const KEY_TICKET_REWORK_DIRECTIVE: &str = "rework_directive";
 
+/// Key suffix for the stable delivery identifier paired with a pending rework
+/// directive. VESSEL creates a fresh identifier for each new rework round and
+/// NEXUS preserves it across delivery retries, so identical directives from
+/// separate rounds are not collapsed by the Manager's idempotency key.
+/// Full key: `ticket:{id}:rework_delivery_id:{role}`
+pub const KEY_TICKET_REWORK_DELIVERY_ID: &str = "rework_delivery_id";
+
 /// Heartbeat key pattern: `heartbeat:{role}-T-{ticket_id}`
 pub fn heartbeat_key(role: &str, ticket_id: &str) -> String {
     format!("heartbeat:{}-T-{}", role, ticket_id)

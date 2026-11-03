@@ -1,4 +1,4 @@
-//! PostgreSQL integration tests for WP-02 concurrency and invariants: OAuth
+//! PostgreSQL integration tests for organization concurrency and invariants: OAuth
 //! callback single consumption, last-admin preservation, owner-transfer
 //! requirement, invitation single-use/wrong-identity, org-creation rollback,
 //! idempotent retries, recoverable provisioning, and secret hashing.

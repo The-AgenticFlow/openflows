@@ -62,6 +62,12 @@ impl CiPoller {
                 return Ok(CiPollResult::Status(status));
             }
 
+            info!(
+                pr = pr_info.number,
+                head = %pr_info.head_sha,
+                "Waiting for CI before merge"
+            );
+
             if attempts.is_multiple_of(MERGEABLE_CHECK_INTERVAL) {
                 let mergeable = self.check_mergeability(owner, repo, pr_info).await?;
                 if mergeable == Some(false) {

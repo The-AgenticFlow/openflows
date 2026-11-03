@@ -1,0 +1,150 @@
+name: Docker Publish Manager
+
+# Pushes ghcr.io/the-agenticflow/openflows-manager (linux/amd64). A release build is followed by a serialized job that moves X.Y, X and latest.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag or SHA)'
+        required: true
+        default: main
+      tag:
+        description: 'Image tag to push, e.g. 1.8.1'
+        required: true
+
+concurrency:
+  group: docker-publish-manager-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: the-agenticflow/openflows-manager
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.kind.outputs.release }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Resolve built commit
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build type
+        id: kind
+        env:
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          release=false
+          [[ "${REF}" == "refs/tags/openflows-${TAG}" && "${TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && release=true
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6
+        with:
+          context: .
+          file: Dockerfile.manager
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.title=openflows-manager
+            org.opencontainers.image.description=OpenFlows Manager service
+            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/The-AgenticFlow/openflows
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=openflows-manager-docker
+          cache-to: type=gha,mode=max,scope=openflows-manager-docker
+          provenance: false
+
+      - name: Print the image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "### Published"
+            echo "\`${REGISTRY}/${IMAGE_NAME}:${TAG}\`"
+            echo "\`${REGISTRY}/${IMAGE_NAME}@${DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Move floating tags
+    needs: build
+    if: needs.build.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # One at a time across all builds. A waiting run replaced by a newer one is harmless: every run recomputes all tags.
+    concurrency:
+      group: docker-publish-manager-floating
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point X.Y, X and latest at the newest published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          refs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/openflows-" --jq '.[].ref')"
+          releases="$(sed 's|refs/tags/openflows-||' <<<"${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          token="$(curl -fsS -u "${GITHUB_ACTOR}:${GH_TOKEN}" "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -er .token)"
+          # Follow the registry's next-page links: a missed page could point a tag at an older release.
+          headers="$(mktemp)"
+          published=""
+          url="/v2/${IMAGE_NAME}/tags/list?n=1000"
+          while [ -n "${url}" ]; do
+            page="$(curl -fsS -D "${headers}" -H "Authorization: Bearer ${token}" "https://${REGISTRY}${url}")"
+            published+="$(jq -r '.tags // [] | .[]' <<<"${page}")"$'\n'
+            url="$(tr -d '\r' <"${headers}" | sed -n 's/^[Ll]ink: *<\([^>]*\)>; *rel="next".*/\1/p' | head -1)"
+          done
+          # Releases whose image exists, newest first. A release tag exists before its build finishes.
+          available="$(grep -Fx -f <(printf '%s\n' "${releases}") <<<"${published}" | sort -rV || true)"
+          newest() { grep -E "$1" <<<"${available}" | head -1 || true; }
+          moves=""
+          for series in $(grep -oE '^[0-9]+\.[0-9]+' <<<"${available}" | sort -u || true); do
+            moves+="${series} $(newest "^${series//./\\.}\.")"$'\n'
+          done
+          for major in $(grep -oE '^[0-9]+' <<<"${available}" | sort -u || true); do
+            moves+="${major} $(newest "^${major}\.")"$'\n'
+          done
+          [ -z "${available}" ] || moves+="latest $(newest '.')"$'\n'
+          while read -r floating version; do
+            [ -n "${floating}" ] || continue
+            docker buildx imagetools create -t "${image}:${floating}" "${image}:${version}"
+            echo "\`${floating}\` -> \`${version}\`" >> "$GITHUB_STEP_SUMMARY"
+          done <<<"${moves}"

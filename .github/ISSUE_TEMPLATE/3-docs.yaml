@@ -1,0 +1,34 @@
+name: "Documentation"
+description: "Something in the docs is wrong, unclear, or missing."
+title: "docs: "
+labels: ["documentation"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: "Which document?"
+      description: "A link or file path to the document."
+      placeholder: "e.g. quick_start.md or https://openflows.dev/..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "What is wrong or missing?"
+      description: "Describe what is incorrect, unclear, outdated, or missing."
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: "Suggested fix"
+      description: "If you know how it should read, tell us."
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: "Contribution"
+      options:
+        - label: "I would like to fix this myself"

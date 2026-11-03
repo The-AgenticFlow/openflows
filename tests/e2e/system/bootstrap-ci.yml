@@ -1,0 +1,13 @@
+# Seed workflow prevents Nexus from scheduling a separate CI-setup issue.
+# Listing it never publishes success; acceptance requires the broken answer to become 42.
+
+name: Acceptance
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: test "$(cat answer.txt)" = 42

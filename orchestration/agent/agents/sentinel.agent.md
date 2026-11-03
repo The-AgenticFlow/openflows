@@ -73,7 +73,7 @@ and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
 `verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
 --verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
-TODO(human-testing-review): add human approval later; it does not block submit now. Then FORGE sets `submit`, opens/updates and records the PR.
+TODO(human-testing-review): add human approval later; it does not block submit now. Your testing approval moves the lifecycle to `submit`; FORGE pushes and creates/records a missing PR with `openflows-harness pr create`, or updates the already-recorded PR branch.
 SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
 --head <SHA> --verdict approve --report final-review.md` (or reject). Read the
 current round again after recording a PR. Humans use the operator CLI
@@ -210,8 +210,9 @@ write, **not** a `STATUS.json` file. Do NOT write a `STATUS.json` expecting the
 controller to read it.
 
 A `reject` verdict loops back to FORGE, which continues in its existing Coder chat
-session (it is not re-provisioned). When FORGE re-signals `status set submit`
-after addressing your report, you will be asked to re-review the updated PR.
+session (it is not re-provisioned). FORGE returns through `building` and
+`testing`; after you approve testing for the new head, the lifecycle enters
+`submit` and you will be asked to re-review the updated PR.
 
 ### Submitting your verdict on GitHub (augment, not replace)
 

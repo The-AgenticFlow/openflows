@@ -8,6 +8,54 @@ terraform {
 # TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
 # Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
 # (Remove when switching to GitHub releases for the openflows binaries.)
+variable "docker_network" {
+  description = "Docker network shared by the control plane and tenant workspaces"
+  type        = string
+  default     = "openflows_default"
+}
+
+variable "connected_local" {
+  description = "Use the OpenFlows team's GitHub App with local user authorization"
+  type        = bool
+  default     = false
+}
+
+variable "connected_local_broker_secret_host_path" {
+  description = "Host path to the local Manager broker key; never the key value"
+  type        = string
+  default     = ""
+}
+
+variable "connected_local_manager_url" {
+  description = "Local Manager URL reachable from Coder workspaces"
+  type        = string
+  default     = "http://openflows-local-manager:3002"
+}
+
+variable "connected_local_helper_host_path" {
+  description = "Host path to the connected-local workspace credential helper"
+  type        = string
+  default     = ""
+}
+
+variable "workspace_image" {
+  description = "Workspace image containing the tools used by the production bootstrap"
+  type        = string
+  default     = "codercom/enterprise-base:ubuntu"
+}
+
+variable "github_api_base" {
+  description = "GitHub REST API origin, including any enterprise API path"
+  type        = string
+  default     = "https://api.github.com"
+}
+
+variable "github_git_base" {
+  description = "Git transport origin used by the controller to provision repository checkouts"
+  type        = string
+  default     = "https://github.com"
+}
+
 variable "dev_binary_host_path" {
   description = "Absolute host path to the .dev-binaries directory"
   type        = string
@@ -99,10 +147,52 @@ data "coder_parameter" "coder_url" {
 
 data "coder_parameter" "external_auth_id" {
   name        = "external_auth_id"
-  description = "Coder external-auth provider id (CODER_EXTERNAL_AUTH_0_ID) that the tenant linked for GitHub"
+  description = "Coder external-auth provider id (CODER_EXTERNAL_AUTH_0_ID) that the tenant linked for GitHub; drives the injected CODER_EXTERNAL_AUTH_<ID>_* env var names"
   default     = "primary-github"
   type        = "string"
   mutable     = false
+}
+
+locals {
+  # Env var prefix the runtime reads the GitHub token from, derived from the
+  # configured provider id the same way GithubConfig::normalize_external_auth_id
+  # does (uppercase, `-`/`.` -> `_`), so a custom provider id works at runtime.
+  external_auth_env = "CODER_EXTERNAL_AUTH_${replace(replace(upper(data.coder_parameter.external_auth_id.value), "-", "_"), ".", "_")}"
+}
+
+# Hosted runtime mode. When true, this worker sources scoped runtime
+# credentials from the secret-injection backend's mounted file
+# (OPENFLOWS_RUNTIME_CREDENTIAL_FILE) instead of the owner's Coder external-auth
+# token, so the tenant's Git identity is scoped and rotation does not require a
+# rebuild. Local mode (the default) preserves the existing operator workflow.
+data "coder_parameter" "hosted" {
+  name        = "hosted"
+  description  = "Whether this workspace is provisioned in hosted mode (scoped runtime credentials)"
+  default     = "false"
+  type        = "bool"
+  mutable     = false
+}
+
+data "coder_parameter" "runtime_secret_ref" {
+  name        = "runtime_secret_ref"
+  description = "Provisioner-resolved per-workspace secret reference"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "workspace_image_digest" {
+  name        = "workspace_image_digest"
+  description = "Release-pinned sha256 digest for the hosted workspace image"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "a2a_relay_addr" {
+  name = "a2a_relay_addr"
+  type = "string"
+  default = "openflows-nexus:3000"
 }
 
 resource "coder_agent" "main" {
@@ -167,9 +257,13 @@ resource "coder_agent" "main" {
     HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
-      mkdir -p "$HOOKS_DIR"
-      cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
-      chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
+      # The artifacts volume (/home/coder/.openflows) is a host bind mount
+      # owned by root, so these operations must run via sudo as the coder
+      # user cannot create directories or write inside a root-owned mount.
+      sudo mkdir -p "$HOOKS_DIR"
+      sudo cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
+      sudo chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
+      sudo chown -R coder:coder "$HOOKS_DIR" 2>/dev/null || true
       log "Installed $ROLE_BASE hooks from artifacts volume"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
@@ -179,46 +273,46 @@ resource "coder_agent" "main" {
     # whose scripts exist are registered, so this works for every role.
     mkdir -p /home/coder/.claude
     python3 - "$HOOKS_DIR" /home/coder/.claude/settings.json <<'PYEOF'
-    import json, os, sys
-    hooks_dir, settings_path = sys.argv[1], sys.argv[2]
-    def cmd(name):
-        path = os.path.join(hooks_dir, name)
-        return path if os.path.isfile(path) else None
-    event_map = {
-        "SessionStart": [(None, "session_start.sh")],
-        "PreToolUse": [("Bash", "pre_bash_guard.sh"),
-                        ("Bash", "pre_bash_readonly_guard.sh"),
-                        ("Write|Edit|MultiEdit", "pre_write_check.sh")],
-        "PostToolUse": [("Write|Edit|MultiEdit", "post_write_lint.sh"),
-                         ("Write|Edit|MultiEdit", "post_write_validate.sh")],
-        "PreCompact": [(None, "pre_compact_handoff.sh")],
-        "Stop": [(None, "stop_require_artifact.sh"),
-                  (None, "stop_require_eval.sh")],
-        "SubagentStop": [(None, "subagent_stop.sh")],
-    }
-    hooks = {}
-    for event, entries in event_map.items():
-        matchers = []
-        for matcher, script in entries:
-            path = cmd(script)
-            if not path:
-                continue
-            entry = {"hooks": [{"type": "command", "command": path}]}
-            if matcher:
-                entry["matcher"] = matcher
-            matchers.append(entry)
-        if matchers:
-            hooks[event] = matchers
-    settings = {}
-    if os.path.exists(settings_path):
-        try:
-            settings = json.load(open(settings_path))
-        except Exception:
-            settings = {}
-    settings["hooks"] = hooks
-    json.dump(settings, open(settings_path, "w"), indent=2)
-    print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
-    PYEOF
+import json, os, sys
+hooks_dir, settings_path = sys.argv[1], sys.argv[2]
+def cmd(name):
+    path = os.path.join(hooks_dir, name)
+    return path if os.path.isfile(path) else None
+event_map = {
+    "SessionStart": [(None, "session_start.sh")],
+    "PreToolUse": [("Bash", "pre_bash_guard.sh"),
+                    ("Bash", "pre_bash_readonly_guard.sh"),
+                    ("Write|Edit|MultiEdit", "pre_write_check.sh")],
+    "PostToolUse": [("Write|Edit|MultiEdit", "post_write_lint.sh"),
+                     ("Write|Edit|MultiEdit", "post_write_validate.sh")],
+    "PreCompact": [(None, "pre_compact_handoff.sh")],
+    "Stop": [(None, "stop_require_artifact.sh"),
+              (None, "stop_require_eval.sh")],
+    "SubagentStop": [(None, "subagent_stop.sh")],
+}
+hooks = {}
+for event, entries in event_map.items():
+    matchers = []
+    for matcher, script in entries:
+        path = cmd(script)
+        if not path:
+            continue
+        entry = {"hooks": [{"type": "command", "command": path}]}
+        if matcher:
+            entry["matcher"] = matcher
+        matchers.append(entry)
+    if matchers:
+        hooks[event] = matchers
+settings = {}
+if os.path.exists(settings_path):
+    try:
+        settings = json.load(open(settings_path))
+    except Exception:
+        settings = {}
+settings["hooks"] = hooks
+json.dump(settings, open(settings_path, "w"), indent=2)
+print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
+PYEOF
 
     # Inherit the controller-spawner's GitHub identity from Coder external
     # auth (the tenant's linked GitHub App token). The workspace owner IS the
@@ -226,11 +320,59 @@ resource "coder_agent" "main" {
     # this token resolves to the real account the workspace should commit and
     # open PRs as. This is a REQUIRED, verified identity: startup fails loudly
     # if it cannot be established — never a silent REST-API fallback.
-    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      RUNTIME_CREDENTIAL_COPY=$(mktemp)
+      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
+      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
+        rm -f "$RUNTIME_CREDENTIAL_COPY"
+        log "FATAL: runtime secret is not mounted"
+        exit 1
+      fi
+      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
+import json, shlex, sys
+d=json.load(open(sys.argv[1]))
+for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]:
+    print('export %s=%s' % (env, shlex.quote(str(d[key]))))
+PY
+)"
+      rm -f "$RUNTIME_CREDENTIAL_COPY"
+      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
+      eval "$(python3 - "$SESSION" <<'PY'
+import json, shlex, sys
+d=json.loads(sys.argv[1])
+print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
+print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
+PY
+)"
+      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
+      API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+      API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
+    else
+      if [ "${var.connected_local}" = "true" ]; then
+        python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+        GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
+      else
+        GIT_TOKEN="${data.coder_parameter.hosted.value == "true" || var.connected_local ? "" : data.coder_external_auth.github[0].access_token}"
+      fi
+      API_TOKEN="$GIT_TOKEN"
+    fi
     if [ -z "$GIT_TOKEN" ]; then
       log "FATAL: no inherited GitHub credential for the controller-spawner (workspace owner external auth is not linked)"
       exit 1
     fi
+    if [ -z "$API_TOKEN" ]; then
+      log "FATAL: no GitHub API credential for pull request operations"
+      exit 1
+    fi
+
+    # The harness uses the brokered API-purpose token for PR operations. Git
+    # uses the brokered Git-purpose token. Neither path uses gh authentication.
+    mkdir -p /home/coder/.config/openflows
+    chmod 700 /home/coder/.config/openflows
+    API_TOKEN_TEMP=$(mktemp /home/coder/.config/openflows/github-api-token.XXXXXX)
+    printf '%s' "$API_TOKEN" > "$API_TOKEN_TEMP"
+    mv -f "$API_TOKEN_TEMP" /home/coder/.config/openflows/github-api-token
 
     # System-level helper so git works for BOTH the agent user (pushes) and
     # the sudo'd root clone below (their $HOME differ).
@@ -242,64 +384,32 @@ resource "coder_agent" "main" {
     sudo chmod 600 /root/.git-credentials
     log "Configured git credentials for GitHub push auth"
 
-    # Install the GitHub CLI so the agent can open PRs with `gh pr create`
-    # instead of hand-rolling the REST API. gh is best-effort, NOT a hard
-    # startup dependency: the git credential helper above is the real push
-    # mechanism, so a workspace with a valid repo seed still starts even if gh
-    # cannot be installed (the agent can open the PR via REST/UI instead).
-    if ! command -v gh >/dev/null 2>&1; then
-      # Ubuntu base image (codercom/enterprise-base): prefer the official
-      # GitHub apt repo (always current), fall back to the distro package.
-      sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
-      sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
-      if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-          | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-      fi
-      sudo apt-get update -qq >/dev/null 2>&1 || true
-      sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
-    fi
-
-    if command -v gh >/dev/null 2>&1; then
-      # Authenticate gh persistently as the inherited identity for BOTH the
-      # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
-      # --hostname + --git-protocol make the stored credential explicit and
-      # deterministic (non-interactive). The token travels through stdin for
-      # the root login too — never embedded in a command-line argument that
-      # another process could read. Failures are fatal, never swallowed.
-      printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
-        || { log "FATAL: gh auth login failed for user coder"; exit 1; }
-      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
-        || { log "FATAL: gh auth login failed for user root"; exit 1; }
-    else
-      log "WARNING: GitHub CLI (gh) unavailable — agent should push via git and open the PR through the REST API or GitHub UI"
+    if [ "${var.connected_local}" = "true" ]; then
+      git config --global --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
+      rm -f /home/coder/.git-credentials
+      sudo rm -f /root/.git-credentials
     fi
 
     # Resolve the expected account from the inherited token via the GitHub API
     # (the coder_external_auth data source does not expose the login). Honor
     # GITHUB_API_BASE so self-hosted setups match the rest of the system.
-    EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
-      | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
-      || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      # Installation tokens are repository-scoped and intentionally do not
+      # expose a personal /user identity. Commits are authored as the App bot.
+      EXPECTED_LOGIN="openflows[bot]"
+    else
+      EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
+        || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    fi
     if [ -z "$EXPECTED_LOGIN" ]; then
       log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
       exit 1
     fi
 
-    if command -v gh >/dev/null 2>&1; then
-      # Verify the authed gh identity actually matches the inherited account, so
-      # gh/git act as the controller-spawner — never a dummy or mismatched login.
-      AUTHED_LOGIN=$(gh api user --jq .login) \
-        || { log "FATAL: could not query the authed gh identity"; exit 1; }
-      if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
-        log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
-        exit 1
-      fi
-      log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
-    else
-      log "WARNING: gh unavailable — skipping gh identity check; git push uses the inherited token via the credential helper"
-    fi
+    log "GitHub identity resolved: $EXPECTED_LOGIN"
 
     # Set git author identity from the inherited account (the template sets
     # none today, so commits would fail or use a wrong default identity).
@@ -330,22 +440,22 @@ resource "coder_agent" "main" {
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull 2>/dev/null || true
-      git fetch --all --prune 2>/dev/null || true
+      cd /home/coder/workspace && timeout -k 5s 45s git pull 2>/dev/null || log "WARNING: repository pull failed or timed out; using local checkout"
+      timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using local refs"
     elif [ -d "$GOLDEN_REPO/.git" ]; then
       sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
       sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
       log "Copied golden repo seed into /home/coder/workspace"
       # Refresh to latest before checkout (design: copy -> refresh -> checkout).
       cd /home/coder/workspace
-      git fetch --all --prune 2>/dev/null || true
+      timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using seed refs"
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
-      if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
+      if timeout -k 5s 90s sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
         cd /home/coder/workspace
-        git fetch --all --prune 2>/dev/null || true
+        timeout -k 5s 45s git fetch --all --prune 2>/dev/null || log "WARNING: repository fetch failed or timed out; using cloned refs"
       else
         log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
@@ -428,17 +538,111 @@ resource "coder_agent" "main" {
       fi
     fi
 
+    # Broker-backed git credential refresh. The startup installation token is
+    # short-lived, so a long-running worker's push can outlive it. Refresh the
+    # runtime session and re-fetch a fresh installation token from the Manager
+    # broker, then rewrite Git's credential store with the git-purpose token
+    # and gh's protected hosts file with the API-purpose token.
+    # Runs in the background for the workspace lifetime; harmless when the
+    # Manager is unreachable.
+    mkdir -p /home/coder/.local/state/openflows
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      rm -f /tmp/openflows-manager-ready
+      nohup bash -c '
+        ACCESS="$${OF_RUNTIME_ACCESS_TOKEN}"
+        REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
+        TICKS=0
+        while true; do
+          sleep 30
+          if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi
+          TICKS=$((TICKS + 1))
+          HEARTBEAT_STATUS=$(curl -s -o /dev/null -w "%%{http_code}" -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat")
+          if [ "$${HEARTBEAT_STATUS}" = "401" ]; then
+            RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+            ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+            REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+            curl -fsS -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null || true
+          fi
+          if [ "$TICKS" -lt 16 ]; then continue; fi
+          TICKS=0
+          RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
+          ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
+          REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
+          GIT=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"git\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
+          API=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"api\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
+          GIT_TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          API_TOKEN=$(printf "%s" "$${API}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
+          if [ -z "$${GIT_TOKEN}" ] || [ -z "$${API_TOKEN}" ]; then continue; fi
+          echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
+          sudo cp /home/coder/.git-credentials /root/.git-credentials
+          sudo chmod 600 /root/.git-credentials
+          API_TOKEN_TEMP=$(mktemp /home/coder/.config/openflows/github-api-token.XXXXXX) || continue
+          printf "%s" "$${API_TOKEN}" > "$${API_TOKEN_TEMP}"
+          mv -f "$${API_TOKEN_TEMP}" /home/coder/.config/openflows/github-api-token
+        done
+      ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
+    fi
+
+    if [ ! -d /home/coder/workspace/.git ]; then
+      log "FATAL: repository bootstrap did not produce /home/coder/workspace/.git"
+      exit 1
+    fi
+
+    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    PERSONA="$INSTRUCTION_ROOT/agent/agents/$ROLE_BASE.agent.md"
+    if [ ! -f "$PERSONA" ]; then
+      log "FATAL: hosted instruction bundle is missing $PERSONA"
+      exit 1
+    fi
+    sudo cp "$PERSONA" /home/coder/workspace/AGENTS.md
+    sudo cp "$PERSONA" "/home/coder/workspace/$ROLE_BASE.agent.md"
+    sudo mkdir -p /home/coder/workspace/.agents/skills /home/coder/workspace/.agents/commands
+    SKILL_MANIFEST="$INSTRUCTION_ROOT/agent/roles/$ROLE_BASE.skills"
+    if [ ! -f "$SKILL_MANIFEST" ]; then
+      log "FATAL: hosted skill manifest is missing $SKILL_MANIFEST"
+      exit 1
+    fi
+    while IFS= read -r skill; do
+      [ -z "$skill" ] && continue
+      sudo mkdir -p "/home/coder/workspace/.agents/skills/$skill"
+      sudo cp "$INSTRUCTION_ROOT/plugin/skills/$skill/SKILL.md" "/home/coder/workspace/.agents/skills/$skill/SKILL.md"
+    done < "$SKILL_MANIFEST"
+    sudo cp -a "$INSTRUCTION_ROOT/plugin/commands/." /home/coder/workspace/.agents/commands/
+    for standard in CODING.md SECURITY.md REVIEW.md; do
+      [ ! -f "$INSTRUCTION_ROOT/agent/standards/$standard" ] || sudo cp "$INSTRUCTION_ROOT/agent/standards/$standard" /home/coder/workspace/
+    done
+    sudo chown -R coder:coder /home/coder/workspace
+    EXCLUDE=$(git -C /home/coder/workspace rev-parse --absolute-git-dir)/info/exclude
+    sudo mkdir -p "$(dirname "$EXCLUDE")"
+    sudo touch "$EXCLUDE"
+    for pattern in /AGENTS.md "/$ROLE_BASE.agent.md" '/.agents/skills/' '/.agents/commands/' /CODING.md /SECURITY.md /REVIEW.md; do
+      sudo grep -qxF -- "$pattern" "$EXCLUDE" || printf '\n%s\n' "$pattern" | sudo tee -a "$EXCLUDE" >/dev/null
+    done
+    log "Installed hosted instructions for $ROLE_BASE"
+
+    # Start heartbeat only after repository and branch bootstrap completes.
+    # Manager uses this heartbeat as the readiness boundary before creating a Chat.
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
     # OPENFLOWS_ROLE must be the BASE role (forge), not the worker id
     # (forge-1): the controller writes dispatch and reads heartbeats under
     # the base-role key, so a worker-id role would never match.
-    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    # Hosted mode already loaded the authenticated tenant URL from the
+    # Manager-injected runtime secret. Never replace it with the public Coder
+    # parameter, which is not a secret delivery channel.
+    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+      export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
-    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
+      log "Manager readiness heartbeat sent after bootstrap"
+      touch /tmp/openflows-manager-ready
+    fi
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
@@ -460,29 +664,31 @@ resource "coder_agent" "main" {
     # If no CLI binary is available, the workspace relies on Coder control-
     # plane agents via the Coder Chat created by the controller.
     AGENT_CLI=""
-    if [ -f /opt/openflows-dev/claude ]; then
+    if [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -f /opt/openflows-dev/claude ]; then
       AGENT_CLI="claude"
       sudo cp /opt/openflows-dev/claude /usr/local/bin/claude
       sudo chmod +x /usr/local/bin/claude
       log "Mounted Claude Code binary from host — starting agent"
-    elif command -v claude >/dev/null 2>&1; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && command -v claude >/dev/null 2>&1; then
       AGENT_CLI="claude"
       log "Claude Code found on PATH — starting agent"
-    elif [ -f /opt/openflows-dev/codex ]; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -f /opt/openflows-dev/codex ]; then
       AGENT_CLI="codex"
       sudo cp /opt/openflows-dev/codex /usr/local/bin/codex
       sudo chmod +x /usr/local/bin/codex
       log "Mounted Codex binary from host — starting agent"
-    elif command -v codex >/dev/null 2>&1; then
+    elif [ "${data.coder_parameter.hosted.value}" != "true" ] && command -v codex >/dev/null 2>&1; then
       AGENT_CLI="codex"
       log "Codex found on PATH — starting agent"
     fi
 
-    if [ -n "$AGENT_CLI" ]; then
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      log "Hosted Forge execution is started by Nexus through a Manager-created Coder Chat"
+    elif [ -n "$AGENT_CLI" ]; then
       nohup "$AGENT_CLI" -p "Start working on ticket $OPENFLOWS_TICKET. Read dispatch with 'openflows-harness dispatch read' and follow the workflow. Use 'openflows-harness status set <phase>' to report progress." </dev/null >/tmp/agent.log 2>&1 &
       log "Agent started (cli=$AGENT_CLI ticket=$OPENFLOWS_TICKET pid=$!)"
     else
-      log "No agent CLI binary found — workspace will rely on Coder Chat control-plane agent"
+      log "No agent CLI binary found — waiting for a Coder Chat from the controller"
     fi
   EOT
 }
@@ -492,8 +698,9 @@ resource "docker_volume" "workspace" {
 }
 
 resource "docker_container" "workspace" {
+  count = data.coder_workspace.me.start_count
   name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
-  image = "codercom/enterprise-base:ubuntu"
+  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
@@ -520,28 +727,59 @@ resource "docker_container" "workspace" {
     }
   }
 
-  env = [
-    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/runtime.json"
+      host_path      = data.coder_parameter.runtime_secret_ref.value
+      read_only      = true
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_broker_secret_host_path != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/local-broker-key"
+      host_path      = var.connected_local_broker_secret_host_path
+      read_only      = true
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_helper_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows/connected-local-github.py"
+      host_path      = var.connected_local_helper_host_path
+      read_only      = true
+    }
+  }
+
+  env = concat([
+    "GITHUB_API_BASE=${var.github_api_base}",
+    "GITHUB_GIT_BASE=${var.github_git_base}",
+    "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
+    "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
+    "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.repo_url.value}",
+    "CODER_EXTERNAL_AUTH_0_ID=${data.coder_parameter.external_auth_id.value}",
+    "${local.external_auth_env}_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
+    "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
-    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_RELAY_ADDR=${data.coder_parameter.a2a_relay_addr.value}",
     "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-    # Forge resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the tenant
-    # owner's linked GitHub App token). Export the provider id and token so a
-    # custom CODER_EXTERNAL_AUTH_0_ID works at runtime.
-    "CODER_EXTERNAL_AUTH_0_ID=${data.coder_parameter.external_auth_id.value}",
-    "CODER_EXTERNAL_AUTH_${replace(replace(upper(data.coder_parameter.external_auth_id.value), "-", "_"), ".", "_")}_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
-  ]
+  ], data.coder_parameter.hosted.value == "true" ? [] : [
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+  ])
 
   # egress allowlist: Coder control plane + github.com + Redis only
   # (enforced at network level; Redis is a documented exception per docs/governance.md)
 
   networks_advanced {
-    name = "openflows_default"
+    name = var.docker_network
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]
@@ -550,5 +788,7 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  id = data.coder_parameter.external_auth_id.value
+  count = data.coder_parameter.hosted.value == "true" || var.connected_local ? 0 : 1
+  id       = data.coder_parameter.external_auth_id.value
+  optional = true
 }

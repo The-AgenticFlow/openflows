@@ -1,0 +1,68 @@
+name: "Feature request"
+description: "Suggest a new idea or improvement."
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping us improve OpenFlows! For open-ended ideas you would like to discuss first, join us on [Discord](https://discord.gg/gDhK2RQZpY).
+
+  - type: checkboxes
+    id: existing_issues
+    attributes:
+      label: "Is there an existing issue for this?"
+      description: "Please search to see if this feature has already been requested."
+      options:
+        - label: "I have searched the existing issues"
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "What problem does this solve?"
+      description: "Describe the problem or limitation you are facing."
+      placeholder: "I'm always frustrated when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: "What would you like to happen?"
+      description: "Describe the solution you would like."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives considered"
+      description: "Describe any alternative solutions or workarounds you have considered."
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Which part of OpenFlows does this relate to?"
+      multiple: true
+      options:
+        - "NEXUS / Controller"
+        - "FORGE"
+        - "SENTINEL"
+        - "VESSEL"
+        - "LORE"
+        - "Harness CLI (openflows-harness)"
+        - "A2A relay / verification"
+        - "Lifecycle hooks"
+        - "Coder templates / workspace provisioning"
+        - "Manager"
+        - "Setup scripts / installation"
+        - "Documentation"
+        - "Other / not sure"
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: "Contribution"
+      options:
+        - label: "I would like to work on this myself"

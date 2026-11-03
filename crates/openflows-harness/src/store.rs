@@ -243,6 +243,25 @@ impl HarnessStore {
         Ok(())
     }
 
+    /// Guard the external side effect before contacting GitHub. A blocked
+    /// worker must recover through planning before it can submit a PR.
+    pub async fn ensure_pr_creation_allowed(&self, ticket: &str, role: &str) -> Result<()> {
+        if !role.eq_ignore_ascii_case("forge") {
+            bail!("Only FORGE may create a PR for this ticket");
+        }
+        let state = self.lifecycle.lifecycle(ticket).await?;
+        if state.phase != Phase::Submit {
+            bail!(
+                "PR creation requires submit phase; current phase is {}",
+                state.phase.as_str()
+            );
+        }
+        if let Some(pr_number) = state.pr_number {
+            bail!("This ticket already records PR #{}", pr_number);
+        }
+        Ok(())
+    }
+
     /// Write a handoff contract (forge → sentinel).
     pub async fn handoff_write(
         &self,

@@ -2,25 +2,16 @@
 
 The goal is to prove that a new OpenFlows build can take an issue, provision agents, produce a correct change, verify the exact commit, obtain the required approvals, merge that change, and clean up. A passing test must include independent evidence of the resulting code and repository history. An agent saying it completed the task is insufficient.
 
-This is the target architecture. PRs #400 and #401 implement its first two increments; the complete issue-to-merge suite remains to be built. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
-
-## What the existing pull requests do
-
-| Pull request | Purpose | What it proves | What it does not prove |
-| --- | --- | --- | --- |
-| [#400](https://github.com/The-AgenticFlow/openflows/pull/400) | Establish the CI merge gate and real service tests | Real Redis and PostgreSQL integration; Coder provisions a workspace; planning gates, tenant separation, restart, and deletion work; every mandatory CI job must succeed | The controller can take an issue through agent chats to a merged PR |
-| [#401](https://github.com/The-AgenticFlow/openflows/pull/401) | Verify acceptance through separate real workspaces | SENTINEL requests tests over A2A; FORGE executes them outside its original checkout; failing tests cannot authorize submit; head and round checks reject stale approvals | Model-driven dispatch, controller issue routing, Coder hooks, GitHub integration, human PR approval, or an actual merge |
-
-#401 is based on #400. They are pull requests containing test infrastructure and coverage, rather than the test issues that agents will solve. Their checks remain useful when the complete system suite is added: they isolate failures and run focused cases that would be expensive to repeat through the whole workflow.
+The connected system scenario combines service integration, delegated verification, external-service fixtures, and production bootstrap into one issue-to-merge journey. Recovery, onboarding, and live scenarios remain future work. Tests reduce regression risk for the scenarios they cover; they cannot guarantee that every possible change is safe.
 
 ## The test layers
 
 | Layer | Environment | When it runs | Status |
 | --- | --- | --- | --- |
 | Build and unit tests | Rust workspace | Every PR and merge candidate | Existing |
-| Service integration | Real Redis and PostgreSQL | Every PR and merge candidate | Covered by #400 and existing manager tests |
-| Worker integration | Real Coder, Terraform, SSH, workers, Redis, A2A | Every PR and merge candidate | Covered in part by #400 and #401 |
-| Complete deterministic system E2E | Real OpenFlows and Coder; local GitHub and model fixtures; real Git | Every PR and merge candidate once established | Next implementation |
+| Service integration | Real Redis and PostgreSQL | Every PR and merge candidate | Covered by service and manager integration tests |
+| Workspace integration | Real Coder, Terraform, SSH, workspaces, Redis, A2A | Every PR and merge candidate | Covered by workspace and delegated verification tests |
+| Connected deterministic system E2E | Real OpenFlows and Coder; local GitHub and model fixtures; real Git | Every PR and merge candidate | One complete scenario; recovery/rework cases remain |
 | Live external E2E | Production templates, linked GitHub authentication, disposable GitHub repo, real model provider | Nightly and before release | Future implementation |
 | Manager and onboarding E2E | Manager HTTP API, PostgreSQL, tenant configuration, Coder; browser journey where applicable | Relevant PRs initially; mandatory once stable | Future implementation; current manager integration is a foundation |
 
@@ -28,7 +19,7 @@ The deterministic system suite provides repeatable merge decisions without exter
 
 ## Complete deterministic system topology
 
-Each run creates a fresh Docker network and disposable resources. Coder creates the Nexus and worker workspaces. The controller inside the Nexus workspace runs the production flow graph, including NEXUS scheduling and VESSEL merge handling, and hosts the hook consumer and A2A relay.
+Each run creates a fresh Docker network and disposable resources. Coder creates the Nexus and role workspaces. The controller inside the Nexus workspace runs the production flow graph, including NEXUS scheduling and VESSEL merge handling, and hosts the hook consumer and A2A relay.
 
 ```mermaid
 flowchart TB
@@ -75,10 +66,10 @@ The manager participates in onboarding scenarios. A controller scenario may begi
 | --- | --- |
 | OpenFlows | Build from the candidate commit; run the actual controller, role routing, harness, hooks, A2A, and VESSEL code |
 | Coder | Pinned real server, PostgreSQL, Terraform provisioning, chat engine, command execution, and workspace lifecycle |
-| Worker commands | Actually edit files, commit changes, run tests, request verification, and record reviews |
+| Workspace commands | Actually edit files, commit changes, run tests, request verification, and record reviews |
 | Redis and PostgreSQL | Real servers and normal migrations; isolated tenant data and databases |
 | Git repository | Real commits, branches, remote pushes, and merge operations |
-| Model provider | Local HTTP fixture returning scripted text and tool calls; Coder must execute those calls in real workers |
+| Model provider | Local HTTP fixture returning scripted text and tool calls; Coder must execute those calls in real workspaces |
 | GitHub service | Local HTTP fixture implementing the required issue, PR, review, check, and merge endpoints; merge requests operate on the real Git repository |
 | Candidate CI | Real acceptance commands run independently against the requested candidate; check status belongs to that commit |
 | Human | Scenario driver performs the human approval through the supported CLI or API, including revision, round, and head |
@@ -119,7 +110,7 @@ Add these after the first complete scenario works, one scenario at a time.
 | Missing, failed, or pending CI | No premature merge; a pending check is not success |
 | Human approval absent or rejected | No merge; rejection is reflected in the workflow |
 | Repeated polling, duplicated hooks, or repeated delivery | No duplicate assignment, workspace, review, or merge side effect |
-| Worker or controller restart | Reconciliation preserves the candidate and required approvals without bypassing gates |
+| Workspace or controller restart | Reconciliation preserves the candidate and required approvals without bypassing gates |
 | Merge response lost after remote merge | Reconciliation detects the actual remote result without producing a second merge |
 | Invalid hook signature or wrong A2A pair token | Request is rejected; lifecycle does not advance |
 | Concurrent tenants | Tickets, credentials, verification, and approvals stay within their tenant |
@@ -128,7 +119,7 @@ Existing focused tests cover parts of these cases. Full system scenarios verify 
 
 ## CI enforcement and diagnostics
 
-Retain the existing focused jobs. Add a distinct required system E2E job to the final `OpenFlows Merge Gate` when the first complete scenario passes consistently. Run it against the candidate commit and the merge-queue candidate where a queue is configured. The final gate must reject failed, cancelled, timed-out, and skipped mandatory jobs.
+The focused jobs and `Connected issue-to-merge E2E` feed the required `OpenFlows Merge Gate`. Run them against the candidate commit and the merge-queue candidate where a queue is configured. The final gate must reject failed, cancelled, timed-out, and skipped mandatory jobs.
 
 Every run uses pinned dependencies, bounded startup and scenario deadlines, readiness checks, unique resource names, disposable credentials, and cleanup restricted to its own resources. CI scenarios must not load operator configuration or production volumes. Cleanup runs on success, failure, and cancellation.
 
@@ -136,22 +127,33 @@ Save correlated controller logs, Coder logs and chat tool results, authenticated
 
 Do not hide intermittent failures with blanket reruns. Report startup failures separately from assertion failures, then repair the cause or keep the affected gate failing.
 
-## Delivery order and completion criteria
+## Remaining coverage and completion criteria
 
-1. Merge #400 to establish the required checks and disposable service infrastructure.
-2. Merge #401 after #400, updating its base to the intended protected branch as needed. This adds the real delegated-verification boundary.
-3. Build the local GitHub adapter, real Git remote, independent CI runner, and scripted model provider around one complete scenario.
-4. Run the production controller in the Nexus workspace and prove actual Coder chat execution and signed hooks. Complete the issue-to-merge scenario and make its CI job mandatory.
-5. Add recovery, rework, approval, and tenant-isolation scenarios; add the manager onboarding journey through its public interfaces.
-6. Add the credentialed live suite against a disposable GitHub repository and real provider, using production templates and linked authentication. Establish nightly monitoring and a release check for the candidate being released.
+1. Expand recovery, rework, approval, and tenant-isolation scenarios.
+2. Add the manager onboarding journey through its public interfaces.
+3. Add a live suite against a disposable GitHub repository and real model provider, using production templates and linked authentication. Run it nightly and against release candidates.
 
-The full deterministic E2E milestone is complete only when an issue submitted through the public boundary reaches a genuinely merged Git commit through the actual controller and agent paths, independently passes acceptance, respects every required gate, and leaves the expected cleanup state. The live milestone additionally proves the production authentication, external services, and templates. Passing #400 and #401 alone does not satisfy either milestone.
+The deterministic E2E scenario must take an issue through the actual controller and agent paths to a real merged Git commit, independently pass acceptance, respect the required gates, and leave the expected cleanup state. The live suite must additionally verify production authentication and external services. Focused service tests alone cannot establish either result.
 
-## Task 3 infrastructure
+## External-service fixtures
 
 The [system fixtures](../../tests/e2e/system/README.md) implement the local scripted model provider, limited GitHub API adapter, real Git remote, and independent exact-commit acceptance runner. Their mandatory contract job checks the production OpenFlows GitHub client and verifies actual acceptance failure, stale evidence rejection, and Git merging. The model contract checks normal and streamed tool responses and matching tool results.
 
-This is delivery step 3 infrastructure, not the complete system milestone. The production controller, real Coder chats and signed hooks, public human approval, and workspace cleanup across the complete journey remain delivery step 4. The fixture contract driver deliberately controls Git/API calls and must not be presented as proof that agents or the controller performed them.
+The fixture contract driver deliberately controls Git/API calls and tests those adapters in isolation. The separate connected scenario uses real controller-created Coder chats and signed hooks; only the human and independent CI actions are supplied by its driver.
+
+## Production bootstrap coverage
+
+The production bootstrap scenario runs the public tenant CLI against a fresh Coder deployment. It uploads all five production Terraform templates, provisions Nexus, clones the real fixture repository, checks the Rust controller's health, and makes a real Coder chat execute a workspace command. It also checks that unchanged bootstrap reuses template versions, changed Terraform settings produce new versions, and workspace deletion succeeds. Logs are collected before deletion.
+
+This check catches regressions in fresh tenant configuration, template upload and configuration forwarding, Nexus startup, repository cloning, and Coder command execution. It does not yet prove issue discovery, FORGE/SENTINEL chats, signed hook delivery, human approval, or VESSEL merging. Those are covered together by the connected scenario below.
+
+## Connected issue-to-merge coverage
+
+Run `bash tests/e2e/system/bootstrap.sh system`. The fresh tenant discovers an issue through the local GitHub API, provisions FORGE and SENTINEL with production templates, and uses actual Coder chats and phase hooks to plan, implement, commit, verify through A2A, and open/review a PR. The driver approves through the public operator CLI; actual VESSEL requests a real squash merge. Independent acceptance checks both the candidate and merged commit. The controller must mark the ticket merged and delete both role workspaces.
+
+The scenario observes no merge attempts while human approval is missing or CI is pending. It also checks the verification executor, temporary checkout, tested head, unchanged default branch before approval, merged tree and parent, hook delivery, and cleanup. Evidence is uploaded by the required `Connected issue-to-merge E2E` job, which feeds `OpenFlows Merge Gate`.
+
+The scripted model supplies repeatable tool choices; it does not test reasoning quality. The GitHub adapter exercises real Git but does not replace a live authentication or branch-protection test. Existing focused suites retain failed acceptance, stale approval, and rejected CI cases. Whole-journey recovery, rejection/rework, and tenant-concurrency scenarios still need expansion.
 
 ## Implementation references
 

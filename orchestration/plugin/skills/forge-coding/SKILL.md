@@ -43,12 +43,23 @@ ticket IDs.
    `openflows-harness verify serve`. Source remains frozen during testing.
 3. Wait for successful A2A verification and SENTINEL testing approval for the
    current revision, round, and commit. Human testing review is TODO, not a blocker. Read harness status on notification; do not poll in a loop.
-4. Once testing approvals permit it, set `submit`, push the assigned branch using
-   the available authorized Git/GitHub tooling, and open or update the PR.
-5. Record it with `openflows-harness pr opened --pr <N> --branch <actual-branch>
-   --title <title>`. Describe the actual changes, verification, and any required
-   public deployment link. Reference an issue only if dispatch identifies it.
-6. Wait for SENTINEL and human PR approval. VESSEL handles merge readiness;
+4. After SENTINEL approves testing, read `openflows-harness status get` and
+   proceed only when the lifecycle is `submit`. The approval moves the shared
+   lifecycle to `submit`; do not repeat the transition. Push the assigned branch
+   with `git push` using the workspace's brokered Git credential.
+5. If no PR number is recorded, run `openflows-harness pr create --repo OWNER/REPO
+   --base BASE --head <actual-branch> --title "Descriptive title" --body "Markdown description"`.
+   Use the task's target base branch, or the repository default if none is
+   specified; do not assume `main`. The title and body must explain the actual
+   change, why it was needed, verification results, and any required public
+   deployment link. Reference an issue only if dispatch identifies it. This
+   single command finds or creates the GitHub PR and records it in SharedStore;
+   no `gh`, GitHub MCP, or separate `pr opened` step is required. If the PR is
+   already recorded, reuse it and push updates to its branch; `pr create` does
+   not edit an existing PR's title or body.
+6. Use `pr opened --pr <N> --branch <actual-branch> --title <title>` only to
+   recover by recording a PR that was created externally, while in `submit`.
+   Wait for SENTINEL and human PR approval. VESSEL handles merge readiness;
    missing or timed-out CI is not success.
 
 Do not force-push or bypass branch protection. If pushing, deployment, or PR

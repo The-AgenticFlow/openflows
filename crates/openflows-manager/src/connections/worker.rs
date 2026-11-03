@@ -3,7 +3,7 @@
 //! Claims leased outbox events and processes them: webhook deliveries,
 //! repository synchronization after binding, reconciliation, and disconnect
 //! cleanup. Processing is retryable and leased through the outbox foundation
-//! (WP-01). A failed worker's lease expires and another worker reclaims it.
+//! A failed worker's lease expires and another worker reclaims it.
 
 use crate::connections::repository::ConnectionRepository;
 use crate::connections::sync::SyncService;
@@ -124,7 +124,7 @@ impl ConnectionWorker {
             "github.disconnect_cleanup" => {
                 // Access was already disabled synchronously at disconnect time
                 // (status + access-generation increment), which stops new
-                // issuance. WP-04 revokes the recorded credential leases here so
+                // issuance. The credential broker revokes the recorded credential leases here so
                 // outstanding tokens are discarded asynchronously; the
                 // connection remains disconnected (binding history preserved).
                 let conn = self.connection_from_payload(&payload).await?;

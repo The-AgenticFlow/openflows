@@ -1,5 +1,5 @@
 //! HTTP-level integration tests for human authentication and session lifecycle
-//! (WP-02). These exercise the real axum handlers, cookies, CSRF, redirects,
+//! These exercise the real axum handlers, cookies, CSRF, redirects,
 //! and PostgreSQL-backed sessions against a fixture GitHub adapter.
 //!
 //! They require a live PostgreSQL (see `common/mod.rs`); they are `#[ignore]`d

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fixture contracts only. The full production controller journey is the next stage.
+# Runs external-service fixture contracts; bootstrap.sh system runs the connected journey.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 project="openflows-fixtures-$(date +%s)-$$"

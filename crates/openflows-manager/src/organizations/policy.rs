@@ -13,7 +13,7 @@
 //!
 //! Ownership is a separate field on the organization, not a fourth role. Only
 //! active admins may manage GitHub connections (enforced here even though the
-//! connection lifecycle itself is WP-03). An `OrgScope` is a database scope,
+//! connection lifecycle itself is implemented separately. An `OrgScope` is a database scope,
 //! never proof of authorization.
 
 use crate::dto::{MembershipRole, MembershipStatus};

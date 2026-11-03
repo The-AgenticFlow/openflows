@@ -204,10 +204,17 @@ impl Node for SentinelNode {
         let mut reviewable = Vec::new();
         let planning_gate_pending: Vec<Value> = Vec::new();
 
-        for ticket in &tickets {
+        for ticket in tickets.iter().filter(|ticket| !ticket.status.is_terminal()) {
             let worker_id = match &ticket.status {
-                TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                TicketStatus::Assigned { worker_id } => worker_id.clone(),
+                TicketStatus::Open => String::new(),
+                TicketStatus::Failed { worker_id, .. } | TicketStatus::InProgress { worker_id } => {
+                    worker_id.clone()
+                }
+                TicketStatus::Assigned { worker_id }
+                | TicketStatus::AwaitingHuman { worker_id, .. } => worker_id.clone(),
+                TicketStatus::Completed { worker_id, outcome } if outcome == "pr_opened" => {
+                    worker_id.clone()
+                }
                 _ => continue,
             };
 
@@ -401,6 +408,62 @@ mod tests {
 
     fn node() -> SentinelNode {
         SentinelNode::new("sentinel.agent.md")
+    }
+
+    #[tokio::test]
+    async fn nonterminal_tickets_deliver_review_after_human_approval() {
+        for status in [
+            json!({"type": "open"}),
+            json!({"type": "assigned", "worker_id": "forge-1"}),
+            json!({"type": "in_progress", "worker_id": "forge-1"}),
+            json!({"type": "awaiting_human", "worker_id": "forge-1", "reason": "review", "attempts": 0}),
+            json!({"type": "failed", "worker_id": "forge-1", "reason": "retry", "attempts": 1}),
+            json!({"type": "completed", "worker_id": "forge-1", "outcome": "pr_opened"}),
+        ] {
+            let store = SharedStore::new_in_memory();
+            store
+                .set(
+                    KEY_TICKETS,
+                    json!([{
+                        "id": "T-42", "title": "Fix answer", "body": "Return 42", "priority": 0,
+                        "branch": "forge-1/T-42", "status": status
+                    }]),
+                )
+                .await;
+            let decision = Decision {
+                pr_number: Some(42),
+                round: 3,
+                actor: "sentinel".into(),
+                approved: true,
+                report: "Verified candidate".into(),
+                revision: 1,
+                head: Some("abc".into()),
+            };
+            let state = Lifecycle {
+                phase: Phase::Submit,
+                revision: 1,
+                review_round: 3,
+                head: Some("abc".into()),
+                pr_number: Some(42),
+                pr_decision: Some(decision.clone()),
+                pr_delivery: Some(decision.clone()),
+                pr_human: Some(Decision {
+                    actor: "human".into(),
+                    ..decision
+                }),
+                ..Default::default()
+            };
+            store.set("ticket:T-42:status", json!(state)).await;
+            let reviewer = node();
+            let prepared = reviewer.prep(&store).await.unwrap();
+            assert_eq!(prepared["reviewable"].as_array().unwrap().len(), 1);
+            let result = reviewer.exec(prepared).await.unwrap();
+            let action = reviewer.post(&store, result).await.unwrap();
+            assert_eq!(action.as_str(), ACTION_REVIEW_APPROVE);
+            let delivered = store.lifecycle("T-42").await.unwrap();
+            assert!(delivered.pr_delivery.is_none());
+            assert!(delivered.pr_human.as_ref().unwrap().approved);
+        }
     }
 
     #[test]

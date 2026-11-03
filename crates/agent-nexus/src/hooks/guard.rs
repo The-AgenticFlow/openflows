@@ -126,6 +126,12 @@ fn shell_writes_source(command: &str) -> bool {
 }
 
 fn shell_write_targets(command: &str) -> Option<Vec<String>> {
+    // A nested command can write even when the outer executable is read-only.
+    // Ignore literal text in single quotes (for example a PR body), but fail
+    // closed for command substitution in executable shell syntax.
+    if has_shell_command_substitution(command) {
+        return None;
+    }
     let words = shell_words(command);
     if words.is_empty() {
         return Some(Vec::new());
@@ -134,19 +140,6 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     let mut targets = redirection_targets(&words);
     targets.extend(tee_targets(&words));
     targets.extend(command_operand_targets(&words));
-    let cmd = command.to_lowercase();
-    if cmd.contains("python ")
-        || cmd.contains("python3 ")
-        || cmd.contains("node ")
-        || cmd.contains("cargo fmt")
-        || cmd.contains("git apply")
-        || cmd.contains("apply_patch")
-        || cmd.contains("sed -i")
-        || cmd.contains("perl -i")
-    {
-        return None;
-    }
-
     // Unknown-but-write-capable commands (dd of=, curl -o, wget -O, git
     // checkout/restore/..., sh -c ...) have filesystem effects the operand
     // parser does not capture. Fail closed: treat them as potential writes in
@@ -156,6 +149,28 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     }
 
     Some(targets)
+}
+
+fn has_shell_command_substitution(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if c == '\'' || c == '"' {
+            if quote.is_none() {
+                quote = Some(c);
+            } else if quote == Some(c) {
+                quote = None;
+            }
+        } else if quote != Some('\'') && (c == '`' || (c == '$' && chars.peek() == Some(&'('))) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The known forwarding wrappers that merely pass control to the real command.
@@ -237,9 +252,18 @@ fn resolve_executable_index(segment: &[String]) -> usize {
 /// `env SOME=1 git checkout`) and let the write slip past.
 fn segment_is_write_capable(segment: &[String]) -> bool {
     let cmd_idx = resolve_executable_index(segment);
-    let cmd = segment[cmd_idx].as_str();
+    let cmd = segment[cmd_idx].rsplit('/').next().unwrap_or("");
     let rest = &segment[cmd_idx + 1..];
     match cmd {
+        "python" | "python3" | "node" | "apply_patch" | "xargs" | "eval" => true,
+        "cargo" => rest
+            .iter()
+            .find(|w| !w.starts_with('+'))
+            .is_some_and(|w| w == "fmt"),
+        "sed" | "perl" => rest.iter().any(|w| w == "-i" || w.starts_with("-i")),
+        "find" => rest
+            .iter()
+            .any(|w| matches!(w.as_str(), "-exec" | "-execdir")),
         "dd" => true,
         "curl" | "wget" => rest
             .iter()
@@ -327,16 +351,17 @@ fn redirection_targets(words: &[String]) -> Vec<String> {
 
 fn tee_targets(words: &[String]) -> Vec<String> {
     let mut targets = Vec::new();
-    for (idx, word) in words.iter().enumerate() {
-        if word != "tee" {
+    for segment in words.split(|word| is_shell_separator(word)) {
+        if segment.is_empty() {
             continue;
         }
-        for arg in &words[idx + 1..] {
+        let cmd_idx = resolve_executable_index(segment);
+        if segment[cmd_idx].rsplit('/').next() != Some("tee") {
+            continue;
+        }
+        for arg in &segment[cmd_idx + 1..] {
             if arg.starts_with('-') {
                 continue;
-            }
-            if is_shell_separator(arg) {
-                break;
             }
             targets.push(clean_shell_word(arg));
         }
@@ -346,49 +371,105 @@ fn tee_targets(words: &[String]) -> Vec<String> {
 
 fn command_operand_targets(words: &[String]) -> Vec<String> {
     let mut targets = Vec::new();
-    let mut idx = 0;
-    while idx < words.len() {
-        let cmd = words[idx].as_str();
+    for segment in words.split(|word| is_shell_separator(word)) {
+        if segment.is_empty() {
+            continue;
+        }
+        let cmd_idx = resolve_executable_index(segment);
+        let cmd = segment[cmd_idx].rsplit('/').next().unwrap_or("");
+        let args = &segment[cmd_idx + 1..];
         if matches!(cmd, "cp" | "mv" | "install") {
-            if let Some(target) = words[idx + 1..]
-                .iter()
-                .rev()
-                .find(|arg| !arg.starts_with('-') && !is_shell_separator(arg))
-            {
+            if let Some(target) = args.iter().rev().find(|arg| !arg.starts_with('-')) {
                 targets.push(clean_shell_word(target));
             }
         } else if matches!(cmd, "touch" | "mkdir" | "rm" | "truncate") {
             targets.extend(
-                words[idx + 1..]
-                    .iter()
-                    .take_while(|arg| !is_shell_separator(arg))
+                args.iter()
                     .filter(|arg| !arg.starts_with('-'))
                     .map(|arg| clean_shell_word(arg)),
             );
         }
-        idx += 1;
     }
     targets
 }
 
 fn shell_words(command: &str) -> Vec<String> {
-    command
-        .replace('\n', " ; ")
-        .replace("&&", " && ")
-        .replace(">>", " __OPENFLOWS_REDIR__ ")
-        .replace('>', " __OPENFLOWS_REDIR__ ")
-        .replace('|', " | ")
-        .replace(';', " ; ")
-        .split_whitespace()
-        .map(|word| {
-            if word == "__OPENFLOWS_REDIR__" {
-                ">".to_string()
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if escaped {
+            word.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            started = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
             } else {
-                clean_shell_word(word)
+                word.push(c);
             }
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            started = true;
+            continue;
+        }
+        if c == '&' && !started && words.last().is_some_and(|word| word == ">") {
+            // Descriptor duplication (`2>&1`) is a redirection target, not
+            // a background-command separator.
+            word.push(c);
+            started = true;
+            continue;
+        }
+        if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '>') {
+            if started {
+                words.push(literal_shell_word(&word));
+                word.clear();
+                started = false;
+            }
+            if !c.is_whitespace() {
+                let op = if matches!(c, '&' | '|') && chars.peek() == Some(&c) {
+                    chars.next();
+                    format!("{c}{c}")
+                } else if c == '>' && chars.peek() == Some(&'>') {
+                    chars.next();
+                    ">".to_string()
+                } else {
+                    c.to_string()
+                };
+                words.push(op);
+            } else if c == '\n' {
+                words.push(";".to_string());
+            }
+        } else {
+            word.push(c);
+            started = true;
+        }
+    }
+    if started {
+        words.push(literal_shell_word(&word));
+    }
+    words
+}
+
+fn literal_shell_word(word: &str) -> String {
+    let word = clean_shell_word(word);
+    if is_shell_separator(&word) || word == ">" {
+        // A quoted/escaped operator is argument data, not shell syntax.
+        format!("\u{0}{word}")
+    } else {
+        word
+    }
 }
 
 fn clean_shell_word(word: &str) -> String {
@@ -401,7 +482,7 @@ fn clean_shell_word(word: &str) -> String {
 }
 
 fn is_shell_separator(word: &str) -> bool {
-    matches!(word, "|" | ";" | "&&" | "||")
+    matches!(word, "|" | ";" | "&&" | "||" | "&")
 }
 
 fn is_allowed_lifecycle_artifact(path: &str) -> bool {
@@ -635,7 +716,7 @@ pub fn phase_guidance(phase: &str, plan_exists: bool, role: &str) -> String {
         "building" if !plan_exists => "Building has no approved plan. Return to planning and run /plan, upload it, then obtain review before implementing.".into(),
         "building" => "Building: implement the approved plan, commit all changes, then set testing with a clean checkout.".into(),
         "testing" => "Testing freezes source. Run verify serve for SENTINEL A2A tests. Wait for successful A2A verification and SENTINEL testing approval, then set submit. Human testing review is TODO and does not block submit. For fixes return to building.".into(),
-        "submit" => "Submit: open/record the PR. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
+        "submit" => "Submit: push the assigned branch. If no PR is recorded, use `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title TITLE --body DESCRIPTION`; choose BASE from the task or repository default and write a descriptive Markdown body. This creates/finds the GitHub PR and records it. If a PR is already recorded, update its branch rather than creating another. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
         "done" => "Ticket is done and terminal.".into(),
         "blocked" => "Blocked: record a blocker and wait for help. Recovery returns to planning.".into(),
         _ => "Read status get; start with planning and an uploaded plan. Unknown state cannot authorize source edits.".into(),

@@ -1,6 +1,7 @@
 # Cargo manifest for the OpenFlows Manager service crate.
 [package]
 name = "openflows-manager"
+default-run = "openflows-manager"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -14,7 +15,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tempfile = { workspace = true }
+fs2 = "0.4"
 config = { version = "0.2.0", path = "../config" }
+coder-client = { version = "0.1.0", path = "../coder-client" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 axum = { version = "0.8", features = ["http1", "json"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -22,6 +27,7 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 base64 = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
@@ -29,9 +35,19 @@ aes-gcm = "0.10"
 subtle = "2"
 http = "1"
 url = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+futures = { workspace = true }
+futures-util = { workspace = true }
+fred = { workspace = true }
 jsonwebtoken = { workspace = true }
 hmac = "0.12"
+tar = "0.4"
+flate2 = "1"
+hex = "0.4"
+aws-config = { version = "1.13.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1.123.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 
 [features]
 default = []
@@ -47,3 +63,4 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+tempfile = { workspace = true }

@@ -1,4 +1,4 @@
-//! WP-04 runtime authentication and GitHub credential broker tests.
+//! Runtime authentication and GitHub credential broker tests.
 //!
 //! Uses HTTP fixtures (a controllable `GithubAppApi` implementation) and
 //! isolated PostgreSQL databases. Covers runtime authentication, restricted
@@ -533,9 +533,14 @@ async fn successful_runtime_exchange_returns_scoped_token() {
     assert_eq!(body["token"], "ghs_fixture_broker_token");
     assert_eq!(body["repository_id"], 9001);
     assert_eq!(body["username"], "x-access-token");
-    // The requested permission profile for forge.git is contents:write.
+    // Forge's Git profile includes workflow write because its task can update
+    // workflow files. Other roles/purposes must not receive this grant.
     let requested = ctx.api.last_requested_permissions().unwrap();
     assert_eq!(requested.get("contents").map(String::as_str), Some("write"));
+    assert_eq!(
+        requested.get("workflows").map(String::as_str),
+        Some("write")
+    );
     assert_eq!(ctx.api.last_requested_repos().unwrap(), vec![9001]);
 
     // A lease was recorded with the fingerprint and generations.
@@ -571,6 +576,41 @@ async fn api_purpose_requests_api_permission_profile() {
     let requested = ctx.api.last_requested_permissions().unwrap();
     assert_eq!(requested.get("checks").map(String::as_str), Some("read"));
     assert_eq!(requested.get("actions").map(String::as_str), Some("read"));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn provisioning_runtime_can_request_credentials_after_heartbeat() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let ctx = setup(db.pool()).await;
+
+    // A freshly started Coder workspace registers and heartbeats before the
+    // tenant worker promotes its desired state to `running`. Its startup script
+    // needs this exchange to clone the tenant repository, so the broker must
+    // permit this narrow bootstrap state while retaining observed=running.
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'provisioning' WHERE id = (\
+             SELECT tenant_id FROM workspaces WHERE id = $1\
+         )",
+    )
+    .bind(ctx.workspace_id.0)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workspaces SET desired_state = 'provisioning' WHERE id = $1")
+        .bind(ctx.workspace_id.0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let resp = ctx
+        .router
+        .clone()
+        .oneshot(broker_request("git", &ctx.raw_credential))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

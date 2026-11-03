@@ -23,6 +23,8 @@ output/
 .env.test
 .env.production
 .env.prod
+.env.openflows
+.openflows/
 
 # IDE - VSCode
 .vscode/*
@@ -127,3 +129,4 @@ worktrees/
 # Linux cross-build dependency cache (separate from host Cargo cache)
 .docker-cargo/
 .setup.log
+.local/provisioners/

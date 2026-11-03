@@ -1,4 +1,4 @@
-//! WP-04 runtime authentication and the GitHub credential broker.
+//! Runtime authentication and the GitHub credential broker.
 //!
 //! This module introduces a runtime principal distinct from human browser/CLI
 //! sessions and human API credentials. A workspace runtime credential is a
@@ -16,12 +16,18 @@
 pub mod broker;
 pub mod credentials;
 pub mod permissions;
+pub mod redis;
 pub mod repository;
+pub mod tenant;
+pub mod workspaces;
 
 pub use crate::id::CredentialLeaseId;
 pub use broker::{BrokerCredential, CredentialBroker, INSTALLATION_TOKEN_USERNAME};
-pub use credentials::{RuntimeCredentialIssue, RuntimeCredentialService};
+pub use credentials::{
+    RuntimeBootstrapIssue, RuntimeCredentialIssue, RuntimeCredentialService, RuntimeSessionIssue,
+};
 pub use permissions::{resolve_profile, PermissionProfile, RuntimePurpose};
 pub use repository::{
     CredentialLease, NewCredentialLease, RuntimeRepository, RuntimeScope, WORKSPACE_AUDIENCE,
 };
+pub use workspaces::{HeartbeatResponse, RuntimeWorkspaceResponse, RuntimeWorkspaceService};

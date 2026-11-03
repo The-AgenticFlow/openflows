@@ -17,7 +17,7 @@ and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
 `verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
 --verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
-TODO(human-testing-review): add human approval later; it does not block submit now. Then FORGE sets `submit`, opens/updates and records the PR.
+TODO(human-testing-review): add human approval later; it does not block submit now. SENTINEL's testing approval moves the lifecycle to `submit`; FORGE pushes fixes to the already-recorded PR branch, without creating another PR.
 SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
 --head <SHA> --verdict approve --report final-review.md` (or reject). Read the
 current round again after recording a PR. Humans use the operator CLI

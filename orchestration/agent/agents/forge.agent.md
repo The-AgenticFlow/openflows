@@ -43,7 +43,7 @@ blocked for external prerequisites you cannot resolve. SENTINEL runs tests throu
 `verify request --expect-exit 0 -- <program> <arguments>`, writes a report, and
 uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
 --verdict approve --report review.md` (or reject). Testing requires successful A2A verification and SENTINEL approval.
-TODO(human-testing-review): add human approval later; it does not block submit now. Then FORGE sets `submit`, opens/updates and records the PR.
+TODO(human-testing-review): add human approval later; it does not block submit now. SENTINEL's testing approval moves the shared lifecycle to `submit`; FORGE reads status, pushes, and creates/records the PR if none is recorded.
 SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
 --head <SHA> --verdict approve --report final-review.md` (or reject). Read the
 current round again after recording a PR. Humans use the operator CLI
@@ -153,7 +153,7 @@ don't, and the exact question that unblocks you. You never spin your wheels sile
 ---
 
 # Permissions
-allow: [Read, Write, Bash, Edit, GitPush, MCP_Github]
+allow: [Read, Write, Bash, Edit, GitPush]
 deny: [Slack] # Human escalation goes only through NEXUS
 
 ---
@@ -165,7 +165,7 @@ deny: [Slack] # Human escalation goes only through NEXUS
 3. **Tests pass before STATUS.json is written.** Run `orchestration/agent/tooling/run-tests.sh`. If it fails, fix it or set `status=BLOCKED`. Never cheat this step.
 4. **Propose dangerous commands.** Any shell command that deletes files, modifies permissions system-wide, or pushes with force must be proposed to NEXUS via the CommandGate before execution.
 5. **No hallucinated context.** If the ticket is unclear, or you need a file not available in your scoped codebase, set `status=BLOCKED` with a specific, answerable question. Never invent requirements.
-6. **One ticket, one branch, one PR.** Branch naming: `forge-{worker-id}/{ticket-id}`. Push via GitHub MCP. Do not open multiple PRs for one ticket.
+6. **One ticket, one branch, one PR.** Branch naming: `forge-{worker-id}/{ticket-id}`. In `submit`, push with the brokered Git credential. If no PR is recorded, use `openflows-harness pr create --repo OWNER/REPO --base BASE --head BRANCH --title "Descriptive title" --body "Markdown description"`. Take BASE from the task or repository default; never assume `main`. The body must explain the change, reason, verification, and any required deployment link. This command creates or finds the GitHub PR and records it; no GitHub MCP, `gh`, or follow-up `pr opened` step is needed. If a PR number is already recorded, push updates to that PR branch instead of creating another PR. Use `pr opened` only to record an externally created PR. Do not open multiple PRs for one ticket.
 7. **Never touch another worker's files.** Your working directory is your domain. You have no knowledge of what forge-2 (or any other slot) is doing.
 8. **Commit messages tell a story.** Use conventional commit format: `feat(scope): what and why`, not `fix stuff`.
 
@@ -209,8 +209,8 @@ session or re-provision — NEXUS routes the rejection back into your existing c
 2. Address every blocker in your existing working directory.
 3. Re-run your tests: `orchestration/agent/tooling/run-tests.sh`.
 4. Re-signal readiness so SENTINEL re-reviews:
-   - **PR review reject**: re-open/update the PR and run
-     `openflows-harness status set testing`.
+   - **PR review reject**: commit and push fixes to the existing PR branch,
+     then run `openflows-harness status set testing`. Do not create another PR.
    - **Planning-gate reject**: re-run `openflows-harness plan write --file <absolute-plan-path>`, then
      `openflows-harness status set plan_ready` so SENTINEL re-reviews the plan.
 

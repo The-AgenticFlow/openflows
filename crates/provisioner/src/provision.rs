@@ -41,6 +41,8 @@ impl Provisioner {
             return Ok(());
         }
 
+        let mut generated_paths = Vec::new();
+
         // Required skills must be available before an agent can start.
         transport
             .create_dir_all(".agents/skills")
@@ -56,6 +58,7 @@ impl Provisioner {
                 .copy_file(&source, &format!(".agents/skills/{skill_name}/SKILL.md"))
                 .await
                 .with_context(|| format!("Failed to provision required skill {skill_name}"))?;
+            generated_paths.push(format!(".agents/skills/{skill_name}/SKILL.md"));
         }
 
         // Keep complete command documents accessible beyond startup excerpts.
@@ -69,6 +72,7 @@ impl Provisioner {
                         .copy_file(&path, &format!(".agents/commands/{name}"))
                         .await
                         .context("Failed to provision command instructions")?;
+                    generated_paths.push(format!(".agents/commands/{name}"));
                 }
             }
         }
@@ -80,6 +84,7 @@ impl Provisioner {
                 .write_file(".mcp.json", &mcp_json)
                 .await
                 .context("Failed to write .mcp.json")?;
+            generated_paths.push(".mcp.json".to_owned());
             info!(role, "Provisioned .mcp.json");
         }
 
@@ -97,6 +102,7 @@ impl Provisioner {
                     .copy_file(&path, standard)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to provision {}: {}", standard, e))?;
+                generated_paths.push((*standard).to_owned());
                 info!(standard, role, "Provisioned standard");
             }
         }
@@ -119,6 +125,7 @@ impl Provisioner {
                 .copy_file(&persona_path, &format!("{}.agent.md", role))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to provision persona: {}", e))?;
+            generated_paths.push(format!("{role}.agent.md"));
             info!(role, "Provisioned persona");
 
             // Also materialize the persona as the workspace's AGENTS.md. Coder's
@@ -131,6 +138,7 @@ impl Provisioner {
                 .copy_file(&persona_path, "AGENTS.md")
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to provision AGENTS.md persona: {}", e))?;
+            generated_paths.push("AGENTS.md".to_owned());
             info!(role, "Provisioned AGENTS.md persona");
         }
 
@@ -173,6 +181,7 @@ impl Provisioner {
                     let target = format!("{base}/{role}/{name}");
                     match transport.copy_file(&entry.path(), &target).await {
                         Ok(_) => {
+                            generated_paths.push(target.clone());
                             info!(role, script = %name, target = %target, "Provisioned hook script")
                         }
                         Err(e) => {
@@ -182,7 +191,13 @@ impl Provisioner {
                     // Also drop an extensionless alias for backends that map
                     // event names without `.sh` (e.g. `.agents/hooks/{role}/SessionStart`).
                     let alias = format!("{base}/{role}/{rel}");
-                    let _ = transport.symlink_or_copy(&entry.path(), &alias).await;
+                    if transport
+                        .symlink_or_copy(&entry.path(), &alias)
+                        .await
+                        .is_ok()
+                    {
+                        generated_paths.push(alias);
+                    }
                 }
             }
 
@@ -210,12 +225,14 @@ impl Provisioner {
                     serde_json::to_string_pretty(&claude_settings),
                     serde_json::to_string_pretty(&agents_settings),
                 ) {
-                    let _ = transport
-                        .write_file(".claude/settings.json", &claude_json)
-                        .await;
-                    let _ = transport
-                        .write_file(".agents/settings.json", &agents_json)
-                        .await;
+                    for (path, contents) in [
+                        (".claude/settings.json", &claude_json),
+                        (".agents/settings.json", &agents_json),
+                    ] {
+                        if transport.write_file(path, contents).await.is_ok() {
+                            generated_paths.push(path.to_owned());
+                        }
+                    }
                     info!(
                         role,
                         count = script_entries.len(),
@@ -226,6 +243,37 @@ impl Provisioner {
         } else {
             info!(role, dir = %hooks_dir.display(), "No role hook directory; skipped client hooks");
         }
+
+        // Local excludes keep generated instructions out of candidate commits; tracked changes stay visible.
+        generated_paths.sort();
+        generated_paths.dedup();
+        let mut patterns = Vec::new();
+        for path in generated_paths {
+            anyhow::ensure!(!path.contains(['\n', '\r']), "Invalid generated file path");
+            let literal = path
+                .replace('\\', "\\\\")
+                .replace('*', "\\*")
+                .replace('?', "\\?")
+                .replace('[', "\\[")
+                .replace(']', "\\]");
+            patterns.push(format!("'/{}'", literal.replace('\'', "'\\''")));
+        }
+        let command = format!(
+            "set -eu\nif git rev-parse --git-dir >/dev/null 2>&1; then\n\
+             exclude=$(git rev-parse --git-path info/exclude)\n\
+             mkdir -p \"$(dirname \"$exclude\")\"\n\
+             touch \"$exclude\"\n\
+             for pattern in {}; do\n\
+             if ! grep -qxF -- \"$pattern\" \"$exclude\"; then printf '\\n%s\\n' \"$pattern\" >> \"$exclude\"; fi\n\
+             done\nfi",
+            patterns.join(" ")
+        );
+        let result = transport.execute(&command).await?;
+        anyhow::ensure!(
+            result.exit_code == 0,
+            "Failed to exclude generated instructions: {}",
+            result.stderr
+        );
 
         Ok(())
     }

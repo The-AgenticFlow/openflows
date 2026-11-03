@@ -105,8 +105,14 @@ cat <<'EOF'
      Persist project tool activation in the user's login-shell config or a project script.
      SENTINEL returns failing commands/setup diagnostics to building; repair and retest.
      Reserve blocked for external prerequisites you cannot resolve.
-  5. Wait for successful A2A verification and SENTINEL testing approval, then set submit.
-  6. Open/update PR; run pr opened --pr <N> --branch <branch> --title <title>.
+  5. Wait for successful A2A verification and SENTINEL testing approval; read status get and continue only in submit.
+     SENTINEL approval moves the lifecycle to submit; do not repeat the transition.
+  6. Push the assigned branch with git push. If no PR number is recorded, run
+     pr create --repo OWNER/REPO --base BASE --head <branch> --title "Descriptive title" --body "Markdown description".
+     Use the task's target base branch, or the repository default. Describe the change, reason,
+     verification, and any required deployment link. This creates/finds the PR and records it.
+     If a PR is already recorded, update that branch; do not create another PR.
+     Use pr opened only to record a PR created externally, not as the normal path.
   7. Wait for SENTINEL and HUMAN PR approval and CI success.
 
   Source is frozen during plan_ready, testing and submit. For corrections,
@@ -123,7 +129,8 @@ Coordination:
   openflows-harness dispatch read              # Read the task payload
   openflows-harness status set <phase>         # Update your progress
   openflows-harness status get                 # Check current phase
-  openflows-harness pr opened --pr N --branch B --title "Title"  # Record PR
+  openflows-harness pr create --repo OWNER/REPO --base BASE --head B --title "Descriptive title" --body "Markdown description"  # Create/find and record PR
+  openflows-harness pr opened --pr N --branch B --title "Title"  # Record an externally opened PR
   openflows-harness handoff write --contract F # Hand off to sentinel
 
 Policy:

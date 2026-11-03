@@ -231,6 +231,53 @@ impl OrganizationsRepository {
         .rows_affected();
         Ok(affected == 1)
     }
+
+    /// Record whether the organization's org-scoped model/Agents-chat capability
+    /// was verified for organization readiness.
+    pub async fn set_model_capability_ok(
+        &self,
+        scope: OrgScope,
+        id: OrganizationId,
+        ok: bool,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE organizations
+                SET model_capability_ok = $1, updated_at = now()
+              WHERE id = $2 AND id = $3",
+        )
+        .bind(ok)
+        .bind(id.0)
+        .bind(scope.organization_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Record a sanitized readiness error code on the organization, exposed via
+    /// the organization/operation status interfaces without leaking upstream
+    /// details.
+    pub async fn set_last_readiness_error(
+        &self,
+        scope: OrgScope,
+        id: OrganizationId,
+        error_code: Option<&str>,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE organizations
+                SET last_readiness_error = $1, updated_at = now()
+              WHERE id = $2 AND id = $3",
+        )
+        .bind(error_code)
+        .bind(id.0)
+        .bind(scope.organization_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
+    }
 }
 
 /// Translate an organization insert failure, mapping slug collisions to 409.

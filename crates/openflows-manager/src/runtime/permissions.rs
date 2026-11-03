@@ -25,6 +25,7 @@ pub enum Permission {
     Checks,
     Statuses,
     Actions,
+    Workflows,
     Metadata,
 }
 
@@ -141,7 +142,10 @@ pub fn resolve_profile(
     let perms = match (role, purpose) {
         // Git protocol: Forge/Vessel/Lore need to push; Nexus/Sentinel read.
         ("nexus", Git) | ("sentinel", Git) => map(&[(Contents, Read)]),
-        ("forge", Git) | ("vessel", Git) | ("lore", Git) => map(&[(Contents, Write)]),
+        // Forge alone may update workflow files; GitHub requires the separate
+        // workflows:write grant in addition to contents:write for those pushes.
+        ("forge", Git) => map(&[(Contents, Write), (Workflows, Write)]),
+        ("vessel", Git) | ("lore", Git) => map(&[(Contents, Write)]),
         // API: Nexus coordinates issues/PRs; Forge/Sentinel review; Vessel CI.
         ("nexus", Api) => map(&[(Contents, Read), (Issues, Write), (PullRequests, Write)]),
         ("forge", Api) => map(&[(Contents, Write), (PullRequests, Write)]),
@@ -233,10 +237,40 @@ mod tests {
     }
 
     #[test]
+    fn workflow_write_is_limited_to_forge_git_profile() {
+        let forge_git = resolve_profile("forge", RuntimePurpose::Git)
+            .unwrap()
+            .permissions
+            .to_wire();
+        assert_eq!(
+            forge_git.get("workflows").map(String::as_str),
+            Some("write")
+        );
+
+        for (role, purpose) in [
+            ("nexus", RuntimePurpose::Git),
+            ("sentinel", RuntimePurpose::Git),
+            ("vessel", RuntimePurpose::Git),
+            ("lore", RuntimePurpose::Git),
+            ("forge", RuntimePurpose::Api),
+        ] {
+            let permissions = resolve_profile(role, purpose)
+                .unwrap()
+                .permissions
+                .to_wire();
+            assert!(
+                !permissions.contains_key("workflows"),
+                "{role}.{} must not receive workflows permission",
+                purpose.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn purpose_changes_git_vs_api_scope() {
         let git = resolve_profile("forge", RuntimePurpose::Git).unwrap();
         let api = resolve_profile("forge", RuntimePurpose::Api).unwrap();
-        assert_eq!(git.permissions.0.len(), 1);
+        assert_eq!(git.permissions.0.len(), 2);
         assert!(api.permissions.to_wire().contains_key("pull_requests"));
     }
 }

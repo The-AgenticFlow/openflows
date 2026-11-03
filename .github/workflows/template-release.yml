@@ -1,0 +1,64 @@
+name: Template Release Assets
+
+on:
+  push:
+    tags:
+      - 'openflows-[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example 2026.10.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('openflows-{0}', inputs.version) || github.ref }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Resolve version
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-${REF_NAME#openflows-}}"
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid release version '$VERSION'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=openflows-$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build deterministic template release
+        run: |
+          docker pull codercom/enterprise-base:ubuntu
+          IMAGE_REFERENCE="$(docker image inspect --format '{{index .RepoDigests 0}}' codercom/enterprise-base:ubuntu)"
+          OPENFLOWS_WORKSPACE_IMAGE_DIGEST="${IMAGE_REFERENCE#*@}"
+          if ! printf '%s' "$OPENFLOWS_WORKSPACE_IMAGE_DIGEST" | grep -qE '^sha256:[0-9a-fA-F]{64}$'; then
+            echo "::error::Could not resolve an immutable workspace image digest"
+            exit 1
+          fi
+          export OPENFLOWS_WORKSPACE_IMAGE_DIGEST
+          cargo run -p openflows-manager --bin build-template-release -- \
+            crates/coder-client/templates \
+            "${{ steps.release.outputs.version }}" \
+            dist/templates
+
+      - name: Upload template assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          files: dist/templates/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

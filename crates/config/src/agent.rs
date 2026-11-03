@@ -48,8 +48,8 @@ impl AgentDef {
         let body = parts[2].trim().to_string();
 
         // Parse the YAML frontmatter as a loose map first
-        let raw: serde_yaml::Value =
-            serde_yaml::from_str(frontmatter).context("Failed to parse YAML frontmatter")?;
+        let raw: serde_json::Value =
+            serde_saphyr::from_str(frontmatter).context("Failed to parse YAML frontmatter")?;
 
         let id = raw["id"].as_str().unwrap_or("").to_string();
         let role = raw["role"].as_str().unwrap_or("").to_string();

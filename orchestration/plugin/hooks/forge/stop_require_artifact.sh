@@ -32,10 +32,10 @@ case "$phase" in
     {
       echo "Ticket ${OPENFLOWS_TICKET:-?} is not finished (phase='${phase:-unset}', no PR recorded)."
       echo "Complete the flow before stopping:"
-      echo "  1. Finish implementation and tests, updating 'openflows-harness status set building|testing'."
-      echo "  2. Open the PR and record it: openflows-harness pr opened --pr <n> --branch <branch> --title <title>."
-      echo "  3. Write the handoff: openflows-harness handoff write --contract <file>."
-      echo "  4. Mark review readiness: openflows-harness status set submit."
+      echo "  1. Finish implementation, commit, and enter testing; wait for SENTINEL approval."
+      echo "  2. Read status get; testing approval moves the lifecycle to submit automatically."
+      echo "  3. In submit, push the assigned branch. If no PR is recorded, run openflows-harness pr create --repo OWNER/REPO --base BASE --head <branch> --title <descriptive-title> --body <markdown-description>."
+      echo "  4. Write the handoff: openflows-harness handoff write --contract <file>."
       echo "If you are genuinely stuck, run: openflows-harness status set blocked (and explain why)."
     } >&2
     exit 2

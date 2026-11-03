@@ -67,6 +67,11 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
+      CODER_OAUTH2_GITHUB_CLIENT_ID: ${CODER_OAUTH2_GITHUB_CLIENT_ID:-}
+      CODER_OAUTH2_GITHUB_CLIENT_SECRET: ${CODER_OAUTH2_GITHUB_CLIENT_SECRET:-}
+      CODER_OAUTH2_GITHUB_ALLOWED_ORGS: ${CODER_OAUTH2_GITHUB_ALLOWED_ORGS:-}
+      CODER_OAUTH2_GITHUB_ALLOW_EVERYONE: ${CODER_OAUTH2_GITHUB_ALLOW_EVERYONE:-false}
+      CODER_OAUTH2_PROVIDER_ENABLE: ${CODER_OAUTH2_PROVIDER_ENABLE:-false}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
       # repos via OIDC. Values come from .env (see quick_start.md Step 2).
       # IMPORTANT: `coder server` fails to start if client_id/client_secret are
@@ -92,6 +97,9 @@ services:
       # OpenFlows controllers use long-lived local service tokens. Hosted mode
       # will replace this with brokered, renewable credentials.
       CODER_MAX_TOKEN_LIFETIME: ${CODER_MAX_TOKEN_LIFETIME:-2160h}
+      # The Manager is normally owned by a Coder administrator. Coder applies
+      # a separate, seven-day default maximum to administrator API keys.
+      CODER_MAX_ADMIN_TOKEN_LIFETIME: ${CODER_MAX_ADMIN_TOKEN_LIFETIME:-2160h}
       CODER_DEFAULT_TOKEN_LIFETIME: ${CODER_DEFAULT_TOKEN_LIFETIME:-2160h}
       CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:?Set CODER_CHAT_HOOK_SECRET to 32+ random bytes before enabling lifecycle hooks}
@@ -114,6 +122,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
+    restart: unless-stopped
+
+  # Host-run Manager -> tenant Nexus hook servers on the Docker network.
+  runtime-relay:
+    image: nginx:1.28-alpine
+    user: "101:101"
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    ports: ["127.0.0.1:7081:8080"]
+    volumes:
+      - ./deploy/local/runtime-relay.conf:/etc/nginx/nginx.conf:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
 volumes:

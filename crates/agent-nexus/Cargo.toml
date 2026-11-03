@@ -30,11 +30,13 @@ futures = { workspace = true }
 
 # Coder agent lifecycle hooks (experimental) consumer
 # 10.3.0+ fixes CVE-2026-25537 / GHSA-h395-gr6q-cpjc (type-confusion auth bypass).
-# `rust_crypto` selects the ring-backed crypto provider so HS256 verification
-# works without an explicit process-level CryptoProvider::install_default().
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+# Use the workspace AWS-LC provider for HS256 verification; this also avoids
+# pulling in the vulnerable RustCrypto bigint stack through jsonwebtoken.
+jsonwebtoken = { workspace = true }
 sha2 = "0.10"
 reqwest = { workspace = true }
+utoipa = { version = "6.0.0", features = ["axum_extras"] }
 
 [dev-dependencies]
 mockito = "1"
+tower = { version = "0.5.3", features = ["util"] }

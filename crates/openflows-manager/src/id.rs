@@ -2,7 +2,7 @@
 //!
 //! Every entity has its own newtype over `Uuid` so a `TenantId` cannot be
 //! accidentally passed where an `OrganizationId` is expected. This is a core
-//! part of the WP-01 "resource IDs alone must not authorize access" boundary:
+//! part of the "resource IDs alone must not authorize access" boundary:
 //! repository methods take an explicit organization scope alongside the
 //! resource id and both are type-checked at compile time.
 

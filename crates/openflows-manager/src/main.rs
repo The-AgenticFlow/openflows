@@ -1,11 +1,53 @@
 //! Binary entry point for running the OpenFlows Manager service.
 
+use clap::{Parser, Subcommand};
 use openflows_manager::{config::ManagerConfig, error::ManagerError, server};
 use std::net::SocketAddr;
 
+#[derive(Parser)]
+#[command(about = "OpenFlows control-plane service and deployment tools")]
+struct Cli {
+    /// Shared deployment file; defaults to .env.openflows, then legacy .env.prod.
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the Manager (also the default without a subcommand).
+    Serve,
+    /// Generate internal keys and register the OpenFlows OAuth application in Coder.
+    Setup {
+        /// Initialize an empty Coder deployment with a recoverable administrator account.
+        #[arg(long, requires = "admin_email")]
+        initialize_coder: bool,
+        #[arg(long, requires = "initialize_coder")]
+        admin_email: Option<String>,
+    },
+    /// Read-only deployment checks; exits nonzero if any check fails.
+    Doctor,
+    /// Reissue a single-use bootstrap after a hosted workspace lost its runtime session.
+    RepairRuntime {
+        /// OpenFlows workspace UUID (not the Coder workspace UUID).
+        workspace_id: uuid::Uuid,
+    },
+    /// Replace the Coder lifecycle-hook secret from standard input.
+    SetCoderHookSecret,
+    /// Authorize this local Manager with the team's GitHub App.
+    GithubLogin,
+    /// Show repositories available to the signed-in user and App.
+    GithubRepos,
+    /// Remove this local Manager's GitHub user authorization.
+    GithubLogout,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ManagerError> {
-    load_env_file()?;
+    let cli = Cli::parse();
+    openflows_manager::operator::load_configuration(cli.config.as_deref())
+        .map_err(ManagerError::Service)?;
     // Initialize the default tracing subscriber before any fallible setup so
     // configuration and bind failures are visible to operators.
     let filter = std::env::var("RUST_LOG")
@@ -15,6 +57,95 @@ async fn main() -> Result<(), ManagerError> {
         .with_target(true)
         .compact()
         .init();
+
+    let command = cli.command.unwrap_or(Command::Serve);
+    if !matches!(&command, Command::Doctor) {
+        openflows_manager::operator::load_hosted_configuration()
+            .await
+            .map_err(ManagerError::Service)?;
+    }
+    match command {
+        Command::Setup {
+            initialize_coder,
+            admin_email,
+        } => {
+            return openflows_manager::operator::setup(initialize_coder, admin_email.as_deref())
+                .await
+                .map_err(ManagerError::Service);
+        }
+        Command::Doctor => {
+            return openflows_manager::operator::doctor()
+                .await
+                .map_err(ManagerError::Service);
+        }
+        Command::RepairRuntime { workspace_id } => {
+            return openflows_manager::operator::repair_runtime(workspace_id)
+                .await
+                .map_err(ManagerError::Service);
+        }
+        Command::SetCoderHookSecret => {
+            return openflows_manager::operator::set_coder_hook_secret()
+                .await
+                .map_err(ManagerError::Service);
+        }
+        Command::GithubLogin | Command::GithubRepos | Command::GithubLogout => {
+            let config = ManagerConfig::from_env()
+                .map_err(|error| ManagerError::Config(error.to_string()))?;
+            if config.mode != openflows_manager::Mode::Local || !config.connected_local_enabled {
+                return Err(ManagerError::Config(
+                    "connected local mode must be enabled for GitHub user commands".into(),
+                ));
+            }
+            let github = std::sync::Arc::new(
+                openflows_manager::auth::local_github::LocalGithubAuth::new(
+                    config.auth.client_id.clone(),
+                )?
+                .with_api_base(config.auth.github_api_base.clone()),
+            );
+            let credentials = openflows_manager::auth::local_credentials::LocalCredentials::new(
+                openflows_manager::auth::local_credentials::credential_path_from_env()?,
+                github.clone(),
+            )?;
+            match command {
+                Command::GithubLogin => {
+                    let challenge = github.start().await?;
+                    println!(
+                        "Open {} and enter {}",
+                        challenge.verification_uri, challenge.user_code
+                    );
+                    let token = github.await_authorization(&challenge).await?;
+                    credentials.save_authorization(token).await?;
+                    openflows_manager::auth::local_credentials::ensure_broker_key()?;
+                    println!("GitHub authorization saved for connected local mode.");
+                }
+                Command::GithubRepos => {
+                    openflows_manager::auth::local_credentials::ensure_broker_key()?;
+                    let token = credentials.access_token().await?;
+                    for repo in github.accessible_repositories(&token).await? {
+                        println!("{}\t{}", repo.id, repo.full_name);
+                    }
+                }
+                Command::GithubLogout => {
+                    credentials.sign_out().await?;
+                    println!("Local GitHub authorization removed.");
+                }
+                _ => unreachable!(),
+            }
+            return Ok(());
+        }
+        Command::Serve => {}
+    }
+
+    // Managed installations can repair or renew the Coder authority before
+    // workers begin. The saved bootstrap password is never sent to runtimes.
+    if let Some(email) = openflows_manager::operator::managed_bootstrap_email()
+        .await
+        .map_err(ManagerError::Service)?
+    {
+        openflows_manager::operator::setup(true, Some(&email))
+            .await
+            .map_err(ManagerError::Service)?;
+    }
 
     // Centralized, typed configuration. Hosted-mode configuration failures are
     // surfaced here rather than silently falling back to local behavior.
@@ -30,18 +161,6 @@ async fn main() -> Result<(), ManagerError> {
     let state = server::AppState::from_env().await?;
 
     server::bind_and_serve(addr, state, shutdown_signal()).await
-}
-
-/// Load repository-local deployment settings before typed configuration is
-/// parsed. Existing process environment variables win, so CI and explicit
-/// shell overrides remain authoritative.
-fn load_env_file() -> Result<(), ManagerError> {
-    let path = std::path::Path::new(".env.prod");
-    if path.exists() {
-        dotenvy::from_path(path)
-            .map_err(|error| ManagerError::Config(format!("cannot load .env.prod: {error}")))?;
-    }
-    Ok(())
 }
 
 async fn shutdown_signal() {
