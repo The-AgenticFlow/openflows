@@ -109,6 +109,7 @@ Paths below are relative to `/api/v1`. Every ID is resolved through the caller's
 | `DELETE /organizations/{org}/tenants/{tenant}` | Admin; 202 cleanup, optional validated purge flag |
 | `POST /organizations/{org}/tenants/{tenant}/clean` | Admin; `{reset_all:false}` or explicit true, 202; no arbitrary Redis commands |
 | `GET /organizations/{org}/tenants/{tenant}/status` | Member; safe runtime status, never credentials |
+| `GET /organizations/{org}/tenants/{tenant}/agent-activity` | Member; one row per managed worker chat (ticket, role, status, stable `error_code` such as `AI_USAGE_LIMIT`). Never returns conversation content or the provider's error detail |
 | `GET /operations/{operation}` | Member of operation org; sanitized steps/errors |
 | `POST /operations/{operation}/retry` | Current permission for original action; failed retryable operations only |
 | `GET /runtime/workspaces/{workspace}` | Nexus of same tenant, or that workspace's own principal |
