@@ -1254,3 +1254,64 @@ async fn tenant_status_reports_runtime_health() {
     .unwrap();
     assert_eq!(health(&h).await, "unresponsive");
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn agent_activity_rows_are_scoped_to_the_tenant() {
+    let h = harness().await;
+    let mine = create_tenant(&h, "activity-a", 1, "activity-a").await;
+    // A second tenant in the same organization (the harness has one repository,
+    // so copy the first tenant's row under another repository id).
+    let other = TenantId::from_uuid(uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO github_repositories
+            (organization_id, connection_id, github_repository_id, full_name, accessible, last_seen_at)
+         SELECT r.organization_id, r.connection_id, r.github_repository_id + 1, 'acme/second', true, now()
+           FROM tenants t
+           JOIN github_repositories r ON r.connection_id = t.connection_id
+            AND r.github_repository_id = t.github_repository_id
+          WHERE t.id = $1",
+    )
+    .bind(mine.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, organization_id, slug, connection_id, github_repository_id, fleet_size)
+         SELECT $1, organization_id, 'activity-b', connection_id, github_repository_id + 1, 1
+           FROM tenants WHERE id = $2",
+    )
+    .bind(other.0)
+    .bind(mine.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    for (tenant, ticket, chat) in [(mine, "T-1", "chat-a"), (other, "T-9", "chat-b")] {
+        let ws = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workspaces (id, organization_id, tenant_id, role, desired_state, observed_state)
+             VALUES ($1, $2, $3, 'forge', 'running', 'running')",
+        )
+        .bind(ws)
+        .bind(h.org.0)
+        .bind(tenant.0)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runtime_chats (workspace_id, ticket_id, coder_workspace_id, coder_chat_id)
+             VALUES ($1, $2, 'cw', $3)",
+        )
+        .bind(ws)
+        .bind(ticket)
+        .bind(chat)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    let rows = openflows_manager::routes::agent_activity::load_chat_rows(&h.pool, h.org, mine)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("T-1", "forge"));
+}

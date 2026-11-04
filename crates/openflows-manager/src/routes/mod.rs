@@ -8,6 +8,7 @@ use axum::{
 use serde::Serialize;
 
 pub mod audit;
+pub mod agent_activity;
 pub mod auth;
 pub mod coder_hooks;
 pub mod coder_identity;
@@ -129,6 +130,10 @@ fn api_v1_router() -> Router<AppState> {
         .route(
             "/organizations/{org}/tenants/{tenant}/status",
             get(tenants::tenant_status),
+        )
+        .route(
+            "/organizations/{org}/tenants/{tenant}/agent-activity",
+            get(agent_activity::agent_activity),
         )
         // GitHub connection lifecycle.
         .route(
