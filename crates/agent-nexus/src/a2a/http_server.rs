@@ -17,7 +17,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{get, post, MethodRouter},
     Json, Router,
 };
 use futures::stream;
@@ -79,15 +79,64 @@ pub struct A2AServerState {
     pub relay: Arc<A2ARelay>,
 }
 
+/// A single A2A route: OpenAPI metadata plus the axum handler. This is the
+/// single source of truth for both router registration and the OpenAPI
+/// document (see `crate::openapi::a2a_openapi`).
+pub(crate) struct A2aRoute {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub summary: &'static str,
+    pub description: &'static str,
+    pub router: MethodRouter<A2AServerState>,
+}
+
+/// All routes served by the A2A relay listener.
+pub(crate) fn routes() -> Vec<A2aRoute> {
+    vec![
+        A2aRoute {
+            method: "POST",
+            path: "/rpc",
+            summary: "A2A JSON-RPC dispatch",
+            description: "Dispatches A2A methods by name in the JSON-RPC body: message/send, tasks/get, tasks/claim, tasks/complete, tasks/cancel, tasks/resubscribe, tasks/push_progress. JSON-RPC errors are returned inside the 200 response envelope, not as separate HTTP error bodies.",
+            router: post(handle_rpc),
+        },
+        A2aRoute {
+            method: "GET",
+            path: "/",
+            summary: "SSE verify-task progress stream",
+            description: "Server-Sent Events stream of VerifyProgressEvent chunks. Requires a task_id query parameter; replays buffered events on connect, then streams live until completion or disconnect.",
+            router: get(handle_stream),
+        },
+        A2aRoute {
+            method: "GET",
+            path: "/health",
+            summary: "A2A relay liveness probe",
+            description: "Returns 200 when the relay process is alive.",
+            router: get(handle_health),
+        },
+        A2aRoute {
+            method: "GET",
+            path: "/.well-known/agent-card.json",
+            summary: "Agent card",
+            description: "Describes the relay's capabilities, task types and methods (not the executors).",
+            router: get(handle_agent_card),
+        },
+        A2aRoute {
+            method: "GET",
+            path: "/openapi.json",
+            summary: "Agent Nexus A2A OpenAPI specification",
+            description: "The generated OpenAPI document for the A2A relay listener.",
+            router: get(crate::openapi::serve_a2a_openapi),
+        },
+    ]
+}
+
 /// Create the A2A HTTP server router.
 pub fn create_router(relay: Arc<A2ARelay>) -> Router {
     let state = A2AServerState { relay };
-
-    Router::new()
-        .route("/rpc", post(handle_rpc))
-        .route("/", get(handle_stream))
-        .route("/health", get(handle_health))
-        .route("/.well-known/agent-card.json", get(handle_agent_card))
+    routes()
+        .into_iter()
+        .fold(Router::new(), |r, rt| r.route(rt.path, rt.router))
         .with_state(state)
 }
 

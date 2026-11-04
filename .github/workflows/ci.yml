@@ -129,8 +129,17 @@ jobs:
       - name: Run cargo-machete
         run: cargo-machete
 
-  # The former shell-tests job that ran tests/ci/resolve-version-test.sh was
-  # removed along with the unused docker version resolver (see PR #358).
+  shell-tests:
+    name: Shell tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run setup.sh tenant name tests
+        run: bash tests/ci/setup-tenant-name-test.sh
 
   typos:
     name: Spelling
@@ -268,6 +277,7 @@ jobs:
       - manager-postgres
       - cargo-doc
       - cargo-machete
+      - shell-tests
       - typos
       - redis-lifecycle
       - coder-e2e

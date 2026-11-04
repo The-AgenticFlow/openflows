@@ -14,6 +14,30 @@ variable "docker_network" {
   default     = "openflows_default"
 }
 
+variable "connected_local" {
+  description = "Use the OpenFlows team's GitHub App with local user authorization"
+  type        = bool
+  default     = false
+}
+
+variable "connected_local_broker_secret_host_path" {
+  description = "Host path to the local Manager broker key; never the key value"
+  type        = string
+  default     = ""
+}
+
+variable "connected_local_manager_url" {
+  description = "Local Manager URL reachable from Coder workspaces"
+  type        = string
+  default     = "http://openflows-local-manager:3002"
+}
+
+variable "connected_local_helper_host_path" {
+  description = "Host path to the connected-local workspace credential helper"
+  type        = string
+  default     = ""
+}
+
 variable "workspace_image" {
   description = "Workspace image containing the tools used by the production bootstrap"
   type        = string
@@ -310,7 +334,12 @@ PY
       API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
     else
-      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+      if [ "${var.connected_local}" = "true" ]; then
+        python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+        GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
+      else
+        GIT_TOKEN="${data.coder_parameter.hosted.value == "true" || var.connected_local ? "" : data.coder_external_auth.github[0].access_token}"
+      fi
       API_TOKEN="$GIT_TOKEN"
     fi
     if [ -z "$GIT_TOKEN" ]; then
@@ -339,6 +368,14 @@ PY
     sudo cp /home/coder/.git-credentials /root/.git-credentials
     sudo chmod 600 /root/.git-credentials
     log "Configured git credentials for GitHub push auth"
+
+    if [ "${var.connected_local}" = "true" ]; then
+      git config --global --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
+      rm -f /home/coder/.git-credentials
+      sudo rm -f /root/.git-credentials
+    fi
 
     # Resolve the expected account from the inherited token via the GitHub API
     # (the coder_external_auth data source does not expose the login). Honor
@@ -692,10 +729,31 @@ resource "docker_container" "workspace" {
     }
   }
 
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_broker_secret_host_path != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/local-broker-key"
+      host_path      = var.connected_local_broker_secret_host_path
+      read_only      = true
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_helper_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows/connected-local-github.py"
+      host_path      = var.connected_local_helper_host_path
+      read_only      = true
+    }
+  }
+
   env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
+    "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
+    "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.repo_url.value}",
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
@@ -722,7 +780,7 @@ resource "docker_container" "workspace" {
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
+  count = data.coder_parameter.hosted.value == "true" || var.connected_local ? 0 : 1
   id       = "primary-github"
   optional = true
 }

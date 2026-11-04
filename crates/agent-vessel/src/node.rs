@@ -974,6 +974,7 @@ impl Node for VesselNode {
                 }
                 continue;
             }
+            let evidence = Self::get_rework_evidence(&store, pr_number).await;
             if !state.merge_ready(&pr_info.head_sha) {
                 // Reconcile a human's GitHub approval into the lifecycle before
                 // deferring. SENTINEL shares the PR author's GitHub identity, so
@@ -1000,7 +1001,9 @@ impl Node for VesselNode {
                     false
                 };
                 if !ready {
-                    let needs_rework = self.check_pr_needs_rework(owner, repo, &pr_info).await;
+                    let needs_rework = self
+                        .check_pr_needs_rework(owner, repo, &pr_info, evidence.as_ref())
+                        .await;
                     if !needs_rework {
                         info!(
                             pr_number,
@@ -1021,7 +1024,6 @@ impl Node for VesselNode {
                 }
             }
 
-            let evidence = Self::get_rework_evidence(&store, pr_number).await;
             let outcome = self
                 .process_single_pr(owner, repo, pr_info, evidence.as_ref())
                 .await?;
@@ -2556,7 +2558,13 @@ impl VesselNode {
 
     /// Checks whether an unapproved PR requires rework (merge conflicts, failing CI,
     /// changes requested, or unaddressed review comments) before gating on `merge_ready`.
-    async fn check_pr_needs_rework(&self, owner: &str, repo: &str, pr_info: &PrInfo) -> bool {
+    async fn check_pr_needs_rework(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_info: &PrInfo,
+        evidence: Option<&ReworkEvidence>,
+    ) -> bool {
         // 1. Merge conflicts
         if pr_info.has_conflicts() || pr_info.mergeable == Some(false) {
             return true;
@@ -2573,7 +2581,7 @@ impl VesselNode {
             }
         }
 
-        // 3. Reviews: changes requested
+        // 3. Reviews: changes requested (only when not already addressed by a rework commit)
         let reviews = self
             .client
             .list_pr_reviews(owner, repo, pr_info.number)
@@ -2581,7 +2589,20 @@ impl VesselNode {
             .unwrap_or_default();
         let review_state = github::effective_review_state(&reviews);
         if review_state == github::PrReviewState::ChangesRequested {
-            return true;
+            let has_unaddressed = github::latest_review_per_user(&reviews)
+                .into_iter()
+                .any(|r| {
+                    r.state_enum() == github::PrReviewState::ChangesRequested
+                        && !crate::pr_monitor::is_feedback_addressed(
+                            r.commit_id.as_deref(),
+                            r.submitted_at.as_deref(),
+                            &pr_info.head_sha,
+                            evidence,
+                        )
+                });
+            if has_unaddressed {
+                return true;
+            }
         }
 
         // 4. Inline review comments (only considered rework if PR is not approved on current head
@@ -2602,7 +2623,14 @@ impl VesselNode {
                 .list_review_comments(owner, repo, pr_info.number)
                 .await
                 .unwrap_or_default();
-            if !comments.is_empty() {
+            if comments.iter().any(|c| {
+                !crate::pr_monitor::is_feedback_addressed(
+                    c.commit_id.as_deref(),
+                    c.created_at.as_deref(),
+                    &pr_info.head_sha,
+                    evidence,
+                )
+            }) {
                 return true;
             }
         }
@@ -5679,7 +5707,9 @@ mod tests {
             ticket_id: Some("T-42".to_string()),
         };
 
-        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        let needs_rework = node
+            .check_pr_needs_rework("org", "repo", &pr_info, None)
+            .await;
         assert!(
             needs_rework,
             "Stale approval on older commit must not hide review comments"
@@ -5745,10 +5775,78 @@ mod tests {
             ticket_id: Some("T-42".to_string()),
         };
 
-        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        let needs_rework = node
+            .check_pr_needs_rework("org", "repo", &pr_info, None)
+            .await;
         assert!(
             needs_rework,
             "Unauthorized drive-by approval must not hide review comments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_needs_rework_ignores_addressed_changes_requested_until_new_review() {
+        let mut server = mockito::Server::new_async().await;
+        let _ci = server
+            .mock("GET", "/repos/org/repo/commits/head_2/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success"}"#)
+            .create_async()
+            .await;
+        let _runs = server
+            .mock("GET", "/repos/org/repo/commits/head_2/check-runs")
+            .with_status(200)
+            .with_body(r#"{"total_count":0,"check_runs":[]}"#)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body(r#"[]"#)
+            .create_async()
+            .await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"owner","id":1},"body":"Round 1 changes","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"head_1","author_association":"OWNER"}]"#)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let config = VesselConfig {
+            github_token: "test".to_string(),
+            ..Default::default()
+        };
+        let node = VesselNode {
+            lifecycle_store: std::sync::Mutex::new(None),
+            poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
+            merger: PrMerger::new(client.clone(), config.merge_method),
+            client,
+            config,
+            slots_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "head_2".to_string(),
+            head_branch: "feat".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feat".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+        let evidence = ReworkEvidence {
+            dispatched_sha: Some("head_1".to_string()),
+            dispatched_at: Some("2026-10-08T12:05:00Z".to_string()),
+        };
+
+        assert!(
+            !node
+                .check_pr_needs_rework("org", "repo", &pr_info, Some(&evidence))
+                .await,
+            "Addressed CHANGES_REQUESTED on head_1 must not trigger rework on head_2"
         );
     }
 }

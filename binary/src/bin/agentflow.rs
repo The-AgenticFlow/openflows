@@ -649,6 +649,11 @@ fn validate_tenant_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tenant name for `tenant add`: the explicit `--name`, else the repo owner.
+fn add_tenant_name(repo: &str, name: Option<String>) -> String {
+    name.unwrap_or_else(|| repo.split('/').next().unwrap_or(repo).to_string())
+}
+
 async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     let TenantCommands::Clean { name, reset_all } = action else {
         unreachable!("run_tenant_clean called with non-clean action");
@@ -740,6 +745,12 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     if matches!(action, TenantCommands::Clean { .. }) {
         return run_tenant_clean(&action).await;
     }
+    // Check the new tenant's Coder workspace name before bootstrapping, so a bad name fails here.
+    if let TenantCommands::Add { repo, name, .. } = &action {
+        let tenant_name = add_tenant_name(repo, name.clone());
+        validate_tenant_name(&tenant_name)?;
+        coder_client::bootstrap::nexus_workspace_name(&tenant_name)?;
+    }
 
     let bootstrapper = coder_client::bootstrap::CoderBootstrapper::from_env()
         .context("Failed to create bootstrapper from environment")?;
@@ -757,9 +768,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                     fleet
                 );
             }
-            let tenant_name =
-                name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
-            validate_tenant_name(&tenant_name)?;
+            let tenant_name = add_tenant_name(&repo, name);
 
             // Derive the tenant fleet registry with pairs applied to forge/sentinel.
             let resolver = openflows::orchestration::OrchestrationResolver::new()

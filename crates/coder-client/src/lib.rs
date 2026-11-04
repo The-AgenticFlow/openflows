@@ -78,6 +78,19 @@ pub fn template_variable_values() -> Vec<(&'static str, String)> {
         ("TF_VAR_workspace_image", "workspace_image"),
         ("TF_VAR_github_api_base", "github_api_base"),
         ("TF_VAR_github_git_base", "github_git_base"),
+        ("TF_VAR_connected_local", "connected_local"),
+        (
+            "TF_VAR_connected_local_broker_secret_host_path",
+            "connected_local_broker_secret_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_helper_host_path",
+            "connected_local_helper_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_manager_url",
+            "connected_local_manager_url",
+        ),
     ]
     .into_iter()
     .filter_map(|(env_name, name)| {

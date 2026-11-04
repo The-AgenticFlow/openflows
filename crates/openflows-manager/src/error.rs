@@ -150,7 +150,11 @@ fn api_status(code: &str) -> u16 {
         "NOT_FOUND" | "RESOURCE_NOT_FOUND" => 404,
         "CONFLICT" | "INSTALLATION_ALREADY_BOUND" | "CODER_SCOPE_MISMATCH" => 409,
         "INVALID_INPUT" | "DEVICE_CODE_INVALID" => 422,
-        "UNAUTHORIZED" | "MISSING_AUTH" | "AUTH_FAILED" | "CSRF_FAILED" => 401,
+        "UNAUTHORIZED"
+        | "MISSING_AUTH"
+        | "AUTH_FAILED"
+        | "CSRF_FAILED"
+        | "GITHUB_REAUTH_REQUIRED" => 401,
         "FORBIDDEN"
         | "ORG_ADMIN_REQUIRED"
         | "GITHUB_OWNER_REQUIRED"
@@ -169,7 +173,8 @@ fn api_status(code: &str) -> u16 {
         "RATE_LIMITED" | "TOO_MANY_REQUESTS" | "TENANT_LIMIT_REACHED" | "WORKER_LIMIT_REACHED" => {
             429
         }
-        "SERVICE_UNAVAILABLE"
+        "GITHUB_LIST_TOO_LARGE"
+        | "SERVICE_UNAVAILABLE"
         | "GITHUB_UNAVAILABLE"
         | "CODER_UNAVAILABLE"
         | "CODER_CHAT_UNAVAILABLE"

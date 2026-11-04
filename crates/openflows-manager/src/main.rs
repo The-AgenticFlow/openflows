@@ -35,6 +35,12 @@ enum Command {
     },
     /// Replace the Coder lifecycle-hook secret from standard input.
     SetCoderHookSecret,
+    /// Authorize this local Manager with the team's GitHub App.
+    GithubLogin,
+    /// Show repositories available to the signed-in user and App.
+    GithubRepos,
+    /// Remove this local Manager's GitHub user authorization.
+    GithubLogout,
 }
 
 #[tokio::main]
@@ -81,6 +87,51 @@ async fn main() -> Result<(), ManagerError> {
             return openflows_manager::operator::set_coder_hook_secret()
                 .await
                 .map_err(ManagerError::Service);
+        }
+        Command::GithubLogin | Command::GithubRepos | Command::GithubLogout => {
+            let config = ManagerConfig::from_env()
+                .map_err(|error| ManagerError::Config(error.to_string()))?;
+            if config.mode != openflows_manager::Mode::Local || !config.connected_local_enabled {
+                return Err(ManagerError::Config(
+                    "connected local mode must be enabled for GitHub user commands".into(),
+                ));
+            }
+            let github = std::sync::Arc::new(
+                openflows_manager::auth::local_github::LocalGithubAuth::new(
+                    config.auth.client_id.clone(),
+                )?
+                .with_api_base(config.auth.github_api_base.clone()),
+            );
+            let credentials = openflows_manager::auth::local_credentials::LocalCredentials::new(
+                openflows_manager::auth::local_credentials::credential_path_from_env()?,
+                github.clone(),
+            )?;
+            match command {
+                Command::GithubLogin => {
+                    let challenge = github.start().await?;
+                    println!(
+                        "Open {} and enter {}",
+                        challenge.verification_uri, challenge.user_code
+                    );
+                    let token = github.await_authorization(&challenge).await?;
+                    credentials.save_authorization(token).await?;
+                    openflows_manager::auth::local_credentials::ensure_broker_key()?;
+                    println!("GitHub authorization saved for connected local mode.");
+                }
+                Command::GithubRepos => {
+                    openflows_manager::auth::local_credentials::ensure_broker_key()?;
+                    let token = credentials.access_token().await?;
+                    for repo in github.accessible_repositories(&token).await? {
+                        println!("{}\t{}", repo.id, repo.full_name);
+                    }
+                }
+                Command::GithubLogout => {
+                    credentials.sign_out().await?;
+                    println!("Local GitHub authorization removed.");
+                }
+                _ => unreachable!(),
+            }
+            return Ok(());
         }
         Command::Serve => {}
     }
