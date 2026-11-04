@@ -401,6 +401,20 @@ fetch_programs() { # fetch_programs VERSION TARGET DEST — install_archive, or 
                "or build from source:  ./scripts/setup.sh ${REPO} --source" ;;
     esac
 }
+# programs_intact DIR — the installed programs are the ones the last download verified. Catches
+# a deleted or damaged program and a switch that was interrupted halfway.
+programs_intact() {
+    local bin
+    for bin in openflows openflows-doctor openflows-harness; do
+        [ "$(sha256_of "${1}/${bin}" 2>/dev/null)" = "$(awk -v b="$bin" '$2 == b {print $1}' "${1}/CHECKSUMS" 2>/dev/null)" ] || return 1
+    done
+}
+record_checksums() { # record_checksums DIR
+    local bin
+    for bin in openflows openflows-doctor openflows-harness; do
+        printf '%s  %s\n' "$(sha256_of "${1}/${bin}")" "$bin"
+    done >"${1}/CHECKSUMS"
+}
 # use_host_programs VERSION — make sure setup can run OpenFlows on this machine: `OPENFLOWS_BIN` is the
 # workspaces' copy if it runs here, else a native copy from the release in .dev-binaries/host.
 use_host_programs() {
@@ -410,9 +424,10 @@ use_host_programs() {
         [ ! -d "$HOST_BIN_DIR" ] || rm -r -- "$HOST_BIN_DIR"
         return 0
     fi
-    if [ "$(cat "${HOST_BIN_DIR}/VERSION" 2>/dev/null)" != "$version" ]; then
+    if [ "$(cat "${HOST_BIN_DIR}/VERSION" 2>/dev/null)" != "$version" ] || ! programs_intact "$HOST_BIN_DIR"; then
         fetch_programs "$version" "$(host_target)" "$HOST_BIN_DIR"
         printf '%s\n' "$version" >"${HOST_BIN_DIR}/VERSION"
+        record_checksums "$HOST_BIN_DIR"
     fi
     export OPENFLOWS_BIN="${HOST_BIN_DIR}/openflows"
     "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
@@ -435,29 +450,19 @@ resolve_version() {
 installed_ref() { # the exact programs this install runs; a change means pushing templates again
     if [ "$MODE" = compose ]; then image_ref; else printf 'release:%s' "$(env_get OPENFLOWS_VERSION)"; fi
 }
-# programs_intact — the installed programs are the ones the last download verified. Catches a
-# deleted or damaged program and a switch that was interrupted halfway.
-programs_intact() {
-    local bin
-    for bin in openflows openflows-doctor openflows-harness; do
-        [ "$(sha256_of "${BIN_DIR}/${bin}" 2>/dev/null)" = "$(awk -v b="$bin" '$2 == b {print $1}' "${BIN_DIR}/CHECKSUMS" 2>/dev/null)" ] || return 1
-    done
-}
 stage_release() {
     step "OpenFlows release (no compiling)"
     local version
     version="$(resolve_version)"
     mkdir -p "$BIN_DIR"
-    if [ "$(cat "${BIN_DIR}/RELEASE" 2>/dev/null)" != "$version" ] || [ -f "${BIN_DIR}/IMAGE" ] || ! programs_intact; then
+    # Host programs first: if their download fails, the workspaces' programs stay untouched.
+    use_host_programs "$version"
+    if [ "$(cat "${BIN_DIR}/RELEASE" 2>/dev/null)" != "$version" ] || [ -f "${BIN_DIR}/IMAGE" ] || ! programs_intact "$BIN_DIR"; then
         fetch_programs "$version" "$WORKSPACE_TARGET" "$BIN_DIR"
         printf '%s\n' "$version" >"${BIN_DIR}/RELEASE"
-        local bin
-        for bin in openflows openflows-doctor openflows-harness; do
-            printf '%s  %s\n' "$(sha256_of "${BIN_DIR}/${bin}")" "$bin"
-        done >"${BIN_DIR}/CHECKSUMS"
+        record_checksums "$BIN_DIR"
         rm -f "${BIN_DIR}/IMAGE"
     fi
-    use_host_programs "$version"
     "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
         || die "The OpenFlows programs do not run on this machine." \
             "Build from source instead:  ./scripts/setup.sh ${REPO} --source"

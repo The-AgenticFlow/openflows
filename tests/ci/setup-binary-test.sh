@@ -142,6 +142,36 @@ touch -t 202001010000 "${WORK}/switch/.dev-binaries/openflows"
 switch_to 3.0.0 >/dev/null
 expect_eq "intact programs are not downloaded again" "$(date -r "${WORK}/switch/.dev-binaries/openflows" +%Y)" 2020
 
+echo "Machines with their own programs"
+switch_host_to() {   # switch_host_to VERSION — like switch_to, on a machine that needs native programs
+    (
+        ROOT="${WORK}/switch-host"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"; HOST_BIN_DIR="${BIN_DIR}/host"
+        LOG_FILE="${WORK}/switch-host.log"; MODE=binary; REPO=o/r
+        needs_host_programs() { return 0; }
+        host_target() { echo fake-host; }
+        mkdir -p "$ROOT"; touch "$ENV_FILE"
+        env_set OPENFLOWS_VERSION "$1"
+        set -e
+        stage_release >/dev/null 2>&1
+    ) || echo "stopped"
+}
+host_program() { "${WORK}/switch-host/.dev-binaries/host/openflows"; }
+workspace_program() { "${WORK}/switch-host/.dev-binaries/openflows"; }
+publish 4.0.0 "$WORKSPACE_TARGET"
+publish 4.0.0 fake-host
+publish 4.1.0 "$WORKSPACE_TARGET"
+switch_host_to 4.0.0
+expect_eq "installs native programs" "$(host_program)" "openflows 4.0.0 fake-host"
+expect_eq "and the workspaces' programs" "$(workspace_program)" "openflows 4.0.0 ${WORKSPACE_TARGET}"
+expect_eq "a failed native download stops" "$(switch_host_to 4.1.0)" "stopped"
+expect_eq "and keeps the workspaces' programs" "$(workspace_program)" "openflows 4.0.0 ${WORKSPACE_TARGET}"
+rm "${WORK}/switch-host/.dev-binaries/host/openflows"
+switch_host_to 4.0.0
+expect_eq "a deleted native program is restored" "$(host_program)" "openflows 4.0.0 fake-host"
+printf '#!/bin/sh\necho damaged\n' >"${WORK}/switch-host/.dev-binaries/host/openflows"
+switch_host_to 4.0.0
+expect_eq "a damaged native program is restored" "$(host_program)" "openflows 4.0.0 fake-host"
+
 echo "Shared App without compiling"
 expect_shared() {   # expect_shared VERSION yes|no
     if has_shared_app "$1"; then expect_eq "$1" yes "$2"; else expect_eq "$1" no "$2"; fi
