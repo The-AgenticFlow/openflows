@@ -1177,3 +1177,80 @@ fn tenant_slug_validation_rejects_unsafe_names() {
     assert!(validate_tenant_slug("has space").is_err());
     assert!(validate_tenant_slug(&"x".repeat(64)).is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn tenant_status_reports_runtime_health() {
+    let h = harness().await;
+    let tenant = create_tenant(&h, "runtime-health", 1, "runtime-health").await;
+    let health = |h: &Harness| {
+        let svc = h.tenant_service.clone();
+        let (owner, org) = (h.owner, h.org);
+        async move {
+            let status = svc.tenant_status(owner, org, tenant).await.unwrap();
+            status["runtime"]["health"].as_str().unwrap().to_owned()
+        }
+    };
+    sqlx::query("DELETE FROM workspaces WHERE tenant_id = $1")
+        .bind(tenant.0)
+        .execute(&h.pool)
+        .await
+        .ok();
+
+    // Not meant to be running yet.
+    assert_eq!(health(&h).await, "inactive");
+
+    let nexus = uuid::Uuid::new_v4();
+    sqlx::query(
+        "UPDATE tenants SET observed_state = 'running', desired_state = 'running' WHERE id = $1",
+    )
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workspaces (id, organization_id, tenant_id, role, desired_state, observed_state)
+         VALUES ($1, $2, $3, 'nexus', 'running', 'running')",
+    )
+    .bind(nexus)
+    .bind(h.org.0)
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "starting");
+
+    sqlx::query(
+        "UPDATE workspaces SET registered_at = now(), last_heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(nexus)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "healthy");
+
+    // Silent runtime whose refresh session has expired: only a restart helps.
+    sqlx::query(
+        "UPDATE workspaces SET last_heartbeat_at = now() - interval '30 minutes' WHERE id = $1",
+    )
+    .bind(nexus)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "restart_required");
+
+    // Silent runtime that can still refresh: it may come back on its own.
+    sqlx::query(
+        "INSERT INTO runtime_credentials
+            (id, workspace_id, credential_hash, audience, expires_at, generation, family_id, family_expires_at)
+         VALUES ($1, $2, $3, 'openflows-workspace-refresh', now() + interval '1 hour', 0, $4, now() + interval '1 day')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(nexus)
+    .bind(format!("test-hash-{nexus}"))
+    .bind(uuid::Uuid::new_v4())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "unresponsive");
+}
