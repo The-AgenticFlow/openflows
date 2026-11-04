@@ -56,6 +56,7 @@ fn api_v1_router() -> Router<AppState> {
         .route("/auth/refresh", post(auth::refresh))
         .route("/auth/csrf", get(auth::csrf_token))
         .route("/invitations/accept", post(invitations::accept_json))
+        .route("/invitations/preview", get(invitations::preview))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/cli/start", post(device::device_start))
         .route("/auth/cli/token", post(device::device_token))
