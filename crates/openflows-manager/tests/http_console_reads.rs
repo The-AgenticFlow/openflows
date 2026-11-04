@@ -314,6 +314,21 @@ async fn repositories_list_is_scoped_to_the_connection_and_organization() {
         "accessible only, sorted"
     );
 
+    // Paging: one repository per page, in name order, following next_cursor.
+    let (status, page1) = app.get(&format!("{path}?limit=1"), &alice).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page1["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page1["items"][0]["full_name"], "alice/alpha");
+    let cursor = page1["next_cursor"].as_str().expect("a second page exists");
+    let (status, page2) = app
+        .get(&format!("{path}?limit=1&after={cursor}"), &alice)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page2["items"][0]["full_name"], "alice/zeta");
+    assert!(page2["next_cursor"].is_null(), "last page has no cursor");
+    let (status, _) = app.get(&format!("{path}?after=not-a-cursor"), &alice).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "malformed cursor");
+
     // Another organization cannot see it, and the connection id does not leak
     // across organizations.
     let (status, _) = app.get(&path, &bob).await;
@@ -356,4 +371,73 @@ async fn platform_overview_is_operator_only() {
     assert_eq!(body["organizations"]["total"], 1);
     assert_eq!(body["tenants"]["total"], 0);
     assert!(body["templates"].is_array());
+
+    // Tenants are counted against the release their organization is on (the
+    // maintained relationship), not the per-tenant pin, which is never set.
+    let org: uuid::Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE slug = 'orga'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let release = uuid::Uuid::new_v4();
+    let connection = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO template_releases (id, version, manifest_sha256, artifact_uri, status)
+         VALUES ($1, 'e2e-release', 'sha-e2e', 'file:///e2e', 'approved')",
+    )
+    .bind(release)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_current_releases (organization_id, release_id)
+         VALUES ($1, $2)
+         ON CONFLICT (organization_id) DO UPDATE SET release_id = EXCLUDED.release_id",
+    )
+    .bind(org)
+    .bind(release)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_connections
+            (id, organization_id, app_id, installation_id, github_account_id,
+             account_type, account_login, status)
+         VALUES ($1, $2, 1, 100, 200, 'User', 'alice', 'active')",
+    )
+    .bind(connection)
+    .bind(org)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO github_repositories
+            (organization_id, connection_id, github_repository_id, full_name, accessible)
+         VALUES ($1, $2, 1, 'alice/counted', true)",
+    )
+    .bind(org)
+    .bind(connection)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, organization_id, slug, connection_id, github_repository_id, fleet_size)
+         VALUES ($1, $2, 'counted', $3, 1, 1)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(org)
+    .bind(connection)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (_, body) = app.get("/api/v1/platform/overview", &alice).await;
+    let release_row = body["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["version"] == "e2e-release")
+        .expect("release listed");
+    assert_eq!(
+        release_row["tenants"], 1,
+        "tenant counted through its organization's release"
+    );
 }

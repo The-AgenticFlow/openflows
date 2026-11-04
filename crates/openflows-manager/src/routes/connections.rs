@@ -50,6 +50,38 @@ pub struct RepositoryDto {
 #[derive(Serialize)]
 pub struct RepositoriesResponse {
     pub items: Vec<RepositoryDto>,
+    /// Opaque cursor for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Paging for the repository list.
+#[derive(Deserialize)]
+pub struct RepositoriesQuery {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+/// Repositories are ordered by name, not by time, so their cursor carries
+/// `(lower-cased name, id)`. It reuses the shared opaque cursor encoding; the
+/// timestamp slot is unused and fixed.
+fn repository_cursor(name_lower: &str, id: i64) -> String {
+    crate::pagination::Cursor {
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        tiebreaker: format!("{name_lower}\t{id}"),
+    }
+    .encode()
+}
+
+fn decode_repository_cursor(raw: &str) -> Result<(String, i64), ManagerError> {
+    let cursor = crate::pagination::Cursor::decode(raw)?;
+    let (name, id) = cursor
+        .tiebreaker
+        .rsplit_once('\t')
+        .ok_or_else(|| ManagerError::InvalidInput("malformed cursor".into()))?;
+    let id = id
+        .parse::<i64>()
+        .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?;
+    Ok((name.to_string(), id))
 }
 
 #[derive(Deserialize)]
@@ -177,11 +209,13 @@ pub async fn list_connections(
 }
 
 /// GET /api/v1/organizations/{org}/github/connections/{id}/repositories
-/// (member view): repositories the installation can currently access.
+/// (member view): repositories the installation can currently access, one
+/// bounded page at a time (`limit`, `after`; `next_cursor` in the response).
 pub async fn list_repositories(
     State(state): State<crate::server::AppState>,
     headers: HeaderMap,
     Path((org, id)): Path<(String, String)>,
+    Query(q): Query<RepositoriesQuery>,
 ) -> Result<Json<RepositoriesResponse>, ManagerError> {
     let services = state
         .services()
@@ -189,10 +223,24 @@ pub async fn list_repositories(
     let principal = authenticated_user(&headers, &services.session_manager).await?;
     let org_id = parse_org(&org)?;
     let connection_id = parse_connection_id(&id)?;
-    let rows = services
+    let limit = crate::pagination::PageLimit::new(q.limit);
+    let after = q
+        .after
+        .as_deref()
+        .map(decode_repository_cursor)
+        .transpose()?;
+    let mut rows = services
         .connections_service
-        .list_repositories(principal.user_id, org_id, connection_id)
+        .list_repositories(principal.user_id, org_id, connection_id, after, limit)
         .await?;
+    let has_more = rows.len() > limit.get() as usize;
+    rows.truncate(limit.get() as usize);
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|r| repository_cursor(&r.full_name.to_lowercase(), r.github_repository_id))
+    } else {
+        None
+    };
     let items = rows
         .into_iter()
         .map(|r| RepositoryDto {
@@ -201,7 +249,7 @@ pub async fn list_repositories(
             last_seen_at: r.last_seen_at,
         })
         .collect();
-    Ok(Json(RepositoriesResponse { items }))
+    Ok(Json(RepositoriesResponse { items, next_cursor }))
 }
 
 /// POST /api/v1/organizations/{org}/github/connections/{id}/reconcile (admin).

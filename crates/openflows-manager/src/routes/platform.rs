@@ -75,7 +75,8 @@ pub async fn overview(
     let templates: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT r.version, r.status, count(t.id)
            FROM template_releases r
-           LEFT JOIN tenants t ON t.pinned_release_id = r.id AND t.observed_state <> 'deleted'
+           LEFT JOIN organization_current_releases cr ON cr.release_id = r.id
+           LEFT JOIN tenants t ON t.organization_id = cr.organization_id AND t.observed_state <> 'deleted'
           GROUP BY r.id, r.version, r.status, r.created_at
           ORDER BY r.created_at DESC
           LIMIT 20",

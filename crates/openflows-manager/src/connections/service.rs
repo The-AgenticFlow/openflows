@@ -477,6 +477,8 @@ impl ConnectionService {
         caller: UserId,
         org_id: OrganizationId,
         connection_id: ConnectionId,
+        after: Option<(String, i64)>,
+        limit: crate::pagination::PageLimit,
     ) -> Result<Vec<crate::connections::repository::RepositoryRow>, ManagerError> {
         self.require_active_member(caller, org_id).await?;
         self.repo
@@ -484,7 +486,13 @@ impl ConnectionService {
             .await?
             .ok_or_else(|| ManagerError::not_found("connection"))?;
         self.repo
-            .list_repositories_for_connection(org_id, connection_id)
+            // One extra row tells the caller whether another page exists.
+            .list_repositories_for_connection(
+                org_id,
+                connection_id,
+                after,
+                i64::from(limit.get()) + 1,
+            )
             .await
     }
 

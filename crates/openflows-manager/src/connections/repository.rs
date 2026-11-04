@@ -701,11 +701,16 @@ impl ConnectionRepository {
         Ok(rows.into_iter().map(RepositoryRow::from).collect())
     }
 
-    /// List the repositories one active connection can currently access.
+    /// List one page of the repositories an active connection can currently
+    /// access, ordered by lower-cased name then id. `after` is the
+    /// `(lower-cased name, id)` of the last row already returned; at most
+    /// `limit` rows come back.
     pub async fn list_repositories_for_connection(
         &self,
         organization_id: OrganizationId,
         connection_id: ConnectionId,
+        after: Option<(String, i64)>,
+        limit: i64,
     ) -> Result<Vec<RepositoryRow>, ManagerError> {
         let rows = sqlx::query_as::<_, RepositoryTuple>(
             "SELECT r.organization_id, r.connection_id, r.github_repository_id, r.full_name, r.accessible, r.last_seen_at
@@ -713,10 +718,16 @@ impl ConnectionRepository {
                  ON c.id = r.connection_id AND c.organization_id = r.organization_id
               WHERE r.organization_id = $1 AND r.connection_id = $2
                 AND r.accessible = true AND c.status = 'active'
-              ORDER BY lower(r.full_name)",
+                AND ($3::text IS NULL
+                     OR (lower(r.full_name), r.github_repository_id) > ($3, $4::bigint))
+              ORDER BY lower(r.full_name), r.github_repository_id
+              LIMIT $5",
         )
         .bind(organization_id.0)
         .bind(connection_id.0)
+        .bind(after.as_ref().map(|(name, _)| name.as_str()))
+        .bind(after.as_ref().map(|(_, id)| *id))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(ManagerError::from)?;
