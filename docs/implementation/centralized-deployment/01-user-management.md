@@ -212,9 +212,11 @@ All paths are relative to `/api/v1`.
 | `GET /organizations/{org}` | Membership | Organization plus sanitized readiness |
 | `PATCH /organizations/{org}` | Admin, allowed settings | Updated organization |
 | `GET /organizations/{org}/members` | Membership | Paginated members |
+| `GET /organizations/{org}/invitations` | Admin; `limit`, `after` | Outstanding invitations newest first, `{items,next_cursor}`; expired ones are listed with status `expired`; no token or hash |
 | `POST /organizations/{org}/invitations` | Admin, `{github_login,role}` | Invitation URL once; expires in 7 days |
 | `DELETE /organizations/{org}/invitations/{id}` | Admin | 204, revoke |
 | `POST /invitations/accept` | Session, `{token}` | Membership; consume once |
+| `GET /invitations/preview?token=` | Session | Organization, role and inviter for the exact invitee while the invitation is usable; otherwise the same 404 for every other case. Consumes nothing |
 | `PATCH /organizations/{org}/members/{user}` | Admin, `{role,status}` | Updated membership |
 | `DELETE /organizations/{org}/members/{user}` | Admin | 204, mark removed |
 | `POST /organizations/{org}/transfer-ownership` | Owner, `{new_owner_user_id}` | Active member becomes owner transactionally |

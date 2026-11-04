@@ -824,9 +824,26 @@ pub struct Chat {
     /// Labels applied at creation time (e.g. ticket, role, flow).
     #[serde(default)]
     pub labels: serde_json::Map<String, serde_json::Value>,
+    /// Coder's structured failure for a chat in `error` status
+    /// (`{message, detail, kind, provider, retryable, status_code}`). The
+    /// `detail` text comes from the upstream provider and may contain account
+    /// identifiers, so consumers must map `kind` to their own safe wording and
+    /// never forward it.
+    #[serde(default)]
+    pub last_error: Option<serde_json::Value>,
 }
 
 impl Chat {
+    /// The provider-independent failure kind (for example `usage_limit`), if any.
+    pub fn error_kind(&self) -> Option<&str> {
+        self.last_error.as_ref()?.get("kind")?.as_str()
+    }
+
+    /// Whether Coder considers the failure worth retrying.
+    pub fn error_retryable(&self) -> Option<bool> {
+        self.last_error.as_ref()?.get("retryable")?.as_bool()
+    }
+
     /// Get the parsed status enum.
     pub fn status(&self) -> ChatStatus {
         ChatStatus::parse_from_str(&self.status_raw)
