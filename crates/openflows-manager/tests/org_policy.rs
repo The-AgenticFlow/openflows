@@ -346,10 +346,30 @@ async fn a_removed_member_can_rejoin_through_a_fresh_invitation() {
         ("viewer".into(), "active".into())
     );
 
-    // Removed: the row stays, inactive.
-    sqlx::query("UPDATE memberships SET status='removed' WHERE organization_id=$1 AND user_id=$2")
-        .bind(org)
-        .bind(bob.0)
+    // An invitation issued while Bob is still a member, and never used.
+    let stale = repo
+        .create_invitation(scope, 101, MembershipRole::Admin, "rejoin-stale", owner)
+        .await
+        .unwrap();
+
+    // Removed: the row stays, inactive (removal stamps updated_at, as the service does).
+    sqlx::query(
+        "UPDATE memberships SET status='removed', updated_at=now() WHERE organization_id=$1 AND user_id=$2",
+    )
+    .bind(org)
+    .bind(bob.0)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Removing someone is not undone by an older, still-valid invitation.
+    assert!(repo.accept_invitation(stale, 101, bob).await.is_err());
+    assert_eq!(
+        membership(pool.clone()).await,
+        ("viewer".into(), "removed".into())
+    );
+    sqlx::query("UPDATE invitations SET revoked_at = now() WHERE id = $1")
+        .bind(stale.0)
         .execute(pool)
         .await
         .unwrap();

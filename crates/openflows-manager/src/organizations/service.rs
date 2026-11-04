@@ -582,12 +582,16 @@ impl OrganizationService {
     /// List an organization's outstanding invitations (admin only). Accepted and
     /// revoked invitations are excluded. An invitation past its expiry is still
     /// listed, flagged `expired`, so an admin can revoke it and issue a new one.
-    /// Never returns the token or its hash.
+    /// Never returns the token or its hash. Paged newest first by
+    /// `(created_at, id)`, so an organization with many invitations can reach
+    /// every one instead of silently losing the older ones.
     pub async fn list_invitations(
         &self,
         caller: UserId,
         org_id: OrganizationId,
-    ) -> Result<Vec<serde_json::Value>, ManagerError> {
+        limit: PageLimit,
+        after: Option<crate::pagination::Cursor>,
+    ) -> Result<crate::pagination::Page<serde_json::Value>, ManagerError> {
         let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
         Policy::require_admin_view(membership.as_ref(), org_state.as_ref())?;
         type Row = (
@@ -607,31 +611,41 @@ impl OrganizationService {
                  ON idn.provider = 'github' AND idn.subject = i.invitee_github_user_id::text
               WHERE i.organization_id = $1
                 AND i.accepted_at IS NULL AND i.revoked_at IS NULL
+                AND ($2::timestamptz IS NULL OR (i.created_at, i.id) < ($2, $3::uuid))
               ORDER BY i.created_at DESC, i.id DESC
-              LIMIT 100",
+              LIMIT $4",
         )
         .bind(org_id.0)
+        .bind(after.as_ref().map(|c| c.created_at))
+        .bind(
+            after
+                .as_ref()
+                .map(|c| c.tiebreaker.parse::<uuid::Uuid>())
+                .transpose()
+                .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?,
+        )
+        .bind(i64::from(limit.get()) + 1)
         .fetch_all(&self.pool)
         .await
         .map_err(ManagerError::from)?;
         let now = chrono::Utc::now();
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, github_user_id, login, role, invited_by, created_at, expires_at)| {
-                    json!({
-                        "invitation_id": id.to_string(),
-                        "invitee_github_user_id": github_user_id,
-                        "invitee_login": login,
-                        "role": role,
-                        "invited_by": invited_by.map(|u| u.to_string()),
-                        "created_at": created_at,
-                        "expires_at": expires_at,
-                        "status": if expires_at <= now { "expired" } else { "pending" },
-                    })
-                },
-            )
-            .collect())
+        Ok(crate::pagination::Page::from_fetch(rows, limit, |r| {
+            crate::pagination::cursor_for(r.5, r.0)
+        })
+        .map_items(
+            |(id, github_user_id, login, role, invited_by, created_at, expires_at)| {
+                json!({
+                    "invitation_id": id.to_string(),
+                    "invitee_github_user_id": github_user_id,
+                    "invitee_login": login,
+                    "role": role,
+                    "invited_by": invited_by.map(|u| u.to_string()),
+                    "created_at": created_at,
+                    "expires_at": expires_at,
+                    "status": if expires_at <= now { "expired" } else { "pending" },
+                })
+            },
+        ))
     }
 
     /// Accept an invitation by token. Requires the caller's authenticated

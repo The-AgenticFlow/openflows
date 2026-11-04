@@ -47,7 +47,11 @@ echo "==> Running manager PostgreSQL integration tests (connection URL omitted)"
 # opts in with `--ignored` now that a database is available.
 (
   cd "$MANAGER_CRATE"
-  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --locked --test postgres --test http_auth --test http_org --test org_policy --test review_regressions -- --ignored --test-threads=4
+  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --locked --test postgres --test http_auth --test http_org --test org_policy --test review_regressions --test http_console_reads --test http_invitation_preview --test http_operations --test http_org_provisioning -- --ignored --test-threads=4
+  # tenant_runtime builds hook URLs for the runtime relay, which must be set.
+  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" \
+    OPENFLOWS_RUNTIME_RELAY_BASE_URL="${OPENFLOWS_RUNTIME_RELAY_BASE_URL:-http://127.0.0.1:7081/tenants/{tenant}}" \
+    cargo test --locked --test tenant_runtime -- --ignored --test-threads=4
   cargo test --locked --test ready --test health
 )
 

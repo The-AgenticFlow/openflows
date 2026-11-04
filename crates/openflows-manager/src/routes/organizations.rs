@@ -414,22 +414,41 @@ pub async fn create_invitation(
     }))
 }
 
-/// `GET /organizations/{org}/invitations` — outstanding invitations (admin only).
+/// Paging for `GET /organizations/{org}/invitations`.
+#[derive(Deserialize)]
+pub struct InvitationListQuery {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+/// `GET /organizations/{org}/invitations` — outstanding invitations (admin
+/// only), newest first, with `limit`/`after` keyset paging.
 pub async fn list_invitations(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(org): Path<String>,
-) -> Result<Json<serde_json::Value>, ManagerError> {
+    Query(q): Query<InvitationListQuery>,
+) -> Result<Json<crate::pagination::Page<serde_json::Value>>, ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
     let principal = authenticated_user(&headers, &services.session_manager).await?;
     let org_id = parse_org(&org)?;
-    let items = services
+    let after = q
+        .after
+        .as_deref()
+        .map(crate::pagination::Cursor::decode)
+        .transpose()?;
+    let page = services
         .orgs_service
-        .list_invitations(principal.user_id, org_id)
+        .list_invitations(
+            principal.user_id,
+            org_id,
+            crate::pagination::PageLimit::new(q.limit),
+            after,
+        )
         .await?;
-    Ok(Json(serde_json::json!({"items": items})))
+    Ok(Json(page))
 }
 
 /// `DELETE /organizations/{org}/invitations/{id}` — revoke (admin only).

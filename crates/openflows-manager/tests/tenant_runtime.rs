@@ -1200,6 +1200,17 @@ async fn tenant_status_reports_runtime_health() {
     // Not meant to be running yet.
     assert_eq!(health(&h).await, "inactive");
 
+    // A normal start: desired `running` while observed is still `paused` until
+    // the first heartbeat. That is "starting", not "inactive".
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'running', observed_state = 'paused' WHERE id = $1",
+    )
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "starting");
+
     let nexus = uuid::Uuid::new_v4();
     sqlx::query(
         "UPDATE tenants SET observed_state = 'running', desired_state = 'running' WHERE id = $1",

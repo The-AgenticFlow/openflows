@@ -733,7 +733,7 @@ impl TenantService {
         .fetch_optional(&self.inputs.pool)
         .await?;
         let runtime = self
-            .runtime_health(org_id, tenant_id, &tenant.observed_state)
+            .runtime_health(org_id, tenant_id, &tenant.desired_state)
             .await?;
         Ok(json!({
             "tenant_id": tenant_id,
@@ -761,7 +761,7 @@ impl TenantService {
         &self,
         org_id: OrganizationId,
         tenant_id: TenantId,
-        observed_state: &str,
+        desired_state: &str,
     ) -> Result<serde_json::Value, ManagerError> {
         // (registered_at, last_heartbeat_at, heartbeat_fresh, refresh_session_valid)
         type NexusLiveness = (Option<Timestamp>, Option<Timestamp>, bool, bool);
@@ -785,7 +785,10 @@ impl TenantService {
         .await?;
         let (registered_at, last_heartbeat_at, fresh, session_valid) =
             nexus.unwrap_or((None, None, false, false));
-        let health = if observed_state != "running" {
+        // Whether the runtime *should* be up comes from the desired state: a tenant
+        // that is starting has desired `running` while its observed state is still
+        // `paused` until the first heartbeat, and must read `starting`, not `inactive`.
+        let health = if desired_state != "running" {
             "inactive"
         } else if fresh {
             "healthy"

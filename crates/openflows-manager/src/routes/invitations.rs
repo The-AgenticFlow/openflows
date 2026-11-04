@@ -221,7 +221,7 @@ pub async fn preview(
         "SELECT o.slug, o.display_name,
                 (SELECT u.display_name FROM invitations i JOIN users u ON u.id = i.invited_by
                   WHERE i.id = $2)
-           FROM organizations o WHERE o.id = $1 AND o.status <> 'deleted'",
+           FROM organizations o WHERE o.id = $1 AND o.status IN ('ready', 'provisioning')",
     )
     .bind(inv.organization_id.0)
     .bind(inv.id.0)

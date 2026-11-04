@@ -212,6 +212,7 @@ All paths are relative to `/api/v1`.
 | `GET /organizations/{org}` | Membership | Organization plus sanitized readiness |
 | `PATCH /organizations/{org}` | Admin, allowed settings | Updated organization |
 | `GET /organizations/{org}/members` | Membership | Paginated members |
+| `GET /organizations/{org}/invitations` | Admin; `limit`, `after` | Outstanding invitations newest first, `{items,next_cursor}`; expired ones are listed with status `expired`; no token or hash |
 | `POST /organizations/{org}/invitations` | Admin, `{github_login,role}` | Invitation URL once; expires in 7 days |
 | `DELETE /organizations/{org}/invitations/{id}` | Admin | 204, revoke |
 | `POST /invitations/accept` | Session, `{token}` | Membership; consume once |

@@ -213,6 +213,15 @@ async fn pending_invitations_list_for_admins_and_hide_revoked() {
     assert_eq!(items[0]["status"], "pending");
     assert!(items[0].get("token").is_none() && items[0].get("token_hash").is_none());
 
+    // Paging: a page of one reports where the next page starts, and the next
+    // page is empty once everything has been seen.
+    let (status, page1) = app.get(&format!("{path}?limit=1"), &alice).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page1["items"].as_array().unwrap().len(), 1);
+    assert!(page1["next_cursor"].is_null(), "only one invitation exists");
+    let (status, _) = app.get(&format!("{path}?after=not-a-cursor"), &alice).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "malformed cursor");
+
     let (status, _) = app.get(&path, &bob).await;
     assert_eq!(
         status,

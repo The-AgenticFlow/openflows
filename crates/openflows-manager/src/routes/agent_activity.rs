@@ -144,7 +144,8 @@ pub async fn agent_activity(
     Ok(Json(AgentActivity { chats }))
 }
 
-/// A tenant's managed worker chats, newest first:
+/// A tenant's managed worker chats, chats of live workspaces first and then
+/// newest first, so a long-running chat is never pushed out by retired ones:
 /// (ticket id, workspace role, Coder chat id, created at).
 pub async fn load_chat_rows(
     pool: &sqlx::PgPool,
@@ -156,7 +157,7 @@ pub async fn load_chat_rows(
            FROM runtime_chats rc
            JOIN workspaces w ON w.id = rc.workspace_id
           WHERE w.organization_id = $1 AND w.tenant_id = $2
-          ORDER BY rc.created_at DESC
+          ORDER BY (w.desired_state = 'deleted') ASC, rc.created_at DESC
           LIMIT $3",
     )
     .bind(org_id.0)

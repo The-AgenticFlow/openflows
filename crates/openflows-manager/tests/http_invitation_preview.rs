@@ -140,6 +140,23 @@ async fn preview_is_for_the_exact_invitee_and_consumes_nothing() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // An organization that cannot take new members offers nothing to accept,
+    // matching what acceptance would allow.
+    sqlx::query("UPDATE organizations SET status = 'suspended' WHERE id = $1")
+        .bind(org.0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (status, _) = app.get(&path, &bob).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "suspended organization");
+    sqlx::query("UPDATE organizations SET status = 'ready' WHERE id = $1")
+        .bind(org.0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (status, _) = app.get(&path, &bob).await;
+    assert_eq!(status, StatusCode::OK, "usable again once ready");
+
     // Revoked invitations disappear.
     let id = created["invitation_id"].as_str().unwrap();
     let (status, _) = app

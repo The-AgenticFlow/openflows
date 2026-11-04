@@ -601,19 +601,24 @@ impl OrganizationRepository {
         // A person who was removed keeps their (inactive) membership row, so a
         // plain insert would collide with it and they could never rejoin. An
         // admin's fresh invitation to the exact same identity is the explicit
-        // act that brings them back, with the role it was issued for. A
-        // suspended membership is not reactivated this way: an admin chose that
-        // state and must lift it deliberately.
+        // act that brings them back, with the role it was issued for. That
+        // decision must come after the removal: an invitation issued before it
+        // (and never used) does not restore access, so removing someone is not
+        // undone by an old, still-valid link. A suspended membership is not
+        // reactivated this way: an admin chose that state and must lift it
+        // deliberately.
         let inserted = sqlx::query(
             "INSERT INTO memberships (organization_id, user_id, role, status)
              VALUES ($1, $2, $3, 'active')
              ON CONFLICT (organization_id, user_id) DO UPDATE
                 SET role = EXCLUDED.role, status = 'active', updated_at = now()
-              WHERE memberships.status = 'removed'",
+              WHERE memberships.status = 'removed'
+                AND memberships.updated_at <= (SELECT i.created_at FROM invitations i WHERE i.id = $4)",
         )
         .bind(org_id)
         .bind(user_id.0)
         .bind(&role)
+        .bind(invitation_id.0)
         .execute(&mut *tx)
         .await
         .map_err(ManagerError::from)?;
