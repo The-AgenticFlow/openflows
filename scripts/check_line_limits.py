@@ -3,11 +3,15 @@
 
 Rule (global cap with grandfathering):
     For every file added or modified between BASE_SHA and HEAD_SHA:
-        new_line_count <= max(MAX_LINES, line_count_on_base)
+        new_line_count <= max(MAX_LINES, line_count_on_merge_base)
 
 A newly-added file has 0 lines on the base, so its cap is exactly MAX_LINES.
 An existing file already over MAX_LINES is "grandfathered": it is capped at its
 current size, so it can only shrink (and is nudged toward the cap).
+
+The baseline is the **merge base** of BASE_SHA and HEAD_SHA (not the base branch
+tip), so an unrelated PR is never flagged just because the base branch advanced
+and shrank a grandfathered file after the PR branched off.
 
 This stops new bloat (new files over the cap) and stops existing files from
 growing, without ever forcing a big refactor of files that already exceed the
@@ -22,6 +26,7 @@ Usage (run from inside the git repository):
     Local example: BASE_SHA=HEAD~1 HEAD_SHA=HEAD python3 scripts/check_line_limits.py
 
 Exits 0 if every file is within its limit, 1 otherwise (printing each violation).
+Fails hard (non-zero) if git itself errors, so a broken run never looks green.
 """
 
 import fnmatch
@@ -33,8 +38,14 @@ MAX_LINES = int(os.environ.get("MAX_LINES", "1000"))
 BASE_SHA = os.environ.get("BASE_SHA", "")
 HEAD_SHA = os.environ.get("HEAD_SHA", "HEAD")
 
+# The merge base of BASE_SHA and HEAD_SHA, resolved in main(). All base-side
+# reads and changed-file detection use this, not the base branch tip.
+MERGE_BASE = ""
+
 # Paths/globs allowed to be large (lockfiles, build/vendored output, generated
-# artifacts). A trailing "/" means "any file under this directory".
+# artifacts). A trailing "/" means "any file under this directory". Name-only
+# patterns (no "/") also match against the basename so nested lockfiles and
+# minified files are ignored wherever they appear.
 IGNORED_PATTERNS = [
     "Cargo.lock",
     "package-lock.json",
@@ -66,20 +77,24 @@ IGNORED_PATTERNS = [
 ]
 
 
-def blob(sha: str, path: str) -> bytes:
-    """Return the raw bytes of a file at a revision (b"" if absent)."""
-    try:
-        result = subprocess.run(
-            ["git", "cat-file", "blob", f"{sha}:{path}"],
-            capture_output=True,
+def run_git(args):
+    """Run git, raising a clear error on failure (fail-closed)."""
+    result = subprocess.run(["git"] + args, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {result.returncode}):\n"
+            f"{result.stderr.decode(errors='replace').strip()}"
         )
-    except OSError:
-        return b""
-    return result.stdout if result.returncode == 0 else b""
+    return result
+
+
+def blob(sha: str, path: str) -> bytes:
+    """Raw bytes of a file at a revision. A missing/unreadable blob is an error."""
+    return run_git(["cat-file", "blob", f"{sha}:{path}"]).stdout
 
 
 def line_count(sha: str, path: str) -> int:
-    """Number of logical lines of a file at a revision (0 if absent)."""
+    """Number of logical lines of a file at a revision."""
     return len(blob(sha, path).splitlines())
 
 
@@ -89,11 +104,12 @@ def is_binary(sha: str, path: str) -> bool:
 
 
 def is_ignored(path: str) -> bool:
+    base = os.path.basename(path)
     for pattern in IGNORED_PATTERNS:
         if pattern.endswith("/"):
             if path.startswith(pattern):
                 return True
-        elif fnmatch.fnmatch(path, pattern):
+        elif fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(base, pattern):
             return True
     return False
 
@@ -106,7 +122,7 @@ def check_file(base_path, head_path):
         return None  # binary files are skipped
 
     if base_path:
-        base_count = line_count(BASE_SHA, base_path)
+        base_count = line_count(MERGE_BASE, base_path)
     else:
         base_count = 0  # brand-new file
 
@@ -120,7 +136,7 @@ def check_file(base_path, head_path):
         reason = f"new file exceeds the {MAX_LINES}-line cap"
     elif base_count > MAX_LINES:
         reason = (
-            f"grandfathered file ({base_count} lines on base) grew "
+            f"grandfathered file ({base_count} lines on merge base) grew "
             "beyond its current size"
         )
     else:
@@ -134,12 +150,8 @@ def changed_files(base: str, head: str):
     base_path is None for brand-new files. Uses git rename detection so a
     rename keeps its grandfathered baseline.
     """
-    result = subprocess.run(
-        ["git", "diff", "-z", "--find-renames", "--name-status", base, head],
-        capture_output=True,
-        text=True,
-    )
-    fields = result.stdout.split("\x00")
+    result = run_git(["diff", "-z", "--find-renames", "--name-status", base, head])
+    fields = result.stdout.decode(errors="replace").split("\x00")
     i = 0
     while i < len(fields):
         status = fields[i]
@@ -165,6 +177,7 @@ def changed_files(base: str, head: str):
 
 
 def main() -> int:
+    global MERGE_BASE
     if not BASE_SHA:
         print(
             "BASE_SHA not set (not a pull_request run); "
@@ -177,11 +190,16 @@ def main() -> int:
         f"(cap {MAX_LINES})..."
     )
 
-    violations = []
-    for base_path, head_path in changed_files(BASE_SHA, HEAD_SHA):
-        violation = check_file(base_path, head_path)
-        if violation:
-            violations.append(violation)
+    try:
+        MERGE_BASE = run_git(["merge-base", BASE_SHA, HEAD_SHA]).stdout.decode().strip()
+        violations = []
+        for base_path, head_path in changed_files(MERGE_BASE, HEAD_SHA):
+            violation = check_file(base_path, head_path)
+            if violation:
+                violations.append(violation)
+    except RuntimeError as error:
+        print(f"ERROR: {error}")
+        return 1
 
     if violations:
         print("\n".join(violations))
