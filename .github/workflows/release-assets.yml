@@ -18,6 +18,10 @@ on:
       version:
         description: 'Version to build and publish, e.g. 1.2.1 (its draft release must exist)'
         required: true
+      wait_for_images:
+        description: 'Publish only once its Docker images exist (turn off only to test on a fork)'
+        type: boolean
+        default: true
 
 concurrency:
   group: release-assets-${{ inputs.version }}
@@ -187,7 +191,7 @@ jobs:
           cd dist
           sha256sum "${TAG}-setup.tar.gz" > "${TAG}-setup.tar.gz.sha256"
 
-      - name: Attach to the draft and publish
+      - name: Attach to the draft
         run: |
           set -euo pipefail
           if [ "$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" != "true" ]; then
@@ -206,8 +210,44 @@ jobs:
             [ "${attempt}" -lt 5 ] || exit 1
             sleep 30
           done
+
+      # A published release is installable, and installs need its images. If they never
+      # appear the release stays a draft; re-run this job once they exist.
+      - name: Wait for the Docker images
+        if: inputs.wait_for_images
+        env:
+          IMAGE_WAIT_SECONDS: 7200
+        run: |
+          set -euo pipefail
+          image_exists() {
+            local token
+            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${1}:pull" | jq -r .token)" || return 1
+            [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${1}/manifests/${VERSION}")" = 200 ]
+          }
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+            until image_exists "${image}"; do
+              if [ "${SECONDS}" -ge "${IMAGE_WAIT_SECONDS}" ]; then
+                echo "::error::ghcr.io/${image}:${VERSION} did not appear; ${TAG} stays a draft."
+                exit 1
+              fi
+              sleep 60
+            done
+          done
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          # Finishing an old draft must not move `latest` back.
+          LATEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          LATEST="${LATEST#openflows-}"
+          MAKE_LATEST=true
+          if [ -n "${LATEST}" ] && [ "$(printf '%s\n' "${LATEST}" "${VERSION}" | sort -V | tail -1)" != "${VERSION}" ]; then
+            MAKE_LATEST=false
+          fi
           for attempt in 1 2 3 4 5; do
-            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest && break
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest="${MAKE_LATEST}" && break
             [ "${attempt}" -lt 5 ] || exit 1
             sleep 30
           done

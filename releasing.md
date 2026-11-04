@@ -87,7 +87,8 @@ PR "locks in" the new version and triggers the tag + GitHub Release.
 
 4. `release.yml` dispatches the Docker image workflows and **release-assets**
    (tags created with `GITHUB_TOKEN` trigger no workflows). It builds from the
-   tag, attaches these files to the draft, then publishes it:
+   tag, attaches these files to the draft, waits for both Docker images, then
+   publishes it:
 
    - `openflows-<X.Y.Z>-<target>.tar.gz` + `.sha256`
      for x86_64/aarch64 Linux-GNU (zigbuild), x86_64 Linux-musl, and x86_64/aarch64
@@ -104,7 +105,8 @@ PR "locks in" the new version and triggers the tag + GitHub Release.
 
 To test this flow, use a fork with immutable releases on: push a tag
 `openflows-X.Y.Z`, create a draft release for it, then dispatch `release-assets.yml`
-on your branch. Use a version newer than the latest real one for the shared App.
+on your branch with `wait_for_images` off. Use a version newer than the latest
+real one for the shared App.
 
 ## Commit message convention
 
