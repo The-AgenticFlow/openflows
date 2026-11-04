@@ -26,7 +26,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
-IMAGE_REPO="ghcr.io/the-agenticflow/openflows"
+IMAGE_REPO="${OPENFLOWS_IMAGE_REPO:-ghcr.io/the-agenticflow/openflows}"
+LAST_RELEASE_WITHOUT_SHARED_APP=1.8.1    # its Manager image predates the console sign-in
 BIN_DIR="${ROOT}/.dev-binaries"          # programs for the workspaces (always linux/amd64)
 HOST_BIN_DIR="${BIN_DIR}/host"           # programs for this machine, when those can't run here
 RELEASE_REPO="${OPENFLOWS_RELEASE_REPO:-The-AgenticFlow/openflows}"
@@ -602,24 +603,40 @@ github_app_manual() {
     env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
 }
 
+has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_SHARED_APP" ]; }
+# pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
+pin_manager_image() {
+    local version repo pinned digest
+    version="$(env_get OPENFLOWS_VERSION)"; repo="${IMAGE_REPO}-manager"
+    pinned="$(env_get OPENFLOWS_MANAGER_IMAGE)"
+    case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
+    docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
+        || die "No published Manager image for OpenFlows ${version} (${repo}:${version})." \
+            "Pick another OPENFLOWS_VERSION, or use your own App: OPENFLOWS_GITHUB_AUTH_MODE=self-managed."
+    digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+        | sed -n "s|^${repo}@||p" | head -1)"
+    [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
+    env_set OPENFLOWS_MANAGER_IMAGE "${repo}:${version}@${digest}"
+}
+
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
     local auth_mode
     auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     if [ -z "$auth_mode" ]; then
-        # connected-local still compiles the local Manager (docker compose --build), so
-        # installs without compiling default to the user's own App.
-        if [ "$MODE" != source ] || { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; }; then
+        if { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; } \
+            || { [ "$MODE" != source ] && ! has_shared_app "$(env_get OPENFLOWS_VERSION)"; }; then
             auth_mode=self-managed
         else
             auth_mode=connected-local
         fi
     fi
     if [ "$auth_mode" = connected-local ] && [ "$MODE" != source ]; then
-        die "The shared OpenFlows GitHub App (connected-local) does not work with --${MODE} yet." \
-            "It still compiles the local Manager from source (docker compose --build)." \
-            "Use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env," \
-            "or install from source:  ./scripts/setup.sh ${REPO} --source"
+        has_shared_app "$(env_get OPENFLOWS_VERSION)" \
+            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App (connected-local) without compiling." \
+                "Set a version newer than ${LAST_RELEASE_WITHOUT_SHARED_APP} as OPENFLOWS_VERSION in .env," \
+                "or use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env."
+        pin_manager_image
     fi
     env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     if [ "$auth_mode" = connected-local ]; then
@@ -688,20 +705,27 @@ compose_base_files() {
 }
 
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
+# compose_files — the -f arguments for this install, one per line; none for plain `docker compose`.
+# connected-local adds the local Manager (from its image unless compiling); the images
+# file copies the programs into .dev-binaries before Coder starts.
+compose_files() {
+    local extra=()
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
+        extra+=(-f docker-compose.connected-local.yml)
+        [ "$MODE" = source ] || extra+=(-f docker-compose.manager-image.yml)
+    fi
+    [ "$MODE" = compose ] && extra+=(-f docker-compose.images.yml)
+    if [ "${#extra[@]}" -gt 0 ]; then
+        compose_base_files
+        printf '%s\n' "${extra[@]}"
+    fi
+}
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i args=()
-    # connected-local adds the local Manager; the images file copies the programs into
-    # .dev-binaries before Coder starts. Without either, run plain `docker compose`.
-    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
-    [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
-    if [ "${#args[@]}" -gt 0 ]; then
-        local base=() line
-        while IFS= read -r line; do base+=("$line"); done < <(compose_base_files)
-        args=("${base[@]}" "${args[@]}")
-    fi
+    local out i line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
     args+=(up -d)
-    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && [ "$MODE" = source ] && args+=(--build)
     # Compose prefers shell variables over .env; pass the image from .env so a leftover
     # export (e.g. from an earlier upgrade) cannot copy a different version.
     local image_env=()
@@ -710,6 +734,7 @@ stage_docker() {
         "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
         "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
     if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
@@ -732,8 +757,14 @@ stage_docker() {
 # stage_connected_local_authorization — the team App is configured by the
 # OpenFlows release. Contributors install it, approve their own GitHub account,
 # and choose the requested repository in the local browser console.
+manager_repo_list() { # the repositories available to the signed-in GitHub user and the App
+    local line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    (cd "$ROOT" && docker compose "${args[@]}" exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null)
+}
 stage_connected_local_authorization() {
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] || return 0
+    TOTAL=$((TOTAL + 1))
     step "Connect GitHub"
     local manager_url="http://127.0.0.1:3002" status
     ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
@@ -743,7 +774,7 @@ stage_connected_local_authorization() {
     printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
         || die "This OpenFlows distribution does not include the team GitHub App configuration." \
                "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
-    if (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+    if manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
         ok "GitHub user authorization ready for ${REPO}"
         return
     fi
@@ -755,7 +786,7 @@ stage_connected_local_authorization() {
     open_url "${manager_url}/#console-key=${console_key}"
     is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
     pause "Complete GitHub connection in the local console, then continue"
-    (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
+    manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
         || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
                "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
     ok "GitHub user authorization ready for ${REPO}"

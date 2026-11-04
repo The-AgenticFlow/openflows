@@ -1,0 +1,9 @@
+# Apply after docker-compose.connected-local.yml to run the published Manager
+# image instead of compiling it. `setup.sh --compose` and `--binary` do this and
+# save the pinned image in .env as OPENFLOWS_MANAGER_IMAGE.
+services:
+  openflows-local-manager:
+    build: !reset null
+    image: ${OPENFLOWS_MANAGER_IMAGE:?set by setup.sh, e.g. ghcr.io/the-agenticflow/openflows-manager:1.9.0}
+    # The image is published for linux/amd64 only; Docker emulates it on ARM64.
+    platform: linux/amd64

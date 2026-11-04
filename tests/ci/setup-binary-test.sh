@@ -108,6 +108,33 @@ expect_eq ".env wins" "$(version_with 1.9.0 2.0.0 3.0.0)" 1.9.0
 expect_eq "then the setup kit" "$(version_with "" 2.0.0 3.0.0)" 2.0.0
 expect_eq "then the latest release" "$(version_with "" "" 3.0.0)" 3.0.0
 
+echo "Shared App without compiling"
+expect_shared() {   # expect_shared VERSION yes|no
+    if has_shared_app "$1"; then expect_eq "$1" yes "$2"; else expect_eq "$1" no "$2"; fi
+}
+expect_shared 1.8.1 no
+expect_shared 1.7.0 no
+expect_shared 1.8.2 yes
+expect_shared 1.10.0 yes
+files_for() {   # files_for MODE AUTH_MODE
+    (
+        ROOT="${WORK}/files-$RANDOM"; mkdir -p "$ROOT"; ENV_FILE="${ROOT}/.env"; MODE="$1"
+        printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\n' "$2" >"$ENV_FILE"
+        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
+        compose_files | grep -v '^-f$' | paste -sd' ' -
+    )
+}
+expect_eq "source, own App: plain compose" "$(files_for source self-managed)" ""
+expect_eq "source, shared App: compiles the Manager" "$(files_for source connected-local)" \
+    "docker-compose.yml docker-compose.connected-local.yml"
+expect_eq "binary, own App: plain compose" "$(files_for binary self-managed)" ""
+expect_eq "binary, shared App: Manager image" "$(files_for binary connected-local)" \
+    "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml"
+expect_eq "compose, own App: images" "$(files_for compose self-managed)" \
+    "docker-compose.yml docker-compose.images.yml"
+expect_eq "compose, shared App: images and Manager image" "$(files_for compose connected-local)" \
+    "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml docker-compose.images.yml"
+
 echo "prod.sh runs the installed programs"
 prod_bin() {   # prod_bin MODE HAS_HOST
     (
