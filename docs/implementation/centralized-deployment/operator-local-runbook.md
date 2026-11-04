@@ -55,9 +55,10 @@ address (or `0.0.0.0:3002` behind a host firewall), not `127.0.0.1:3002`, so
 (which has no built-in `host.docker.internal` alias), add the matching
 `extra_hosts: ["host.docker.internal:host-gateway"]` mapping to every service
 and workspace container that must reach the Manager — the Coder service in
-`deployment.compose.yml` includes it, and workspace templates must add the
-same mapping to the `docker_container` resources. Without this mapping, runtime
-registration and hook delivery fail on Linux.
+`deployment.compose.yml` includes it, and the workspace templates add the same
+mapping (`host { host = "host.docker.internal", ip = "host-gateway" }`) to
+their `docker_container` resources. Without this mapping, runtime registration
+and hook delivery fail on Linux. See [Linux hosts](#linux-hosts) below.
 
 Use `OPENFLOWS_CODER_BOOTSTRAP_EMAIL` only for a **new, empty Coder**. For an
 existing Coder, clear it and supply an administrator credential through
@@ -87,6 +88,18 @@ run Compose outside the checkout, set an absolute `OPENFLOWS_SECRET_DIR`.
 The hook key must be printable ASCII because Compose passes it to Coder as an
 environment variable. Coder and Manager must read the same file; setup rejects
 binary keys rather than silently accepting a value Coder cannot use intact.
+
+On Linux, workspaces cannot read their runtime credential by default. The
+Manager writes each secret file as mode 0600 owned by your host user, the
+file is bind-mounted into the workspace, and the workspace user (uid 1000) is
+a different user, so the agent harness fails with "Permission denied" on
+`/run/openflows/runtime.json`. Set `OPENFLOWS_SECRET_FILE_MODE=0644` for the
+Manager to create secret files readable inside the workspace. The Manager
+accepts a mode open to group or other only when `OPENFLOWS_SECRET_DIR` itself
+is mode 0700 (`chmod 700`), so other host users still cannot reach the files.
+Files created before the setting need `chmod 644` (or
+`setfacl -m u:1000:r <file>`). macOS Docker Desktop maps ownership and does
+not need this.
 
 ## 3. Start
 
@@ -136,5 +149,50 @@ connects and its runtime heartbeats. If it fails, inspect the operation and
 Coder build/agent logs.
 
 For changed templates, use a new `OPENFLOWS_RELEASE_NAME`; release names are
-immutable. For AWS staging/production, use the
+immutable. Template variables (`TF_VAR_docker_network`,
+`TF_VAR_dev_binary_host_path`, …) are captured when a release is published,
+so changing them also needs a new release name, followed by a promotion of
+that release to each existing organization. For AWS staging/production, use the
 [production runbook](operator-production-runbook.md).
+
+## Linux hosts
+
+A Linux host running the Manager directly (not in Compose) next to a Docker
+Coder needs these settings; each one was a failure seen in practice.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `OPENFLOWS_MANAGER_ADDR` | the `docker0` bridge address, e.g. `172.17.0.1:3002` | Containers cannot reach a Manager bound to `127.0.0.1`. The bridge address is not exposed to your network, unlike `0.0.0.0`. Point the Console's `OPENFLOWS_MANAGER_URL` at the same address. |
+| `OPENFLOWS_RUNTIME_MANAGER_URL` | `http://172.17.0.1:3002` (or `http://host.docker.internal:3002` with templates that map it) | Workspaces register, heartbeat and request credentials here. Check from inside a container with `curl http://<address>/health`. |
+| `OPENFLOWS_HOOK_URL` | `http://host.docker.internal:3002/api/v1/hooks/coder/chat` | Coder calls this; the Coder service has the host-gateway mapping. |
+| `OPENFLOWS_RUNTIME_REDIS_URL` | `redis://redis:6379` | Workspaces cannot reach a Redis published on host loopback. Attach the Redis container to the workspace network with the alias `redis` (`docker network connect --alias redis <network> <redis-container>`). |
+| `OPENFLOWS_PROVISIONER_NETWORK` / `OPENFLOWS_PROVISIONER_CODER_URL` | the Coder Compose network and `http://coder:7080` | Per-organization provisioner containers otherwise dial `host.docker.internal:7080`, which is refused when Coder publishes on `127.0.0.1` only. |
+| `TF_VAR_docker_network` | the same Coder Compose network | Workspaces must join the network the relay and Redis are on. |
+| `TF_VAR_dev_binary_host_path` | absolute path to `.dev-binaries` | Run `make dev-sync` first; workspaces mount these binaries. |
+| `OPENFLOWS_RUNTIME_RELAY_BASE_URL` | `http://127.0.0.1:7081/tenants/{tenant}` | Run the relay (`runtime-relay` in `docker-compose.yml`) on the workspace network, published on `127.0.0.1:7081`. |
+
+Coder needs, in addition to its licence (multi-organization and external
+provisioners are Premium features):
+
+- `CODER_EXPERIMENTS=agent-lifecycle-hooks,oauth2` — the OAuth2 provider
+  lets each user link their Coder account to OpenFlows.
+- `CODER_CHAT_HOOK_ENABLED=true`, `CODER_CHAT_HOOK_URL` (the hook URL above)
+  and `CODER_CHAT_HOOK_SECRET` (the same value as the Manager's
+  `coder-hook-secret`). Coder refuses a plain-HTTP hook URL unless
+  `CODER_CHAT_HOOK_ALLOW_INSECURE=true`; allow that on a local host only and
+  use HTTPS everywhere else.
+- GitHub sign-in (`CODER_OAUTH2_GITHUB_CLIENT_ID` / `_CLIENT_SECRET`,
+  `_ALLOW_SIGNUPS`). Account linking accepts only GitHub-backed Coder
+  accounts. Locally you may reuse the OpenFlows GitHub App: add
+  `<coder-url>/api/v2/users/oauth2/github/callback` as an extra callback URL
+  and grant the App the *Email addresses: read-only* account permission
+  (Coder reads `/user/emails`). Use a separate client in production.
+- An OAuth2 provider app for the Manager, with callback
+  `<openflows-public-url>/auth/coder/callback`; put its client id in
+  `OPENFLOWS_CODER_OAUTH_CLIENT_ID` and its secret in a secret file referenced
+  by `OPENFLOWS_CODER_OAUTH_CLIENT_SECRET_REF`.
+
+A runtime that was offline for longer than its 24-hour refresh window (for
+example a laptop that slept) can no longer re-authenticate; its tenant status
+reports `runtime.health = "restart_required"`. Stop and start the tenant to
+issue a fresh bootstrap, or use `repair-runtime` above.
