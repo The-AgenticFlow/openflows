@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.kind.outputs.release }}
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -148,3 +149,31 @@ jobs:
             docker buildx imagetools create -t "${image}:${floating}" "${image}:${version}"
             echo "\`${floating}\` -> \`${version}\`" >> "$GITHUB_STEP_SUMMARY"
           done <<<"${moves}"
+
+  # Shares its concurrency group with docker-publish.yml so the two workflows
+  # never edit the same release notes at once. The script comes from the
+  # workflow's own ref, since the release ref built above may predate it.
+  record-digest:
+    name: Record digest in release notes
+    needs: build
+    if: needs.build.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-notes-${{ inputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout: scripts/record-image-digest.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Record the image digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAG: ${{ inputs.tag }}
+        run: scripts/record-image-digest.sh "${TAG}" "${REGISTRY}/${IMAGE_NAME}" "${DIGEST}"
