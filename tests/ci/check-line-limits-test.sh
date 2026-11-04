@@ -103,6 +103,28 @@ expect_clean() {
     pass "$desc"
 }
 
+# expect_error <desc> <repo> <base> <head> — the checker must fail (non-zero)
+# and surface a git error rather than silently passing (fail-closed).
+expect_error() {
+    local desc="$1" repo="$2" base="$3" head="$4"
+    local out code
+    set +e
+    out="$(run_check "$repo" "$base" "$head" 2>&1)"
+    code=$?
+    set -e
+    if [ "$code" -eq 0 ]; then
+        fail "$desc (expected a non-zero exit, got 0)"
+        printf '      output:\n%s\n' "$out" | sed 's/^/      /'
+        return
+    fi
+    if [[ "$out" != *"ERROR"* ]]; then
+        fail "$desc (expected an ERROR in output)"
+        printf '      output:\n%s\n' "$out" | sed 's/^/      /'
+        return
+    fi
+    pass "$desc"
+}
+
 # ── Scenario 1: new + modified files vs the cap ────────────────────────────
 repo="$(new_repo)"
 gen_lines "$repo/small.rs" 500
@@ -189,6 +211,37 @@ develop_head="$(commit "$repo" develop-shrink)"  # develop shrank f.rs to 900
 echo "Scenario 6: an advancing base branch does not flag an unrelated PR"
 expect_clean "unrelated PR passes when the base branch shrank a grandfathered file" \
     "$repo" "$develop_head" "$feature_head"
+
+# ── Scenario 7: markdown files are excluded ─────────────────────────────────
+repo="$(new_repo)"
+gen_lines "$repo/CHANGELOG.md" 500
+base7="$(commit "$repo" base)"
+
+gen_lines "$repo/CHANGELOG.md" 1500   # M: grows a lot -> would violate if counted
+gen_lines "$repo/new.md" 2000          # A: new big markdown -> would violate if counted
+head7="$(commit "$repo" head)"
+
+echo "Scenario 7: markdown files are excluded from the cap"
+expect_clean "markdown files are not subject to the cap" "$repo" "$base7" "$head7"
+
+# ── Scenario 8: boundary just over the cap ──────────────────────────────────
+repo="$(new_repo)"
+gen_lines "$repo/placeholder.rs" 1
+base8="$(commit "$repo" base)"
+
+gen_lines "$repo/over.rs" 1001         # A: one line over the cap -> violation
+head8="$(commit "$repo" head)"
+
+echo "Scenario 8: a new file one line over the cap is caught"
+expect_violation "a new file at 1001 lines is caught" "$repo" "$base8" "$head8" "over.rs"
+
+# ── Scenario 9: git failure fails closed ────────────────────────────────────
+repo="$(new_repo)"
+gen_lines "$repo/a.rs" 10
+base9="$(commit "$repo" base)"
+
+echo "Scenario 9: a git failure fails the check instead of passing"
+expect_error "invalid BASE_SHA exits non-zero with an error" "$repo" "DEADBEEF-not-a-commit" "HEAD"
 
 # ── Cleanup ─────────────────────────────────────────────────────────────────
 # The EXIT trap removes the temp parent and every scratch repo under it.

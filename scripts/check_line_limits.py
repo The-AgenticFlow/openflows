@@ -17,8 +17,9 @@ This stops new bloat (new files over the cap) and stops existing files from
 growing, without ever forcing a big refactor of files that already exceed the
 cap today.
 
-Scope: all tracked text files, excluding lockfiles, build/vendored output and
-binary files (see IGNORED_PATTERNS below).
+Scope: tracked source/config text files. Markdown/docs, lockfiles,
+build/vendored output, generated artifacts and binary files are excluded (see
+IGNORED_PATTERNS below).
 
 Usage (run from inside the git repository):
     BASE_SHA=<base> HEAD_SHA=<head> python3 scripts/check_line_limits.py
@@ -67,6 +68,8 @@ IGNORED_PATTERNS = [
     "*.exe",
     "*.pb.go",
     "*.pb.ts",
+    "*.md",
+    "*.markdown",
     "target/",
     "dist/",
     "build/",

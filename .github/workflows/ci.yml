@@ -160,8 +160,8 @@ jobs:
           fetch-depth: 0
       - name: Enforce per-file line-count limits
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: python3 scripts/check_line_limits.py
 
   redis-lifecycle:
