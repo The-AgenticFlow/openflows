@@ -23,11 +23,16 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     set +a
 fi
 
-# A compose install (setup.sh --compose) has no Rust toolchain: run the programs
-# copied from the published image instead of building them.
-if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ] && [ -z "${OPENFLOWS_BIN:-}" ]; then
-    OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
-fi
+# Compose and binary installs (setup.sh --compose, --binary) have no Rust toolchain:
+# run the installed programs instead of building them. .dev-binaries/host holds a
+# native copy on machines that can't run the workspaces' linux/amd64 programs.
+case "${OPENFLOWS_SETUP_MODE:-}" in
+    compose|binary)
+        if [ -z "${OPENFLOWS_BIN:-}" ]; then
+            OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
+            [ -x "${PROJECT_ROOT}/.dev-binaries/host/openflows" ] && OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/host/openflows"
+        fi ;;
+esac
 
 # Track whether the caller explicitly pinned a binary (env var or --bin flag).
 # When explicit, we respect it as-is and never touch it. Otherwise we always
@@ -42,9 +47,9 @@ else
     OPENFLOWS_BIN_EXPLICIT=0
 fi
 SKIP_BUILD=false
-if [ "${OPENFLOWS_SETUP_MODE:-}" = "compose" ]; then
-    SKIP_BUILD=true   # also skips the dev-sync build in `bootstrap`
-fi
+case "${OPENFLOWS_SETUP_MODE:-}" in
+    compose|binary) SKIP_BUILD=true ;;   # also skips the dev-sync build in `bootstrap`
+esac
 BUILD_DONE=false
 
 usage() {
