@@ -123,6 +123,24 @@ impl Policy {
         }
     }
 
+    /// Require an active admin for a *read* (for example the audit log). Unlike
+    /// [`Policy::require_admin`], this does not demand a mutable organization,
+    /// so admins can still read history while the organization provisions.
+    pub fn require_admin_view(
+        membership: Option<&Membership>,
+        org: Option<&OrganizationState>,
+    ) -> Result<(), ManagerError> {
+        Self::require_member(membership, org)?;
+        let m = membership.expect("require_member guarantees membership");
+        match (m.status, m.role) {
+            (MembershipStatus::Active, MembershipRole::Admin) => Ok(()),
+            _ => Err(ManagerError::api(
+                "ORG_ADMIN_REQUIRED",
+                "an organization admin is required for this action",
+            )),
+        }
+    }
+
     /// Require an active developer-or-above (admin or developer). Viewers are
     /// denied with 403.
     pub fn require_developer(

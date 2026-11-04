@@ -3,6 +3,66 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.8.1] - 2026-10-29
+
+### Bug Fixes
+
+- *(docker)* Ship the templates, document /ready and the missing docker cli
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(docker)* Use supported Rust toolchain and permit release rebuild override
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+### Documentation
+
+- *(manager)* List every subcommand in the image section
+
+
+
+
+
+
+
+  by @onelrian
+
+### Build
+
+- *(docker)* Publish the openflows-manager image
+
+
+
+
+
+
+
+  by @onelrian
+
+
+
+
+### Contributors
+
+- @Christiantyemele
+- @onelrian
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.0...openflows-1.8.1
+
+
+
 ## [1.8.0] - 2026-10-28
 
 ### Features
@@ -640,13 +700,6 @@ All notable changes to this project will be documented in this file.
   by @NkwaTambe
 
 
-
-
-### Contributors
-
-- @Christiantyemele
-- @NkwaTambe
-- @lele-maxwell
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.7.1...openflows-1.8.0
 
