@@ -15,6 +15,7 @@ pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
+pub mod operations;
 pub mod organizations;
 pub mod platform;
 pub mod platform_releases;
@@ -90,6 +91,10 @@ fn api_v1_router() -> Router<AppState> {
         )
         .route("/organizations/{org}/audit", get(audit::list_audit))
         .route("/platform/overview", get(platform::overview))
+        .route(
+            "/organizations/{org}/operations",
+            get(operations::list_operations),
+        )
         .route("/operations/{id}", get(organizations::get_operation))
         .route(
             "/operations/{id}/retry",
