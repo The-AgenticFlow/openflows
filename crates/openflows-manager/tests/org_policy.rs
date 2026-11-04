@@ -314,6 +314,79 @@ async fn invitation_wrong_invitee_expired_revoked_and_concurrent_acceptance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated PostgreSQL"]
+async fn a_removed_member_can_rejoin_through_a_fresh_invitation() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let owner = ensure_user(pool, 1, 100, "alice").await;
+    let bob = ensure_user(pool, 2, 101, "bob").await;
+    let org = insert_organization_with_owner(pool, "rejoin", owner.0)
+        .await
+        .unwrap();
+    let repo = OrganizationRepository::new(pool.clone());
+    let scope = OrgScope::new(OrganizationId::from_uuid(org));
+    let membership = |pool: sqlx::PgPool| async move {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT role, status FROM memberships WHERE organization_id=$1 AND user_id=$2",
+        )
+        .bind(org)
+        .bind(bob.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let first = repo
+        .create_invitation(scope, 101, MembershipRole::Viewer, "rejoin-1", owner)
+        .await
+        .unwrap();
+    repo.accept_invitation(first, 101, bob).await.unwrap();
+    assert_eq!(
+        membership(pool.clone()).await,
+        ("viewer".into(), "active".into())
+    );
+
+    // Removed: the row stays, inactive.
+    sqlx::query("UPDATE memberships SET status='removed' WHERE organization_id=$1 AND user_id=$2")
+        .bind(org)
+        .bind(bob.0)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // A new invitation brings them back with the role it was issued for.
+    let second = repo
+        .create_invitation(scope, 101, MembershipRole::Developer, "rejoin-2", owner)
+        .await
+        .unwrap();
+    repo.accept_invitation(second, 101, bob).await.unwrap();
+    assert_eq!(
+        membership(pool.clone()).await,
+        ("developer".into(), "active".into())
+    );
+
+    // A suspended membership is an admin's decision: an invitation must not undo it.
+    sqlx::query(
+        "UPDATE memberships SET status='suspended' WHERE organization_id=$1 AND user_id=$2",
+    )
+    .bind(org)
+    .bind(bob.0)
+    .execute(pool)
+    .await
+    .unwrap();
+    let third = repo
+        .create_invitation(scope, 101, MembershipRole::Admin, "rejoin-3", owner)
+        .await
+        .unwrap();
+    assert!(repo.accept_invitation(third, 101, bob).await.is_err());
+    assert_eq!(
+        membership(pool.clone()).await,
+        ("developer".into(), "suspended".into())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL"]
 async fn org_creation_rolls_back_fully_on_failure() {
     let db = TestDb::new().await.unwrap();
     db.migrate().await.unwrap();
