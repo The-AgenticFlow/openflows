@@ -200,5 +200,14 @@ jobs:
             test -s "dist/${TAG}-${target}.tar.gz"
             test -s "dist/${TAG}-${target}.tar.gz.sha256"
           done
-          gh release upload "${TAG}" dist/*.tar.gz dist/*.sha256 --repo "${GITHUB_REPOSITORY}" --clobber
-          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
+          # GitHub's upload API fails now and then; both commands are safe to repeat.
+          for attempt in 1 2 3 4 5; do
+            gh release upload "${TAG}" dist/*.tar.gz dist/*.sha256 --repo "${GITHUB_REPOSITORY}" --clobber && break
+            [ "${attempt}" -lt 5 ] || exit 1
+            sleep 30
+          done
+          for attempt in 1 2 3 4 5; do
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest && break
+            [ "${attempt}" -lt 5 ] || exit 1
+            sleep 30
+          done
