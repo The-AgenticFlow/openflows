@@ -108,6 +108,40 @@ expect_eq ".env wins" "$(version_with 1.9.0 2.0.0 3.0.0)" 1.9.0
 expect_eq "then the setup kit" "$(version_with "" 2.0.0 3.0.0)" 2.0.0
 expect_eq "then the latest release" "$(version_with "" "" 3.0.0)" 3.0.0
 
+echo "Switching versions"
+switch_to() {   # switch_to VERSION — run the release stage; echo what is installed afterwards
+    (
+        ROOT="${WORK}/switch"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"; HOST_BIN_DIR="${BIN_DIR}/host"
+        LOG_FILE="${WORK}/switch.log"; MODE=binary; REPO=o/r
+        needs_host_programs() { return 1; }
+        mkdir -p "$ROOT"; touch "$ENV_FILE"
+        env_set OPENFLOWS_VERSION "$1"
+        set -e
+        stage_release >/dev/null 2>&1
+    ) || echo "stopped"
+    "${WORK}/switch/.dev-binaries/openflows"
+}
+harness() { "${WORK}/switch/.dev-binaries/openflows-harness"; }
+publish 3.0.0 "$WORKSPACE_TARGET"
+publish 3.1.0 "$WORKSPACE_TARGET"
+expect_eq "install" "$(switch_to 3.0.0)" "openflows 3.0.0 ${WORKSPACE_TARGET}"
+expect_eq "upgrade" "$(switch_to 3.1.0)" "openflows 3.1.0 ${WORKSPACE_TARGET}"
+expect_eq "rollback" "$(switch_to 3.0.0)" "openflows 3.0.0 ${WORKSPACE_TARGET}"
+expect_eq "a version without files stops and keeps the programs" "$(switch_to 2.9.9 | paste -sd' ' -)" "stopped openflows 3.0.0 ${WORKSPACE_TARGET}"
+switch_to 3.0.0 >/dev/null
+rm "${WORK}/switch/.dev-binaries/openflows-harness"
+switch_to 3.0.0 >/dev/null
+expect_eq "a deleted program is restored" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
+printf '#!/bin/sh\necho damaged\n' >"${WORK}/switch/.dev-binaries/openflows-harness"
+switch_to 3.0.0 >/dev/null
+expect_eq "a damaged program is restored" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
+printf '#!/bin/sh\necho openflows-harness 3.1.0\n' >"${WORK}/switch/.dev-binaries/openflows-harness"
+switch_to 3.0.0 >/dev/null
+expect_eq "a half-finished switch is repaired" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
+touch -t 202001010000 "${WORK}/switch/.dev-binaries/openflows"
+switch_to 3.0.0 >/dev/null
+expect_eq "intact programs are not downloaded again" "$(date -r "${WORK}/switch/.dev-binaries/openflows" +%Y)" 2020
+
 echo "Shared App without compiling"
 expect_shared() {   # expect_shared VERSION yes|no
     if has_shared_app "$1"; then expect_eq "$1" yes "$2"; else expect_eq "$1" no "$2"; fi

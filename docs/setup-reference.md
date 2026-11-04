@@ -278,7 +278,7 @@ Linux or macOS, x86-64 or ARM64. Workspaces always run `linux/amd64` (Docker emu
 
 ### Install from release binaries (`--binary`)
 
-`./scripts/setup.sh owner/repo --binary` works like `--compose`, with no image: setup downloads `openflows-<version>-<target>.tar.gz` from the release, verifies it against its `.sha256`, and installs the programs into `.dev-binaries/` (recorded in `.dev-binaries/RELEASE`). Upgrade and rollback are the same as above.
+`./scripts/setup.sh owner/repo --binary` works like `--compose`, with no image: setup downloads `openflows-<version>-<target>.tar.gz` from the release, verifies it against its `.sha256`, and installs the programs into `.dev-binaries/` (recorded in `.dev-binaries/RELEASE` and `CHECKSUMS`). Each run re-downloads them if one is missing or damaged. A failed download leaves the installed programs as they were. Upgrade and rollback are the same as above.
 
 Without a checkout, use the release's `openflows-<version>-setup.tar.gz` ([quick start](../quick_start.md#run)). It contains the setup scripts and Compose files, and defaults to `--binary` at its own version. `OPENFLOWS_VERSION` in `.env` overrides that.
 

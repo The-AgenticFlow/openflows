@@ -435,14 +435,26 @@ resolve_version() {
 installed_ref() { # the exact programs this install runs; a change means pushing templates again
     if [ "$MODE" = compose ]; then image_ref; else printf 'release:%s' "$(env_get OPENFLOWS_VERSION)"; fi
 }
+# programs_intact — the installed programs are the ones the last download verified. Catches a
+# deleted or damaged program and a switch that was interrupted halfway.
+programs_intact() {
+    local bin
+    for bin in openflows openflows-doctor openflows-harness; do
+        [ "$(sha256_of "${BIN_DIR}/${bin}" 2>/dev/null)" = "$(awk -v b="$bin" '$2 == b {print $1}' "${BIN_DIR}/CHECKSUMS" 2>/dev/null)" ] || return 1
+    done
+}
 stage_release() {
     step "OpenFlows release (no compiling)"
     local version
     version="$(resolve_version)"
     mkdir -p "$BIN_DIR"
-    if [ "$(cat "${BIN_DIR}/RELEASE" 2>/dev/null)" != "$version" ] || [ -f "${BIN_DIR}/IMAGE" ] || [ ! -x "${BIN_DIR}/openflows" ]; then
+    if [ "$(cat "${BIN_DIR}/RELEASE" 2>/dev/null)" != "$version" ] || [ -f "${BIN_DIR}/IMAGE" ] || ! programs_intact; then
         fetch_programs "$version" "$WORKSPACE_TARGET" "$BIN_DIR"
         printf '%s\n' "$version" >"${BIN_DIR}/RELEASE"
+        local bin
+        for bin in openflows openflows-doctor openflows-harness; do
+            printf '%s  %s\n' "$(sha256_of "${BIN_DIR}/${bin}")" "$bin"
+        done >"${BIN_DIR}/CHECKSUMS"
         rm -f "${BIN_DIR}/IMAGE"
     fi
     use_host_programs "$version"
