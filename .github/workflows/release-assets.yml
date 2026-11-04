@@ -8,7 +8,8 @@ name: Release Assets
 # Dispatched by `release.yml`: tags created with GITHUB_TOKEN trigger no workflows.
 # Each run bundles all shipped binaries (`openflows`, `openflows-doctor`,
 # `openflows-harness`) into one tarball per platform, plus the files
-# `setup.sh --binary` needs without a checkout. Asset names are fixed:
+# `setup.sh --binary` needs without a checkout, and calls `template-release.yml` for
+# the template bundles. Asset names are fixed:
 # `openflows-<version>-<target>.tar.gz(+.sha256)`, `openflows-<version>-setup.tar.gz(+.sha256)`.
 
 on:
@@ -144,10 +145,18 @@ jobs:
           path: dist/*
           retention-days: 5
 
+  templates:
+    name: Template bundles
+    uses: ./.github/workflows/template-release.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ inputs.version }}
+
   attach:
     name: Attach assets and publish
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, templates]
     permissions:
       contents: write
     env:
