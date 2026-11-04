@@ -7,8 +7,8 @@ use axum::{
 };
 use serde::Serialize;
 
-pub mod audit;
 pub mod agent_activity;
+pub mod audit;
 pub mod auth;
 pub mod coder_hooks;
 pub mod coder_identity;
