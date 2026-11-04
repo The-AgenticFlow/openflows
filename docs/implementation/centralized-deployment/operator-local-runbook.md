@@ -89,6 +89,18 @@ The hook key must be printable ASCII because Compose passes it to Coder as an
 environment variable. Coder and Manager must read the same file; setup rejects
 binary keys rather than silently accepting a value Coder cannot use intact.
 
+On Linux, workspaces cannot read their runtime credential by default. The
+Manager writes each secret file as mode 0600 owned by your host user, the
+file is bind-mounted into the workspace, and the workspace user (uid 1000) is
+a different user, so the agent harness fails with "Permission denied" on
+`/run/openflows/runtime.json`. Set `OPENFLOWS_SECRET_FILE_MODE=0644` for the
+Manager to create secret files readable inside the workspace. The Manager
+accepts a mode open to group or other only when `OPENFLOWS_SECRET_DIR` itself
+is mode 0700 (`chmod 700`), so other host users still cannot reach the files.
+Files created before the setting need `chmod 644` (or
+`setfacl -m u:1000:r <file>`). macOS Docker Desktop maps ownership and does
+not need this.
+
 ## 3. Start
 
 If you will create or restart local Coder workspaces, first build the Linux

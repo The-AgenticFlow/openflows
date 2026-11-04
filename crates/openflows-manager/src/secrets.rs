@@ -17,6 +17,58 @@ use async_trait::async_trait;
 /// name; callers store only the reference in their own records.
 pub type SecretRef = String;
 
+#[cfg(all(test, unix))]
+mod file_mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn dir_with_mode(mode: u32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn default_mode_is_owner_only() {
+        let dir = dir_with_mode(0o700);
+        let p = FilesystemSecretProvider::new(dir.path()).unwrap();
+        let r = p.put("a", b"x").await.unwrap();
+        let mode = std::fs::metadata(r).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn wider_mode_applies_exactly_in_a_closed_directory() {
+        let dir = dir_with_mode(0o700);
+        let p = FilesystemSecretProvider::new(dir.path())
+            .unwrap()
+            .with_file_mode(0o644)
+            .unwrap();
+        let r = p.put("a", b"x").await.unwrap();
+        let mode = std::fs::metadata(r).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn wider_mode_is_refused_when_the_directory_is_open() {
+        let dir = dir_with_mode(0o755);
+        let err = FilesystemSecretProvider::new(dir.path())
+            .unwrap()
+            .with_file_mode(0o644)
+            .unwrap_err();
+        assert!(matches!(err, SecretError::Rejected(_)));
+    }
+
+    #[test]
+    fn invalid_modes_are_refused() {
+        let dir = dir_with_mode(0o700);
+        for mode in [0o400, 0o1000, 0o200] {
+            let p = FilesystemSecretProvider::new(dir.path()).unwrap();
+            assert!(p.with_file_mode(mode).is_err(), "{mode:o}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod reference_tests {
     use super::*;
@@ -419,14 +471,27 @@ impl SecretProvider for InMemorySecretProvider {
     }
 }
 
-/// Durable local/Docker secret backend. Each secret is a mode-0600 file under
-/// one operator-selected directory; the returned reference is directly
-/// mountable by the Docker provisioner. Kubernetes deployments should provide
-/// their own Secret-backed adapter rather than sharing this host directory.
+/// Durable local/Docker secret backend. Each secret is a file under one
+/// operator-selected directory (mode 0600 by default); the returned reference
+/// is directly mountable by the Docker provisioner. Kubernetes deployments
+/// should provide their own Secret-backed adapter rather than sharing this
+/// host directory.
+///
+/// A mounted file keeps the host owner and mode. On Linux the workspace user
+/// (uid 1000) is not the host user, so a 0600 runtime credential is unreadable
+/// inside the workspace and the agent harness cannot start. `with_file_mode`
+/// lets the operator widen the file mode (for example 0644). That is only
+/// accepted when the secret directory itself denies group and other access
+/// (mode 0700): the files stay unreachable to other host users, and only the
+/// container, which bind-mounts the single file, can read it.
 #[derive(Debug)]
 pub struct FilesystemSecretProvider {
     root: std::path::PathBuf,
+    file_mode: u32,
 }
+
+/// Default secret file mode: owner read/write only.
+pub const DEFAULT_SECRET_FILE_MODE: u32 = 0o600;
 
 impl FilesystemSecretProvider {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, SecretError> {
@@ -437,7 +502,39 @@ impl FilesystemSecretProvider {
         let root = root.canonicalize().map_err(|e| {
             SecretError::Unavailable(format!("cannot resolve secret directory: {e}"))
         })?;
-        Ok(FilesystemSecretProvider { root })
+        Ok(FilesystemSecretProvider {
+            root,
+            file_mode: DEFAULT_SECRET_FILE_MODE,
+        })
+    }
+
+    /// Use `mode` for newly created secret files. The owner must keep
+    /// read/write. Any group/other bit requires a secret directory that is
+    /// closed to group and other (no `0o077` bits), so widening a file never
+    /// exposes it to other host users.
+    pub fn with_file_mode(mut self, mode: u32) -> Result<Self, SecretError> {
+        if mode > 0o777 || mode & 0o600 != 0o600 {
+            return Err(SecretError::Rejected(
+                "secret file mode must be at most 0777 and keep owner read/write".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if mode & 0o077 != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&self.root)
+                .map_err(|e| {
+                    SecretError::Unavailable(format!("cannot inspect secret directory: {e}"))
+                })?
+                .permissions()
+                .mode();
+            if dir_mode & 0o077 != 0 {
+                return Err(SecretError::Rejected(
+                    "a secret file mode open to group or other requires the secret directory to be mode 0700".into(),
+                ));
+            }
+        }
+        self.file_mode = mode;
+        Ok(self)
     }
 
     fn path(&self, reference: &str) -> Result<std::path::PathBuf, SecretError> {
@@ -478,12 +575,20 @@ impl SecretProvider for FilesystemSecretProvider {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            // Create closed, then set the exact mode: the umask would
+            // otherwise silently trim a wider requested mode.
             options.mode(0o600);
         }
         let mut file = options.open(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => SecretError::AlreadyExists(name.into()),
             _ => SecretError::Unavailable(format!("cannot create secret: {e}")),
         })?;
+        #[cfg(unix)]
+        if self.file_mode != 0o600 {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(self.file_mode))
+                .map_err(|e| SecretError::Unavailable(format!("cannot set secret mode: {e}")))?;
+        }
         file.write_all(value)
             .and_then(|_| file.sync_all())
             .map_err(|e| SecretError::Unavailable(format!("cannot write secret: {e}")))?;
