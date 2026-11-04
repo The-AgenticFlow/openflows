@@ -120,13 +120,19 @@ def run_tenant_add(log):
         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
     global TENANT_LINKED
     deadline = time.monotonic() + 600
-    while proc.poll() is None:
-        if time.monotonic() > deadline:
+    try:
+        while proc.poll() is None:
+            if time.monotonic() > deadline:
+                raise TimeoutError('openflows tenant add did not finish')
+            if not TENANT_LINKED:
+                TENANT_LINKED = link_tenant_github()
+            time.sleep(2)
+    finally:
+        # Never leave provisioning running after a failed link or timeout: the
+        # launcher tears down Coder as soon as this test exits.
+        if proc.poll() is None:
             proc.kill()
-            raise TimeoutError('openflows tenant add did not finish')
-        if not TENANT_LINKED:
-            TENANT_LINKED = link_tenant_github()
-        time.sleep(2)
+        proc.wait()
     return proc.returncode
 
 
