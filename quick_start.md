@@ -78,7 +78,13 @@ It will:
 8. Push the workspace templates. With `--source` it builds the binaries first (about 10 minutes the first time); otherwise it uses the installed programs.
 9. Connect your repo. With the shared App, the local Manager renews your GitHub App user token when needed and supplies it to the workspaces; with your own App, you click **Authorize** once to link GitHub to your Coder account.
 
-For connected-local mode, open the Manager console at <http://localhost:3002> after setup. The console handles App installation, GitHub approval, and repository selection.
+With the shared App, setup pauses and opens the Manager console at <http://localhost:3002>. There:
+
+1. Click **Install OpenFlows App** and choose your repository.
+2. Click **Connect GitHub** and approve the device code. Your repositories appear only after this.
+3. Select your repository, click **Use selected repository**, then press Enter in the terminal.
+
+If the console asks for its key, reopen it with `xdg-open "http://127.0.0.1:3002/#console-key=$(cat ~/.config/openflows/console-key)"` (macOS: `open`).
 
 Maintainers can verify the team App with a disposable repository: approve the
 device code, confirm the repository appears in the console, and run one test

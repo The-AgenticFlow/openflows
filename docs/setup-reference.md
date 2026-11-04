@@ -238,6 +238,7 @@ Both GitHub App modes work ([details](#shared-github-app-without-compiling)).
 | `OPENFLOWS_HOST_UID`, `OPENFLOWS_HOST_GID` | Setup | Your user, so the copied programs are owned by you |
 | `OPENFLOWS_MANAGER_IMAGE` | Setup | Shared App only: the pinned Manager image |
 | `OPENFLOWS_SETUP_MODE` | Setup | `binary`, `compose` or `source`, reused when you run setup without a flag |
+| `OPENFLOWS_RELEASE_REPO`, `OPENFLOWS_IMAGE_REPO` | You, in the shell (optional) | Where to get release files (`owner/repo`) and images, for a fork or a mirror. Setup reads these from the shell, not `.env` |
 
 ### Checking the digest
 
@@ -500,6 +501,10 @@ The image's programs are copied as `OPENFLOWS_HOST_UID:OPENFLOWS_HOST_GID` (1000
 ### "OpenFlows X has no shared GitHub App (connected-local) without compiling"
 
 Releases 1.8.1 and older have no usable Manager image. Set a newer `OPENFLOWS_VERSION`, set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed` to use your own App, or install with `--source`.
+
+### The console's repository list is empty
+
+It fills in after **Connect GitHub**, and only with repositories that both you and the App can access. If the key box is empty, reopen the console with its key ([quick start](../quick_start.md#run)). If your repository is still missing, add it to the App's installation on GitHub, then click **Refresh**.
 
 ### "OpenFlows X has no T programs to download"
 

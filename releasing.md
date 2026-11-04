@@ -22,10 +22,10 @@ develop ──PR merge──▶ main          (release-only; guard enforces deve
         release-plz-* PR (version bump + CHANGELOG) ──▶ main
                      │  merge of that PR → release-plz release
                      ▼
-        tag openflows-X.Y.Z + single GitHub Release (no `v`)
+        tag openflows-X.Y.Z + single draft GitHub Release (no `v`)
                      ▼
-        release-assets → attach openflows-<X.Y.Z>-<target>.tar.gz
-                         (bundles openflows, openflows-doctor, openflows-harness)
+        release-assets → attach binaries, setup kit and template bundles,
+                         then publish the release
 ```
 
 - `develop` is the **default branch** and the integration point. All feature
@@ -33,8 +33,9 @@ develop ──PR merge──▶ main          (release-only; guard enforces deve
 - `main` is **release-only**. Only `develop` (and release-plz's own
   `release-plz-*` version-bump PRs) may be merged into `main`. A guard workflow
   (`release-branch.yml`) rejects any other PR to `main`.
-- release-plz is the sole publisher; the `release-assets` workflow attaches
-  binaries.
+- release-plz creates the release as a draft; the `release-assets` workflow
+  attaches its files and publishes it. Published releases are immutable, so
+  files can't be added afterwards.
 
 ## How versions are provided (automatic)
 
@@ -77,22 +78,33 @@ PR "locks in" the new version and triggers the tag + GitHub Release.
    appears, run the `Release → release-plz (release-pr)` workflow manually.)
 
 3. Merging that `release-plz-*` PR pushes `main` again, which triggers
-   **release-plz `release`** — it creates one tag and GitHub Release for the
-   `openflows` package:
+   **release-plz `release`** — it creates one tag and draft GitHub Release for
+   the `openflows` package:
 
    - `openflows-X.Y.Z` (release **openflows**).
 
    Tag/release name carries no `v` prefix.
 
-4. The tag push triggers **release-assets**, which builds and attaches the
-   cross-platform tarballs:
+4. `release.yml` dispatches the Docker image workflows and **release-assets**
+   (tags created with `GITHUB_TOKEN` trigger no workflows). It builds from the
+   tag, attaches these files to the draft, then publishes it:
 
    - `openflows-<X.Y.Z>-<target>.tar.gz` + `.sha256`
-     for x86_64/aarch64 Linux-GNU (zigbuild), Linux-musl, and macOS, each
-     containing the `openflows`, `openflows-doctor`, and `openflows-harness`
-     binaries.
+     for x86_64/aarch64 Linux-GNU (zigbuild), x86_64 Linux-musl, and x86_64/aarch64
+     macOS, each containing the `openflows`, `openflows-doctor`, and
+     `openflows-harness` binaries.
+   - `openflows-<X.Y.Z>-setup.tar.gz` + `.sha256`: what `setup.sh --binary` needs
+     without a checkout.
+   - `manifest.json` and the template bundles, from `template-release.yml`, for
+     the hosted Manager.
 
-   Asset names are fixed/predictable, so re-runs overwrite rather than error.
+5. **If a job fails**, the release stays a draft and isn't installable. Re-run the
+   failed jobs of `Release Assets`; re-runs overwrite files rather than error. A
+   published release can't be completed later.
+
+To test this flow, use a fork with immutable releases on: push a tag
+`openflows-X.Y.Z`, create a draft release for it, then dispatch `release-assets.yml`
+on your branch. Use a version newer than the latest real one for the shared App.
 
 ## Commit message convention
 
