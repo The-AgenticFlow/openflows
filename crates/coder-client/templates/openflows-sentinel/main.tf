@@ -415,6 +415,14 @@ resource "docker_container" "workspace" {
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
+  # Linux Docker has no built-in host.docker.internal. Map it to the host
+  # gateway so workspaces can reach a Manager running on the Docker host
+  # (Docker Desktop on macOS/Windows already provides this name).
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
+
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
