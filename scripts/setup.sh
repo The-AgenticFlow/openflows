@@ -26,7 +26,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
-IMAGE_REPO="${OPENFLOWS_IMAGE_REPO:-ghcr.io/the-agenticflow/openflows}"
 LAST_RELEASE_WITHOUT_SHARED_APP=1.8.1    # its Manager image predates the console sign-in
 BIN_DIR="${ROOT}/.dev-binaries"          # programs for the workspaces (always linux/amd64)
 HOST_BIN_DIR="${BIN_DIR}/host"           # programs for this machine, when those can't run here
@@ -228,6 +227,11 @@ env_set() { # env_set KEY VALUE — replace the line or append
     cat "$tmp" >"$ENV_FILE" && rm -f "$tmp"
     chmod 600 "$ENV_FILE"
 }
+# image_repo — where the images come from, in the order Compose reads it: shell, .env, default.
+image_repo() {
+    local repo="${OPENFLOWS_IMAGE_REPO:-$(env_get OPENFLOWS_IMAGE_REPO)}"
+    printf '%s' "${repo:-ghcr.io/the-agenticflow/openflows}"
+}
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
@@ -406,7 +410,8 @@ fetch_programs() { # fetch_programs VERSION TARGET DEST — install_archive, or 
 programs_intact() {
     local bin
     for bin in openflows openflows-doctor openflows-harness; do
-        [ "$(sha256_of "${1}/${bin}" 2>/dev/null)" = "$(awk -v b="$bin" '$2 == b {print $1}' "${1}/CHECKSUMS" 2>/dev/null)" ] || return 1
+        [ -f "${1}/${bin}" ] || return 1
+        [ "$(sha256_of "${1}/${bin}")" = "$(awk -v b="$bin" '$2 == b {print $1}' "${1}/CHECKSUMS" 2>/dev/null)" ] || return 1
     done
 }
 record_checksums() { # record_checksums DIR
@@ -471,7 +476,7 @@ stage_release() {
     ok "OpenFlows ${B}${version}${N} · checksums verified"
 }
 image_ref() { # image_ref → the exact image the stack runs, e.g. ghcr.io/…/openflows:1.8.1@sha256:…
-    printf '%s:%s@%s' "$IMAGE_REPO" "$(env_get OPENFLOWS_VERSION)" "$(env_get OPENFLOWS_IMAGE_DIGEST)"
+    printf '%s:%s@%s' "$(image_repo)" "$(env_get OPENFLOWS_VERSION)" "$(env_get OPENFLOWS_IMAGE_DIGEST)"
 }
 
 latest_release_version() { # latest published release, e.g. 1.8.1
@@ -481,26 +486,27 @@ latest_release_version() { # latest published release, e.g. 1.8.1
 
 stage_image() {
     step "OpenFlows image (no compiling)"
-    local version digest pinned label
+    local version digest pinned label repo
     version="$(resolve_version)"
+    repo="$(image_repo)"
 
     pinned="$(env_get OPENFLOWS_IMAGE_DIGEST)"
     if [ -n "$pinned" ]; then
-        docker pull -q --platform linux/amd64 "${IMAGE_REPO}@${pinned}" >"$LOG_FILE" 2>&1 \
-            || die "Image ${IMAGE_REPO}@${pinned} was not found." \
+        docker pull -q --platform linux/amd64 "${repo}@${pinned}" >"$LOG_FILE" 2>&1 \
+            || die "Image ${repo}@${pinned} was not found." \
                 "Check OPENFLOWS_IMAGE_DIGEST in .env against the release notes, or clear it to use ${version}'s current image."
         digest="$pinned"
     else
-        docker pull -q --platform linux/amd64 "${IMAGE_REPO}:${version}" >"$LOG_FILE" 2>&1 \
+        docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
             || die "No published image for OpenFlows ${version}." \
                 "Pick a version that has one: https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows"
-        digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE_REPO}:${version}" \
-            | sed -n "s|^${IMAGE_REPO}@||p" | head -1)"
-        [ -n "$digest" ] || die "Could not read the digest of ${IMAGE_REPO}:${version}."
+        digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+            | sed -n "s|^${repo}@||p" | head -1)"
+        [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
     fi
     # Docker ignores the tag when a digest is given, so a digest left over from
     # another version would otherwise install that version silently.
-    label="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${IMAGE_REPO}@${digest}" 2>/dev/null || true)"
+    label="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${repo}@${digest}" 2>/dev/null || true)"
     if [ -n "$label" ] && [ "$label" != "$version" ]; then
         die "OPENFLOWS_IMAGE_DIGEST is for version ${label}, not ${version}." \
             "Clear OPENFLOWS_IMAGE_DIGEST in .env, or set OPENFLOWS_VERSION=${label}."
@@ -624,7 +630,7 @@ has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | 
 # pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
 pin_manager_image() {
     local version repo pinned digest
-    version="$(env_get OPENFLOWS_VERSION)"; repo="${IMAGE_REPO}-manager"
+    version="$(env_get OPENFLOWS_VERSION)"; repo="$(image_repo)-manager"
     pinned="$(env_get OPENFLOWS_MANAGER_IMAGE)"
     case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
     docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \

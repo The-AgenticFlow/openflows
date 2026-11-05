@@ -238,7 +238,8 @@ Both GitHub App modes work ([details](#shared-github-app-without-compiling)).
 | `OPENFLOWS_HOST_UID`, `OPENFLOWS_HOST_GID` | Setup | Your user, so the copied programs are owned by you |
 | `OPENFLOWS_MANAGER_IMAGE` | Setup | Shared App only: the pinned Manager image |
 | `OPENFLOWS_SETUP_MODE` | Setup | `binary`, `compose` or `source`, reused when you run setup without a flag |
-| `OPENFLOWS_RELEASE_REPO`, `OPENFLOWS_IMAGE_REPO` | You, in the shell (optional) | Where to get release files (`owner/repo`) and images, for a fork or a mirror. Setup reads these from the shell, not `.env` |
+| `OPENFLOWS_IMAGE_REPO` | You (optional) | Where to get images, for a fork or a mirror. Set it in `.env` to keep it; the shell wins over `.env` |
+| `OPENFLOWS_RELEASE_REPO` | You, in the shell (optional) | Where to get release files (`owner/repo`). Setup reads this from the shell, not `.env` |
 
 ### Checking the digest
 

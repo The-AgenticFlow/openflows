@@ -138,6 +138,9 @@ expect_eq "a damaged program is restored" "$(harness)" "openflows-harness 3.0.0 
 printf '#!/bin/sh\necho openflows-harness 3.1.0\n' >"${WORK}/switch/.dev-binaries/openflows-harness"
 switch_to 3.0.0 >/dev/null
 expect_eq "a half-finished switch is repaired" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
+rm "${WORK}"/switch/.dev-binaries/{openflows,openflows-doctor,openflows-harness,CHECKSUMS}
+switch_to 3.0.0 >/dev/null
+expect_eq "programs deleted with their checksums are restored" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
 touch -t 202001010000 "${WORK}/switch/.dev-binaries/openflows"
 switch_to 3.0.0 >/dev/null
 expect_eq "intact programs are not downloaded again" "$(date -r "${WORK}/switch/.dev-binaries/openflows" +%Y)" 2020
@@ -171,6 +174,35 @@ expect_eq "a deleted native program is restored" "$(host_program)" "openflows 4.
 printf '#!/bin/sh\necho damaged\n' >"${WORK}/switch-host/.dev-binaries/host/openflows"
 switch_host_to 4.0.0
 expect_eq "a damaged native program is restored" "$(host_program)" "openflows 4.0.0 fake-host"
+rm "${WORK}"/switch-host/.dev-binaries/host/{openflows,openflows-doctor,openflows-harness,CHECKSUMS}
+switch_host_to 4.0.0
+expect_eq "native programs deleted with their checksums are restored" "$(host_program)" "openflows 4.0.0 fake-host"
+
+echo "Image repository"
+staged_image() {   # staged_image SHELL_REPO ENV_REPO — the image setup pulls and the digest it pins
+    (
+        ROOT="${WORK}/image-repo"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"
+        LOG_FILE="${WORK}/image-repo.log"; PULLED="${WORK}/image-repo.pulled"
+        use_host_programs() { :; }
+        mkdir -p "$ROOT"; rm -f "$ENV_FILE"; touch "$ENV_FILE"
+        env_set OPENFLOWS_VERSION 5.0.0
+        [ -z "$2" ] || env_set OPENFLOWS_IMAGE_REPO "$2"
+        if [ -n "$1" ]; then export OPENFLOWS_IMAGE_REPO="$1"; else unset OPENFLOWS_IMAGE_REPO; fi
+        docker() {
+            local image="${!#}"
+            case "$1 $*" in
+                pull*) printf '%s' "$image" >"$PULLED" ;;
+                *RepoDigests*) printf '%s@sha256:abc\n' "${image%:*}" ;;
+            esac
+        }
+        stage_image >/dev/null
+        printf '%s %s' "$(cat "$PULLED")" "$(image_ref)"
+    )
+}
+DEFAULT_IMAGE=ghcr.io/the-agenticflow/openflows
+expect_eq "the default" "$(staged_image "" "")" "${DEFAULT_IMAGE}:5.0.0 ${DEFAULT_IMAGE}:5.0.0@sha256:abc"
+expect_eq "from .env" "$(staged_image "" reg.test/env)" "reg.test/env:5.0.0 reg.test/env:5.0.0@sha256:abc"
+expect_eq "the shell wins over .env, as in Compose" "$(staged_image reg.test/shell reg.test/env)" "reg.test/shell:5.0.0 reg.test/shell:5.0.0@sha256:abc"
 
 echo "Shared App without compiling"
 expect_shared() {   # expect_shared VERSION yes|no
