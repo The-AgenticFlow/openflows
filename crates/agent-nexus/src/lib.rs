@@ -11,9 +11,9 @@ use config::{
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
-        KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
-        KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
-        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DEPLOYMENT, KEY_TICKET_DISPATCH,
+        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE,
+        KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 pub mod a2a;
 pub mod hooks;
+mod lore;
 pub mod openapi;
 pub mod runtime_control;
 
@@ -251,11 +252,65 @@ pub struct FlowRecovery {
     pub needs_recovery: bool,
 }
 
+/// Controller rules that differ by worker role, kept in one place so a new
+/// role (or a change to one) does not mean hunting for string comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoleTraits {
+    /// Takes part in FORGE/SENTINEL A2A verification (gets a pair token).
+    pub uses_a2a: bool,
+    /// Starts its workspace from the default branch, never a ticket's PR branch.
+    pub starts_from_default_branch: bool,
+    /// Its chats belong to a dedicated scheduler (SENTINEL reviews, the LORE
+    /// docs driver), never to generic chat creation or recovery.
+    pub scheduler_owns_chats: bool,
+    /// Works on merged (terminal) tickets, so terminal-ticket recycling must
+    /// not reclaim it while its work is outstanding.
+    pub serves_terminal_tickets: bool,
+    /// Workspace crashes count against (and may escalate) the ticket.
+    pub crashes_count_against_ticket: bool,
+}
+
+impl RoleTraits {
+    const BUILDER: Self = Self {
+        uses_a2a: true,
+        starts_from_default_branch: false,
+        scheduler_owns_chats: false,
+        serves_terminal_tickets: false,
+        crashes_count_against_ticket: true,
+    };
+
+    pub(crate) fn of(worker_id: &str) -> Self {
+        match NexusNode::worker_role(worker_id) {
+            "sentinel" => Self {
+                scheduler_owns_chats: true,
+                ..Self::BUILDER
+            },
+            "lore" => Self {
+                uses_a2a: false,
+                starts_from_default_branch: true,
+                scheduler_owns_chats: true,
+                serves_terminal_tickets: true,
+                crashes_count_against_ticket: false,
+            },
+            _ => Self::BUILDER,
+        }
+    }
+}
+
 pub struct NexusNode {
     pub persona_path: PathBuf,
     pub registry_path: PathBuf,
     pub a2a_relay: Option<std::sync::Arc<crate::a2a::A2ARelay>>,
     runtime_control: Option<runtime_control::RuntimeControlClient>,
+    /// Keys that verify operator docs approvals (see
+    /// [`config::docs_lifecycle::DocsGateKeys`]); NEXUS opens a docs PR only
+    /// for a verified seal.
+    docs_gate_keys: Option<config::docs_lifecycle::DocsGateKeys>,
+    /// `(token, api_base)` replacing the resolved GitHub client (tests).
+    github_override: Option<(String, String)>,
+    /// Merged tickets whose docs records are closed, so the LORE driver does
+    /// not read them every poll (see `lore.rs`).
+    docs_closed: std::sync::Mutex<lore::ClosedDocsCache>,
 }
 
 impl NexusNode {
@@ -265,7 +320,26 @@ impl NexusNode {
             registry_path: registry_path.into(),
             a2a_relay: None,
             runtime_control: None,
+            docs_gate_keys: config::docs_lifecycle::gate_keys_from_env_logged(),
+            github_override: None,
+            docs_closed: Default::default(),
         }
+    }
+
+    /// Use `secret` to verify operator docs approvals (normally read from env).
+    pub fn with_docs_gate_secret(mut self, secret: Option<String>) -> Self {
+        self.docs_gate_keys = secret.map(|s| config::docs_lifecycle::DocsGateKeys::new(&s));
+        self
+    }
+
+    /// Talk to GitHub at `api_base` with `token` instead of the resolved client.
+    pub fn with_github_override(
+        mut self,
+        token: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        self.github_override = Some((token.into(), api_base.into()));
+        self
     }
 
     /// Attach an A2A relay reference so NexusNode can check relay health
@@ -292,6 +366,26 @@ impl NexusNode {
         hasher.update(b"\0");
         hasher.update(ticket_id.as_bytes());
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Derive and register the FORGE/SENTINEL A2A pair token for a ticket.
+    /// LORE never takes part in A2A verification, so it gets no token.
+    async fn register_a2a_pair_token(
+        store: &SharedStore,
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        if !RoleTraits::of(worker_id).uses_a2a {
+            return Ok(None);
+        }
+        let token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&token)),
+            )
+            .await;
+        Ok(Some(token))
     }
 
     fn managed_worker_request_key(worker_id: &str, ticket_id: &str) -> String {
@@ -525,7 +619,9 @@ Before significant work, read the relevant skill file to understand the workflow
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
 
         for pr in &gh_prs {
-            if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref()).await {
+            if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref(), &pr.head_branch)
+                .await
+            {
                 continue;
             }
             if known_numbers.contains(&pr.number) {
@@ -1110,14 +1206,8 @@ Before significant work, read the relevant skill file to understand the workflow
             .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
             .await
             .unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
-        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
-        store
-            .set(
-                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
-                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
-            )
-            .await;
+        let branch = Self::workspace_branch_for(worker_id, &pending_prs, ticket_id);
+        let a2a_pair_token = Self::register_a2a_pair_token(store, worker_id, ticket_id).await?;
 
         // Note: The openflows-forge template expects the dev binaries via the
         // Terraform variable `TF_VAR_dev_binary_host_path` (not workspace parameters). Providing it this
@@ -1135,7 +1225,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 "tenant": config::EnvConfig::from_env()
                     .map(|e| e.tenant.effective_tenant().to_string())
                     .unwrap_or_else(|_| "default".to_string()),
-                "a2a_pair_token": a2a_pair_token,
+                "a2a_pair_token": a2a_pair_token.as_deref().unwrap_or_default(),
                 "coder_url": coder_url.unwrap_or_else(|| {
                     config::EnvConfig::from_env()
                         .map(|e| e.coder.url)
@@ -1323,14 +1413,8 @@ Before significant work, read the relevant skill file to understand the workflow
             .rsplit_once('-')
             .and_then(|(_, value)| value.parse::<i32>().ok());
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
-        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
-        store
-            .set(
-                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
-                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
-            )
-            .await;
+        let branch = Self::workspace_branch_for(worker_id, &pending_prs, ticket_id);
+        let a2a_pair_token = Self::register_a2a_pair_token(store, worker_id, ticket_id).await?;
         let idempotency_store_key = Self::managed_worker_request_key(worker_id, ticket_id);
         let idempotency_key: String = store
             .get_typed(&idempotency_store_key)
@@ -1346,7 +1430,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 slot_number,
                 Some(ticket_id),
                 (!branch.is_empty()).then_some(branch.as_str()),
-                Some(&a2a_pair_token),
+                a2a_pair_token.as_deref(),
                 &idempotency_key,
             )
             .await?;
@@ -1541,6 +1625,15 @@ Before significant work, read the relevant skill file to understand the workflow
     ///
     /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
     /// rework workspace resumes its commits). Empty means create a fresh task branch.
+    /// LORE always starts from the default branch (it creates or checks out
+    /// its own `lore/` branch); a merged ticket's FORGE PR branch is never its base.
+    fn workspace_branch_for(worker_id: &str, pending_prs: &[Value], ticket_id: &str) -> String {
+        if RoleTraits::of(worker_id).starts_from_default_branch {
+            return String::new();
+        }
+        Self::resolve_workspace_branch(pending_prs, ticket_id)
+    }
+
     fn resolve_workspace_branch(pending_prs: &[Value], ticket_id: &str) -> String {
         pending_prs
             .iter()
@@ -1571,7 +1664,8 @@ Before significant work, read the relevant skill file to understand the workflow
         // Review chats belong exclusively to the phase/revision/round scheduler.
         // Generic recovery uses a different chat key and would create a second
         // reviewer (and overwrite its dispatch with builder instructions).
-        if Self::worker_role(worker_id) == "sentinel" {
+        // LORE chats are likewise owned by the docs driver (`lore.rs`).
+        if RoleTraits::of(worker_id).scheduler_owns_chats {
             return;
         }
 
@@ -2214,6 +2308,11 @@ Use `openflows-harness` for all coordination:
     /// - A ticket reaches `planning` phase (SENTINEL reviews the plan and approves the gate)
     /// - A ticket reaches `review_ready` phase (SENTINEL reviews the PR)
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
+        let lore_enabled = Self::lore_enabled(store).await;
+        if lore_enabled {
+            self.refresh_closed_docs(store).await;
+            Box::pin(self.docs_cutover(store, tickets)).await;
+        }
         for ticket in tickets {
             let key = format!("ticket:{}:review_poll_lease", ticket.id);
             let token = uuid::Uuid::new_v4().to_string();
@@ -2227,6 +2326,11 @@ Use `openflows-harness` for all coordination:
             }
             self.poll_harness_status_and_spawn_agents_inner(store, std::slice::from_ref(ticket))
                 .await;
+            // Run after the review scheduler's (large) future has returned so
+            // the LORE driver does not nest inside its stack frame.
+            if lore_enabled {
+                Box::pin(self.drive_lore_docs(store, ticket)).await;
+            }
             if let Err(error) = store.release_claim(&key, &token).await {
                 warn!(ticket_id = %ticket.id, %error, "Cannot release review scheduling lease");
             }
@@ -2251,13 +2355,14 @@ Use `openflows-harness` for all coordination:
             }
         };
 
-        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
-            Some(s) => s,
-            None => {
-                info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
-                return;
-            }
-        };
+        if store
+            .get_typed::<HashMap<String, WorkerSlot>>(KEY_WORKER_SLOTS)
+            .await
+            .is_none()
+        {
+            info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
+            return;
+        }
 
         let ticket_count = tickets.len();
         let is_ticket_active = |t: &Ticket| {
@@ -3100,161 +3205,6 @@ Use `openflows-harness` for all coordination:
                 _ => {
                     // Not in a phase that requires SENTINEL spawn (building, testing, etc.)
                     continue;
-                }
-            }
-        }
-
-        // Check for merged tickets that need Lore documentation
-        self.spawn_lore_for_merged_tickets(store, tickets, &client, &slots)
-            .await;
-    }
-
-    /// Spawn Lore agent for merged tickets to generate documentation.
-    async fn spawn_lore_for_merged_tickets(
-        &self,
-        store: &SharedStore,
-        tickets: &[Ticket],
-        client: &CoderClient,
-        slots: &HashMap<String, WorkerSlot>,
-    ) {
-        for ticket in tickets {
-            // Only process merged tickets
-            let is_merged = matches!(&ticket.status, TicketStatus::Merged { .. });
-            if !is_merged {
-                continue;
-            }
-
-            // Check if Lore chat already exists for this ticket
-            let lore_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "lore");
-            let existing_lore_chat: Option<String> = store.get_typed(&lore_chat_key).await;
-            if existing_lore_chat.is_some() {
-                debug!(ticket_id = %ticket.id, "Lore chat already exists, skipping spawn");
-                continue;
-            }
-
-            // Check if Lore already completed documentation
-            let lore_done_key = full_ticket_key_flat(&ticket.id, "lore_done");
-            let lore_done: Option<bool> = store.get_typed(&lore_done_key).await;
-            if lore_done == Some(true) {
-                debug!(ticket_id = %ticket.id, "Lore already completed documentation");
-                continue;
-            }
-
-            // Find an idle lore worker slot
-            let lore_slot = slots.iter().find(|(id, slot)| {
-                Self::worker_role(id) == "lore" && matches!(slot.status, WorkerStatus::Idle)
-            });
-
-            let (lore_worker_id, lore_slot) = match lore_slot {
-                Some((id, slot)) => (id.clone(), slot.clone()),
-                None => {
-                    debug!(
-                        ticket_id = %ticket.id,
-                        "No idle lore worker available for merged ticket"
-                    );
-                    continue;
-                }
-            };
-
-            let workspace_id = match &lore_slot.workspace_id {
-                Some(ws) => ws.clone(),
-                None => {
-                    // Provision a lore workspace
-                    match self
-                        .provision_coder_workspace(store, &lore_worker_id, &ticket.id)
-                        .await
-                    {
-                        Ok(Some(ws_id)) => ws_id,
-                        Ok(None) | Err(_) => {
-                            warn!(
-                                ticket_id = %ticket.id,
-                                lore_worker_id,
-                                "Failed to provision lore workspace"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            // Build dispatch payload for Lore
-            let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "lore");
-            let dispatch_payload = json!({
-                "ticket_id": ticket.id,
-                "title": ticket.title,
-                "body": ticket.body,
-                "branch": ticket.branch,
-                "action": "generate_documentation",
-            });
-            store.set(&dispatch_key, dispatch_payload).await;
-
-            // Update lore slot to Assigned
-            let mut updated_slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-            if let Some(slot) = updated_slots.get_mut(&lore_worker_id) {
-                slot.status = WorkerStatus::Assigned {
-                    ticket_id: ticket.id.clone(),
-                    issue_url: ticket.issue_url.clone(),
-                };
-                slot.workspace_id = Some(workspace_id.clone());
-            }
-            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
-
-            // Create lore chat
-            let mut labels = serde_json::Map::new();
-            labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
-            labels.insert(CHAT_LABEL_ROLE.to_string(), json!("lore"));
-            labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
-
-            // Resolve organization_id first - fail fast if unavailable
-            let organization_id = match client.get_default_organization_id().await {
-                Ok(id) => id,
-                Err(e) => {
-                    error!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        error = %e,
-                        "CRITICAL: Failed to resolve organization_id for Lore chat - cannot proceed"
-                    );
-                    continue;
-                }
-            };
-
-            let chat_req = coder_client::types::CreateChatRequest {
-                organization_id: Some(organization_id),
-                owner_id: None,
-                workspace_id: workspace_id.clone(),
-                model_config_id: None,
-                content: vec![],
-                labels: Some(labels),
-            };
-
-            if let Err(e) = self
-                .ensure_workspace_instructions(store, client, &workspace_id, &lore_worker_id)
-                .await
-            {
-                warn!(error = %e, "Lore instructions unavailable; deferring chat");
-                continue;
-            }
-            let chat_result = client.create_chat(&chat_req).await;
-
-            match chat_result {
-                Ok(chat) => {
-                    store.set(&lore_chat_key, json!(chat.id)).await;
-                    info!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        chat_id = %chat.id,
-                        "Spawned Lore chat for merged ticket documentation"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        error = %e,
-                        "Failed to create Lore chat"
-                    );
                 }
             }
         }
@@ -4150,7 +4100,9 @@ Use `openflows-harness` for all coordination:
                             .await
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
-                    if ticket_done {
+                    if ticket_done
+                        && !Self::terminal_work_outstanding(store, &slot.id, ticket_id).await
+                    {
                         let ticket_id = ticket_id.clone();
                         if let Some(workspace_id) = slot.workspace_id.as_deref() {
                             if let Err(error) =
@@ -4195,7 +4147,9 @@ Use `openflows-harness` for all coordination:
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
 
-                    if complete {
+                    if complete
+                        && !Self::terminal_work_outstanding(store, &slot.id, ticket_id).await
+                    {
                         let ticket_id = ticket_id.clone();
                         if let Some(workspace_id) = slot.workspace_id.as_deref() {
                             if let Err(error) =
@@ -4385,7 +4339,11 @@ Use `openflows-harness` for all coordination:
                             reason: "ticket no longer exists".to_string(),
                         });
                     } else if let Some(t) = ticket {
-                        if t.status.is_terminal() {
+                        // LORE documents merged tickets; a terminal ticket is its
+                        // normal binding. The docs driver (`lore.rs`) releases it.
+                        if t.status.is_terminal()
+                            && !RoleTraits::of(&slot.id).serves_terminal_tickets
+                        {
                             recovery.stale_workers.push(StaleWorker {
                                 worker_id: slot.id.clone(),
                                 ticket_id: ticket_id.clone(),
@@ -4399,7 +4357,7 @@ Use `openflows-harness` for all coordination:
                     let ticket_completed = tickets
                         .iter()
                         .any(|t| t.id == *ticket_id && t.status.is_terminal());
-                    if ticket_completed {
+                    if ticket_completed && !RoleTraits::of(&slot.id).serves_terminal_tickets {
                         recovery.stale_workers.push(StaleWorker {
                             worker_id: slot.id.clone(),
                             ticket_id: ticket_id.clone(),
@@ -4509,8 +4467,16 @@ Use `openflows-harness` for all coordination:
             .map(|(id, slot)| (id.clone(), slot.clone()))
     }
 
-    async fn should_discover_pr(store: &SharedStore, number: u64, ticket_id: Option<&str>) -> bool {
-        ticket_id.is_some_and(|id| !id.is_empty())
+    async fn should_discover_pr(
+        store: &SharedStore,
+        number: u64,
+        ticket_id: Option<&str>,
+        head_branch: &str,
+    ) -> bool {
+        // A docs PR names its ticket by branch, but one handed to a human
+        // (no docs record owns it) must not be re-queued every poll.
+        let is_docs = head_branch.starts_with(config::docs_lifecycle::DOCS_BRANCH_PREFIX);
+        (!is_docs && ticket_id.is_some_and(|id| !id.is_empty()))
             || store.get(&format!("pr:{number}:unmanaged")).await.is_none()
     }
 
@@ -4662,6 +4628,31 @@ Use `openflows-harness` for all coordination:
                 continue;
             };
 
+            // A LORE docs PR documents a merged ticket: its docs record, not
+            // that ticket's (terminal) lifecycle, decides whether VESSEL sees it.
+            let head_branch = pr["head_branch"].as_str().unwrap_or_default();
+            if head_branch.starts_with(config::docs_lifecycle::DOCS_BRANCH_PREFIX) {
+                match store.docs_record(ticket_id).await {
+                    Ok(record)
+                        if record.merge_candidate(pr_number)
+                            || !record.owns_pr(head_branch, pr_number) =>
+                    {
+                        ready.push(pr.clone());
+                    }
+                    Ok(record) => debug!(
+                        pr_number,
+                        ticket_id,
+                        phase = record.phase.as_str(),
+                        paused = record.paused,
+                        "Holding docs PR until it is published and unpaused"
+                    ),
+                    Err(error) => {
+                        warn!(pr_number, ticket_id, %error, "Holding docs PR: docs record unreadable")
+                    }
+                }
+                continue;
+            }
+
             let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, "forge");
             if store.get(&rework_key).await.is_some() {
                 debug!(
@@ -4767,6 +4758,18 @@ Use `openflows-harness` for all coordination:
 
         for ticket in tickets.iter_mut() {
             if ticket.id == ticket_id {
+                if ticket.status.is_terminal() {
+                    // Merged/closed tickets are final; a worker problem on one
+                    // (e.g. LORE documenting it) must never rewrite its status.
+                    warn!(
+                        ticket_id,
+                        worker_id,
+                        reason,
+                        "Refusing to escalate a terminal ticket; releasing the worker only"
+                    );
+                    self.release_worker_slot(store, worker_id).await;
+                    return;
+                }
                 if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
                     // Already escalated — do not re-notify or bump attempts on
                     // every controller poll.
@@ -5143,12 +5146,21 @@ Use `openflows-harness` for all coordination:
             if crashed_workspace.ticket_id.is_empty() {
                 continue;
             }
+            // LORE is bound to merged tickets: its crashes must never count
+            // against (or escalate) the ticket. Stopped workspaces are
+            // restarted below; anything needing a new workspace is handed to
+            // the docs driver, which re-provisions and re-delivers.
+            let docs_driven =
+                !RoleTraits::of(&crashed_workspace.worker_id).crashes_count_against_ticket;
 
-            let attempts = self
-                .increment_recovery_attempts(store, &crashed_workspace.ticket_id)
-                .await;
+            let attempts = if docs_driven {
+                0
+            } else {
+                self.increment_recovery_attempts(store, &crashed_workspace.ticket_id)
+                    .await
+            };
 
-            if attempts >= Ticket::MAX_ATTEMPTS {
+            if !docs_driven && attempts >= Ticket::MAX_ATTEMPTS {
                 let reason = format!(
                     "workspace {} crashed {} times and requires human intervention",
                     crashed_workspace.workspace_id, attempts
@@ -5239,6 +5251,15 @@ Use `openflows-harness` for all coordination:
                                 "Recreating Coder workspace after crash (unknown status, agent not ready)"
                             );
 
+                            if docs_driven {
+                                self.recover_lore_workspace(
+                                    store,
+                                    &crashed_workspace.worker_id,
+                                    &crashed_workspace.ticket_id,
+                                )
+                                .await;
+                                continue;
+                            }
                             let mut slots: HashMap<String, WorkerSlot> =
                                 store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                             if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
@@ -5283,6 +5304,15 @@ Use `openflows-harness` for all coordination:
                             "Recreating Coder workspace after crash"
                         );
 
+                        if docs_driven {
+                            self.recover_lore_workspace(
+                                store,
+                                &crashed_workspace.worker_id,
+                                &crashed_workspace.ticket_id,
+                            )
+                            .await;
+                            continue;
+                        }
                         let mut slots: HashMap<String, WorkerSlot> =
                             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                         if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
@@ -5416,13 +5446,16 @@ impl Node for NexusNode {
                 .values()
                 .filter(|slot| {
                     let is_done = matches!(slot.status, WorkerStatus::Done { .. });
-                    let is_terminal = match &slot.status {
-                        WorkerStatus::Assigned { ticket_id, .. }
-                        | WorkerStatus::Working { ticket_id, .. } => tickets
-                            .iter()
-                            .any(|t| t.id == *ticket_id && t.status.is_terminal()),
-                        _ => false,
-                    };
+                    // LORE slots are bound to merged tickets by design and are
+                    // released by the docs driver once the docs PR is recorded.
+                    let is_terminal = !RoleTraits::of(&slot.id).serves_terminal_tickets
+                        && match &slot.status {
+                            WorkerStatus::Assigned { ticket_id, .. }
+                            | WorkerStatus::Working { ticket_id, .. } => tickets
+                                .iter()
+                                .any(|t| t.id == *ticket_id && t.status.is_terminal()),
+                            _ => false,
+                        };
                     is_done || is_terminal
                 })
                 .map(|slot| slot.id.clone())
@@ -7775,9 +7808,9 @@ mod tests {
         store
             .set("pr:345:unmanaged", json!({"reason":"no ticket"}))
             .await;
-        assert!(!NexusNode::should_discover_pr(&store, 345, None).await);
-        assert!(NexusNode::should_discover_pr(&store, 345, Some("T-1")).await);
-        assert!(NexusNode::should_discover_pr(&store, 346, None).await);
+        assert!(!NexusNode::should_discover_pr(&store, 345, None, "feature").await);
+        assert!(NexusNode::should_discover_pr(&store, 345, Some("T-1"), "forge-1/T-1").await);
+        assert!(NexusNode::should_discover_pr(&store, 346, None, "feature").await);
     }
 
     #[tokio::test]
@@ -7991,5 +8024,1233 @@ mod tests {
             "Forge slot must NOT be recycled to Idle when ticket outcome is pr_opened"
         );
         assert_eq!(forge_slot.workspace_id.as_deref(), Some("ws-forge"));
+    }
+
+    const DOCS_SECRET: &str = "test-secret";
+
+    fn merged_ticket(id: &str) -> Ticket {
+        Ticket {
+            id: id.to_string(),
+            title: "Add retries".to_string(),
+            body: "Retry transient failures".to_string(),
+            priority: 1,
+            branch: Some(format!("forge-1/{id}")),
+            status: TicketStatus::Merged {
+                pr_number: 7,
+                worker_id: "forge-1".to_string(),
+            },
+            issue_url: None,
+            attempts: 0,
+        }
+    }
+
+    fn lore_slot(status: WorkerStatus, workspace: Option<&str>) -> WorkerSlot {
+        let mut slot = slot("lore", status);
+        slot.workspace_id = workspace.map(str::to_string);
+        slot
+    }
+
+    fn bound_to(ticket: &str) -> WorkerStatus {
+        WorkerStatus::Assigned {
+            ticket_id: ticket.into(),
+            issue_url: None,
+        }
+    }
+
+    fn lore_node() -> NexusNode {
+        NexusNode::new("missing-persona", "missing-registry")
+            .with_docs_gate_secret(Some(DOCS_SECRET.into()))
+    }
+
+    fn hosted_lore_node(server: &mockito::Server) -> NexusNode {
+        lore_node().with_runtime_control(runtime_control::RuntimeControlClient::for_test(
+            server.url(),
+        ))
+    }
+
+    /// A store past the docs cutover, so merged tickets are documentable.
+    async fn lore_store(slot: WorkerSlot) -> SharedStore {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(config::state::KEY_DOCS_CUTOVER, json!({ "ts": 1 }))
+            .await;
+        store.set(KEY_WORKER_SLOTS, json!({ "lore": slot })).await;
+        store.set("repository", json!("org/repo")).await;
+        store
+    }
+
+    async fn local_lore_store(server: &mockito::Server, slot: WorkerSlot) -> SharedStore {
+        let store = lore_store(slot).await;
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        store
+    }
+
+    async fn mock_ready_workspace(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("GET", "/api/v2/workspaces/ws")
+            .with_status(200)
+            .with_body(
+                r#"{"id":"ws","status":"running","latest_build":{"status":"running","resources":[{"agents":[{"name":"main","status":"connected","lifecycle_state":"ready"}]}]}}"#,
+            )
+            .create_async()
+            .await
+    }
+
+    async fn mock_lore_chat(server: &mut mockito::Server, status: &str) -> mockito::Mock {
+        server
+            .mock("GET", "/api/v2/chats/lore-chat")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"id":"lore-chat","workspace_id":"ws","status":"{status}"}}"#
+            ))
+            .create_async()
+            .await
+    }
+
+    async fn mock_no_chats(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("GET", "/api/v2/chats")
+            .with_status(200)
+            .with_body(r#"{"chats":[]}"#)
+            .create_async()
+            .await
+    }
+
+    async fn mock_org(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("GET", "/api/v2/organizations")
+            .with_status(200)
+            .with_body(r#"[{"id":"org","name":"default","is_default":true}]"#)
+            .create_async()
+            .await
+    }
+
+    async fn set_delivery(store: &SharedStore, ticket: &str, delivery: lore::LoreDelivery) {
+        store
+            .set(
+                &full_ticket_key_flat(ticket, config::state::KEY_TICKET_DOCS_DELIVERY),
+                json!(delivery),
+            )
+            .await;
+    }
+
+    async fn delivery(store: &SharedStore, ticket: &str) -> lore::LoreDelivery {
+        store
+            .get_typed(&full_ticket_key_flat(
+                ticket,
+                config::state::KEY_TICKET_DOCS_DELIVERY,
+            ))
+            .await
+            .unwrap_or_default()
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    async fn docs_event(
+        store: &SharedStore,
+        ticket: &str,
+        actor: &str,
+        event: config::docs_lifecycle::DocsEvent,
+    ) {
+        let record = store.docs_record(ticket).await.unwrap();
+        store
+            .docs_transition(ticket, record.version, actor, event)
+            .await
+            .unwrap();
+    }
+
+    async fn submit_docs(store: &SharedStore, ticket: &str, head: &str) {
+        let record = store.docs_record(ticket).await.unwrap();
+        docs_event(
+            store,
+            ticket,
+            "lore",
+            config::docs_lifecycle::DocsEvent::Submit {
+                branch: record
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| record.expected_branch(ticket)),
+                head: head.into(),
+                base: "main".into(),
+                report: "CHANGELOG entry".into(),
+                files: vec!["CHANGELOG.md".into()],
+            },
+        )
+        .await;
+    }
+
+    async fn decide_docs_sealed(
+        store: &SharedStore,
+        ticket: &str,
+        approved: bool,
+        notes: &str,
+        secret: &str,
+    ) {
+        let record = store.docs_record(ticket).await.unwrap();
+        let head = record.head.clone().unwrap();
+        docs_event(
+            store,
+            ticket,
+            "human",
+            config::docs_lifecycle::DocsEvent::Decide {
+                revision: record.revision,
+                seal: if approved {
+                    config::docs_lifecycle::approval_seal(secret, ticket, record.revision, &head)
+                } else {
+                    String::new()
+                },
+                head,
+                approved,
+                report: notes.into(),
+            },
+        )
+        .await;
+    }
+
+    async fn decide_docs(store: &SharedStore, ticket: &str, approved: bool, notes: &str) {
+        decide_docs_sealed(store, ticket, approved, notes, DOCS_SECRET).await;
+    }
+
+    async fn poll(node: &NexusNode, store: &SharedStore, tickets: &[Ticket], times: usize) {
+        for _ in 0..times {
+            Box::pin(node.poll_harness_status_and_spawn_agents(store, tickets)).await;
+        }
+    }
+
+    async fn lore_slots(store: &SharedStore) -> HashMap<String, WorkerSlot> {
+        store.get_typed(KEY_WORKER_SLOTS).await.unwrap()
+    }
+
+    fn lore_slot_status(slots: &HashMap<String, WorkerSlot>) -> &WorkerStatus {
+        &slots["lore"].status
+    }
+
+    fn managed_status(workspace: &str, observed: &str) -> String {
+        let heartbeat = if observed == "running" {
+            r#","last_heartbeat_at":"2026-11-05T00:00:00Z""#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"workspace_id":"{workspace}","role":"lore","slot":null,"desired_state":"running","observed_state":"{observed}"{heartbeat}}}"#
+        )
+    }
+
+    /// Manager mocks: every workspace request yields `ws-new`, which is ready.
+    async fn mock_managed_provisioning(server: &mut mockito::Server) -> Vec<mockito::Mock> {
+        vec![
+            server
+                .mock("POST", "/api/v1/runtime/workspaces")
+                .with_status(202)
+                .with_body(r#"{"workspace_id":"ws-new","operation_id":"op","status":"queued"}"#)
+                .create_async()
+                .await,
+            server
+                .mock("GET", "/api/v1/runtime/workspaces/ws-new")
+                .with_status(200)
+                .with_body(managed_status("ws-new", "running"))
+                .create_async()
+                .await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn merged_ticket_spawns_one_prompted_lore_chat() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = mock_org(&mut server).await;
+        let _ws = mock_ready_workspace(&mut server).await;
+        let _list = mock_no_chats(&mut server).await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .match_body(mockito::Matcher::Regex(
+                r#"lore/T-9.*docs submit --report /tmp/docs-report.md.*Never open a PR yourself.*"role":"lore""#.into(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"id":"lore-chat","workspace_id":"ws"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _existing = mock_lore_chat(&mut server, "running").await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        let node = lore_node();
+        poll(&node, &store, &[merged_ticket("T-9")], 2).await;
+        create.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"))
+                .await
+                .as_deref(),
+            Some("lore-chat")
+        );
+        let delivered = delivery(&store, "T-9").await;
+        assert_eq!(delivered.step, "start:e0");
+        assert_eq!(delivered.epoch, 0);
+        assert!(delivered.started > 0);
+        let dispatch: Value = store
+            .get(&full_ticket_key("T-9", KEY_TICKET_DISPATCH, "lore"))
+            .await
+            .unwrap();
+        assert_eq!(dispatch["branch"], "lore/T-9");
+    }
+
+    #[tokio::test]
+    async fn failed_lore_chat_creation_records_nothing_and_retries() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = mock_org(&mut server).await;
+        let _ws = mock_ready_workspace(&mut server).await;
+        let _list = mock_no_chats(&mut server).await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .with_status(500)
+            .expect(2)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        let node = lore_node();
+        poll(&node, &store, &[merged_ticket("T-9")], 2).await;
+        create.assert_async().await;
+        assert!(store
+            .get(&full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"))
+            .await
+            .is_none());
+        // Nothing was delivered; only the start of the failure streak is kept.
+        let failed = delivery(&store, "T-9").await;
+        assert!(failed.failing_since.is_some());
+        assert_eq!(
+            lore::LoreDelivery {
+                failing_since: None,
+                ..failed
+            },
+            lore::LoreDelivery::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn lore_that_never_comes_up_is_parked() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = mock_org(&mut server).await;
+        let _ws = mock_ready_workspace(&mut server).await;
+        let _list = mock_no_chats(&mut server).await;
+        let _create = server
+            .mock("POST", "/api/v2/chats")
+            .with_status(500)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        let node = lore_node();
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        assert!(!store.docs_record("T-9").await.unwrap().paused);
+
+        let mut failing = delivery(&store, "T-9").await;
+        failing.failing_since = Some(now() - lore::LORE_PROVISION_MAX_SECS - 1);
+        set_delivery(&store, "T-9", failing).await;
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert!(record.paused);
+        assert!(
+            record.pause_reason.unwrap().contains("has not come up"),
+            "parked with the reason"
+        );
+
+        // Resuming starts a new epoch with the failure streak cleared (once
+        // the parked workspace is torn down, simulated here).
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({ "lore": lore_slot(WorkerStatus::Idle, None) }),
+            )
+            .await;
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            config::docs_lifecycle::DocsEvent::Resume,
+        )
+        .await;
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        let resumed = delivery(&store, "T-9").await;
+        assert_eq!(resumed.epoch, 1);
+        assert!(resumed.failing_since.unwrap() > now() - 60);
+        assert!(!store.docs_record("T-9").await.unwrap().paused);
+    }
+
+    #[tokio::test]
+    async fn repeated_lore_crashes_park_the_record() {
+        let store = lore_store(lore_slot(bound_to("T-9"), None)).await;
+        let node = lore_node();
+        for _ in 0..lore::LORE_MAX_CRASHES {
+            node.recover_lore_workspace(&store, "lore", "T-9").await;
+        }
+        assert_eq!(
+            delivery(&store, "T-9").await.crashes,
+            lore::LORE_MAX_CRASHES
+        );
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert!(record.paused);
+        assert!(record.pause_reason.unwrap().contains("crashed 3 times"));
+    }
+
+    #[tokio::test]
+    async fn lore_chat_whose_id_was_lost_is_adopted_not_duplicated() {
+        let mut server = mockito::Server::new_async().await;
+        let _ws = mock_ready_workspace(&mut server).await;
+        let _list = server
+            .mock("GET", "/api/v2/chats")
+            .with_status(200)
+            .with_body(
+                r#"{"chats":[{"id":"orphan","workspace_id":"ws","status":"waiting","labels":{"role":"lore","ticket_id":"T-9"}},{"id":"other","workspace_id":"ws","status":"waiting","labels":{"role":"lore","ticket_id":"T-8"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let resend = server
+            .mock("POST", "/api/v2/chats/orphan/messages")
+            .match_body(mockito::Matcher::Regex("Document merged ticket T-9".into()))
+            .with_status(200)
+            .with_body(r#"{"id":"m1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        poll(&lore_node(), &store, &[merged_ticket("T-9")], 1).await;
+        create.assert_async().await;
+        resend.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"))
+                .await
+                .as_deref(),
+            Some("orphan")
+        );
+        assert_eq!(delivery(&store, "T-9").await.step, "start:e0");
+    }
+
+    #[tokio::test]
+    async fn idle_lore_slot_never_reuses_another_tickets_workspace() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let _gone = server
+            .mock("GET", "/api/v2/workspaces/ws-other")
+            .with_status(404)
+            .create_async()
+            .await;
+        let store =
+            local_lore_store(&server, lore_slot(WorkerStatus::Idle, Some("ws-other"))).await;
+        poll(&lore_node(), &store, &[merged_ticket("T-9")], 1).await;
+        create.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert!(matches!(lore_slot_status(&slots), WorkerStatus::Idle));
+        assert_eq!(slots["lore"].workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn busy_lore_slot_makes_other_tickets_wait() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let _chat = mock_lore_chat(&mut server, "running").await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        store
+            .set(
+                &full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"),
+                json!("lore-chat"),
+            )
+            .await;
+        set_delivery(
+            &store,
+            "T-9",
+            lore::LoreDelivery {
+                step: "start:e0".into(),
+                ts: now(),
+                started: now(),
+                ..Default::default()
+            },
+        )
+        .await;
+        poll(
+            &lore_node(),
+            &store,
+            &[merged_ticket("T-9"), merged_ticket("T-10")],
+            1,
+        )
+        .await;
+        create.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert_eq!(lore_slot_status(&slots).ticket_id(), Some("T-9"));
+        assert_eq!(
+            delivery(&store, "T-10").await,
+            lore::LoreDelivery::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn pausing_one_ticket_frees_lore_for_the_others() {
+        let mut server = mockito::Server::new_async().await;
+        let deleted = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/ws-1")
+            .with_status(202)
+            .expect(1)
+            .create_async()
+            .await;
+        let _provision = mock_managed_provisioning(&mut server).await;
+        let spawn_t10 = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::Regex(
+                "Document merged ticket T-10".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"chat_id":"chat-10","workspace_id":"ws-new","created":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(bound_to("T-9"), Some("ws-1"))).await;
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            config::docs_lifecycle::DocsEvent::Pause {
+                reason: "release freeze".into(),
+            },
+        )
+        .await;
+        let node = hosted_lore_node(&server);
+        poll(
+            &node,
+            &store,
+            &[merged_ticket("T-9"), merged_ticket("T-10")],
+            3,
+        )
+        .await;
+        deleted.assert_async().await;
+        spawn_t10.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert_eq!(lore_slot_status(&slots).ticket_id(), Some("T-10"));
+        assert_eq!(delivery(&store, "T-10").await.step, "start:e0");
+    }
+
+    #[tokio::test]
+    async fn resume_and_restart_replace_lore_on_a_fresh_workspace() {
+        let mut server = mockito::Server::new_async().await;
+        let _provision = mock_managed_provisioning(&mut server).await;
+        let deleted = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/ws-new")
+            .with_status(202)
+            .expect(1)
+            .create_async()
+            .await;
+        let spawned = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::Regex("Document merged ticket T-9".into()))
+            .with_status(200)
+            .with_body(r#"{"chat_id":"chat","workspace_id":"ws-new","created":true}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(WorkerStatus::Idle, None)).await;
+        // LORE had been told to start under epoch 0, then the operator paused it.
+        set_delivery(
+            &store,
+            "T-9",
+            lore::LoreDelivery {
+                step: "start:e0".into(),
+                ts: now(),
+                started: now(),
+                ..Default::default()
+            },
+        )
+        .await;
+        use config::docs_lifecycle::DocsEvent;
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            DocsEvent::Pause {
+                reason: "hold".into(),
+            },
+        )
+        .await;
+        let ticket = [merged_ticket("T-9")];
+        let node = hosted_lore_node(&server);
+        poll(&node, &store, &ticket, 1).await;
+        assert_eq!(
+            delivery(&store, "T-9").await.step,
+            "start:e0",
+            "paused: nothing sent"
+        );
+
+        docs_event(&store, "T-9", "human", DocsEvent::Resume).await;
+        poll(&node, &store, &ticket, 2).await;
+        let resumed = delivery(&store, "T-9").await;
+        assert_eq!((resumed.step.as_str(), resumed.epoch), ("start:e1", 1));
+
+        // Restart tears the live workspace down before re-delivering.
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            DocsEvent::Restart {
+                reason: "chat lost its context".into(),
+            },
+        )
+        .await;
+        poll(&node, &store, &ticket, 2).await;
+        deleted.assert_async().await;
+        spawned.assert_async().await;
+        let restarted = delivery(&store, "T-9").await;
+        assert_eq!((restarted.step.as_str(), restarted.epoch), ("start:e2", 2));
+    }
+
+    #[tokio::test]
+    async fn stalled_lore_is_nudged_then_parked_but_never_while_busy() {
+        let mut server = mockito::Server::new_async().await;
+        let mut chat = mock_lore_chat(&mut server, "running").await;
+        let nudge = server
+            .mock("POST", "/api/v2/chats/lore-chat/messages")
+            .match_body(mockito::Matcher::Regex(
+                "No documentation progress has been recorded".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"id":"n1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        store
+            .set(
+                &full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"),
+                json!("lore-chat"),
+            )
+            .await;
+        let stale = now() - 2 * lore::LORE_STALL_SECS;
+        let stalled = |nudges| lore::LoreDelivery {
+            step: "start:e0".into(),
+            ts: stale,
+            started: stale,
+            nudges,
+            ..Default::default()
+        };
+        let ticket = [merged_ticket("T-9")];
+        let node = lore_node();
+
+        // A running turn is working, however long it takes (below the hard limit).
+        set_delivery(&store, "T-9", stalled(0)).await;
+        poll(&node, &store, &ticket, 1).await;
+        assert_eq!(delivery(&store, "T-9").await.nudges, 0);
+
+        chat.remove_async().await;
+        chat = mock_lore_chat(&mut server, "waiting").await;
+        poll(&node, &store, &ticket, 2).await;
+        let after = delivery(&store, "T-9").await;
+        assert_eq!(after.nudges, 1);
+        assert!(after.ts > stale, "a nudge restarts the stall timer");
+        nudge.assert_async().await;
+
+        // After the last nudge LORE is parked: the record is paused for the operator.
+        set_delivery(&store, "T-9", stalled(lore::LORE_MAX_NUDGES)).await;
+        poll(&node, &store, &ticket, 1).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert!(record.paused);
+        assert!(record.pause_reason.unwrap().contains("nudges"));
+        drop(chat);
+    }
+
+    #[tokio::test]
+    async fn a_step_running_past_the_hard_limit_is_parked() {
+        let mut server = mockito::Server::new_async().await;
+        let _chat = mock_lore_chat(&mut server, "running").await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        store
+            .set(
+                &full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"),
+                json!("lore-chat"),
+            )
+            .await;
+        set_delivery(
+            &store,
+            "T-9",
+            lore::LoreDelivery {
+                step: "start:e0".into(),
+                ts: now(),
+                started: now() - lore::LORE_STEP_MAX_SECS - 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        poll(&lore_node(), &store, &[merged_ticket("T-9")], 1).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert!(record.paused, "a running chat cannot hold the slot forever");
+    }
+
+    #[tokio::test]
+    async fn paused_docs_do_not_spawn_lore() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(WorkerStatus::Idle, None)).await;
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            config::docs_lifecycle::DocsEvent::Pause {
+                reason: "release freeze".into(),
+            },
+        )
+        .await;
+        poll(&lore_node(), &store, &[merged_ticket("T-9")], 1).await;
+        create.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert!(matches!(lore_slot_status(&slots), WorkerStatus::Idle));
+    }
+
+    async fn approved_docs_store(secret: &str) -> SharedStore {
+        let store = lore_store(lore_slot(WorkerStatus::Idle, None)).await;
+        submit_docs(&store, "T-9", "abc").await;
+        decide_docs_sealed(&store, "T-9", true, "", secret).await;
+        store
+    }
+
+    #[tokio::test]
+    async fn nexus_opens_the_docs_pr_for_a_sealed_approval() {
+        let mut server = mockito::Server::new_async().await;
+        let _head = server
+            .mock("GET", "/repos/org/repo/git/ref/heads/lore/T-9")
+            .with_status(200)
+            .with_body(r#"{"object":{"sha":"abc"}}"#)
+            .create_async()
+            .await;
+        let _none = server
+            .mock("GET", "/repos/org/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let _repo = server
+            .mock("GET", "/repos/org/repo")
+            .with_status(200)
+            .with_body(r#"{"default_branch":"main"}"#)
+            .create_async()
+            .await;
+        let _compare = mock_compare(&mut server, &["CHANGELOG.md"]).await;
+        let create = server
+            .mock("POST", "/repos/org/repo/pulls")
+            .match_body(mockito::Matcher::Regex(
+                r#""base":"main".*"head":"lore/T-9"|"head":"lore/T-9".*"base":"main""#.into(),
+            ))
+            .with_status(201)
+            .with_body(r#"{"number":77,"title":"docs","body":null,"head":{"sha":"abc","ref":"lore/T-9"},"base":{"ref":"main","sha":"b"},"state":"open"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = approved_docs_store(DOCS_SECRET).await;
+        let node = lore_node().with_github_override("t", server.url());
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        create.assert_async().await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert_eq!(record.phase, config::docs_lifecycle::DocsPhase::Published);
+        assert_eq!(record.pr_number, Some(77));
+    }
+
+    /// GitHub's diff of the approved head `abc` against `main` touches `files`.
+    async fn mock_compare(server: &mut mockito::Server, files: &[&str]) -> mockito::Mock {
+        let files: Vec<String> = files
+            .iter()
+            .map(|f| format!(r#"{{"filename":"{f}","status":"modified"}}"#))
+            .collect();
+        server
+            .mock("GET", "/repos/org/repo/compare/main...abc?per_page=1")
+            .with_status(200)
+            .with_body(format!(r#"{{"files":[{}]}}"#, files.join(",")))
+            .create_async()
+            .await
+    }
+
+    async fn mock_docs_branch(server: &mut mockito::Server) -> Vec<mockito::Mock> {
+        vec![
+            server
+                .mock("GET", "/repos/org/repo/git/ref/heads/lore/T-9")
+                .with_status(200)
+                .with_body(r#"{"object":{"sha":"abc"}}"#)
+                .create_async()
+                .await,
+            server
+                .mock("GET", "/repos/org/repo")
+                .with_status(200)
+                .with_body(r#"{"default_branch":"main"}"#)
+                .create_async()
+                .await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn approved_heads_that_change_code_on_github_are_never_published() {
+        use config::docs_lifecycle::DocsPhase;
+        let mut server = mockito::Server::new_async().await;
+        let _branch = mock_docs_branch(&mut server).await;
+        // LORE reported only CHANGELOG.md; GitHub shows what the PR would merge.
+        let _compare = mock_compare(&mut server, &["CHANGELOG.md", "src/lib.rs"]).await;
+        let create = server
+            .mock("POST", "/repos/org/repo/pulls")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = approved_docs_store(DOCS_SECRET).await;
+        let node = lore_node().with_github_override("t", server.url());
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert_eq!(record.phase, DocsPhase::Drafting);
+        assert!(record.feedback.unwrap().contains("src/lib.rs"));
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn docs_prs_into_another_base_are_never_adopted() {
+        let mut server = mockito::Server::new_async().await;
+        let _branch = mock_docs_branch(&mut server).await;
+        let _compare = mock_compare(&mut server, &["CHANGELOG.md"]).await;
+        // A PR LORE opened itself from the docs branch into a release branch.
+        let _foreign = server
+            .mock("GET", "/repos/org/repo/pulls")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"[{"number":5,"title":"docs","body":null,"head":{"sha":"abc","ref":"lore/T-9"},"base":{"ref":"release/1","sha":"b"},"state":"open"}]"#)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/repos/org/repo/pulls")
+            .with_status(201)
+            .with_body(r#"{"number":77,"title":"docs","body":null,"head":{"sha":"abc","ref":"lore/T-9"},"base":{"ref":"main","sha":"b"},"state":"open"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = approved_docs_store(DOCS_SECRET).await;
+        let node = lore_node().with_github_override("t", server.url());
+        poll(&node, &store, &[merged_ticket("T-9")], 1).await;
+        create.assert_async().await;
+        assert_eq!(store.docs_record("T-9").await.unwrap().pr_number, Some(77));
+    }
+
+    #[tokio::test]
+    async fn unverifiable_approvals_alert_the_operator_once_and_can_be_resealed() {
+        use config::docs_lifecycle::{DocsEvent, DocsPhase};
+        let store = approved_docs_store("rotated-out-secret").await;
+        let node = lore_node();
+        poll(&node, &store, &[merged_ticket("T-9")], 2).await;
+        let record = store.docs_record("T-9").await.unwrap();
+        assert_eq!(record.phase, DocsPhase::Approved);
+        assert_eq!(
+            delivery(&store, "T-9").await.seal_alert,
+            Some(record.version)
+        );
+
+        // The operator approves again with the controller's current key.
+        let head = record.head.clone().unwrap();
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            DocsEvent::Decide {
+                revision: record.revision,
+                seal: config::docs_lifecycle::approval_seal(
+                    DOCS_SECRET,
+                    "T-9",
+                    record.revision,
+                    &head,
+                ),
+                head,
+                approved: true,
+                report: String::new(),
+            },
+        )
+        .await;
+        let resealed = store.docs_record("T-9").await.unwrap();
+        assert_eq!(resealed.phase, DocsPhase::Approved);
+        assert!(config::docs_lifecycle::verify_approval(&resealed, "T-9", DOCS_SECRET).is_ok());
+    }
+
+    #[tokio::test]
+    async fn forged_approvals_and_moved_branches_never_publish() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/repos/org/repo/pulls")
+            .expect(0)
+            .create_async()
+            .await;
+        let _moved = server
+            .mock("GET", "/repos/org/repo/git/ref/heads/lore/T-9")
+            .with_status(200)
+            .with_body(r#"{"object":{"sha":"pushed-later"}}"#)
+            .create_async()
+            .await;
+
+        // Sealed with a key the controller does not hold: nothing happens.
+        let forged = approved_docs_store("workspace-guess").await;
+        let node = lore_node().with_github_override("t", server.url());
+        poll(&node, &forged, &[merged_ticket("T-9")], 1).await;
+        assert_eq!(
+            forged.docs_record("T-9").await.unwrap().phase,
+            config::docs_lifecycle::DocsPhase::Approved
+        );
+
+        // Genuine approval, but the branch moved: back to LORE for a new review.
+        let moved = approved_docs_store(DOCS_SECRET).await;
+        poll(&node, &moved, &[merged_ticket("T-9")], 1).await;
+        let record = moved.docs_record("T-9").await.unwrap();
+        assert_eq!(record.phase, config::docs_lifecycle::DocsPhase::Drafting);
+        assert!(record.feedback.unwrap().contains("pushed-later"));
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn published_docs_follow_the_pr_on_github() {
+        use config::docs_lifecycle::{DocsEvent, DocsPhase};
+        let mut server = mockito::Server::new_async().await;
+        let _merged = server
+            .mock("GET", "/repos/org/repo/pulls/77")
+            .with_status(200)
+            .with_body(r#"{"number":77,"title":"docs","body":null,"head":{"sha":"abc","ref":"lore/T-9"},"base":{"ref":"main","sha":"b"},"state":"closed","merged":true,"merge_commit_sha":"m1"}"#)
+            .create_async()
+            .await;
+        let _closed = server
+            .mock("GET", "/repos/org/repo/pulls/78")
+            .with_status(200)
+            .with_body(r#"{"number":78,"title":"docs","body":null,"head":{"sha":"abc","ref":"lore/T-10"},"base":{"ref":"main","sha":"b"},"state":"closed","merged":false}"#)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(WorkerStatus::Idle, None)).await;
+        for (ticket, number) in [("T-9", 77), ("T-10", 78)] {
+            submit_docs(&store, ticket, "abc").await;
+            decide_docs(&store, ticket, true, "").await;
+            docs_event(&store, ticket, "nexus", DocsEvent::Published { number }).await;
+        }
+        let node = lore_node().with_github_override("t", server.url());
+        poll(
+            &node,
+            &store,
+            &[merged_ticket("T-9"), merged_ticket("T-10")],
+            1,
+        )
+        .await;
+        let merged = store.docs_record("T-9").await.unwrap();
+        assert_eq!(merged.phase, DocsPhase::Merged);
+        assert_eq!(merged.merge_sha.as_deref(), Some("m1"));
+        assert_eq!(
+            store.docs_record("T-10").await.unwrap().phase,
+            DocsPhase::Abandoned
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_docs_are_not_reread_until_reopened() {
+        let store = lore_store(lore_slot(WorkerStatus::Idle, None)).await;
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            config::docs_lifecycle::DocsEvent::Skip {
+                reason: "trivial".into(),
+            },
+        )
+        .await;
+        let node = lore_node();
+        let ticket = [merged_ticket("T-9")];
+        poll(&node, &store, &ticket, 1).await;
+        // Cached as closed: delivery state planted now is not cleaned up.
+        set_delivery(
+            &store,
+            "T-9",
+            lore::LoreDelivery {
+                step: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        poll(&node, &store, &ticket, 1).await;
+        assert_eq!(delivery(&store, "T-9").await.step, "x");
+        // A reopen marker invalidates the cache and the record is read again.
+        store
+            .set(config::state::KEY_DOCS_REOPENED, json!({"ticket": "T-0"}))
+            .await;
+        poll(&node, &store, &ticket, 1).await;
+        assert_eq!(delivery(&store, "T-9").await, lore::LoreDelivery::default());
+    }
+
+    #[tokio::test]
+    async fn disabled_lore_runs_neither_cutover_nor_driver() {
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_WORKER_SLOTS, json!({})).await;
+        poll(&lore_node(), &store, &[merged_ticket("T-9")], 1).await;
+        assert!(store.get(config::state::KEY_DOCS_CUTOVER).await.is_none());
+        assert_eq!(store.docs_record("T-9").await.unwrap().version, 0);
+    }
+
+    #[tokio::test]
+    async fn docs_cutover_skips_tickets_merged_before_the_gate_once() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(&full_ticket_key_flat("T-2", "lore_done"), json!(true))
+            .await;
+        submit_docs(&store, "T-3", "abc").await;
+        let node = lore_node();
+        let before = [
+            merged_ticket("T-1"),
+            merged_ticket("T-2"),
+            merged_ticket("T-3"),
+        ];
+        node.docs_cutover(&store, &before).await;
+        use config::docs_lifecycle::DocsPhase;
+        assert_eq!(
+            store.docs_record("T-1").await.unwrap().phase,
+            DocsPhase::Skipped
+        );
+        let legacy = store.docs_record("T-2").await.unwrap();
+        assert_eq!(legacy.phase, DocsPhase::Skipped);
+        assert!(legacy.skip_reason.unwrap().contains("legacy"));
+        assert_eq!(
+            store.docs_record("T-3").await.unwrap().phase,
+            DocsPhase::DocsReady,
+            "docs already in flight are kept"
+        );
+        assert!(store.get(config::state::KEY_DOCS_CUTOVER).await.is_some());
+
+        // Tickets merged after the cutover are documented.
+        node.docs_cutover(&store, &[merged_ticket("T-4")]).await;
+        assert_eq!(store.docs_record("T-4").await.unwrap().version, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_ticket_is_never_escalated_to_awaiting_human() {
+        for (worker, slot_status) in [("lore", bound_to("T-9")), ("forge-1", bound_to("T-9"))] {
+            let store = SharedStore::new_in_memory();
+            store.set(KEY_TICKETS, json!([merged_ticket("T-9")])).await;
+            store
+                .set(
+                    KEY_WORKER_SLOTS,
+                    json!({ worker: slot(worker, slot_status) }),
+                )
+                .await;
+            let node = lore_node();
+            node.mark_ticket_awaiting_human(&store, "T-9", worker, "workspace crashed 3 times")
+                .await;
+            let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
+            assert!(
+                matches!(tickets[0].status, TicketStatus::Merged { .. }),
+                "{worker}: a merged ticket stays merged"
+            );
+            let slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+            assert!(
+                matches!(slots[worker].status, WorkerStatus::Idle),
+                "{worker}: the worker is released"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_keeps_lore_slot_only_while_lore_is_drafting() {
+        let store = SharedStore::new_in_memory();
+        store.set(KEY_TICKETS, json!([merged_ticket("T-9")])).await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({ "lore": lore_slot(bound_to("T-9"), None) }),
+            )
+            .await;
+        let node = lore_node();
+
+        node.recover_orphans(&store).await.unwrap();
+        let slots = lore_slots(&store).await;
+        assert!(
+            matches!(lore_slot_status(&slots), WorkerStatus::Assigned { .. }),
+            "a merged ticket is LORE's normal binding while it drafts"
+        );
+        let recovery = NexusNode::reconcile(&[merged_ticket("T-9")], &slots, &[]);
+        assert!(recovery.stale_workers.is_empty());
+
+        submit_docs(&store, "T-9", "abc").await;
+        node.recover_orphans(&store).await.unwrap();
+        let slots = lore_slots(&store).await;
+        assert!(matches!(lore_slot_status(&slots), WorkerStatus::Idle));
+    }
+
+    #[tokio::test]
+    async fn create_chat_for_assignment_never_hijacks_lore_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = local_lore_store(&server, lore_slot(bound_to("T-9"), Some("ws"))).await;
+        let node = lore_node();
+        node.create_chat_for_assignment(&store, "lore", &merged_ticket("T-9"))
+            .await;
+        create.assert_async().await;
+        assert!(store
+            .get(&full_ticket_key("T-9", KEY_TICKET_DISPATCH, "lore"))
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn role_traits_hold_the_per_role_rules() {
+        let lore = RoleTraits::of("lore-1");
+        assert!(!lore.uses_a2a && lore.starts_from_default_branch && lore.scheduler_owns_chats);
+        assert!(lore.serves_terminal_tickets && !lore.crashes_count_against_ticket);
+        let sentinel = RoleTraits::of("sentinel-2");
+        assert!(sentinel.scheduler_owns_chats && sentinel.uses_a2a);
+        assert!(!sentinel.serves_terminal_tickets && sentinel.crashes_count_against_ticket);
+        assert_eq!(RoleTraits::of("forge-1"), RoleTraits::BUILDER);
+    }
+
+    #[tokio::test]
+    async fn docs_prs_reach_vessel_only_when_mergeable_or_unowned() {
+        use config::docs_lifecycle::DocsEvent;
+        let store = SharedStore::new_in_memory();
+        submit_docs(&store, "T-9", "abc").await;
+        let pr = |number: u64, ticket: &str, branch: &str| json!({"number": number, "ticket_id": ticket, "head_branch": branch});
+        let prs = [pr(42, "T-9", "lore/T-9"), pr(43, "T-5", "lore/T-5")];
+        let ready = NexusNode::pending_prs_ready_for_vessel(&store, &prs).await;
+        assert_eq!(
+            ready
+                .iter()
+                .map(|p| p["number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![43],
+            "awaiting the operator is held; an unowned docs PR goes to VESSEL to hand to a human"
+        );
+        decide_docs(&store, "T-9", true, "").await;
+        docs_event(&store, "T-9", "nexus", DocsEvent::Published { number: 42 }).await;
+        let ready = NexusNode::pending_prs_ready_for_vessel(&store, &prs[..1]).await;
+        assert_eq!(ready.len(), 1, "published docs PRs go to VESSEL");
+    }
+
+    #[tokio::test]
+    async fn unmanaged_docs_prs_are_not_rediscovered() {
+        let store = SharedStore::new_in_memory();
+        store.set("pr:42:unmanaged", json!({"reason": "x"})).await;
+        assert!(!NexusNode::should_discover_pr(&store, 42, Some("T-9"), "lore/T-9").await);
+        assert!(NexusNode::should_discover_pr(&store, 42, Some("T-9"), "forge-1/T-9").await);
+    }
+
+    #[tokio::test]
+    async fn hosted_lore_binds_slot_then_spawns_after_manager_reports_ready() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("POST", "/api/v1/runtime/workspaces")
+            .match_body(mockito::Matcher::Regex(r#""ticket_id":"T-9""#.into()))
+            .with_status(202)
+            .with_body(r#"{"workspace_id":"managed-lore","operation_id":"op","status":"queued"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let starting = server
+            .mock("GET", "/api/v1/runtime/workspaces/managed-lore")
+            .with_status(200)
+            .with_body(managed_status("managed-lore", "starting"))
+            .expect(1)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::Regex("docs submit".into()))
+            .with_status(200)
+            .with_body(r#"{"chat_id":"lore-chat","workspace_id":"managed-lore","created":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(WorkerStatus::Idle, None)).await;
+        let ticket = [merged_ticket("T-9")];
+        let node = hosted_lore_node(&server);
+        // Bind + request, then still starting.
+        poll(&node, &store, &ticket, 2).await;
+        request.assert_async().await;
+        starting.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert_eq!(lore_slot_status(&slots).ticket_id(), Some("T-9"));
+        assert_eq!(slots["lore"].workspace_id.as_deref(), Some("managed-lore"));
+
+        starting.remove_async().await;
+        let _ready = server
+            .mock("GET", "/api/v1/runtime/workspaces/managed-lore")
+            .with_status(200)
+            .with_body(managed_status("managed-lore", "running"))
+            .create_async()
+            .await;
+        poll(&node, &store, &ticket, 2).await;
+        create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn docs_ready_releases_lore_and_rejection_respawns_it_with_feedback() {
+        let mut server = mockito::Server::new_async().await;
+        let deleted = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/ws-1")
+            .with_status(202)
+            .expect(1)
+            .create_async()
+            .await;
+        let _provision = mock_managed_provisioning(&mut server).await;
+        let feedback = server
+            .mock("POST", "/api/v1/runtime/chats")
+            .match_body(mockito::Matcher::Regex(
+                "needs another revision. Feedback: Explain the migration".into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"chat_id":"chat-2","workspace_id":"ws-new","created":true}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(bound_to("T-9"), Some("ws-1"))).await;
+        store
+            .set(
+                &full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"),
+                json!("chat-1"),
+            )
+            .await;
+        let ticket = [merged_ticket("T-9")];
+        let node = hosted_lore_node(&server);
+
+        submit_docs(&store, "T-9", "abc").await;
+        poll(&node, &store, &ticket, 2).await;
+        deleted.assert_async().await;
+        let slots = lore_slots(&store).await;
+        assert!(
+            matches!(lore_slot_status(&slots), WorkerStatus::Idle),
+            "waiting on the operator holds no slot or workspace"
+        );
+        assert_eq!(delivery(&store, "T-9").await.ready_notified, Some(1));
+
+        decide_docs(&store, "T-9", false, "Explain the migration").await;
+        poll(&node, &store, &ticket, 3).await;
+        feedback.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&full_ticket_key("T-9", KEY_TICKET_CHAT, "lore"))
+                .await
+                .as_deref(),
+            Some("chat-2")
+        );
     }
 }

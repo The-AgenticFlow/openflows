@@ -167,7 +167,9 @@ All keys are shown relative to their `ns:{tenant}:` prefix. This is the complete
 |----------|-------|
 | Controller (`NexusNode`) | `tickets`, `worker_slots`, `pending_prs`, `registry_json`, `control:*`, `ticket:{id}:status`, `ticket:{id}:chat:*`, heartbeat |
 | Controller (`VesselNode`) | `pending_prs`, `repository`, `ci_readiness`, `ticket:{id}:deployment` |
-| Controller (`LoreNode`) | event ring buffer (`ticket_merged`) + `ticket:{id}:deployment` |
+| Controller (`NexusNode`, LORE driver) | `tickets` (merged), `ticket:{id}:docs`, `ticket:{id}:docs_delivery`, `ticket:{id}:deployment`, `ticket:{id}:chat:lore`, `docs:cutover_v1`, `docs:reopened` |
+| Harness (LORE) | `ticket:{id}:dispatch:lore`, `ticket:{id}:docs` |
+| Controller (`VesselNode`, docs PRs) | `ticket:{id}:docs` (read; records `rework` and `merged`) |
 | Harness (FORGE/SENTINEL/VESSEL) | `ticket:{id}:dispatch:*`, `ticket:{id}:status`, `ticket:{id}:gate:*`, `ticket:{id}:handoff` |
 | SENTINEL | `pair:{id}:verification` (A2A result), `ticket:{id}:review:*` |
 

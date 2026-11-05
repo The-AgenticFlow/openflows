@@ -27,7 +27,6 @@ agent-nexus     = { version = "0.1.0", path = "../crates/agent-nexus" }
 agent-forge     = { version = "0.1.0", path = "../crates/agent-forge" }
 agent-vessel    = { version = "0.1.0", path = "../crates/agent-vessel" }
 agent-sentinel  = { version = "1.1.6", path = "../crates/agent-sentinel" }
-agent-lore      = { version = "0.1.0", path = "../crates/agent-lore" }
 provisioner    = { version = "0.1.0", path = "../crates/provisioner" }
 coder-client    = { version = "0.1.0", path = "../crates/coder-client" }
 openflows-harness = { version = "1.2.1", path = "../crates/openflows-harness" }

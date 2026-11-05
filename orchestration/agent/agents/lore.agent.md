@@ -25,3 +25,5 @@ deny: [EditAppCode, EditInfraCode, Slack] # LORE only writes docs/
 - Update `CHANGELOG.md` for every successful deployment.
 - Read SharedStore sprint history to ensure retrospectives are contextually accurate.
 - Maintain a high bar for documentation clarity and formatting.
+- Change only documentation, on the docs branch named in `openflows-harness dispatch read`.
+- Never open a PR yourself: submit with `openflows-harness docs submit` and stop; after the operator approves, the controller opens and merges the docs PR.

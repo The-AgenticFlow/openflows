@@ -92,6 +92,118 @@ operator/worker commands within the existing Redis credential boundary; this
 change does not add an authentication service or treat environment role strings
 as cryptographic identity. GitHub-only approval does not replace these gates.
 
+## Documentation gate (LORE)
+
+The ticket lifecycle is terminal at `done`, so post-merge documentation has its
+own versioned record, `ticket:{id}:docs`, with the same reducer and
+compare-and-set rules:
+
+```text
+drafting → docs_ready → approved → published → merged
+   ↑  (reject)  │           │ (branch moved)   │ (conflicts / CI failed / head moved: rework)
+   └────────────┴───────────┴──────────────────┘
+published → abandoned (PR closed without merging)
+drafting → skipped (nothing submitted)
+merged | abandoned | skipped → drafting (operator --reopen, new cycle and branch)
+```
+
+The record also has an operator `paused` flag, an `epoch` (bumped by resume,
+restart, rework and reopen; NEXUS re-delivers LORE's instruction on a fresh
+workspace when it changes) and a `cycle` (bumped by reopen; selects the docs
+branch). NEXUS starts a LORE Coder chat for each merged ticket whose record is
+drafting, and the flow never waits on it.
+
+LORE pushes branch `lore/<ticket>` (`lore/<ticket>--c<N>` after a reopen) and
+runs `openflows-harness docs submit --report <file>`. The submit is refused
+unless the checkout is clean, the branch is exactly the expected one, the
+pushed head matches, and every changed file is documentation: Markdown, reST
+and AsciiDoc files, changelogs, and text files and images under `docs/`.
+Refused everywhere: executable, configuration and build-input files (MDX, and
+`requirements*.txt`, `CMakeLists.txt` or `robots.txt` even under `docs/`),
+every dot-directory and dotfile (`.github/`, `.cursor/`, `.changeset/`, ...),
+`orchestration/`, agent instruction files (`*.agent.md`, `SKILL.md`,
+`CLAUDE.md`, `AGENTS.md`), and legal and ownership files (`LICENSE*`,
+`COPYING*`, `NOTICE*`, `CODEOWNERS`). The file list is computed with
+`--no-renames`, so moving a source file into `docs/` shows as a deletion of
+that source file. The submission records the head, base and changed-file list.
+
+That check runs in LORE's workspace, so it only helps LORE: `files` and `base`
+are what the workspace reported and are never trusted. The operator's review
+link (`compare/<default branch>...<head>`) is built from GitHub's default
+branch, and before opening the docs PR NEXUS asks GitHub for the files the
+approved head changes against the default branch (both sides of renames) and
+applies the same policy; VESSEL repeats it on the PR's file list before
+merging. A violation sends the docs back to LORE (`rework`) and notifies the
+operator. The operator decides that exact artifact, or controls LORE:
+
+```sh
+openflows gate docs --tenant <tenant> --pending
+openflows gate docs --tenant <tenant> --ticket <ticket> --status
+openflows gate docs --tenant <tenant> --ticket <ticket> \
+  --revision <N> --head <SHA or 7+ char prefix> --verdict approve|reject --notes "Feedback for LORE"
+openflows gate docs --tenant <tenant> --ticket <ticket> --pause "<reason>"
+openflows gate docs --tenant <tenant> --ticket <ticket> --resume
+openflows gate docs --tenant <tenant> --ticket <ticket> --restart "<reason>"
+openflows gate docs --tenant <tenant> --ticket <ticket> --skip "<reason>"
+openflows gate docs --tenant <tenant> --ticket <ticket> --reopen "<reason>"
+```
+
+A verdict can be given again while the docs are approved or published:
+approving re-seals the approval (for example after a secret rotation), and
+rejecting revokes it and returns the docs to LORE, keeping any open PR.
+
+**Approvals are sealed.** Workspaces can reach the store, so an `approved`
+field alone cannot be trusted. The operator CLI seals each approval with an
+HMAC over the ticket, revision and head, so it must run where the controller's
+environment is available. The seal key is derived (with its own label) from
+`OPENFLOWS_DOCS_GATE_SECRET`, or from `CODER_CHAT_HOOK_SECRET` when that is
+unset, so the hook's HS256 key bytes are never used directly for a second
+purpose; either secret must be at least 32 bytes and is never given to
+workspaces. Each seal names its key id. To rotate, set the new secret and move
+the old one to `OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS` until outstanding
+approvals have merged. NEXUS verifies the seal before opening the docs PR and
+VESSEL verifies it again before merging; without a secret neither does
+anything with docs PRs (the controller logs an error at boot when LORE is
+enabled). An approval that does not verify (for example, sealed with a key the
+controller no longer holds) is reported to the operator once, with the command
+to approve it again.
+
+The controller's secrets reach it as Coder workspace parameters, so the Coder
+deployment and its administrators are inside this trust boundary: the seal
+stops workspaces, not Coder, from approving docs. Branch protection on the
+default branch is still required, since LORE pushes with the user's GitHub
+token and the gate cannot stop a direct push.
+
+A rejection returns LORE to drafting with the notes as feedback. After
+approval NEXUS (not LORE) checks that the branch on GitHub is still at the
+approved head and changes documentation only, opens the docs PR into the
+repository default branch (or finds an open one into it; a PR from the docs
+branch into any other base is never adopted), and records it (`published`).
+VESSEL merges it only while it is published and unpaused, the seal verifies,
+the PR head is the approved head, the PR targets the default branch, and its
+files are documentation only; the merge itself pins that head. A docs PR into
+another base goes to a human. Conflicts, failed CI, non-documentation files,
+or commits pushed after approval send the record back to LORE (`rework`) on
+the **same branch and PR** with the reason as feedback, and the operator
+reviews the new head. While CI runs, or when VESSEL cannot read the record or
+GitHub, it holds that docs PR only; other pending PRs are processed as usual. A
+merge (by VESSEL or a human) closes the record as `merged`; a PR closed without
+merging closes it as `abandoned` and notifies the operator.
+
+While paused, NEXUS frees LORE's slot and destroys its workspace (unpushed
+work is discarded), opens no PR, and VESSEL holds the docs PR; the reducer
+refuses submissions. Merges and closures on GitHub are still recorded.
+Resuming starts LORE again on a fresh workspace from the pushed branch.
+A LORE that makes no progress after three nudges, that spends four hours on
+one step, whose workspace or chat has not come up for 30 minutes, or whose
+workspace crashed three times since the last resume, is parked: NEXUS pauses
+the record, frees the slot and asks the operator to resume or skip.
+`--restart` replaces a drafting LORE's workspace and chat. `--skip` closes a
+record nothing was submitted for in the current cycle (also right after a
+mistaken `--reopen`); `--reopen` starts a new cycle for a merged, abandoned or
+skipped one. The record keeps its latest 100 transitions. Merged tickets that predate
+the gate are skipped once at cutover (only while LORE is enabled).
+
 ## Merge and recovery
 
 PR decisions and pending GitHub delivery are written in one lifecycle update.
