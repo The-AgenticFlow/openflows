@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use chrono::DateTime;
-use github::{effective_review_state, latest_review_per_user, PrReviewState};
+use github::{latest_review_per_user, PrReview, PrReviewState};
 use pocketflow_core::{CiStatus, PrInfo};
 use tracing::{debug, warn};
 
@@ -131,6 +131,56 @@ pub(crate) fn is_feedback_addressed(
     feedback_commit_id == Some(dispatched_sha)
 }
 
+/// The reviews that still apply to the PR's candidate head.
+///
+/// Takes each reviewer's latest review and drops change requests that prior
+/// rework has addressed (see [`is_feedback_addressed`]). Every review-gating
+/// decision must aggregate over this list, so an addressed change request from
+/// one reviewer cannot hide another reviewer's valid approval (#396).
+pub(crate) fn applicable_reviews<'a>(
+    reviews: &'a [PrReview],
+    head_sha: &str,
+    evidence: Option<&ReworkEvidence>,
+) -> Vec<&'a PrReview> {
+    latest_review_per_user(reviews)
+        .into_iter()
+        .filter(|r| {
+            r.state_enum() != PrReviewState::ChangesRequested
+                || !is_feedback_addressed(
+                    r.commit_id.as_deref(),
+                    r.submitted_at.as_deref(),
+                    head_sha,
+                    evidence,
+                )
+        })
+        .collect()
+}
+
+/// Aggregate [`applicable_reviews`] into the review verdict for `head_sha`.
+///
+/// - Any remaining (unaddressed) change request blocks: `ChangesRequested`.
+/// - Otherwise `Approved` requires an authorized reviewer's approval of the
+///   candidate head (or an approval GitHub reported without a commit).
+/// - Otherwise `None`: the PR still needs review.
+pub(crate) fn candidate_review_state(applicable: &[&PrReview], head_sha: &str) -> PrReviewState {
+    if applicable
+        .iter()
+        .any(|r| r.state_enum() == PrReviewState::ChangesRequested)
+    {
+        return PrReviewState::ChangesRequested;
+    }
+    let has_authorized_head_approval = applicable.iter().any(|r| {
+        r.state_enum() == PrReviewState::Approved
+            && r.is_authorized_reviewer()
+            && (r.commit_id.as_deref() == Some(head_sha) || r.commit_id.is_none())
+    });
+    if has_authorized_head_approval {
+        PrReviewState::Approved
+    } else {
+        PrReviewState::None
+    }
+}
+
 /// Pure state classifier over the inputs that determine the PR lifecycle.
 ///
 /// Priority (per plan):
@@ -195,7 +245,10 @@ pub async fn classify(
             Vec::new()
         }
     };
-    let review_state = effective_review_state(&reviews);
+    // Change requests addressed by rework are dropped before aggregating, so a
+    // remaining authorized approval of the current head still counts.
+    let applicable = applicable_reviews(&reviews, &pr_info.head_sha, evidence);
+    let effective_review = candidate_review_state(&applicable, &pr_info.head_sha);
 
     let comments = match client
         .list_review_comments(owner, repo, pr_info.number)
@@ -210,40 +263,6 @@ pub async fn classify(
             );
             Vec::new()
         }
-    };
-
-    // If review_state is ChangesRequested, verify whether any reviewer currently has
-    // unaddressed ChangesRequested. If a change request was submitted on an older commit
-    // and addressed by subsequent rework, it does not trigger rework.
-    let effective_review = if review_state == PrReviewState::ChangesRequested {
-        let has_unaddressed_changes_requested = latest_review_per_user(&reviews).iter().any(|r| {
-            r.state_enum() == PrReviewState::ChangesRequested
-                && !is_feedback_addressed(
-                    r.commit_id.as_deref(),
-                    r.submitted_at.as_deref(),
-                    &pr_info.head_sha,
-                    evidence,
-                )
-        });
-        if has_unaddressed_changes_requested {
-            PrReviewState::ChangesRequested
-        } else {
-            PrReviewState::None
-        }
-    } else if review_state == PrReviewState::Approved {
-        // Verify that the approval is from an authorized reviewer AND covers the candidate head commit.
-        let has_authorized_head_approval = latest_review_per_user(&reviews).iter().any(|r| {
-            r.state_enum() == PrReviewState::Approved
-                && r.is_authorized_reviewer()
-                && (r.commit_id.as_deref() == Some(&pr_info.head_sha) || r.commit_id.is_none())
-        });
-        if has_authorized_head_approval {
-            PrReviewState::Approved
-        } else {
-            PrReviewState::None
-        }
-    } else {
-        review_state
     };
 
     // Comments are "unaddressed" when there are comments that have not been addressed by prior
@@ -548,6 +567,143 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, PrMonitorState::NeedsReview);
+    }
+
+    fn reviews(json: &str) -> Vec<PrReview> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Rework for `commit_old` was dispatched at 12:30 and FORGE pushed `commit_new`.
+    fn rework_evidence() -> ReworkEvidence {
+        ReworkEvidence {
+            dispatched_sha: Some("commit_old".to_string()),
+            dispatched_at: Some("2026-10-08T12:30:00Z".to_string()),
+        }
+    }
+
+    fn review_state_for(json: &str) -> PrReviewState {
+        let all = reviews(json);
+        let evidence = rework_evidence();
+        let applicable = applicable_reviews(&all, "commit_new", Some(&evidence));
+        candidate_review_state(&applicable, "commit_new")
+    }
+
+    #[test]
+    fn addressed_change_request_does_not_hide_authorized_head_approval() {
+        // #396: alice's change request on commit_old was addressed by rework;
+        // bob approved the current head.
+        assert_eq!(
+            review_state_for(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:00:00Z","author_association":"MEMBER"},
+                    {"state":"APPROVED","user":{"login":"bob"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"COLLABORATOR"}]"#
+            ),
+            PrReviewState::Approved
+        );
+    }
+
+    #[test]
+    fn unaddressed_change_request_still_blocks_head_approval() {
+        // carol requested changes on the current head; the rework could not
+        // have addressed it, so bob's approval does not make the PR approved.
+        assert_eq!(
+            review_state_for(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:00:00Z","author_association":"MEMBER"},
+                    {"state":"CHANGES_REQUESTED","user":{"login":"carol"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:30:00Z","author_association":"MEMBER"},
+                    {"state":"APPROVED","user":{"login":"bob"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"COLLABORATOR"}]"#
+            ),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn change_request_submitted_after_dispatch_still_blocks() {
+        // alice reviewed commit_old after rework had already been dispatched,
+        // so that rework cannot have addressed her request.
+        assert_eq!(
+            review_state_for(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:45:00Z","author_association":"MEMBER"},
+                    {"state":"APPROVED","user":{"login":"bob"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"COLLABORATOR"}]"#
+            ),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn addressed_change_request_does_not_admit_ineligible_approvals() {
+        // Unauthorized approvals of the head and stale approvals of older
+        // commits still do not unblock the PR.
+        assert_eq!(
+            review_state_for(
+                r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:00:00Z","author_association":"MEMBER"},
+                    {"state":"APPROVED","user":{"login":"mallory"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"NONE"},
+                    {"state":"APPROVED","user":{"login":"carol"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:10:00Z","author_association":"OWNER"}]"#
+            ),
+            PrReviewState::None
+        );
+    }
+
+    #[test]
+    fn change_request_is_not_addressed_without_rework_evidence() {
+        // With no evidence that rework was dispatched, nothing is filtered.
+        let all = reviews(
+            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:00:00Z","author_association":"MEMBER"},
+                {"state":"APPROVED","user":{"login":"bob"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"COLLABORATOR"}]"#,
+        );
+        let applicable = applicable_reviews(&all, "commit_new", None);
+        assert_eq!(
+            candidate_review_state(&applicable, "commit_new"),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_addressed_change_request_with_head_approval_is_ready_for_merge() {
+        // #396 end to end through classify(): previously NeedsReview.
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"Fix this","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"commit_old","author_association":"MEMBER"},
+                           {"id":2,"user":{"login":"bob","id":101},"body":"LGTM","state":"APPROVED","submitted_at":"2026-10-08T13:00:00Z","commit_id":"commit_new","author_association":"COLLABORATOR"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "commit_new".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+        let evidence = rework_evidence();
+
+        let state = classify(
+            &client,
+            "org",
+            "repo",
+            &pr_info,
+            CiStatus::Success,
+            Some(&evidence),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, PrMonitorState::ReadyForMerge);
     }
 
     #[tokio::test]
