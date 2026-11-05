@@ -13,6 +13,8 @@ use axum::{
 use serde::Serialize;
 use utoipa_swagger_ui::SwaggerUi;
 
+pub mod agent_activity;
+pub mod audit;
 pub mod auth;
 pub mod coder_hooks;
 pub mod coder_identity;
@@ -21,7 +23,9 @@ pub mod device;
 pub mod health;
 pub mod invitations;
 pub mod local_github;
+pub mod operations;
 pub mod organizations;
+pub mod platform;
 pub mod platform_releases;
 pub mod runtime;
 pub mod tenants;
@@ -268,6 +272,17 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             router: get(auth::csrf_token),
         },
         ApiRoute {
+            methods: &["GET"],
+            path: "/invitations/preview",
+            tag: "invitations",
+            summary: "Preview an invitation addressed to the signed-in user",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(invitations::preview),
+        },
+        ApiRoute {
             methods: &["POST"],
             path: "/invitations/accept",
             tag: "invitations",
@@ -398,6 +413,50 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             success: 200,
             description: None,
             router: post(organizations::create_invitation),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/invitations",
+            tag: "organizations",
+            summary: "List pending invitations",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(organizations::list_invitations),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/audit",
+            tag: "organizations",
+            summary: "List audit log entries",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(audit::list_audit),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/operations",
+            tag: "organizations",
+            summary: "List operation history",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(operations::list_operations),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/platform/overview",
+            tag: "platform",
+            summary: "Platform-wide overview for operators",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(platform::overview),
         },
         ApiRoute {
             methods: &["DELETE"],
@@ -543,6 +602,17 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             router: get(tenants::tenant_status),
         },
         ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/tenants/{tenant}/agent-activity",
+            tag: "tenants",
+            summary: "What a tenant's agents are doing",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(agent_activity::agent_activity),
+        },
+        ApiRoute {
             methods: &["POST"],
             path: "/organizations/{org}/github/connect",
             tag: "github",
@@ -585,6 +655,17 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             success: 200,
             description: None,
             router: get(connections::list_connections),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/organizations/{org}/github/connections/{id}/repositories",
+            tag: "github",
+            summary: "List repositories of a connection",
+            auth: Auth::Bearer,
+            is_json: true,
+            success: 200,
+            description: None,
+            router: get(connections::list_repositories),
         },
         ApiRoute {
             methods: &["POST"],

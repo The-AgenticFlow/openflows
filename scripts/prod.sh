@@ -23,6 +23,17 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     set +a
 fi
 
+# Compose and binary installs (setup.sh --compose, --binary) have no Rust toolchain:
+# run the installed programs instead of building them. .dev-binaries/host holds a
+# native copy on machines that can't run the workspaces' linux/amd64 programs.
+case "${OPENFLOWS_SETUP_MODE:-}" in
+    compose|binary)
+        if [ -z "${OPENFLOWS_BIN:-}" ]; then
+            OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
+            [ -x "${PROJECT_ROOT}/.dev-binaries/host/openflows" ] && OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/host/openflows"
+        fi ;;
+esac
+
 # Track whether the caller explicitly pinned a binary (env var or --bin flag).
 # When explicit, we respect it as-is and never touch it. Otherwise we always
 # rebuild the in-repo release binary from source before every invocation, so
@@ -36,6 +47,9 @@ else
     OPENFLOWS_BIN_EXPLICIT=0
 fi
 SKIP_BUILD=false
+case "${OPENFLOWS_SETUP_MODE:-}" in
+    compose|binary) SKIP_BUILD=true ;;   # also skips the dev-sync build in `bootstrap`
+esac
 BUILD_DONE=false
 
 usage() {
@@ -49,9 +63,10 @@ Usage:
 
 Options:
   --bin PATH     Use this exact openflows binary and skip auto-rebuild
-  --skip-build   Skip the automatic `cargo build --release` before running
-                 (uses whatever binary find_binary() resolves to, which may
-                 be stale — only use this if you know what you're doing)
+  --skip-build   Skip the automatic `cargo build --release` before running,
+                 and the dev-binary sync in `bootstrap` (uses whatever binary
+                 find_binary() resolves to and the programs already in
+                 .dev-binaries — only use this if you know what you're doing)
 
 Note: by default, every invocation rebuilds ./target/release/openflows from
 current source first (cargo build is incremental, so this is fast when
@@ -177,7 +192,9 @@ case "$CMD" in
         echo "═══════════════════════════════════════"
         echo ""
         echo "Step 1: Syncing dev binary..."
-        if [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
+        if [ "$SKIP_BUILD" = "true" ]; then
+            echo "  → Skipping (--skip-build): using the programs already in .dev-binaries"
+        elif [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
             "${SCRIPT_DIR}/dev-sync.sh"
         else
             echo "⚠ dev-sync.sh not found, skipping..."

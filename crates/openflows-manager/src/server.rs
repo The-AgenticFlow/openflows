@@ -152,10 +152,22 @@ pub async fn resolve_secret_provider(
                     "filesystem secret provider requires OPENFLOWS_SECRET_DIR".into(),
                 )
             })?;
-            Ok(Box::new(
-                crate::secrets::FilesystemSecretProvider::new(root)
-                    .map_err(|e| ManagerError::Config(e.to_string()))?,
-            ))
+            let mut provider = crate::secrets::FilesystemSecretProvider::new(root)
+                .map_err(|e| ManagerError::Config(e.to_string()))?;
+            // Optional: make mounted secret files readable by the workspace
+            // user on Linux hosts (see FilesystemSecretProvider).
+            if let Ok(raw) = std::env::var("OPENFLOWS_SECRET_FILE_MODE") {
+                let mode =
+                    u32::from_str_radix(raw.trim().trim_start_matches("0o"), 8).map_err(|_| {
+                        ManagerError::Config(
+                            "OPENFLOWS_SECRET_FILE_MODE must be an octal mode such as 0644".into(),
+                        )
+                    })?;
+                provider = provider
+                    .with_file_mode(mode)
+                    .map_err(|e| ManagerError::Config(e.to_string()))?;
+            }
+            Ok(Box::new(provider))
         }
         AWS_SECRETS_MANAGER_SECRET_PROVIDER => {
             let prefix = std::env::var("OPENFLOWS_AWS_SECRETS_PREFIX").map_err(|_| {

@@ -21,34 +21,87 @@ installation.
 
 ## You need
 
-- Docker (running), Rust (`cargo`), `curl`, `python3`
-- A GitHub account with access to the repository and permission to install the OpenFlows App there (or approval from its owner)
+- Docker (running), `curl`, `python3`
+- Rust (`cargo`), only for `--source`
+- A GitHub account with access to the repository and permission to install the OpenFlows App there (or approval from its owner). To use your own App instead, an account that can create a GitHub App on the repo's owner
 - An API key for an LLM provider (Anthropic, OpenAI, OpenRouter or Google)
+
+## Choose how to install
+
+| | `--binary` | `--compose` | `--source` (default) |
+| --- | --- | --- | --- |
+| Programs come from | The release's binaries | The published images | Compiled from this checkout |
+| Needs Rust | No | No | Yes |
+| First run | A few minutes | A few minutes | About 10 minutes |
+| Host | Linux or macOS, x86-64 or ARM64 | Same | Linux or macOS |
+| Version | Any release after 1.8.1 | Any release (macOS, ARM64: after 1.8.1) | This checkout |
+| GitHub App | The team's shared App, or your own | Same (shared App: after 1.8.1) | Same |
+
+All three need Docker: Coder and the workspaces run in it. Workspaces run `linux/amd64`, which Docker emulates on ARM64 (slower).
 
 ## Run
 
 ```bash
-./scripts/setup.sh owner/repo
+./scripts/setup.sh owner/repo --binary      # release binaries, no compiling
+./scripts/setup.sh owner/repo --compose     # published images, no compiling
+./scripts/setup.sh owner/repo --source      # compile from this checkout
 ```
 
-That is the whole setup. The script is safe to re-run: it checks what is already done and continues from there. If something is missing, it stops and tells you exactly what to do.
+**No checkout?** Download a release's setup kit, then run setup from it:
+
+```bash
+VERSION=<version>   # a release after 1.8.1
+curl -fsSL "https://github.com/The-AgenticFlow/openflows/releases/download/openflows-${VERSION}/openflows-${VERSION}-setup.tar.gz" | tar -xz
+cd "openflows-${VERSION}" && ./scripts/setup.sh owner/repo
+```
+
+> **Version 1.8.1 or older with `--compose`?** Those releases have no shared App without compiling. Create `.env` and switch to your own App first:
+>
+> ```bash
+> cp .env.example .env
+> sed -i 's/^OPENFLOWS_GITHUB_AUTH_MODE=.*/OPENFLOWS_GITHUB_AUTH_MODE=self-managed/' .env
+> ```
+
+Without a flag, setup uses the mode of your last run, or `--source` the first time. That is the whole setup. The script is safe to re-run: it checks what is already done and continues from there. If something is missing, it stops and tells you exactly what to do.
 
 It will:
 
 1. Check your machine (and install the `coder` CLI if missing).
 2. Create `.env` and generate secrets.
-3. Open the local OpenFlows console, install the team-owned **OpenFlows GitHub App** on a repository, authorize your GitHub account using its device code, then choose that repository. No personal App, App secret, client ID, or App slug is needed.
-4. Start Redis, Coder, and the local Manager in Docker.
-5. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
-6. Add your **LLM** provider and model (asks for the API key).
-7. Build binaries and push the workspace templates (first run takes about 10 minutes).
-8. Connect your repo. The local Manager renews your GitHub App user token when needed and supplies it to the workspaces.
+3. With `--binary` or `--compose`: pick the OpenFlows version, then verify its checksums or pin its image digest.
+4. Set up GitHub access:
+   - Shared App (default): open the local OpenFlows console, install the team-owned **OpenFlows GitHub App** on a repository, authorize your GitHub account using its device code, then choose that repository. No personal App, App secret, client ID, or App slug is needed.
+   - Your own App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`): your browser opens, you click **Create GitHub App**, then install it on your repo.
+5. Start Redis and Coder in Docker (plus the local Manager when using the shared App).
+6. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
+7. Add your **LLM** provider and model (asks for the API key).
+8. Push the workspace templates. With `--source` it builds the binaries first (about 10 minutes the first time); otherwise it uses the installed programs.
+9. Connect your repo. With the shared App, the local Manager renews your GitHub App user token when needed and supplies it to the workspaces; with your own App, you click **Authorize** once to link GitHub to your Coder account.
 
-For connected-local mode, open the Manager console at <http://localhost:3002> after setup. The console handles App installation, GitHub approval, and repository selection.
+With the shared App, setup pauses and opens the Manager console at <http://localhost:3002>. There:
+
+1. Click **Install OpenFlows App** and choose your repository.
+2. Click **Connect GitHub** and approve the device code. Your repositories appear only after this.
+3. Select your repository, click **Use selected repository**, then press Enter in the terminal.
+
+If the console asks for its key, reopen it with `xdg-open "http://127.0.0.1:3002/#console-key=$(cat ~/.config/openflows/console-key)"` (macOS: `open`).
 
 Maintainers can verify the team App with a disposable repository: approve the
 device code, confirm the repository appears in the console, and run one test
 push. Never record or share local credential files or token values.
+
+## Version, upgrade, rollback (`--binary`, `--compose`)
+
+Set the version in `.env` (empty means the latest release), clear the pinned digest, and re-run setup:
+
+```bash
+OPENFLOWS_VERSION=<version>
+OPENFLOWS_IMAGE_DIGEST=
+```
+
+With a setup kit, first extract the new version's kit and move your `.env` into its folder.
+
+Your stack and workspaces must be running when you re-run setup. At the end, setup updates stopped workspaces and offers to update the running ones so they load the new templates and programs. If you skip that, setup reports **Upgrade not complete** (exit status 3) and offers again on the next run. From a script, add `--update-workspaces` to update them without asking. Details: [upgrade and rollback](docs/setup-reference.md#upgrade-and-rollback).
 
 ## Testing the Manager's organization provisioning locally
 
@@ -136,4 +189,4 @@ Open an issue in your repo. OpenFlows picks it up, writes code, reviews it and o
 
 ## Something went wrong?
 
-Re-run `./scripts/setup.sh owner/repo` after fixing the problem it printed. Your Coder token lasts 90 days; re-running the script refreshes it. For manual steps, hooks, roles, configuration and troubleshooting, see [docs/setup-reference.md](docs/setup-reference.md).
+Re-run `./scripts/setup.sh owner/repo` after fixing the problem it printed. Messages specific to `--binary` and `--compose` are explained in [troubleshooting](docs/setup-reference.md#troubleshooting). Your Coder token lasts 90 days; re-running the script refreshes it. For manual steps, hooks, roles, configuration and troubleshooting, see [docs/setup-reference.md](docs/setup-reference.md).

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # OpenFlows one-command setup.
 #
-#   ./scripts/setup.sh [owner/repo] [--name TEAM] [--fleet N]   (N = FORGE-SENTINEL pairs; asked when omitted)
+#   ./scripts/setup.sh [owner/repo] [--source | --compose | --binary] [--name TEAM] [--fleet N]
+#                      [--update-workspaces]
+#
+#   --source   compile OpenFlows from this checkout (default; needs Rust)
+#   --compose  use the published images, no compiling
+#   --binary   use the release's binaries, no compiling (default in a setup kit)
+#              For both, OPENFLOWS_VERSION in .env picks the version (empty = latest release)
+#   --update-workspaces  after an upgrade, update running workspaces without asking
+#   N = FORGE-SENTINEL pairs; asked when omitted
+#
+# Exit status: 0 done, 3 upgrade not complete (workspaces still on the old version), else failed.
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
-# Stages: preflight → .env → GitHub App → Docker → Coder admin/token →
+# Stages: preflight → .env → [image or release] → GitHub App → Docker → Coder admin/token →
 #         LLM model → bootstrap → tenant → doctor.
 #
 # Non-interactive use: pass owner/repo, and set OPENFLOWS_LLM_PROVIDER /
@@ -16,6 +26,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
+LAST_RELEASE_WITHOUT_SHARED_APP=1.8.1    # its Manager image predates the console sign-in
+BIN_DIR="${ROOT}/.dev-binaries"          # programs for the workspaces (always linux/amd64)
+HOST_BIN_DIR="${BIN_DIR}/host"           # programs for this machine, when those can't run here
+RELEASE_REPO="${OPENFLOWS_RELEASE_REPO:-The-AgenticFlow/openflows}"
+WORKSPACE_TARGET=x86_64-unknown-linux-gnu
 TOTAL=8
 STEP=0
 
@@ -29,6 +44,8 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then FANCY=1; else FANCY=0; fi   # animat
 LOG_FILE="${ROOT}/.setup.log"
 START_TIME=$SECONDS
 RAIL_OPEN=0
+UPGRADE_PENDING=""
+UPDATE_WORKSPACES=0
 STEP_START=0
 PW=66   # panel inner width
 
@@ -210,6 +227,12 @@ env_set() { # env_set KEY VALUE — replace the line or append
     cat "$tmp" >"$ENV_FILE" && rm -f "$tmp"
     chmod 600 "$ENV_FILE"
 }
+# image_repo — where the images come from, in the order Compose reads it: shell, .env, default.
+image_repo() {
+    local repo
+    if [ "${OPENFLOWS_IMAGE_REPO+x}" = x ]; then repo="$OPENFLOWS_IMAGE_REPO"; else repo="$(env_get OPENFLOWS_IMAGE_REPO)"; fi
+    printf '%s' "${repo:-ghcr.io/the-agenticflow/openflows}"
+}
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
@@ -258,9 +281,18 @@ install_coder() {
 stage_preflight() {
     step "Checking your machine"
     local missing=()
+    if [ "$MODE" != source ] && [ -z "$(host_target)" ]; then
+        die "No OpenFlows release programs for $(uname -s) $(uname -m)." \
+            "Supported: Linux x86-64 and ARM64, macOS Intel and Apple Silicon." \
+            "Build from source instead:  ./scripts/setup.sh ${REPO} --source"
+    fi
     have curl    || missing+=("curl      → install with your package manager")
     have python3 || missing+=("python3   → install with your package manager")
-    have cargo   || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh")
+    if [ "$MODE" = source ]; then
+        [ -d "${ROOT}/crates" ] || die "--source needs a checkout of the repository; this folder is a setup kit." \
+            "Install from the release instead:  ./scripts/setup.sh ${REPO} --binary"
+        have cargo || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh   (or skip compiling: --compose)")
+    fi
     if ! have docker; then
         missing+=("docker    → https://docs.docker.com/get-docker/")
     elif ! docker info >/dev/null 2>&1; then
@@ -293,7 +325,11 @@ stage_preflight() {
             fi
         done
     fi
-    ok "docker, compose, cargo, coder, python3, curl"
+    if [ "$MODE" = source ]; then
+        ok "docker, compose, cargo, coder, python3, curl"
+    else
+        ok "docker, compose, coder, python3, curl"
+    fi
 }
 
 # ── stage 2: .env ───────────────────────────────────────────────────────────
@@ -313,6 +349,9 @@ stage_env() {
     fi
     ok ".env ready"
 }
+
+# shellcheck source=setup-release.sh
+source "${SCRIPT_DIR}/setup-release.sh"
 
 # ── stage 3: GitHub App ─────────────────────────────────────────────────────
 github_app_via_manifest() { # $1=owner → sets client id/secret/install url in .env
@@ -418,16 +457,40 @@ github_app_manual() {
     env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
 }
 
+has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_SHARED_APP" ]; }
+# pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
+pin_manager_image() {
+    local version repo pinned digest
+    version="$(env_get OPENFLOWS_VERSION)"; repo="$(image_repo)-manager"
+    pinned="$(env_get OPENFLOWS_MANAGER_IMAGE)"
+    case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
+    docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
+        || die "No published Manager image for OpenFlows ${version} (${repo}:${version})." \
+            "Pick another OPENFLOWS_VERSION, or use your own App: OPENFLOWS_GITHUB_AUTH_MODE=self-managed."
+    digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+        | sed -n "s|^${repo}@||p" | head -1)"
+    [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
+    env_set OPENFLOWS_MANAGER_IMAGE "${repo}:${version}@${digest}"
+}
+
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
     local auth_mode
     auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     if [ -z "$auth_mode" ]; then
-        if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
+        if { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; } \
+            || { [ "$MODE" != source ] && ! has_shared_app "$(env_get OPENFLOWS_VERSION)"; }; then
             auth_mode=self-managed
         else
             auth_mode=connected-local
         fi
+    fi
+    if [ "$auth_mode" = connected-local ] && [ "$MODE" != source ]; then
+        has_shared_app "$(env_get OPENFLOWS_VERSION)" \
+            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App (connected-local) without compiling." \
+                "Set a version newer than ${LAST_RELEASE_WITHOUT_SHARED_APP} as OPENFLOWS_VERSION in .env," \
+                "or use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env."
+        pin_manager_image
     fi
     env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     if [ "$auth_mode" = connected-local ]; then
@@ -479,28 +542,83 @@ stage_github_app() {
     fi
 }
 
+# compose_base_files — "-f FILE" for each Compose file this project normally uses. Passing
+# any -f stops Compose from reading COMPOSE_FILE and docker-compose.override.yml on its own,
+# so they are added back here before setup's own files. Prints one argument per line.
+compose_base_files() {
+    local files="${COMPOSE_FILE:-$(env_get COMPOSE_FILE)}" f
+    local sep="${COMPOSE_PATH_SEPARATOR:-$(env_get COMPOSE_PATH_SEPARATOR)}"
+    if [ -n "$files" ]; then
+        tr "${sep:-:}" '\n' <<<"$files" | awk 'NF {print "-f"; print}'
+        return
+    fi
+    printf '%s\n' -f docker-compose.yml
+    for f in docker-compose.override.yml docker-compose.override.yaml; do
+        if [ -f "${ROOT}/${f}" ]; then printf '%s\n' -f "$f"; break; fi
+    done
+}
+
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
+# compose_files — the -f arguments for this install, one per line; none for plain `docker compose`.
+# connected-local adds the local Manager (from its image unless compiling); the images
+# file copies the programs into .dev-binaries before Coder starts.
+compose_files() {
+    local extra=()
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
+        extra+=(-f docker-compose.connected-local.yml)
+        [ "$MODE" = source ] || extra+=(-f docker-compose.manager-image.yml)
+    fi
+    [ "$MODE" = compose ] && extra+=(-f docker-compose.images.yml)
+    if [ "${#extra[@]}" -gt 0 ]; then
+        compose_base_files
+        printf '%s\n' "${extra[@]}"
+    fi
+}
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i
-    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
-        out="$(cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml up -d --build 2>&1)" \
-            || { printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2; die "connected-local docker compose up failed"; }
-    elif ! out="$(cd "$ROOT" && docker compose up -d 2>&1)"; then
+    local out i line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    args+=(up -d)
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && [ "$MODE" = source ] && args+=(--build)
+    # Compose prefers shell variables over .env; pass the image from .env so a leftover
+    # export (e.g. from an earlier upgrade) cannot copy a different version.
+    local image_env=()
+    [ "$MODE" = compose ] && image_env=(
+        "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
+        "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
+        "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
+        "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
+    if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
     ( for ((i = 0; i < 90; i++)); do curl -fs -m 3 "$(coder_url)/api/v2/buildinfo" >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1 ) &
     spin $! "Waiting for Coder to become healthy" \
         || die "Coder did not become healthy in 3 minutes." "Check logs: docker compose logs coder"
+    if [ "$MODE" = compose ]; then
+        [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
+            || die "The OpenFlows programs were not copied from $(image_ref)." \
+                "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
+        "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs do not run on this machine." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
+    fi
     ok "Coder is up at ${B}$(coder_url)${N}"
 }
 
 # stage_connected_local_authorization — the team App is configured by the
 # OpenFlows release. Contributors install it, approve their own GitHub account,
 # and choose the requested repository in the local browser console.
+manager_repo_list() { # the repositories available to the signed-in GitHub user and the App
+    local line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    (cd "$ROOT" && docker compose "${args[@]}" exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null)
+}
 stage_connected_local_authorization() {
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] || return 0
+    TOTAL=$((TOTAL + 1))
     step "Connect GitHub"
     local manager_url="http://127.0.0.1:3002" status
     ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
@@ -510,7 +628,7 @@ stage_connected_local_authorization() {
     printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
         || die "This OpenFlows distribution does not include the team GitHub App configuration." \
                "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
-    if (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+    if manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
         ok "GitHub user authorization ready for ${REPO}"
         return
     fi
@@ -522,7 +640,7 @@ stage_connected_local_authorization() {
     open_url "${manager_url}/#console-key=${console_key}"
     is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
     pause "Complete GitHub connection in the local console, then continue"
-    (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
+    manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
         || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
                "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
     ok "GitHub user authorization ready for ${REPO}"
@@ -754,12 +872,18 @@ stage_llm() {
 }
 
 # ── stage 7: bootstrap (templates) ──────────────────────────────────────────
-# templates_ready — true when all five openflows-* templates exist and the dev binary is newer than every source file
+# templates_ready — true when all five openflows-* templates exist and the programs are current:
+# --source: the dev binary is newer than every source file; --compose: the templates were pushed for this image.
 templates_ready() {
-    local bin="${ROOT}/.dev-binaries/openflows"
+    local bin="${BIN_DIR}/openflows"
     [ -x "$bin" ] || return 1
+    if [ "$MODE" != source ]; then
+        [ "$(env_get OPENFLOWS_SETUP_TEMPLATES_IMAGE)" = "$(installed_ref)" ] || return 1
+    # Programs from an image or a release (IMAGE, RELEASE markers) must be rebuilt from this checkout.
+    elif [ -f "${BIN_DIR}/IMAGE" ] || [ -f "${BIN_DIR}/RELEASE" ]; then
+        return 1
     # Rebuild when any source or template is newer than the built binary.
-    if [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
         return 1
     fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
@@ -768,9 +892,145 @@ names = {t.get("name") for t in json.load(sys.stdin)}
 sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
 }
 
+# openflows_workspaces — this user's OpenFlows workspaces, one
+# "<name> <status> <outdated> <id> <active template version id>" per line; fails when Coder
+# doesn't answer, so callers never mistake that for "no workspaces"
+openflows_workspaces() {
+    local body
+    body="$(api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null)" || return 1
+    python3 -c '
+import sys, json
+for w in json.load(sys.stdin).get("workspaces") or []:
+    if w.get("template_name", "").startswith("openflows-"):
+        print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no",
+              w["id"], w["template_active_version_id"])' <<<"$body" 2>/dev/null
+}
+
+# mark_pending_restart — add every workspace that isn't stopped to OPENFLOWS_SETUP_PENDING_RESTART
+# (comma-separated: .env is sourced by prod.sh): one that is starting may already have copied the
+# old programs. When Coder doesn't answer it saves "*": every workspace not stopped then needs a
+# restart, since the programs were replaced anyway.
+mark_pending_restart() {
+    local names active
+    active="$(openflows_workspaces)" && active="$(awk '$2 != "stopped" {print $1}' <<<"$active")" || active="*"
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; printf '%s\n' "$active"; } \
+        | awk 'NF && !seen[$1]++' | paste -sd, -)"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
+}
+
+# unmark_pending_restart NAME — drop a workspace that restarted with the new programs.
+unmark_pending_restart() {
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(env_get OPENFLOWS_SETUP_PENDING_RESTART \
+        | WS="$1" awk -v RS=, -v ORS=, 'NF && $1 != ENVIRON["WS"]' | sed 's/,$//')"
+}
+
+# wait_build BUILD_ID — wait until a workspace build finishes; succeeds only if it succeeded.
+# Times out after OPENFLOWS_SETUP_BUILD_TIMEOUT seconds (default 600).
+wait_build() {
+    local id="$1" deadline=$((SECONDS + ${OPENFLOWS_SETUP_BUILD_TIMEOUT:-600})) status
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        status="$(api GET "/api/v2/workspacebuilds/${id}" 2>/dev/null | json job.status)"
+        case "$status" in
+            succeeded) return 0 ;;
+            failed|canceled|canceling) return 1 ;;
+        esac
+        sleep 3
+    done
+    return 1
+}
+
+# update_stopped — move stopped outdated workspaces to the active template version with a
+# stop build, so they stay stopped (`coder update` would start them)
+update_stopped() {
+    local name status outdated id version build
+    while read -r name status outdated id version; do
+        if [ "$status" != stopped ] || [ "$outdated" != yes ]; then continue; fi
+        if build="$(api POST "/api/v2/workspaces/${id}/builds" \
+                "{\"transition\":\"stop\",\"template_version_id\":\"${version}\"}" 2>>"$LOG_FILE" | json id)" \
+            && [ -n "$build" ] && wait_build "$build"; then
+            ok "updated ${name} to the new templates (still stopped)"
+        else
+            warn "could not update ${name} — see Build History in the Coder dashboard"
+        fi
+    done <<<"$(openflows_workspaces || true)"
+}
+
+# offer_update — a workspace keeps its template version until it is updated (a restart reuses
+# it) and copies the programs only when it starts. Bootstrap pushes a new template version only
+# when a template changed, and saves the workspaces not stopped when it replaced the programs
+# (OPENFLOWS_SETUP_PENDING_RESTART). Stopped workspaces are updated right away; running ones
+# are updated (outdated) or restarted (programs only) with --update-workspaces or once the user
+# agrees, since that pauses their work. Whatever is left stays pending — outdated or failed in
+# Coder, restarts in .env — and is offered again on the next run; UPGRADE_PENDING tells main
+# the upgrade is not complete.
+offer_update() {
+    local all update restart pending ws
+    update_stopped
+    if ! all="$(openflows_workspaces)"; then
+        warn "Could not check the workspaces: Coder did not answer"
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
+    update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
+    # Stopped or deleted workspaces copy the new programs when they next start; the others
+    # (running or still starting/stopping) stay pending until they restart.
+    pending="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
+        (($1 in was) || ("*" in was)) && $2 != "stopped" && $2 != "deleted" {print $1, $2, $3}' <<<"$all")"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(awk '{print $1}' <<<"$pending" | paste -sd, -)"
+    restart="$(awk '$2 == "running" && $3 == "no" {print $1}' <<<"$pending")"
+    if [ -n "$update$restart" ]; then
+        warn "Running workspaces still use the old version: $(printf '%s\n' "$update" "$restart" | awk NF | paste -sd' ' -)"
+        if [ "$UPDATE_WORKSPACES" = 1 ] || \
+           { is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; }; then
+            for ws in $update; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "updated ${ws} to the new templates"
+                    unmark_pending_restart "$ws"
+                else
+                    warn "could not update ${ws} — see ${LOG_FILE}"
+                fi
+            done
+            for ws in $restart; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "restarted ${ws} with the new programs"
+                    unmark_pending_restart "$ws"
+                else
+                    warn "could not restart ${ws} — see ${LOG_FILE}"
+                fi
+            done
+        elif ! is_tty; then
+            info "Not updated: no terminal to ask. Pass --update-workspaces to update them automatically."
+        fi
+    fi
+    if ! all="$(openflows_workspaces)"; then
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
+    # Outdated, failed or still building (a failed or timed-out update leaves one of these).
+    UPGRADE_PENDING="$( { awk '$3 == "yes" || ($2 != "running" && $2 != "stopped") {print $1}' <<<"$all"
+        env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
+    return 0
+}
+
 stage_bootstrap() {
-    step "Workspace templates (first run takes ~10 min)"
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
+    if [ "$MODE" != source ]; then
+        step "Workspace templates"
+        if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
+           [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
+            ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+            return
+        fi
+        run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+        env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
+        env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
+        mark_pending_restart
+        ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+        return
+    fi
+    step "Workspace templates (first run takes ~10 min)"
     if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
        [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
         ok "binaries and 5 templates already in place"
@@ -780,6 +1040,10 @@ stage_bootstrap() {
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
+    rm -f "${BIN_DIR}/IMAGE" "${BIN_DIR}/RELEASE"
+    # The next --compose or --binary run must push its templates again, even for the same version.
+    env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
+    mark_pending_restart
     ok "binaries built, 5 templates pushed"
 }
 
@@ -879,12 +1143,16 @@ stage_tenant() {
 
 # ── main ────────────────────────────────────────────────────────────────────
 main() {
-    REPO=""; NAME=""; FLEET=""
+    REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --source|--compose|--binary)
+                [ -z "$MODE" ] || [ "$MODE" = "${1#--}" ] || die "Choose one install mode: --source, --compose or --binary."
+                MODE="${1#--}"; shift ;;
             --name) NAME="${2:?--name needs a value}"; shift 2 ;;
             --fleet) FLEET="${2:?--fleet needs a value}"; shift 2 ;;
-            -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            --update-workspaces) UPDATE_WORKSPACES=1; shift ;;
+            -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
             -*) die "Unknown option: $1" ;;
             *) REPO="$1"; shift ;;
         esac
@@ -927,9 +1195,28 @@ main() {
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."
 
+    # Install mode: the flag, else the mode of the previous run, else source.
+    if [ -z "$MODE" ]; then
+        MODE="$(env_get OPENFLOWS_SETUP_MODE)"
+        if [ -z "$MODE" ] && [ -f "${ROOT}/RELEASE_VERSION" ]; then
+            MODE=binary
+        elif [ -z "$MODE" ]; then
+            MODE=source
+            printf '  %sInstall mode: source (compiles OpenFlows). No compiling: --compose or --binary%s\n' "$D" "$N"
+        fi
+    fi
+    case "$MODE" in
+        source) ;;
+        compose|binary) TOTAL=9 ;;
+        *) die "Unknown install mode '${MODE}' in OPENFLOWS_SETUP_MODE (use source, compose or binary)." ;;
+    esac
+
     stage_preflight
     stage_env
     env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
+    env_set OPENFLOWS_SETUP_MODE "$MODE"
+    [ "$MODE" = compose ] && stage_image
+    [ "$MODE" = binary ] && stage_release
     stage_github_app
     stage_docker
     stage_connected_local_authorization
@@ -937,12 +1224,28 @@ main() {
     stage_llm
     stage_bootstrap
     stage_tenant
+    offer_update
 
     close_step
     printf '\n'
     RAIL_OPEN=0
+    local installed="source (compiled from this checkout)"
+    [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
+    [ "$MODE" = binary ] && installed="release $(env_get OPENFLOWS_VERSION)"
+    if [ -n "$UPGRADE_PENDING" ]; then
+        panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
+            "These workspaces still use the old version:" \
+            "  ${UPGRADE_PENDING}" "" \
+            "Re-run ./scripts/setup.sh (add --update-workspaces to skip the" \
+            "question), or per workspace:" \
+            "  coder update <workspace>         (new templates)" \
+            "  coder restart <workspace> --yes  (new programs)" ""
+        printf '\n'
+        exit 3
+    fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
+        "Installed    ${installed}" \
         "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \

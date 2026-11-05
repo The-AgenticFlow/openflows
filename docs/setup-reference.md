@@ -19,6 +19,7 @@ The manual GitHub App instructions below describe `OPENFLOWS_GITHUB_AUTH_MODE=se
 - [Step 8 — Add a tenant](#step-8--add-a-tenant)
 - [Step 9 — Let the controller run](#step-9--let-the-controller-run)
 - [Verify it's working](#verify-its-working)
+- [Install from published images (`--compose`)](#install-without-compiling---compose---binary)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
@@ -29,7 +30,7 @@ The manual GitHub App instructions below describe `OPENFLOWS_GITHUB_AUTH_MODE=se
 ## Prerequisites
 
 - Docker 24+
-- Rust 1.70+ (builds the `openflows` binary during bootstrap)
+- Rust 1.70+ (builds the `openflows` binary during bootstrap; not needed with [`--compose`](#install-without-compiling---compose---binary))
 - The `coder` CLI on your `PATH` — bootstrap shells out to `coder templates push`:
   ```bash
   curl -fsSL https://coder.com/install.sh | sh
@@ -166,7 +167,7 @@ Run the one-time setup to initialize Coder with the OpenFlows templates and conf
 ./scripts/prod.sh bootstrap
 ```
 
-This builds the `openflows` binary into `.dev-binaries/`, creates the admin user, pushes the workspace templates, and verifies GitHub/LLM auth.
+This builds the `openflows` binary into `.dev-binaries/`, creates the admin user, pushes the workspace templates, and verifies GitHub/LLM auth. With the published images, the programs come from the image instead; see [Install from published images](#install-without-compiling---compose---binary).
 
 Confirm the templates were pushed at **http://localhost:7080/templates**.
 
@@ -213,6 +214,93 @@ In a separate terminal:
 ```bash
 ./scripts/prod.sh doctor
 ```
+
+---
+
+## Install without compiling (`--compose`, `--binary`)
+
+`./scripts/setup.sh owner/repo --compose` installs OpenFlows without Rust or compiling. Every step above stays the same except where the programs come from:
+
+1. Setup picks the version (`OPENFLOWS_VERSION`, or the latest release when empty), pulls `ghcr.io/the-agenticflow/openflows:<version>` and saves the image's digest in `.env`.
+2. Setup starts the stack with `docker-compose.images.yml` added on top of your usual Compose files (`COMPOSE_FILE`, or `docker-compose.yml` plus `docker-compose.override.yml` when present, so your own ports, mounts and storage settings stay). Its `openflows-binaries` service copies `openflows`, `openflows-doctor` and `openflows-harness` from the image into `.dev-binaries/` (owned by your user) and records the exact image in `.dev-binaries/IMAGE`.
+3. Bootstrap pushes the templates without building (`prod.sh --skip-build bootstrap`), and the workspaces load the programs from `.dev-binaries/` as they do for a source install.
+
+Setup remembers the mode in `.env`, so later runs without a flag keep using the images.
+
+Both GitHub App modes work ([details](#shared-github-app-without-compiling)).
+
+### Settings
+
+| Variable | Set by | Meaning |
+| --- | --- | --- |
+| `OPENFLOWS_VERSION` | You, or setup (latest release) | Version to install, e.g. `1.8.1` |
+| `OPENFLOWS_IMAGE_DIGEST` | Setup | Fingerprint (`sha256:…`) of that version's image. A tag can be moved by a rebuild; the digest always names the same image |
+| `OPENFLOWS_HOST_UID`, `OPENFLOWS_HOST_GID` | Setup | Your user, so the copied programs are owned by you |
+| `OPENFLOWS_MANAGER_IMAGE` | Setup | Shared App only: the pinned Manager image |
+| `OPENFLOWS_SETUP_MODE` | Setup | `binary`, `compose` or `source`, reused when you run setup without a flag |
+| `OPENFLOWS_IMAGE_REPO` | You (optional) | Where to get images, for a fork or a mirror. Set it in `.env` to keep it; the shell wins over `.env` |
+| `OPENFLOWS_RELEASE_REPO` | You, in the shell (optional) | Where to get release files (`owner/repo`). Setup reads this from the shell, not `.env` |
+
+### Checking the digest
+
+Each release's notes list its image digests under **Docker images**. Compare them with `OPENFLOWS_IMAGE_DIGEST` in your `.env`, or with the image your workspaces use:
+
+```bash
+cat .dev-binaries/IMAGE
+```
+
+### Upgrade and rollback
+
+1. Make sure the stack and the workspaces are running (`docker compose start`). Setup waits for the tenant's workspace in its last step.
+2. In `.env`, set the version and clear the digest:
+   ```bash
+   OPENFLOWS_VERSION=1.8.1
+   OPENFLOWS_IMAGE_DIGEST=
+   ```
+3. Re-run `./scripts/setup.sh`. It pulls that version, pins its digest, copies the programs and pushes the templates.
+4. Update the workspaces. Each workspace keeps the template version it was built with (a restart reuses it) and copies the programs only when it starts. `coder update` moves it to the new templates and restarts it; when the templates did not change, a restart is enough. Setup updates stopped workspaces right away (they stay stopped) and offers to do the right one for each running workspace (default: no, since it briefly pauses work in progress). `--update-workspaces` does it without asking, which is how to finish an upgrade from a script or CI. Setup waits for each build; until every workspace is updated, it ends with **Upgrade not complete**, exits with status `3` and offers the rest again on the next run. To do it yourself:
+   ```bash
+   coder update openflows-nexus-<tenant>
+   ```
+
+Rolling back is the same with an older version.
+
+### Templates always match the programs
+
+The workspace templates are built into the `openflows` program, so the image's program pushes that release's templates, whatever the checkout contains. Programs and templates always come from the same release.
+
+### Switching install modes
+
+Run setup with the other flag. It replaces the programs and pushes their templates. Accept setup's offer to update the workspaces, or run `coder update <workspace>` afterwards.
+
+### Host requirements
+
+Linux or macOS, x86-64 or ARM64. Workspaces always run `linux/amd64` (Docker emulates it on ARM64, which is slower), and setup also runs `openflows` on your machine. When the workspaces' programs can't run there (macOS, ARM64, glibc older than 2.34), setup downloads a native copy from the release into `.dev-binaries/host/`. Releases 1.8.1 and older have no files to download, so on those machines they need `--source`.
+
+### Install from release binaries (`--binary`)
+
+`./scripts/setup.sh owner/repo --binary` works like `--compose`, with no image: setup downloads `openflows-<version>-<target>.tar.gz` from the release, verifies it against its `.sha256`, and installs the programs into `.dev-binaries/` (recorded in `.dev-binaries/RELEASE` and `CHECKSUMS`). Each run re-downloads them if one is missing or damaged. A failed download leaves the installed programs as they were. Upgrade and rollback are the same as above.
+
+Without a checkout, use the release's `openflows-<version>-setup.tar.gz` ([quick start](../quick_start.md#run)). It contains the setup scripts and Compose files, and defaults to `--binary` at its own version. `OPENFLOWS_VERSION` in `.env` overrides that.
+
+Each release attaches: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`. Each archive holds `openflows`, `openflows-doctor` and `openflows-harness`.
+
+**Uninstall:** `docker compose down -v`, then delete the folder. With the shared App, also delete `~/.config/openflows`.
+
+### Shared GitHub App without compiling
+
+With `OPENFLOWS_GITHUB_AUTH_MODE=connected-local`, `--binary` and `--compose` run the published Manager image `ghcr.io/the-agenticflow/openflows-manager:<version>` (`docker-compose.manager-image.yml`), pinned by digest as `OPENFLOWS_MANAGER_IMAGE`. It needs a version newer than 1.8.1. `--source` keeps compiling the Manager from the checkout. Your own App (`self-managed`) doesn't use the Manager.
+
+### Two installs on one machine
+
+`docker-compose.yml` names the project `openflows`, so a second checkout would take over the first one's containers. Give the second install its own project and network in its `.env` before running setup:
+
+```bash
+COMPOSE_PROJECT_NAME=openflows-test
+TF_VAR_docker_network=openflows-test_default
+```
+
+Both installs use ports 7080, 6379 and 7081, so run one at a time.
 
 ---
 
@@ -394,6 +482,46 @@ Even with the provider configured, git access only works when all three are true
 3. The App is set to **public** (App → Advanced → "Make this GitHub App public") so other accounts can link it.
 
 Verify inside a workspace **without printing the token**: `test -s ~/.git-credentials && echo 'git credentials configured'` (or run `git ls-remote <your-repo-url>` to confirm auth works). **Never** `cat ~/.git-credentials` — it prints your live GitHub token to the terminal/session logs.
+
+### "No published image for OpenFlows X" (`--compose`)
+
+That version has no image on GitHub Packages. Pick one listed at [ghcr.io/the-agenticflow/openflows](https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows), set it as `OPENFLOWS_VERSION`, and re-run setup.
+
+### "OPENFLOWS_IMAGE_DIGEST is for version X, not Y" (`--compose`)
+
+You changed `OPENFLOWS_VERSION` but kept the old digest. Clear `OPENFLOWS_IMAGE_DIGEST` in `.env` and re-run setup; it pins the digest of the new version.
+
+### "Image … was not found" (`--compose`)
+
+The digest in `OPENFLOWS_IMAGE_DIGEST` does not exist. Check it against the release notes, or clear it to use the version's current image.
+
+### "Cannot write to .dev-binaries as user X" (`--compose`)
+
+The image's programs are copied as `OPENFLOWS_HOST_UID:OPENFLOWS_HOST_GID` (1000:1000 when unset), so the files stay owned by you. Setup fills these in for you; when running `docker compose -f docker-compose.yml -f docker-compose.images.yml` by hand, set them to the output of `id -u` / `id -g` and create `.dev-binaries/` yourself first (if Docker creates it, it is owned by root).
+
+### "OpenFlows X has no shared GitHub App (connected-local) without compiling"
+
+Releases 1.8.1 and older have no usable Manager image. Set a newer `OPENFLOWS_VERSION`, set `OPENFLOWS_GITHUB_AUTH_MODE=self-managed` to use your own App, or install with `--source`.
+
+### The console's repository list is empty
+
+It fills in after **Connect GitHub**, and only with repositories that both you and the App can access. If the key box is empty, reopen the console with its key ([quick start](../quick_start.md#run)). If your repository is still missing, add it to the App's installation on GitHub, then click **Refresh**.
+
+### "OpenFlows X has no T programs to download"
+
+That release has no attached files (1.8.1 and older). Set a newer `OPENFLOWS_VERSION`, or install with `--source`.
+
+### "The T archive of OpenFlows X failed verification"
+
+The download doesn't match the release's checksum, so nothing was installed. Run setup again; if it fails again, don't use this download and report it.
+
+### "The OpenFlows programs do not run on this machine"
+
+Your system can't run the release's program for this platform. Install with `--source`.
+
+### Setup waits at "Connecting owner/repo" and never finishes
+
+The tenant's nexus workspace is stopped, and setup waits for it to come up. Start the stack and workspaces, or restart the workspace: `coder restart openflows-nexus-<tenant> --yes`.
 
 ---
 
