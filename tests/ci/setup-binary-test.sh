@@ -187,7 +187,11 @@ staged_image() {   # staged_image SHELL_REPO ENV_REPO — the image setup pulls 
         mkdir -p "$ROOT"; rm -f "$ENV_FILE"; touch "$ENV_FILE"
         env_set OPENFLOWS_VERSION 5.0.0
         [ -z "$2" ] || env_set OPENFLOWS_IMAGE_REPO "$2"
-        if [ -n "$1" ]; then export OPENFLOWS_IMAGE_REPO="$1"; else unset OPENFLOWS_IMAGE_REPO; fi
+        case "$1" in
+            "") unset OPENFLOWS_IMAGE_REPO ;;
+            empty) export OPENFLOWS_IMAGE_REPO="" ;;
+            *) export OPENFLOWS_IMAGE_REPO="$1" ;;
+        esac
         docker() {
             local image="${!#}"
             case "$1 $*" in
@@ -203,6 +207,7 @@ DEFAULT_IMAGE=ghcr.io/the-agenticflow/openflows
 expect_eq "the default" "$(staged_image "" "")" "${DEFAULT_IMAGE}:5.0.0 ${DEFAULT_IMAGE}:5.0.0@sha256:abc"
 expect_eq "from .env" "$(staged_image "" reg.test/env)" "reg.test/env:5.0.0 reg.test/env:5.0.0@sha256:abc"
 expect_eq "the shell wins over .env, as in Compose" "$(staged_image reg.test/shell reg.test/env)" "reg.test/shell:5.0.0 reg.test/shell:5.0.0@sha256:abc"
+expect_eq "an empty shell value means the default, as in Compose" "$(staged_image empty reg.test/env)" "${DEFAULT_IMAGE}:5.0.0 ${DEFAULT_IMAGE}:5.0.0@sha256:abc"
 
 echo "Shared App without compiling"
 expect_shared() {   # expect_shared VERSION yes|no

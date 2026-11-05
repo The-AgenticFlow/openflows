@@ -229,7 +229,8 @@ env_set() { # env_set KEY VALUE — replace the line or append
 }
 # image_repo — where the images come from, in the order Compose reads it: shell, .env, default.
 image_repo() {
-    local repo="${OPENFLOWS_IMAGE_REPO:-$(env_get OPENFLOWS_IMAGE_REPO)}"
+    local repo
+    if [ "${OPENFLOWS_IMAGE_REPO+x}" = x ]; then repo="$OPENFLOWS_IMAGE_REPO"; else repo="$(env_get OPENFLOWS_IMAGE_REPO)"; fi
     printf '%s' "${repo:-ghcr.io/the-agenticflow/openflows}"
 }
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
