@@ -29,7 +29,7 @@ use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
 use crate::pr_monitor::{
     applicable_reviews, build_directive, candidate_review_state, classify, collect_rework,
-    PrMonitorState, ReworkEvidence,
+    is_authorized_head_approval, PrMonitorState, ReworkEvidence,
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
@@ -2671,16 +2671,16 @@ impl VesselNode {
         {
             return Ok(false);
         }
+        // The rework evidence is what marks those change requests as addressed.
+        // While one is still on GitHub, later passes need the evidence too.
+        let relies_on_rework_evidence =
+            applicable.len() != github::latest_review_per_user(&reviews).len();
         // The effective approver: an authorized reviewer whose *latest* review
         // approves the current head. Stale approvals of older commits and
         // drive-by approvals from outside accounts do not count.
         let Some(approver) = applicable
             .into_iter()
-            .filter(|r| {
-                r.state_enum() == github::PrReviewState::Approved
-                    && r.is_authorized_reviewer()
-                    && r.commit_id.as_deref() == Some(head_sha)
-            })
+            .filter(|r| is_authorized_head_approval(r, head_sha))
             .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
             .and_then(|r| r.user.clone())
         else {
@@ -2766,7 +2766,9 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        self.clear_address_review_dispatched(store, pr_number).await;
+        if !relies_on_rework_evidence {
+            self.clear_address_review_dispatched(store, pr_number).await;
+        }
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -3945,6 +3947,9 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    mod reconcile_rework;
+    use reconcile_rework::run_reconcile_with_evidence;
+
     #[tokio::test]
     async fn merge_reservation_clears_only_for_definitive_rejection() {
         for (status, pending) in [
@@ -4055,77 +4060,6 @@ mod tests {
 
     async fn run_reconcile(node: &VesselNode, store: &SharedStore) -> bool {
         run_reconcile_with_evidence(node, store, None).await
-    }
-
-    async fn run_reconcile_with_evidence(
-        node: &VesselNode,
-        store: &SharedStore,
-        evidence: Option<&ReworkEvidence>,
-    ) -> bool {
-        let state = store.lifecycle("T-42").await.unwrap();
-        node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head", evidence)
-            .await
-            .unwrap()
-    }
-
-    /// FORGE was sent `/address_review` for `old-head` at 12:00 on 2026-10-04
-    /// and has since pushed `head`.
-    fn rework_evidence() -> ReworkEvidence {
-        ReworkEvidence {
-            dispatched_sha: Some("old-head".to_string()),
-            dispatched_at: Some("2026-10-04T12:00:00Z".to_string()),
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_github_approval_ignores_change_request_addressed_by_rework() {
-        // #396: alice requested changes on old-head before rework was dispatched;
-        // FORGE pushed head, and bob (authorized) approved head. Alice's addressed
-        // change request must not hide bob's valid approval.
-        let (_server, node, store) = reconcile_fixture(
-            200,
-            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-04T10:00:00Z"},
-                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
-        )
-        .await;
-        let evidence = rework_evidence();
-        assert!(run_reconcile_with_evidence(&node, &store, Some(&evidence)).await);
-        let pr_human = store.lifecycle("T-42").await.unwrap().pr_human.unwrap();
-        assert!(pr_human.approved);
-        assert!(pr_human.report.contains("bob"));
-    }
-
-    #[tokio::test]
-    async fn reconcile_github_approval_still_vetoed_by_unaddressed_change_request() {
-        // alice's change request arrived after rework was dispatched, so the
-        // rework could not have addressed it: it still blocks bob's approval.
-        let (_server, node, store) = reconcile_fixture(
-            200,
-            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-04T13:00:00Z"},
-                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
-        )
-        .await;
-        let evidence = rework_evidence();
-        assert!(!run_reconcile_with_evidence(&node, &store, Some(&evidence)).await);
-        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
-    }
-
-    #[tokio::test]
-    async fn reconcile_github_approval_addressed_change_request_does_not_admit_ineligible_approval()
-    {
-        // Dropping alice's addressed change request must not relax approval
-        // eligibility: an outside account's approval and a stale approval of
-        // old-head still do not reconcile.
-        let (_server, node, store) = reconcile_fixture(
-            200,
-            r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-04T10:00:00Z"},
-                {"state":"APPROVED","user":{"login":"mallory"},"author_association":"NONE","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
-                {"state":"APPROVED","user":{"login":"carol"},"author_association":"OWNER","commit_id":"old-head","submitted_at":"2026-10-04T11:00:00Z"}]"#,
-        )
-        .await;
-        let evidence = rework_evidence();
-        assert!(!run_reconcile_with_evidence(&node, &store, Some(&evidence)).await);
-        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
     }
 
     #[tokio::test]

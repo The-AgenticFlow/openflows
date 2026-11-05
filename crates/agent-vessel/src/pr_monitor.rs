@@ -156,11 +156,22 @@ pub(crate) fn applicable_reviews<'a>(
         .collect()
 }
 
+/// An approval that counts for `head_sha`: from an `OWNER`, `MEMBER` or
+/// `COLLABORATOR`, and submitted on exactly that commit. GitHub documents the
+/// review `commit_id` as nullable, so an approval without a commit cannot be
+/// shown to cover the candidate head and does not count (fail closed).
+/// Classification and approval reconciliation share this rule.
+pub(crate) fn is_authorized_head_approval(review: &PrReview, head_sha: &str) -> bool {
+    review.state_enum() == PrReviewState::Approved
+        && review.is_authorized_reviewer()
+        && review.commit_id.as_deref() == Some(head_sha)
+}
+
 /// Aggregate [`applicable_reviews`] into the review verdict for `head_sha`.
 ///
 /// - Any remaining (unaddressed) change request blocks: `ChangesRequested`.
-/// - Otherwise `Approved` requires an authorized reviewer's approval of the
-///   candidate head (or an approval GitHub reported without a commit).
+/// - Otherwise `Approved` requires an authorized reviewer's approval of
+///   exactly the candidate head (see [`is_authorized_head_approval`]).
 /// - Otherwise `None`: the PR still needs review.
 pub(crate) fn candidate_review_state(applicable: &[&PrReview], head_sha: &str) -> PrReviewState {
     if applicable
@@ -169,12 +180,10 @@ pub(crate) fn candidate_review_state(applicable: &[&PrReview], head_sha: &str) -
     {
         return PrReviewState::ChangesRequested;
     }
-    let has_authorized_head_approval = applicable.iter().any(|r| {
-        r.state_enum() == PrReviewState::Approved
-            && r.is_authorized_reviewer()
-            && (r.commit_id.as_deref() == Some(head_sha) || r.commit_id.is_none())
-    });
-    if has_authorized_head_approval {
+    if applicable
+        .iter()
+        .any(|r| is_authorized_head_approval(r, head_sha))
+    {
         PrReviewState::Approved
     } else {
         PrReviewState::None
@@ -637,6 +646,19 @@ mod tests {
                 r#"[{"state":"CHANGES_REQUESTED","user":{"login":"alice"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:00:00Z","author_association":"MEMBER"},
                     {"state":"APPROVED","user":{"login":"mallory"},"commit_id":"commit_new","submitted_at":"2026-10-08T13:00:00Z","author_association":"NONE"},
                     {"state":"APPROVED","user":{"login":"carol"},"commit_id":"commit_old","submitted_at":"2026-10-08T12:10:00Z","author_association":"OWNER"}]"#
+            ),
+            PrReviewState::None
+        );
+    }
+
+    #[test]
+    fn approval_without_commit_does_not_count_for_the_head() {
+        // GitHub documents the review commit_id as nullable. An approval that
+        // names no commit cannot be shown to cover the candidate head, and
+        // reconciliation applies the same rule.
+        assert_eq!(
+            review_state_for(
+                r#"[{"state":"APPROVED","user":{"login":"bob"},"commit_id":null,"submitted_at":"2026-10-08T13:00:00Z","author_association":"COLLABORATOR"}]"#
             ),
             PrReviewState::None
         );
