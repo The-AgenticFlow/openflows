@@ -217,12 +217,12 @@ impl NexusNode {
         }
     }
 
-    /// The tenant repository as `(owner, name)`.
+    /// The tenant repository as `(owner, name)`. `prep` already copies
+    /// `GITHUB_REPOSITORY` into the store, so the store is the single source
+    /// (as in VESSEL); reading the env here would point tenants and tests at
+    /// whatever repository the host process happens to run in.
     async fn docs_repository(store: &SharedStore) -> Option<(String, String)> {
-        let repository = config::EnvConfig::from_env()
-            .ok()
-            .and_then(|env| env.github.repository)
-            .or(store.get_typed::<String>("repository").await)?;
+        let repository = store.get_typed::<String>("repository").await?;
         let (owner, name) = repository.trim().split_once('/')?;
         (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
             .then(|| (owner.to_string(), name.to_string()))
