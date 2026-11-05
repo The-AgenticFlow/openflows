@@ -23,6 +23,9 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     set +a
 fi
 
+# The programs default to port 7080; setup and Compose follow CODER_PORT.
+export CODER_URL="${CODER_URL:-http://localhost:${CODER_PORT:-7080}}"
+
 # Compose and binary installs (setup.sh --compose, --binary) have no Rust toolchain:
 # run the installed programs instead of building them. .dev-binaries/host holds a
 # native copy on machines that can't run the workspaces' linux/amd64 programs.

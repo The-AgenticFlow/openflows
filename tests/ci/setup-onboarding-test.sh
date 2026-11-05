@@ -145,6 +145,21 @@ out="$(doctor_output 'OPENFLOWS_SETUP_MODE=compose\nOPENFLOWS_GITHUB_AUTH_MODE=s
 expect_has "your own App" "$out" "your own App"
 expect_lacks "no repository yet: no empty line" "$out" "Repository"
 
+echo "prod.sh talks to the Coder that setup started"
+coder_url_seen() {   # coder_url_seen LINES_FOR_ENV
+    (
+        P="${WORK}/url-$RANDOM"; mkdir -p "${P}/scripts" "${P}/.dev-binaries"
+        cp "${ROOT}/scripts/prod.sh" "${P}/scripts/"
+        printf 'OPENFLOWS_SETUP_MODE=binary\n%b' "$1" >"${P}/.env"
+        printf '#!/bin/sh\necho "url=$CODER_URL"\n' >"${P}/.dev-binaries/openflows"
+        chmod +x "${P}/.dev-binaries/openflows"
+        env -u OPENFLOWS_BIN -u CODER_URL -u CODER_PORT bash "${P}/scripts/prod.sh" doctor 2>&1 | sed -n 's/^url=//p'
+    )
+}
+expect_has "the default port" "$(coder_url_seen '')" "http://localhost:7080"
+expect_has "CODER_PORT" "$(coder_url_seen 'CODER_PORT=7186\n')" "http://localhost:7186"
+expect_has "CODER_URL wins" "$(coder_url_seen 'CODER_PORT=7186\nCODER_URL=https://coder.test\n')" "https://coder.test"
+
 echo
 if [ "$failures" -gt 0 ]; then
     echo "$failures test(s) failed"
