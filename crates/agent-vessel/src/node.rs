@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
+use crate::merger::{is_merge_conflict_message, is_merge_refused_pending_review};
 use crate::pr_monitor::{
     applicable_reviews, build_directive, candidate_review_state, classify, collect_rework,
     is_authorized_head_approval, PrMonitorState, ReworkEvidence,
@@ -2108,6 +2109,16 @@ impl VesselNode {
                         );
                         self.handle_conflicts(owner, repo, pr_info).await
                     }
+                    Ok(result) if is_merge_refused_pending_review(&result.message) => {
+                        let message = &result.message;
+                        warn!(pr_number, %message, "GitHub refused the merge; waiting for a reviewer to re-review or dismiss the change request");
+                        Ok(VesselOutcome::Reviews {
+                            ticket_id,
+                            pr_number,
+                            state: PrMonitorState::NeedsReview.as_str().to_string(),
+                            head_sha: Some(pr_info.head_sha.clone()),
+                        })
+                    }
                     Ok(result) => Ok(VesselOutcome::MergeBlocked {
                         ticket_id,
                         pr_number,
@@ -3868,13 +3879,6 @@ impl VesselNode {
 
         Ok(())
     }
-}
-
-fn is_merge_conflict_message(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("merge conflict")
-        || lower.contains("merge_conflict")
-        || (lower.contains("405") && lower.contains("method not allowed"))
 }
 
 /// Build the lightweight `/ci_fix` chat directive for FORGE.
