@@ -110,7 +110,9 @@ def is_ignored(path: str) -> bool:
     base = os.path.basename(path)
     for pattern in IGNORED_PATTERNS:
         if pattern.endswith("/"):
-            if path.startswith(pattern):
+            # Match the directory at any depth, not just the repository root
+            # (e.g. crates/x/target/... is excluded by the "target/" pattern).
+            if pattern.rstrip("/") in path.split("/"):
                 return True
         elif fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(base, pattern):
             return True
@@ -124,10 +126,12 @@ def check_file(base_path, head_path):
     if is_binary(HEAD_SHA, head_path):
         return None  # binary files are skipped
 
-    if base_path:
+    if base_path and not is_ignored(base_path):
         base_count = line_count(MERGE_BASE, base_path)
     else:
-        base_count = 0  # brand-new file
+        # Brand-new file, or renamed from an excluded (ignored) path: there is
+        # no in-scope baseline, so treat it as a new in-scope file.
+        base_count = 0
 
     head_count = line_count(HEAD_SHA, head_path)
     allowed = max(MAX_LINES, base_count)

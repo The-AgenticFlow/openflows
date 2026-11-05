@@ -243,6 +243,33 @@ base9="$(commit "$repo" base)"
 echo "Scenario 9: a git failure fails the check instead of passing"
 expect_error "invalid BASE_SHA exits non-zero with an error" "$repo" "DEADBEEF-not-a-commit" "HEAD"
 
+# ── Scenario 10: nested excluded directories are ignored ───────────────────
+repo="$(new_repo)"
+mkdir -p "$repo/src"
+gen_lines "$repo/src/main.rs" 10
+base10="$(commit "$repo" base)"
+
+mkdir -p "$repo/crates/x/target"
+gen_lines "$repo/crates/x/target/generated.rs" 2000  # nested target/ -> ignored
+head10="$(commit "$repo" head)"
+
+echo "Scenario 10: excluded directories are matched at any depth"
+expect_clean "a file under a nested excluded directory passes" "$repo" "$base10" "$head10"
+
+# ── Scenario 11: rename from an ignored path is treated as new in-scope ────
+repo="$(new_repo)"
+mkdir -p "$repo/vendor" "$repo/src"
+gen_lines "$repo/vendor/large.rs" 1001  # over cap, but in an ignored dir
+gen_lines "$repo/src/placeholder.rs" 1
+base11="$(commit "$repo" base)"
+
+git -C "$repo" mv vendor/large.rs src/large.rs  # now in-scope -> must meet the cap
+head11="$(commit "$repo" rename)"
+
+echo "Scenario 11: a rename out of an ignored path applies the cap"
+expect_violation "a file renamed from an ignored path is capped as new" \
+    "$repo" "$base11" "$head11" "src/large.rs"
+
 # ── Cleanup ─────────────────────────────────────────────────────────────────
 # The EXIT trap removes the temp parent and every scratch repo under it.
 
