@@ -107,7 +107,7 @@ impl VesselNode {
             .clone()
             .context("Missing lifecycle store")?;
         let hold = |reason: String| VesselOutcome::DocsPrHeld { pr_number, reason };
-        let ticket = match self.docs_merge_gate(owner, repo, &store, &pr_info).await? {
+        let ticket = match Box::pin(self.docs_merge_gate(owner, repo, &store, &pr_info)).await? {
             Ok(ticket) => ticket,
             Err(outcome) => return Ok(outcome),
         };
@@ -116,11 +116,7 @@ impl VesselNode {
             reason,
             docs_ticket: ticket.clone(),
         };
-        match self
-            .poller
-            .poll_until_terminal(owner, repo, &pr_info)
-            .await?
-        {
+        match Box::pin(self.poller.poll_until_terminal(owner, repo, &pr_info)).await? {
             CiPollResult::Status(CiStatus::Success) => {}
             CiPollResult::Conflicts => return Ok(rework(Self::docs_conflict_reason(&pr_info))),
             CiPollResult::Timeout => {
@@ -152,7 +148,7 @@ impl VesselNode {
         // PR (GitHub's merge call pins the head, not the base). So read the
         // PR and the docs gate again and repeat every check right before merging.
         let pr_info = self.client.get_pull_request(owner, repo, pr_number).await?;
-        let ticket = match self.docs_merge_gate(owner, repo, &store, &pr_info).await? {
+        let ticket = match Box::pin(self.docs_merge_gate(owner, repo, &store, &pr_info)).await? {
             Ok(ticket) => ticket,
             Err(outcome) => return Ok(outcome),
         };
@@ -162,7 +158,7 @@ impl VesselNode {
             docs_ticket: ticket.clone(),
         };
         // `merge` pins the PR head, so GitHub refuses if it moved since.
-        match self.merger.merge(owner, repo, &pr_info).await {
+        match Box::pin(self.merger.merge(owner, repo, &pr_info)).await {
             Ok(result) if result.merged => Ok(VesselOutcome::DocsPrMerged {
                 pr_number,
                 sha: result.sha.unwrap_or_default(),
@@ -207,7 +203,7 @@ impl VesselNode {
         pr_info: &PrInfo,
     ) -> Result<std::result::Result<String, VesselOutcome>> {
         let pr_number = pr_info.number;
-        let (ticket, approved_head) = match self.docs_route(store, pr_info).await? {
+        let (ticket, approved_head) = match Box::pin(self.docs_route(store, pr_info)).await? {
             DocsRoute::Unmanaged(reason) => {
                 return Ok(Err(VesselOutcome::Unmanaged { pr_number, reason }))
             }
@@ -670,8 +666,25 @@ mod tests {
         merge.assert_async().await;
     }
 
-    #[tokio::test]
-    async fn post_records_docs_rework_and_merge_on_the_docs_record() {
+    /// `VesselNode::post`'s unoptimized frame alone is ~1.7 MB, so this runs
+    /// on an 8 MiB stack like `test_post_reviews_resolves_real_forge_slot_*`.
+    #[test]
+    fn post_records_docs_rework_and_merge_on_the_docs_record() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(post_records_docs_rework_and_merge_on_the_docs_record_body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn post_records_docs_rework_and_merge_on_the_docs_record_body() {
         use config::docs_lifecycle::DocsPhase;
         let store = published_docs_store().await;
         store

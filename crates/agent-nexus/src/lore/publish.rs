@@ -88,7 +88,7 @@ impl NexusNode {
             warn!(ticket_id = %ticket.id, "No docs gate secret (OPENFLOWS_DOCS_GATE_SECRET or CODER_CHAT_HOOK_SECRET) is configured; NEXUS cannot verify docs approvals and will not open docs PRs");
             return None;
         };
-        let error = match store.verified_docs_head(&ticket.id, record, keys).await {
+        let error = match Box::pin(store.verified_docs_head(&ticket.id, record, keys)).await {
             Ok(head) => return Some(head),
             Err(error) => error,
         };

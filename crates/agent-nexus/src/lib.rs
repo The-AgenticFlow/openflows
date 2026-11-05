@@ -7290,8 +7290,11 @@ mod tests {
         notify.assert_async().await;
     }
 
-    #[tokio::test]
-    async fn review_scheduler_and_recovery_share_one_plan_reviewer() {
+    #[test]
+    fn review_scheduler_and_recovery_share_one_plan_reviewer() {
+        support::on_large_stack(review_scheduler_and_recovery_share_one_plan_reviewer_body);
+    }
+    async fn review_scheduler_and_recovery_share_one_plan_reviewer_body() {
         let mut server = mockito::Server::new_async().await;
         let _org = server
             .mock("GET", "/api/v2/organizations")
@@ -7984,4 +7987,5 @@ mod tests {
     }
 
     mod lore_docs;
+    mod support;
 }

@@ -420,7 +420,7 @@ impl NexusNode {
                     Self::send_lore_message(backend, &ticket.id, &chat_id, step_key, step).await
                 {
                     warn!(ticket_id = %ticket.id, chat_id, %error, "Could not deliver docs step to LORE; will retry next poll");
-                    self.lore_delivery_failed(store, ticket, backend, record, &error)
+                    Box::pin(self.lore_delivery_failed(store, ticket, backend, record, &error))
                         .await;
                     return;
                 }
@@ -464,7 +464,7 @@ impl NexusNode {
                     Self::send_lore_message(backend, &ticket.id, &chat_id, &key, &nudge).await
                 {
                     warn!(ticket_id = %ticket.id, chat_id, %error, "Could not nudge stalled LORE; will retry next poll");
-                    self.lore_delivery_failed(store, ticket, backend, record, &error)
+                    Box::pin(self.lore_delivery_failed(store, ticket, backend, record, &error))
                         .await;
                     return;
                 }
