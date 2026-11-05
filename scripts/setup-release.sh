@@ -58,11 +58,11 @@ fetch_programs() { # fetch_programs VERSION TARGET DEST — install_archive, or 
     esac
 }
 # programs_intact DIR — the installed programs are the ones the last download verified. Catches
-# a deleted or damaged program and a switch that was interrupted halfway.
+# a deleted, damaged or non-executable program and a switch that was interrupted halfway.
 programs_intact() {
     local bin
     for bin in openflows openflows-doctor openflows-harness; do
-        [ -f "${1}/${bin}" ] || return 1
+        [ -f "${1}/${bin}" ] && [ -x "${1}/${bin}" ] || return 1
         [ "$(sha256_of "${1}/${bin}")" = "$(awk -v b="$bin" '$2 == b {print $1}' "${1}/CHECKSUMS" 2>/dev/null)" ] || return 1
     done
 }

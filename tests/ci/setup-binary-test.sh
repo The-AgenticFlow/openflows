@@ -141,6 +141,9 @@ expect_eq "a half-finished switch is repaired" "$(harness)" "openflows-harness 3
 rm "${WORK}"/switch/.dev-binaries/{openflows,openflows-doctor,openflows-harness,CHECKSUMS}
 switch_to 3.0.0 >/dev/null
 expect_eq "programs deleted with their checksums are restored" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
+chmod -x "${WORK}/switch/.dev-binaries/openflows-harness"
+switch_to 3.0.0 >/dev/null
+expect_eq "a program that lost its permissions is restored" "$(harness)" "openflows-harness 3.0.0 ${WORKSPACE_TARGET}"
 touch -t 202001010000 "${WORK}/switch/.dev-binaries/openflows"
 switch_to 3.0.0 >/dev/null
 expect_eq "intact programs are not downloaded again" "$(date -r "${WORK}/switch/.dev-binaries/openflows" +%Y)" 2020
@@ -177,6 +180,9 @@ expect_eq "a damaged native program is restored" "$(host_program)" "openflows 4.
 rm "${WORK}"/switch-host/.dev-binaries/host/{openflows,openflows-doctor,openflows-harness,CHECKSUMS}
 switch_host_to 4.0.0
 expect_eq "native programs deleted with their checksums are restored" "$(host_program)" "openflows 4.0.0 fake-host"
+chmod -x "${WORK}/switch-host/.dev-binaries/host/openflows"
+switch_host_to 4.0.0
+expect_eq "a native program that lost its permissions is restored" "$(host_program)" "openflows 4.0.0 fake-host"
 
 echo "Image repository"
 staged_image() {   # staged_image SHELL_REPO ENV_REPO — the image setup pulls and the digest it pins
