@@ -273,6 +273,8 @@ The workspace templates are built into the `openflows` program, so the image's p
 
 Run setup with the other flag. It replaces the programs and pushes their templates. Accept setup's offer to update the workspaces, or run `coder update <workspace>` afterwards.
 
+Switching from the shared App to your own App also removes the local Manager and its database container. The database's data stays, so you can switch back.
+
 ### Host requirements
 
 Linux or macOS, x86-64 or ARM64. Workspaces always run `linux/amd64` (Docker emulates it on ARM64, which is slower), and setup also runs `openflows` on your machine. When the workspaces' programs can't run there (macOS, ARM64, glibc older than 2.34), setup downloads a native copy from the release into `.dev-binaries/host/`. Releases 1.8.1 and older have no files to download, so on those machines they need `--source`.
