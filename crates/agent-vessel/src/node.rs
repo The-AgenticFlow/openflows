@@ -4625,7 +4625,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
@@ -4711,7 +4714,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body(
                 r#"[{"id":10,"body":"Please fix error handling","path":"src/main.rs","line":50}]"#,
@@ -4799,7 +4805,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
@@ -5674,7 +5683,7 @@ mod tests {
             .await;
         // Inline review comments present
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100&page=1")
             .with_status(200)
             .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
             .expect_at_least(1)
@@ -5742,7 +5751,7 @@ mod tests {
             .await;
         // Inline review comments present
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100&page=1")
             .with_status(200)
             .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
             .expect_at_least(1)
@@ -5800,7 +5809,10 @@ mod tests {
             .create_async()
             .await;
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body(r#"[]"#)
             .create_async()
