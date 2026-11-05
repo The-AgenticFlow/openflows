@@ -1,5 +1,7 @@
 # Local operator runbook
 
+The shared Docker/Kubernetes workspace contract is in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md). This runbook describes the local installation.
+
 Run OpenFlows on one host for evaluation. Docker Compose starts Coder,
 PostgreSQL, and Redis; the Manager runs from this checkout. This is not a
 production multi-tenant installation.
