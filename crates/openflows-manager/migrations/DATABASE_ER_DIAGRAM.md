@@ -47,6 +47,7 @@ erDiagram
         uuid id PK
         uuid organization_id FK
         bigint invitee_github_user_id
+        text invitee_login
         text role
         text token_hash
         uuid invited_by FK

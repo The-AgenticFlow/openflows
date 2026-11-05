@@ -509,7 +509,10 @@ mod tests {
             .create_async()
             .await;
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
@@ -559,7 +562,10 @@ mod tests {
             .create_async()
             .await;
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)

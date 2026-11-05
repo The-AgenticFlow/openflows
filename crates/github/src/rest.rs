@@ -1156,11 +1156,22 @@ impl GithubRestClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<ReviewComment>> {
-        let url = format!(
-            "{}/repos/{}/{}/pulls/{}/comments?per_page=100",
-            self.api_base, owner, repo, pr_number
-        );
-        self.get_json(&url).await
+        let mut comments = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/pulls/{}/comments?per_page=100&page={}",
+                self.api_base, owner, repo, pr_number, page
+            );
+            let batch: Vec<ReviewComment> = self.get_json(&url).await?;
+            let len = batch.len();
+            comments.extend(batch);
+            if len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(comments)
     }
 
     /// Submit a review on a pull request (approve, request changes, or comment).
@@ -2080,6 +2091,48 @@ mod lifecycle_ci_tests {
             effective_review_state(&reviews),
             PrReviewState::ChangesRequested
         );
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
+    #[tokio::test]
+    async fn list_review_comments_follows_pagination_so_all_comments_are_seen() {
+        let mut server = mockito::Server::new_async().await;
+        let comments_page1: Vec<_> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i + 1,
+                    "path": "src/lib.rs",
+                    "commit_id": "commit_1",
+                    "body": format!("comment {i}"),
+                    "user": {"login": "reviewer"},
+                    "created_at": "2026-10-05T00:00:00Z"
+                })
+            })
+            .collect();
+        let page1 = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/7/comments?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(serde_json::to_string(&comments_page1).unwrap())
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/repos/org/repo/pulls/7/comments?per_page=100&page=2")
+            .with_status(200)
+            .with_body(r#"[{"id":101,"path":"src/main.rs","commit_id":"commit_1","body":"comment 101","user":{"login":"reviewer"},"created_at":"2026-10-06T00:00:00Z"}]"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        let comments = client.list_review_comments("org", "repo", 7).await.unwrap();
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments[100].path, "src/main.rs");
+        assert_eq!(comments[100].body, "comment 101");
         page1.assert_async().await;
         page2.assert_async().await;
     }

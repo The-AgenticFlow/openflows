@@ -87,6 +87,14 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    /// Convert each item, keeping the cursor.
+    pub fn map_items<U>(self, f: impl FnMut(T) -> U) -> Page<U> {
+        Page {
+            items: self.items.into_iter().map(f).collect(),
+            next_cursor: self.next_cursor,
+        }
+    }
+
     /// Build a page from a `limit + 1`-sized fetch, trimming the extra row and
     /// emitting a next cursor when a further page exists.
     pub fn from_fetch(
