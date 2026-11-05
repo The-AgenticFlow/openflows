@@ -970,7 +970,7 @@ ensure_github_link() {
     local linked me user login url
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
     linked="$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)"
-    if [ "$linked" = "True" ]; then ok "GitHub already linked"; return; fi
+    if [ "$linked" = "True" ]; then ok "GitHub already linked"; ensure_app_installed; return; fi
     me="$(api GET /api/v2/users/me 2>/dev/null || true)"
     user="$(printf '%s' "$me" | json username)"; login="$(printf '%s' "$me" | json login_type)"
     url="$(public_url)/external-auth/$(auth_id)"
@@ -1000,6 +1000,46 @@ ensure_github_link() {
     spin $! "Waiting for you to link GitHub (up to 10 min)" \
         || die "GitHub was not linked in time." "Make sure the browser is signed in to Coder as '${user}' at ${url}."
     ok "GitHub linked"
+    ensure_app_installed
+}
+# app_configure_url OWNER — where to manage your own App on OWNER. Returns 1 when it isn't
+# installed there and 2 when Coder can't tell. Coder lists accounts, not their repositories.
+app_configure_url() {
+    api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    auth = json.load(sys.stdin)
+    if not auth["app_installable"]:
+        sys.exit(2)
+    for install in auth["installations"]:
+        if install["account"]["login"].lower() == sys.argv[1].lower():
+            print(install["configure_url"])
+            sys.exit(0)
+except (ValueError, KeyError, TypeError):
+    sys.exit(2)
+sys.exit(1)' "$1"
+}
+ensure_app_installed() {
+    local owner="${REPO%%/*}" url rc=0
+    url="$(app_configure_url "$owner")" || rc=$?
+    if [ "$rc" = 1 ]; then
+        local install_url
+        install_url="$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
+        panel "$C" "Install the app" "Your GitHub App is not installed on ${owner}." "Choose 'Only select repositories' → ${REPO}" "${install_url}"
+        open_url "$install_url"
+        is_tty || die "Your GitHub App is not installed on ${owner}." \
+            "Install it from CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL in .env, then re-run setup."
+        pause "Install the app on your repo, then continue"
+        rc=0; url="$(app_configure_url "$owner")" || rc=$?
+        [ "$rc" != 1 ] || die "Your GitHub App is still not installed on ${owner}." \
+            "Install it on ${REPO}, or check you linked the GitHub account that can see it, then re-run setup."
+    fi
+    if [ "$rc" != 0 ]; then
+        warn "Could not check that your GitHub App is installed on ${owner}. Make sure it can access ${REPO}."
+        return
+    fi
+    ok "GitHub App installed on ${owner}"
+    info "It also needs access to ${REPO}: ${url}"
 }
 
 # The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
@@ -1057,6 +1097,24 @@ stage_tenant() {
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
+install_label() {
+    case "$MODE" in
+        compose) printf 'image %s' "$(env_get OPENFLOWS_VERSION)" ;;
+        binary) printf 'release %s' "$(env_get OPENFLOWS_VERSION)" ;;
+        *) printf 'source (compiled from this checkout)' ;;
+    esac
+}
+app_label() {
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then printf 'shared OpenFlows App'; else printf 'your own App'; fi
+}
+show_install_plan() {
+    panel "$C" "Setting up" \
+        "Repository   ${REPO}" \
+        "GitHub App   $(app_label)" \
+        "Installed    $(install_label)" \
+        "Fleet        ${FLEET} FORGE-SENTINEL pair(s)"
+}
+
 main() {
     REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
@@ -1133,6 +1191,7 @@ main() {
     [ "$MODE" = compose ] && stage_image
     [ "$MODE" = binary ] && stage_release
     stage_github_app
+    show_install_plan
     stage_docker
     stage_connected_local_authorization
     stage_coder_token
@@ -1144,9 +1203,6 @@ main() {
     close_step
     printf '\n'
     RAIL_OPEN=0
-    local installed="source (compiled from this checkout)"
-    [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
-    [ "$MODE" = binary ] && installed="release $(env_get OPENFLOWS_VERSION)"
     if [ -n "$UPGRADE_PENDING" ]; then
         panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
             "These workspaces still use the old version:" \
@@ -1160,7 +1216,8 @@ main() {
     fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
-        "Installed    ${installed}" \
+        "GitHub App   $(app_label)" \
+        "Installed    $(install_label)" \
         "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \

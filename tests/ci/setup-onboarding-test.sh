@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Tests what scripts/setup.sh shows before starting and how it checks your own GitHub App (#486),
+# with stand-ins for Coder's API and the terminal.
+#
+# Usage: bash tests/ci/setup-onboarding-test.sh
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=../../scripts/setup.sh
+source "${ROOT}/scripts/setup.sh"   # main only runs when setup.sh is executed, not sourced
+set +e
+
+failures=0
+pass() { printf '  ok    %s\n' "$1"; }
+fail() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+expect_has() {   # expect_has description output text
+    case "$2" in *"$3"*) pass "$1" ;; *) fail "$1 (no '$3' in: $2)" ;; esac
+}
+expect_lacks() {   # expect_lacks description output text
+    case "$2" in *"$3"*) fail "$1 (found '$3')" ;; *) pass "$1" ;; esac
+}
+
+WORK="$(mktemp -d)"
+trap 'rm -r -- "$WORK"' EXIT
+ENV_FILE="${WORK}/.env"
+REPO=Acme/private-repo; NAME=acme; FLEET=2
+unset OPENFLOWS_GITHUB_AUTH_MODE
+
+echo "What setup shows before starting"
+plan() {   # plan INSTALL_MODE APP_MODE
+    MODE="$1"
+    printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\nOPENFLOWS_VERSION=1.9.0\n' "$2" >"$ENV_FILE"
+    show_install_plan 2>&1
+}
+out="$(plan binary connected-local)"
+expect_has "the repository" "$out" "Acme/private-repo"
+expect_has "the shared App" "$out" "shared OpenFlows App"
+expect_has "the release" "$out" "release 1.9.0"
+expect_has "the fleet" "$out" "2 FORGE-SENTINEL pair(s)"
+out="$(plan compose self-managed)"
+expect_has "your own App" "$out" "your own App"
+expect_has "the image" "$out" "image 1.9.0"
+expect_has "compiling" "$(plan source self-managed)" "source (compiled from this checkout)"
+expect_lacks "never prints a secret" "$(printf 'CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=hunter2\n' >>"$ENV_FILE"; MODE=source; show_install_plan 2>&1)" hunter2
+
+echo "Your own App is installed on the repo's owner"
+is_tty() { [ "${FAKE_TTY:-}" = yes ]; }
+open_url() { :; }
+INSTALLED='{"app_installable":true,"installations":[{"account":{"login":"acme"},"configure_url":"https://github.com/settings/installations/1"}]}'
+OTHER='{"app_installable":true,"installations":[{"account":{"login":"someone"},"configure_url":"https://github.com/settings/installations/2"}]}'
+UNKNOWN='{"app_installable":false,"installations":[]}'
+api() { [ -n "${FAKE_API:-}" ] || return 1; cat "$FAKE_API"; }
+check() {   # check RESPONSE [RESPONSE_AFTER_PAUSE] — prints the output, then `stopped` if setup stopped
+    (
+        FAKE_API="${WORK}/api.json"; printf '%s' "$1" >"$FAKE_API"
+        AFTER="${2:-$1}"
+        pause() { printf '%s' "$AFTER" >"$FAKE_API"; }
+        set -e
+        ensure_app_installed
+        echo finished
+    ) 2>&1 || echo stopped
+}
+out="$(check "$INSTALLED")"
+expect_has "installed: continues" "$out" finished
+expect_has "installed: says so, ignoring case" "$out" "installed on Acme"
+expect_has "installed: links to its repository list" "$out" "https://github.com/settings/installations/1"
+expect_has "installed: reminds about the repository" "$out" "Acme/private-repo"
+out="$(check "$OTHER")"
+expect_has "on another account, no terminal: stops" "$out" stopped
+expect_has "on another account: says how to fix it" "$out" "CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL"
+expect_lacks "on another account: does not continue" "$out" finished
+expect_has "no installations: stops" "$(check '{"app_installable":true,"installations":[]}')" stopped
+export FAKE_TTY=yes
+out="$(check "$OTHER" "$INSTALLED")"
+expect_has "installed while setup waits: continues" "$out" finished
+out="$(check "$OTHER" "$OTHER")"
+expect_has "still not installed after waiting: stops" "$out" stopped
+unset FAKE_TTY
+for response in "$UNKNOWN" "not json" ""; do
+    out="$(check "$response")"
+    expect_has "Coder can't tell ('${response:0:12}'): warns" "$out" "Could not check"
+    expect_has "Coder can't tell ('${response:0:12}'): continues" "$out" finished
+done
+
+echo "When setup runs the check"
+linked_calls() {   # linked_calls APP_MODE AUTHENTICATED — whether the App is checked
+    (
+        printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\n' "$1" >"$ENV_FILE"
+        FAKE_AUTHENTICATED="$2"
+        api() { printf '{"authenticated":%s}' "$FAKE_AUTHENTICATED"; }
+        ensure_app_installed() { echo checked; }
+        ensure_github_link 2>&1
+    )
+}
+expect_has "already linked: checks" "$(linked_calls self-managed true)" checked
+expect_lacks "not linked, no terminal: nothing to check yet" "$(linked_calls self-managed false)" checked
+expect_lacks "the shared App: the console checks instead" "$(linked_calls connected-local true)" checked
+
+echo "The health check shows the same"
+doctor_output() {   # doctor_output LINES_FOR_ENV
+    (
+        P="${WORK}/doctor-$RANDOM"; mkdir -p "${P}/scripts" "${P}/.dev-binaries"
+        cp "${ROOT}/scripts/prod.sh" "${P}/scripts/"
+        printf '%b' "$1" >"${P}/.env"
+        printf '#!/bin/sh\necho doctor ran\n' >"${P}/.dev-binaries/openflows"
+        chmod +x "${P}/.dev-binaries/openflows"
+        env -u OPENFLOWS_BIN bash "${P}/scripts/prod.sh" doctor 2>&1
+    )
+}
+out="$(doctor_output 'OPENFLOWS_SETUP_MODE=binary\nOPENFLOWS_SETUP_REPO=acme/repo\nOPENFLOWS_GITHUB_AUTH_MODE=connected-local\nOPENFLOWS_VERSION=1.9.0\nCODER_EXTERNAL_AUTH_0_CLIENT_SECRET=hunter2\n')"
+expect_has "the repository" "$out" "acme/repo"
+expect_has "the shared App" "$out" "shared OpenFlows App"
+expect_has "the install" "$out" "release 1.9.0"
+expect_has "and still runs the check" "$out" "doctor ran"
+expect_lacks "never prints a secret" "$out" hunter2
+out="$(doctor_output 'OPENFLOWS_SETUP_MODE=compose\nOPENFLOWS_GITHUB_AUTH_MODE=self-managed\nOPENFLOWS_VERSION=1.9.0\n')"
+expect_has "your own App" "$out" "your own App"
+expect_lacks "no repository yet: no empty line" "$out" "Repository"
+
+echo
+if [ "$failures" -gt 0 ]; then
+    echo "$failures test(s) failed"
+    exit 1
+fi
+echo "All onboarding tests passed"

@@ -521,6 +521,12 @@ The download doesn't match the release's checksum, so nothing was installed. Run
 
 Your system can't run the release's program for this platform. Install with `--source`.
 
+### Setup says your GitHub App is not installed
+
+With your own App, setup checks that the App is installed on the repo's owner, using the GitHub account you linked in Coder. Install it from `CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL` in `.env`, then re-run setup. If it is installed, check that you linked the right account.
+
+Coder lists the accounts an App is on, not their repositories, so setup can't confirm the repo itself. It prints a link where you can check that the repo is selected.
+
 ### Setup waits at "Connecting owner/repo" and never finishes
 
 The tenant's nexus workspace is stopped, and setup waits for it to come up. Start the stack and workspaces, or restart the workspace: `coder restart openflows-nexus-<tenant> --yes`.
