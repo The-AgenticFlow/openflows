@@ -170,7 +170,7 @@ All keys are shown relative to their `ns:{tenant}:` prefix. This is the complete
 | Controller (`NexusNode`, LORE driver) | `tickets` (merged), `ticket:{id}:docs`, `ticket:{id}:docs_delivery`, `ticket:{id}:deployment`, `ticket:{id}:chat:lore`, `docs:cutover_v1`, `docs:reopened` |
 | Harness (LORE) | `ticket:{id}:dispatch:lore`, `ticket:{id}:docs` |
 | Controller (`VesselNode`, docs PRs) | `ticket:{id}:docs` (read; records `rework` and `merged`), `ctl:{tenant}:ticket:{id}:docs_control` (read) |
-| Operator CLI (`openflows gate docs`) | `ticket:{id}:docs`, `ctl:{tenant}:ticket:{id}:docs_control` (the operator's latest docs decision; written first) |
+| Operator CLI (`openflows gate docs`) | `ticket:{id}:docs`, `ctl:{tenant}:ticket:{id}:docs_control` (the operator's latest docs decision; both written in one atomic step) |
 | Harness (FORGE/SENTINEL/VESSEL) | `ticket:{id}:dispatch:*`, `ticket:{id}:status`, `ticket:{id}:gate:*`, `ticket:{id}:handoff` |
 | SENTINEL | `pair:{id}:verification` (A2A result), `ticket:{id}:review:*` |
 

@@ -86,19 +86,11 @@ impl HarnessStore {
     ) -> Result<DocsRecord> {
         let state = self.lifecycle.docs_record(ticket).await?;
         let event = Self::complete_docs_decision(ticket, &state, event, keys)?;
-        // Record the decision where workspaces cannot write it *before* the
-        // docs record changes, so a crash in between leaves the gate closed:
-        // a revocation is in force at once, and an approval counts only once
-        // both agree. See `config::docs_lifecycle::control`.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let preview = state.apply("human", event.clone(), now)?;
+        // The docs record and the operator's latest decision (kept where
+        // workspaces cannot write it) commit together under one version
+        // check; see `config::docs_lifecycle::control`.
         self.lifecycle
-            .set_docs_control(ticket, &DocsControl::from_record(&preview))
-            .await?;
-        self.lifecycle
-            .docs_transition(ticket, state.version, "human", event)
+            .docs_operator_transition(ticket, state.version, event)
             .await
     }
 

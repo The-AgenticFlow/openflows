@@ -147,7 +147,17 @@ impl VesselNode {
         // rejected the docs, and anyone with access may have retargeted the
         // PR (GitHub's merge call pins the head, not the base). So read the
         // PR and the docs gate again and repeat every check right before merging.
+        let checked_head = pr_info.head_sha.clone();
         let pr_info = self.client.get_pull_request(owner, repo, pr_number).await?;
+        // CI passed for `checked_head` only. A different head (even a newly
+        // approved one) has not passed CI: hold, and poll its CI next pass.
+        if pr_info.head_sha != checked_head {
+            info!(pr_number, checked_head, head = %pr_info.head_sha, "Docs PR head changed while CI ran; holding");
+            return Ok(hold(format!(
+                "head moved from {checked_head} to {} while CI ran; CI is checked again for the new head",
+                pr_info.head_sha
+            )));
+        }
         let ticket = match Box::pin(self.docs_merge_gate(owner, repo, &store, &pr_info)).await? {
             Ok(ticket) => ticket,
             Err(outcome) => return Ok(outcome),
@@ -522,6 +532,28 @@ mod tests {
         let outcome = node.process_docs_pr("org", "repo", docs_pr("abc")).await;
         assert!(
             matches!(&outcome, VesselOutcome::Unmanaged { reason, .. } if reason.contains("targets release")),
+            "{outcome:?}"
+        );
+        merge.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_head_that_changes_while_ci_runs_is_held_not_merged() {
+        let mut server = mockito::Server::new_async().await;
+        let _repo = mock_docs_repo(&mut server, &["CHANGELOG.md"]).await;
+        let _ci = mock_ci(&mut server, "abc", "success").await;
+        // CI passed for abc; by the time it finished the PR points at def.
+        let _pr = mock_docs_pr(&mut server, "def", "main").await;
+        let merge = server
+            .mock("PUT", "/repos/org/repo/pulls/42/merge")
+            .expect(0)
+            .create_async()
+            .await;
+        let store = published_docs_store().await;
+        let node = docs_test_node(&server, &store).await;
+        let outcome = node.process_docs_pr("org", "repo", docs_pr("abc")).await;
+        assert!(
+            matches!(&outcome, VesselOutcome::DocsPrHeld { reason, .. } if reason.contains("while CI ran")),
             "{outcome:?}"
         );
         merge.assert_async().await;

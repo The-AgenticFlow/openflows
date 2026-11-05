@@ -179,8 +179,9 @@ issued once, not that it still stands: a workspace that can write the store
 could put back an approved record the operator has since rejected. So every
 operator action also records the resulting decision (the approved revision and
 head, if any, and the pause flag) under the controller-only key
-`ctl:{tenant}:ticket:{id}:docs_control`, *before* it changes the docs record,
-so an interrupted command leaves the gate closed. NEXUS and VESSEL accept an
+`ctl:{tenant}:ticket:{id}:docs_control`, in one atomic step with the docs
+record and under its version check, so a command that loses a race with a newer
+decision writes neither. NEXUS and VESSEL accept an
 approval only if the docs record agrees with that decision and it is not
 paused. Hosted tenants have two Redis users: workspaces get the tenant user
 (`~ns:{tenant}:*`), and only the NEXUS workspace gets the controller user
@@ -206,7 +207,8 @@ the PR head is the approved head, the PR targets the default branch, and its
 files are documentation only; the merge itself pins that head. CI can take
 minutes, so VESSEL reads the PR and the docs gate again after CI and repeats
 every check right before merging: an operator pause or rejection, a retargeted
-base or a changed file list during CI stops the merge. A docs PR into
+base or a changed file list during CI stops the merge, and a head that moved
+while CI ran is held until CI has run for it. A docs PR into
 another base goes to a human. Conflicts, failed CI, non-documentation files,
 or commits pushed after approval send the record back to LORE (`rework`) on
 the **same branch and PR** with the reason as feedback, and the operator

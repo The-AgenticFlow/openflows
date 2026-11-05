@@ -5,7 +5,7 @@
 
 use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
-use config::docs_lifecycle::{DocsControl, DocsEvent, DocsGateKeys, DocsPhase, DocsRecord};
+use config::docs_lifecycle::{DocsEvent, DocsGateKeys, DocsPhase, DocsRecord};
 use config::lifecycle::{Event, Phase};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;

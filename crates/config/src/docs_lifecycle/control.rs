@@ -8,9 +8,11 @@
 //! [`DocsControl`] records that latest word: the approved revision and head (if
 //! any) and the pause flag, as of the operator's last action. The operator CLI
 //! writes it to the controller-only key prefix (`ctl:{tenant}:`, see the store)
-//! **before** it changes the docs record, so a crash in between leaves the gate
-//! closed rather than open. NEXUS (before opening a docs PR) and VESSEL (before
-//! merging one) require the docs record to agree with it.
+//! in the same atomic step as the docs record, under the docs record's version
+//! check (`SharedStore::docs_operator_transition`): a command that loses the
+//! check writes neither, so it can never replace a newer decision. NEXUS
+//! (before opening a docs PR) and VESSEL (before merging one) require the docs
+//! record to agree with it.
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
