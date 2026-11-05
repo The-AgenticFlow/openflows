@@ -140,6 +140,8 @@ jobs:
           persist-credentials: false
       - name: Run setup.sh tenant name tests
         run: bash tests/ci/setup-tenant-name-test.sh
+      - name: Run setup.sh release install tests
+        run: bash tests/ci/setup-binary-test.sh
       - name: Run line-limit checker tests
         run: bash tests/ci/check-line-limits-test.sh
 
