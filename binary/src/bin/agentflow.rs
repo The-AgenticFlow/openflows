@@ -892,9 +892,10 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                 match pocketflow_core::SharedStore::new_redis(&redis_url).await {
                     Ok(store) => {
                         // raw_keys + raw_del operate on full keys, so we purge the
-                        // real `ns:{name}:*` namespace instead of re-prefixing it.
-                        let pattern = format!("ns:{}:*", name);
-                        let keys: Vec<String> = store.raw_keys(&pattern).await;
+                        // real `ns:{name}:*` namespace (and its controller-only
+                        // `ctl:{name}:*` keys) instead of re-prefixing it.
+                        let mut keys = store.raw_keys(&format!("ns:{name}:*")).await;
+                        keys.extend(store.raw_keys(&format!("ctl:{name}:*")).await);
                         if !keys.is_empty() {
                             for key in &keys {
                                 store.raw_del(key).await;
@@ -986,8 +987,8 @@ async fn run_store(action: StoreCommands) -> Result<()> {
         }
         StoreCommands::Purge { name, yes } => {
             validate_tenant_name(&name)?;
-            let pattern = format!("ns:{}:*", name);
-            let keys: Vec<String> = store.raw_keys(&pattern).await;
+            let mut keys = store.raw_keys(&format!("ns:{name}:*")).await;
+            keys.extend(store.raw_keys(&format!("ctl:{name}:*")).await);
             if keys.is_empty() {
                 println!("  ✗ No keys found for tenant '{}'", name);
                 return Ok(());
@@ -1054,9 +1055,10 @@ async fn run_store(action: StoreCommands) -> Result<()> {
             println!("  (Restart the controller to pick up changes)");
         }
         StoreCommands::Wipe { yes } => {
-            // raw_keys("ns:*") matches every tenant namespace plus any other
-            // shared keys, so this is a true whole-store global reset.
-            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            // Every tenant namespace and its controller-only keys: a true
+            // whole-store global reset.
+            let mut keys = store.raw_keys("ns:*").await;
+            keys.extend(store.raw_keys("ctl:*").await);
             if keys.is_empty() {
                 println!("  (shared store is already empty — nothing to wipe)");
                 return Ok(());

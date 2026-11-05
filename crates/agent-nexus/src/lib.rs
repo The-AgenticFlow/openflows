@@ -8211,6 +8211,15 @@ mod tests {
             },
         )
         .await;
+        // As the operator CLI does, record the decision controller-side.
+        let record = store.docs_record(ticket).await.unwrap();
+        store
+            .set_docs_control(
+                ticket,
+                &config::docs_lifecycle::DocsControl::from_record(&record),
+            )
+            .await
+            .unwrap();
     }
 
     async fn decide_docs(store: &SharedStore, ticket: &str, approved: bool, notes: &str) {
@@ -8944,6 +8953,17 @@ mod tests {
             decide_docs(&store, ticket, true, "").await;
             docs_event(&store, ticket, "nexus", DocsEvent::Published { number }).await;
         }
+        // A pause stops LORE and automatic merges, not the record following
+        // a human's merge on GitHub.
+        docs_event(
+            &store,
+            "T-9",
+            "human",
+            DocsEvent::Pause {
+                reason: "release freeze".into(),
+            },
+        )
+        .await;
         let node = lore_node().with_github_override("t", server.url());
         poll(
             &node,
@@ -9200,6 +9220,47 @@ mod tests {
             .await;
         poll(&node, &store, &ticket, 2).await;
         create.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_vanished_hosted_chat_is_forgotten_and_eventually_parks_lore() {
+        let mut server = mockito::Server::new_async().await;
+        let gone = server
+            .mock("POST", "/api/v1/runtime/chats/chat-1/messages")
+            .with_status(404)
+            .with_body(r#"{"error":"chat not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _deleted = server
+            .mock("DELETE", "/api/v1/runtime/workspaces/ws-1")
+            .with_status(202)
+            .create_async()
+            .await;
+        let store = lore_store(lore_slot(bound_to("T-9"), Some("ws-1"))).await;
+        let chat_key = full_ticket_key("T-9", KEY_TICKET_CHAT, "lore");
+        store.set(&chat_key, json!("chat-1")).await;
+        let ticket = [merged_ticket("T-9")];
+        let node = hosted_lore_node(&server);
+
+        // The step cannot be delivered: the stored chat is forgotten (the next
+        // poll asks the Manager again) and the failure streak starts.
+        poll(&node, &store, &ticket, 2).await;
+        gone.assert_async().await;
+        assert!(store.get_typed::<String>(&chat_key).await.is_none());
+        let streak = delivery(&store, "T-9").await.failing_since;
+        assert!(
+            streak.is_some(),
+            "a failed delivery must count as a failure"
+        );
+
+        // A streak past the limit parks LORE for the operator and frees the slot.
+        let key = full_ticket_key_flat("T-9", config::state::KEY_TICKET_DOCS_DELIVERY);
+        let mut stale = delivery(&store, "T-9").await;
+        stale.failing_since = Some(streak.unwrap() - lore::LORE_PROVISION_MAX_SECS - 1);
+        store.set(&key, json!(stale)).await;
+        poll(&node, &store, &ticket, 3).await;
+        assert!(store.docs_record("T-9").await.unwrap().paused);
     }
 
     #[tokio::test]

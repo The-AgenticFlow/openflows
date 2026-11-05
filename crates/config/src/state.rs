@@ -209,6 +209,9 @@ pub const KEY_TICKET_DEPLOYMENT: &str = "deployment";
 /// Key suffix for the post-merge LORE documentation gate record.
 /// Full key: `ticket:{id}:docs` (see [`crate::docs_lifecycle::DocsRecord`]).
 pub const KEY_TICKET_DOCS: &str = "docs";
+/// Operator docs decision ([`crate::docs_lifecycle::DocsControl`]), stored
+/// under the controller-only `ctl:{tenant}:` prefix, never `ns:{tenant}:`.
+pub const KEY_TICKET_DOCS_CONTROL: &str = "docs_control";
 
 /// Key suffix for NEXUS's record of the last LORE instruction it delivered.
 /// Full key: `ticket:{id}:docs_delivery`. Controller-private; never an authority.

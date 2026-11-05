@@ -74,7 +74,8 @@ impl NexusNode {
         info!(ticket_id = %ticket.id, revision = record.revision, head, "LORE docs awaiting operator decision");
     }
 
-    /// The approved head of `record` if its seal verifies. Otherwise the
+    /// The approved head of `record` if its seal verifies and it is the
+    /// operator's latest decision (`SharedStore::verified_docs_head`). Otherwise the
     /// operator is told, once per record version, why nothing will be opened
     /// or merged and how to approve again.
     pub(super) async fn verified_docs_head(
@@ -87,8 +88,8 @@ impl NexusNode {
             warn!(ticket_id = %ticket.id, "No docs gate secret (OPENFLOWS_DOCS_GATE_SECRET or CODER_CHAT_HOOK_SECRET) is configured; NEXUS cannot verify docs approvals and will not open docs PRs");
             return None;
         };
-        let error = match keys.verify(record, &ticket.id) {
-            Ok(head) => return Some(head.to_string()),
+        let error = match store.verified_docs_head(&ticket.id, record, keys).await {
+            Ok(head) => return Some(head),
             Err(error) => error,
         };
         error!(ticket_id = %ticket.id, %error, "Refusing to open or merge a docs PR without a valid operator approval");

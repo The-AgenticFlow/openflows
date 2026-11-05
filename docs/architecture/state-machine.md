@@ -168,6 +168,28 @@ enabled). An approval that does not verify (for example, sealed with a key the
 controller no longer holds) is reported to the operator once, with the command
 to approve it again.
 
+Hosted tenants deliver `CODER_CHAT_HOOK_SECRET` (the `hook_key` of the
+mounted runtime bundle) to the NEXUS workspace only; worker bundles carry
+neither the hook key nor the hook URL. A locally added tenant passes
+`OPENFLOWS_DOCS_GATE_SECRET` and `OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS` (when
+set where `tenant add` runs) to the NEXUS workspace only.
+
+**Only the operator's latest decision counts.** A seal proves an approval was
+issued once, not that it still stands: a workspace that can write the store
+could put back an approved record the operator has since rejected. So every
+operator action also records the resulting decision (the approved revision and
+head, if any, and the pause flag) under the controller-only key
+`ctl:{tenant}:ticket:{id}:docs_control`, *before* it changes the docs record,
+so an interrupted command leaves the gate closed. NEXUS and VESSEL accept an
+approval only if the docs record agrees with that decision and it is not
+paused. Hosted tenants have two Redis users: workspaces get the tenant user
+(`~ns:{tenant}:*`), and only the NEXUS workspace gets the controller user
+(`{user}-ctl`, which may also use `~ctl:{tenant}:*`). Run `openflows gate docs`
+from the NEXUS workspace (or anywhere with the controller's Redis credential):
+with a workspace credential it fails instead of recording a decision. A local
+(single Redis user) deployment does not separate these users, so there the
+gate does not protect against a workspace that writes to Redis directly.
+
 The controller's secrets reach it as Coder workspace parameters, so the Coder
 deployment and its administrators are inside this trust boundary: the seal
 stops workspaces, not Coder, from approving docs. Branch protection on the
@@ -181,7 +203,10 @@ repository default branch (or finds an open one into it; a PR from the docs
 branch into any other base is never adopted), and records it (`published`).
 VESSEL merges it only while it is published and unpaused, the seal verifies,
 the PR head is the approved head, the PR targets the default branch, and its
-files are documentation only; the merge itself pins that head. A docs PR into
+files are documentation only; the merge itself pins that head. CI can take
+minutes, so VESSEL reads the PR and the docs gate again after CI and repeats
+every check right before merging: an operator pause or rejection, a retargeted
+base or a changed file list during CI stops the merge. A docs PR into
 another base goes to a human. Conflicts, failed CI, non-documentation files,
 or commits pushed after approval send the record back to LORE (`rework`) on
 the **same branch and PR** with the reason as feedback, and the operator
@@ -195,13 +220,14 @@ work is discarded), opens no PR, and VESSEL holds the docs PR; the reducer
 refuses submissions. Merges and closures on GitHub are still recorded.
 Resuming starts LORE again on a fresh workspace from the pushed branch.
 A LORE that makes no progress after three nudges, that spends four hours on
-one step, whose workspace or chat has not come up for 30 minutes, or whose
+one step, whose workspace or chat has not come up (or could not be messaged) for 30 minutes, or whose
 workspace crashed three times since the last resume, is parked: NEXUS pauses
 the record, frees the slot and asks the operator to resume or skip.
 `--restart` replaces a drafting LORE's workspace and chat. `--skip` closes a
 record nothing was submitted for in the current cycle (also right after a
 mistaken `--reopen`); `--reopen` starts a new cycle for a merged, abandoned or
-skipped one. The record keeps its latest 100 transitions. Merged tickets that predate
+skipped one. Both also work while paused and clear the pause, so a pause that
+lands as the PR merges cannot strand a closed record. The record keeps its latest 100 transitions. Merged tickets that predate
 the gate are skipped once at cutover (only while LORE is enabled).
 
 ## Merge and recovery

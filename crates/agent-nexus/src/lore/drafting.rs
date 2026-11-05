@@ -194,6 +194,11 @@ impl NexusNode {
         if record.paused {
             // A hold must not keep the (usually single) LORE slot from others.
             self.release_lore_slot(store, ticket, "docs paused").await;
+            // A pause stops LORE and automatic merges, not the facts: a human
+            // may still merge or close the docs PR, and the record follows it.
+            if record.phase == DocsPhase::Published {
+                Box::pin(self.reconcile_docs_pr(store, ticket, &record)).await;
+            }
             return;
         }
         match record.phase {
@@ -415,6 +420,8 @@ impl NexusNode {
                     Self::send_lore_message(backend, &ticket.id, &chat_id, step_key, step).await
                 {
                     warn!(ticket_id = %ticket.id, chat_id, %error, "Could not deliver docs step to LORE; will retry next poll");
+                    self.lore_delivery_failed(store, ticket, backend, record, &error)
+                        .await;
                     return;
                 }
                 delivery = fresh(&delivery);
@@ -457,6 +464,8 @@ impl NexusNode {
                     Self::send_lore_message(backend, &ticket.id, &chat_id, &key, &nudge).await
                 {
                     warn!(ticket_id = %ticket.id, chat_id, %error, "Could not nudge stalled LORE; will retry next poll");
+                    self.lore_delivery_failed(store, ticket, backend, record, &error)
+                        .await;
                     return;
                 }
                 delivery.nudges += 1;
@@ -465,6 +474,26 @@ impl NexusNode {
             }
         }
         store.set(&delivery_key, json!(delivery)).await;
+    }
+
+    /// A message could not reach LORE's chat. The hosted path cannot see
+    /// whether the stored chat still exists, so it forgets it: the next poll
+    /// asks the Manager again (idempotent per workspace and ticket), which
+    /// reuses a live chat or creates one. Either way the failure counts toward
+    /// [`LORE_PROVISION_MAX_SECS`], so a chat that never comes back parks LORE
+    /// instead of holding the slot forever.
+    pub(super) async fn lore_delivery_failed(
+        &self,
+        store: &SharedStore,
+        ticket: &Ticket,
+        backend: &LoreBackend<'_>,
+        record: &DocsRecord,
+        error: &anyhow::Error,
+    ) {
+        if matches!(backend, LoreBackend::Managed(_)) {
+            store.del(&Self::lore_chat_key(&ticket.id)).await;
+        }
+        self.lore_not_ready(store, ticket, record, error).await;
     }
 
     /// LORE's workspace or chat failed to come up. Retried every poll, but after

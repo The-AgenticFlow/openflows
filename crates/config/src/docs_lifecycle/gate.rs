@@ -61,7 +61,11 @@ impl GateKey {
 /// The keys that seal and verify operator docs approvals.
 ///
 /// The secret is `OPENFLOWS_DOCS_GATE_SECRET`, falling back to
-/// `CODER_CHAT_HOOK_SECRET` for existing deployments. Either way the seal key
+/// `CODER_CHAT_HOOK_SECRET`. Only the controller receives either: hosted
+/// tenants put the hook key in the NEXUS runtime bundle alone (worker bundles
+/// omit it), and `tenant add` passes both to the NEXUS workspace alone. The
+/// seal proves an approval was issued; whether it is still the operator's
+/// latest decision is checked against [`super::DocsControl`]. Either way the seal key
 /// is derived from it with a separate label, and both must be at least
 /// [`MIN_GATE_SECRET_LEN`] bytes. During a rotation,
 /// `OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS` still verifies approvals sealed

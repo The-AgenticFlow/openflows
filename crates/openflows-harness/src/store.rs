@@ -5,7 +5,7 @@
 
 use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
-use config::docs_lifecycle::{DocsEvent, DocsGateKeys, DocsPhase, DocsRecord};
+use config::docs_lifecycle::{DocsControl, DocsEvent, DocsGateKeys, DocsPhase, DocsRecord};
 use config::lifecycle::{Event, Phase};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
@@ -466,6 +466,17 @@ impl HarnessStore {
     ) -> Result<DocsRecord> {
         let state = self.lifecycle.docs_record(ticket).await?;
         let event = Self::complete_docs_decision(ticket, &state, event, keys)?;
+        // Record the decision where workspaces cannot write it *before* the
+        // docs record changes, so a crash in between leaves the gate closed:
+        // a revocation is in force at once, and an approval counts only once
+        // both agree. See `config::docs_lifecycle::control`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let preview = state.apply("human", event.clone(), now)?;
+        self.lifecycle
+            .set_docs_control(ticket, &DocsControl::from_record(&preview))
+            .await?;
         self.lifecycle
             .docs_transition(ticket, state.version, "human", event)
             .await
@@ -575,13 +586,15 @@ impl HarnessStore {
                 "--no-renames",
                 "--no-ext-diff",
                 "--name-only",
+                // NUL-separated raw paths: without -z, Git quotes and escapes
+                // non-ASCII names (`"docs/fran\303\247ais.md"`).
+                "-z",
                 &range,
             ],
         )
         .context("Cannot list the files changed by the docs branch")?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .split('\0')
+        .filter(|path| !path.is_empty())
         .map(str::to_string)
         .collect();
         Ok(DocsSubmission {
@@ -1206,6 +1219,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must be submitted from branch lore/T-1--c2"));
+    }
+
+    #[test]
+    fn docs_submission_keeps_non_ascii_names_as_written() {
+        let (_root, work) = docs_checkout();
+        std::fs::create_dir_all(work.join("docs")).unwrap();
+        std::fs::write(work.join("docs/français.md"), "# Guide\n").unwrap();
+        std::fs::write(work.join("docs/two words.md"), "# Notes\n").unwrap();
+        commit_and_push(&work, "docs: guides");
+        let mut files = HarnessStore::docs_submission(&work, "lore/T-1")
+            .unwrap()
+            .files;
+        files.sort();
+        assert_eq!(files, vec!["docs/français.md", "docs/two words.md"]);
+        assert!(
+            config::docs_lifecycle::non_docs_paths(files.iter().map(String::as_str)).is_empty()
+        );
     }
 
     #[test]

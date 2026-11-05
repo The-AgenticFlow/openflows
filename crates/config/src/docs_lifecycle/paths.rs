@@ -54,7 +54,8 @@ const PROTECTED_NAMES: &[&str] = &[
     "copilot-instructions.md",
     "codeowners",
 ];
-/// Legal files (`LICENSE`, `LICENSE.md`, `COPYING.txt`, `NOTICE`).
+/// Legal files, matched as name prefixes so suffixed variants count too
+/// (`LICENSE`, `LICENSE-MIT.md`, `LICENSES/`, `COPYING-LESSER.md`, `NOTICE.txt`).
 const PROTECTED_NAME_STEMS: &[&str] = &["license", "licence", "copying", "notice"];
 /// Prose formats that are documentation wherever they live. MDX is not one:
 /// it is JSX that docs sites execute at build time.
@@ -85,7 +86,9 @@ pub fn is_docs_path(path: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name);
     if PROTECTED_PREFIXES.iter().any(|p| lower.starts_with(p))
         || PROTECTED_NAMES.contains(&name)
-        || PROTECTED_NAME_STEMS.contains(&stem)
+        || lower
+            .split('/')
+            .any(|part| PROTECTED_NAME_STEMS.iter().any(|s| part.starts_with(s)))
         || BUILD_INPUT_STEMS.iter().any(|s| stem.starts_with(s))
         || name.ends_with(".agent.md")
         || name == "skill.md"

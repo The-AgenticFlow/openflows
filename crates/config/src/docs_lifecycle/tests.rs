@@ -267,6 +267,102 @@ fn pause_holds_lore_and_publication_but_not_external_facts() {
 }
 
 #[test]
+fn the_operator_can_close_or_reopen_paused_docs() {
+    let pause = |record: &DocsRecord| {
+        record
+            .apply(
+                "human",
+                DocsEvent::Pause {
+                    reason: "hold".into(),
+                },
+                6,
+            )
+            .unwrap()
+    };
+    // A pause that lands just before the merge is recorded must not strand
+    // the closed record: resume is refused (terminal), so reopen must work.
+    let merged_paused = pause(&published())
+        .apply(
+            "vessel",
+            DocsEvent::Merged {
+                number: 9,
+                sha: "m".into(),
+            },
+            7,
+        )
+        .unwrap();
+    assert!(merged_paused.paused);
+    assert!(merged_paused.apply("human", DocsEvent::Resume, 8).is_err());
+    let reopened = merged_paused
+        .apply(
+            "human",
+            DocsEvent::Reopen {
+                reason: "redo".into(),
+            },
+            8,
+        )
+        .unwrap();
+    assert!(!reopened.paused && reopened.pause_reason.is_none());
+    assert_eq!(reopened.phase, DocsPhase::Drafting);
+
+    // A parked, unsubmitted draft can be skipped without resuming it first,
+    // but only by the operator.
+    let parked = DocsRecord::default()
+        .apply(
+            "nexus",
+            DocsEvent::Pause {
+                reason: "stalled".into(),
+            },
+            1,
+        )
+        .unwrap();
+    assert!(parked
+        .apply("nexus", DocsEvent::Skip { reason: "x".into() }, 2)
+        .is_err());
+    let skipped = parked
+        .apply(
+            "human",
+            DocsEvent::Skip {
+                reason: "legacy".into(),
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(skipped.phase, DocsPhase::Skipped);
+    assert!(!skipped.paused);
+}
+
+#[test]
+fn only_the_latest_operator_decision_confirms_an_approval() {
+    let ready = submit(&DocsRecord::default(), "abc").unwrap();
+    let approved = decide(&ready, true, "").unwrap();
+    let control = DocsControl::from_record(&approved);
+    assert!(DocsControl::confirm(Some(&control), &approved, "T-1").is_ok());
+    // Nothing recorded where workspaces cannot write: refused.
+    assert!(DocsControl::confirm(None, &approved, "T-1").is_err());
+
+    // The operator rejects; a workspace restores the old approved record.
+    let rejected = decide(&approved, false, "explain the retry budget").unwrap();
+    let control = DocsControl::from_record(&rejected);
+    assert!(control.approved.is_none());
+    let error = DocsControl::confirm(Some(&control), &approved, "T-1").unwrap_err();
+    assert!(format!("{error:#}").contains("not the operator's latest decision"));
+
+    // A pause recorded by the operator holds even if the record is unpaused.
+    let paused = approved
+        .apply(
+            "human",
+            DocsEvent::Pause {
+                reason: "freeze".into(),
+            },
+            3,
+        )
+        .unwrap();
+    let control = DocsControl::from_record(&paused);
+    assert!(DocsControl::confirm(Some(&control), &approved, "T-1").is_err());
+}
+
+#[test]
 fn restart_redrives_drafting_only() {
     let restarted = DocsRecord::default()
         .apply(
@@ -467,6 +563,10 @@ fn docs_paths_are_documentation_only() {
         "LICENSE",
         "LICENSE.md",
         "docs/COPYING.txt",
+        "LICENSE-MIT.md",
+        "COPYING-LESSER.md",
+        "docs/licenses/apache.md",
+        "NOTICES.md",
         "NOTICE.md",
         "CODEOWNERS",
         "docs/CODEOWNERS",

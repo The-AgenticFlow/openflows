@@ -8,8 +8,11 @@
 //!
 //! Path classification and approval sealing live in [`paths`] and [`gate`].
 
+pub mod control;
 pub mod gate;
 pub mod paths;
+
+pub use control::{ApprovedDocs, DocsControl};
 
 pub use gate::{
     approval_seal, gate_keys_from_env_logged, verify_approval, DocsGateKeys, MIN_GATE_SECRET_LEN,
@@ -236,9 +239,14 @@ impl DocsRecord {
             "Documentation is {}; only `--reopen` can start a new docs cycle",
             self.phase.as_str()
         );
+        // The operator may also close out (skip) or reopen paused docs: a
+        // closed record cannot be resumed, so a pause that lands as the PR
+        // merges must not strand it.
         ensure!(
             !self.paused
                 || matches!(event, DocsEvent::Resume | DocsEvent::Pause { .. })
+                || (actor == "human"
+                    && matches!(event, DocsEvent::Skip { .. } | DocsEvent::Reopen { .. }))
                 || event.records_external_fact(),
             "Documentation is paused; wait for `openflows gate docs --resume`"
         );
@@ -453,6 +461,8 @@ impl DocsRecord {
                     "Skipping documentation requires a reason"
                 );
                 next.skip_reason = Some(reason);
+                next.paused = false;
+                next.pause_reason = None;
                 next.phase = DocsPhase::Skipped;
             }
             DocsEvent::Reopen { reason } => {
@@ -481,6 +491,8 @@ impl DocsRecord {
                 next.merge_sha = None;
                 next.skip_reason = None;
                 next.feedback = Some(reason);
+                next.paused = false;
+                next.pause_reason = None;
                 next.phase = DocsPhase::Drafting;
             }
         }
