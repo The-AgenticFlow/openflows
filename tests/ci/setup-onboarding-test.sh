@@ -97,6 +97,17 @@ expect_has "already linked: checks" "$(linked_calls self-managed true)" checked
 expect_lacks "not linked, no terminal: nothing to check yet" "$(linked_calls self-managed false)" checked
 expect_lacks "the shared App: the console checks instead" "$(linked_calls connected-local true)" checked
 
+echo "The setup log"
+log_mode() {
+    (
+        ROOT="${WORK}/log"; ENV_FILE="${ROOT}/.env"; LOG_FILE="${ROOT}/.setup.log"; mkdir -p "$ROOT"
+        touch "$LOG_FILE"; chmod 644 "$LOG_FILE"
+        main "not a repo" --binary >/dev/null 2>&1
+    )
+    stat -c '%a' "${WORK}/log/.setup.log" 2>/dev/null || stat -f '%Lp' "${WORK}/log/.setup.log"
+}
+case "$(log_mode)" in 600) pass "only you can read it" ;; *) fail "the log is readable by others ($(log_mode))" ;; esac
+
 echo "The health check shows the same"
 doctor_output() {   # doctor_output LINES_FOR_ENV
     (

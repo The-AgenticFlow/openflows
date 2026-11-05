@@ -1131,6 +1131,7 @@ main() {
         esac
     done
     cd "$ROOT"
+    : >"$LOG_FILE"; chmod 600 "$LOG_FILE"
     banner
     is_tty && trap 'printf "\033[?25h"' EXIT
 
