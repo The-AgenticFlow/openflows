@@ -11,9 +11,9 @@ use config::{
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
-        KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DEPLOYMENT, KEY_TICKET_DISPATCH,
-        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE,
-        KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
+        KEY_TICKET_REWORK_DELIVERY_ID, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };

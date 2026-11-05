@@ -1,119 +1,23 @@
-//! LORE post-merge documentation driver.
-//!
-//! LORE is not a flow node. For every merged ticket NEXUS reads the durable
-//! docs record (`ticket:{id}:docs`, reducer [`config::docs_lifecycle`]) and
-//! moves it at most one step per poll:
-//!
-//! - **drafting** — claim the LORE slot, provision its workspace, and deliver
-//!   the instruction the record calls for into LORE's Coder chat. A changed
-//!   record epoch (resume, restart, rework, reopen) replaces the workspace.
-//! - **docs_ready** — notify the operator once per revision, then release the
-//!   slot and workspace (the work is pushed), so one ticket waiting on a human
-//!   never blocks documentation for the others.
-//! - **approved** — verify the operator's sealed approval, that the branch on
-//!   GitHub is still at the approved head, and (from GitHub, not from what
-//!   LORE reported) that the head changes only documentation relative to the
-//!   default branch; then open (or find) the docs PR into the default branch
-//!   and record it. No workspace is involved.
-//! - **published** — follow the docs PR on GitHub: a merge closes the record,
-//!   a PR closed without merging abandons it. VESSEL merges and reworks it.
-//! - **paused** — release LORE so other tickets can use the slot; send nothing.
-//! - **merged / abandoned / skipped** — release LORE, forget delivery state,
-//!   and stop reading the record until it is reopened ([`ClosedDocsCache`]).
-//!
-//! A step with no recorded progress for [`LORE_STALL_SECS`] is nudged up to
-//! [`LORE_MAX_NUDGES`] times; after that, or after [`LORE_STEP_MAX_SECS`] on
-//! one step even while the chat reports running, NEXUS parks the record
-//! (pauses it), frees the slot, and asks the operator to resume or skip. The
-//! same happens when LORE's workspace or chat has not come up for
-//! [`LORE_PROVISION_MAX_SECS`], or its workspace crashed [`LORE_MAX_CRASHES`]
-//! times, so a workspace that never boots cannot loop silently.
+//! LORE drafting, workspace and chat handling. See the module doc in
+//! [`super`] for the overall docs lifecycle.
+
 use super::*;
-use config::docs_lifecycle::{non_docs_paths, DocsEvent, DocsPhase, DocsRecord, DOCS_TICKET};
-use config::state::{KEY_DOCS_CUTOVER, KEY_DOCS_REOPENED, KEY_TICKET_DOCS_DELIVERY};
-use std::collections::HashSet;
-
-/// A delivered step with no recorded progress for this long is nudged.
-pub(crate) const LORE_STALL_SECS: u64 = 30 * 60;
-/// Nudges per step before LORE is parked for the operator.
-pub(crate) const LORE_MAX_NUDGES: u32 = 3;
-/// Hard ceiling for one step, even while the chat reports it is running.
-pub(crate) const LORE_STEP_MAX_SECS: u64 = 4 * 60 * 60;
-/// How long LORE's workspace or chat may keep failing to come up before LORE
-/// is parked for the operator.
-pub(crate) const LORE_PROVISION_MAX_SECS: u64 = 30 * 60;
-/// Workspace crashes per record epoch before LORE is parked for the operator.
-pub(crate) const LORE_MAX_CRASHES: u32 = 3;
-/// Closed docs records are re-read at least this often, as a safety net for
-/// a reopen whose marker write was lost.
-const CLOSED_DOCS_REFRESH_SECS: u64 = 60 * 60;
-
-/// Merged tickets whose docs records are closed. Cleared whenever the reopen
-/// marker ([`KEY_DOCS_REOPENED`]) changes, and at least hourly.
-#[derive(Debug, Default)]
-pub(crate) struct ClosedDocsCache {
-    tickets: HashSet<String>,
-    marker: Option<Value>,
-    refreshed_at: u64,
-}
-
-/// Control plane hosting LORE's chat: direct Coder (local) or Manager (hosted).
-pub(crate) enum LoreBackend<'a> {
-    Coder(CoderClient),
-    Managed(&'a runtime_control::RuntimeControlClient),
-}
-
-/// NEXUS's private record of what it last told LORE for a ticket.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct LoreDelivery {
-    /// Instruction key last delivered (see [`NexusNode::lore_instruction`]).
-    pub step: String,
-    /// When `step` (or its last nudge) was delivered, in seconds.
-    pub ts: u64,
-    /// When `step` was first delivered, in seconds (the hard step limit).
-    pub started: u64,
-    /// Nudges sent for `step`.
-    pub nudges: u32,
-    /// Docs revision the operator was last notified about.
-    pub ready_notified: Option<u64>,
-    /// Record epoch the current workspace and chat serve.
-    pub epoch: u64,
-    /// Since when LORE's workspace or chat has failed to come up, in seconds.
-    pub failing_since: Option<u64>,
-    /// Workspace crashes in this epoch.
-    pub crashes: u32,
-    /// Record version whose unverifiable approval the operator was told about.
-    pub seal_alert: Option<u64>,
-}
-
-enum LoreChat {
-    /// A new chat was created with the instruction as its first message.
-    Created,
-    /// A live chat already serves this ticket's bound workspace.
-    Existing {
-        chat_id: String,
-        status: Option<ChatStatus>,
-    },
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+use config::docs_lifecycle::{DocsEvent, DocsPhase, DocsRecord, DOCS_TICKET};
+use config::state::{
+    KEY_DOCS_CUTOVER, KEY_DOCS_REOPENED, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
+    KEY_TICKET_DISPATCH, KEY_TICKET_DOCS_DELIVERY,
+};
 
 impl NexusNode {
-    fn lore_delivery_key(ticket_id: &str) -> String {
+    pub(super) fn lore_delivery_key(ticket_id: &str) -> String {
         full_ticket_key_flat(ticket_id, KEY_TICKET_DOCS_DELIVERY)
     }
 
-    fn lore_chat_key(ticket_id: &str) -> String {
+    pub(super) fn lore_chat_key(ticket_id: &str) -> String {
         full_ticket_key(ticket_id, KEY_TICKET_CHAT, "lore")
     }
 
-    fn is_documentable(ticket: &Ticket) -> bool {
+    pub(super) fn is_documentable(ticket: &Ticket) -> bool {
         matches!(ticket.status, TicketStatus::Merged { .. }) && ticket.id != DOCS_TICKET
     }
 
@@ -141,11 +45,11 @@ impl NexusNode {
         }
     }
 
-    fn docs_known_closed(&self, ticket_id: &str) -> bool {
+    pub(super) fn docs_known_closed(&self, ticket_id: &str) -> bool {
         self.docs_closed.lock().unwrap().tickets.contains(ticket_id)
     }
 
-    fn remember_docs_closed(&self, ticket_id: &str) {
+    pub(super) fn remember_docs_closed(&self, ticket_id: &str) {
         self.docs_closed
             .lock()
             .unwrap()
@@ -208,7 +112,7 @@ impl NexusNode {
         }
     }
 
-    async fn lore_backend(&self, store: &SharedStore) -> Option<LoreBackend<'_>> {
+    pub(super) async fn lore_backend(&self, store: &SharedStore) -> Option<LoreBackend<'_>> {
         match &self.runtime_control {
             Some(runtime) => Some(LoreBackend::Managed(runtime)),
             None => Self::coder_client_from_store(store)
@@ -221,7 +125,7 @@ impl NexusNode {
     /// `GITHUB_REPOSITORY` into the store, so the store is the single source
     /// (as in VESSEL); reading the env here would point tenants and tests at
     /// whatever repository the host process happens to run in.
-    async fn docs_repository(store: &SharedStore) -> Option<(String, String)> {
+    pub(super) async fn docs_repository(store: &SharedStore) -> Option<(String, String)> {
         let repository = store.get_typed::<String>("repository").await?;
         let (owner, name) = repository.trim().split_once('/')?;
         (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
@@ -229,7 +133,7 @@ impl NexusNode {
     }
 
     /// GitHub client and repository for the controller's docs PR work.
-    async fn docs_github(
+    pub(super) async fn docs_github(
         &self,
         store: &SharedStore,
     ) -> Option<(github::GithubRestClient, String, String)> {
@@ -250,7 +154,7 @@ impl NexusNode {
         Some((client, owner, repo))
     }
 
-    async fn docs_event(
+    pub(super) async fn docs_event(
         store: &SharedStore,
         ticket_id: &str,
         record: &DocsRecord,
@@ -313,7 +217,12 @@ impl NexusNode {
         }
     }
 
-    async fn drive_lore_drafting(&self, store: &SharedStore, ticket: &Ticket, record: &DocsRecord) {
+    pub(super) async fn drive_lore_drafting(
+        &self,
+        store: &SharedStore,
+        ticket: &Ticket,
+        record: &DocsRecord,
+    ) {
         let Some((step_key, step)) = Self::lore_instruction(ticket, record) else {
             return;
         };
@@ -354,7 +263,7 @@ impl NexusNode {
         Box::pin(self.deliver_lore_step(store, ticket, &backend, record, &step_key, &step)).await;
     }
 
-    fn lore_start_prompt(ticket: &Ticket, branch: &str) -> String {
+    pub(super) fn lore_start_prompt(ticket: &Ticket, branch: &str) -> String {
         format!(
             "Document merged ticket {id}: {title}. Read `openflows-harness dispatch read` and `openflows-harness docs status`. Follow the lore-changelog and lore-documentation skills: update the changelog, and add an ADR under docs/ only for architectural decisions. Change only documentation (Markdown/reST/AsciiDoc, changelogs, text and images under docs/; never dot-directories such as .github/, orchestration/, agent instructions, legal files, MDX, or build inputs such as requirements.txt); `docs submit` refuses anything else and the controller re-checks it on GitHub. {branch_rule} Commit, push the branch to origin, write a short summary to /tmp/docs-report.md (outside the repository), and run `openflows-harness docs submit --report /tmp/docs-report.md`. Then stop: the operator approves or rejects the submitted head, and after approval the controller opens and merges the docs PR. Never open a PR yourself.",
             id = ticket.id,
@@ -363,7 +272,7 @@ impl NexusNode {
         )
     }
 
-    fn lore_branch_rule(branch: &str) -> String {
+    pub(super) fn lore_branch_rule(branch: &str) -> String {
         format!(
             "Work on branch `{branch}`: if it exists on origin, check it out and continue from it (pull it first); otherwise create it from the repository default branch."
         )
@@ -422,7 +331,11 @@ impl NexusNode {
     /// to the ticket it was created for). An idle slot that still holds a
     /// workspace is released first (taking one extra poll); it is never
     /// reused across tickets.
-    async fn claim_lore_slot(&self, store: &SharedStore, ticket: &Ticket) -> Option<String> {
+    pub(super) async fn claim_lore_slot(
+        &self,
+        store: &SharedStore,
+        ticket: &Ticket,
+    ) -> Option<String> {
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let Some((worker_id, slot, bound)) = Self::lore_slot_for(&ticket.id, &slots) else {
@@ -452,7 +365,7 @@ impl NexusNode {
         Some(worker_id)
     }
 
-    async fn deliver_lore_step(
+    pub(super) async fn deliver_lore_step(
         &self,
         store: &SharedStore,
         ticket: &Ticket,
@@ -556,7 +469,7 @@ impl NexusNode {
 
     /// LORE's workspace or chat failed to come up. Retried every poll, but after
     /// [`LORE_PROVISION_MAX_SECS`] of failures LORE is parked for the operator.
-    async fn lore_not_ready(
+    pub(super) async fn lore_not_ready(
         &self,
         store: &SharedStore,
         ticket: &Ticket,
@@ -582,7 +495,7 @@ impl NexusNode {
 
     /// Stop a stuck LORE: pause the record (so the operator decides), free
     /// the slot and workspace, and tell the operator how to continue.
-    async fn park_lore(
+    pub(super) async fn park_lore(
         &self,
         store: &SharedStore,
         ticket: &Ticket,
@@ -612,7 +525,7 @@ impl NexusNode {
         warn!(ticket_id = %ticket.id, why, "Parked stalled LORE for the operator");
     }
 
-    async fn send_lore_message(
+    pub(super) async fn send_lore_message(
         backend: &LoreBackend<'_>,
         ticket_id: &str,
         chat_id: &str,
@@ -638,7 +551,7 @@ impl NexusNode {
     /// A LORE chat for this ticket already living in `workspace_id`, found by
     /// its labels. Recovers a chat whose id was never stored (crash or lost
     /// response after creation) instead of creating a second LORE.
-    async fn adopt_lore_chat(
+    pub(super) async fn adopt_lore_chat(
         client: &CoderClient,
         ticket_id: &str,
         workspace_id: &str,
@@ -663,7 +576,7 @@ impl NexusNode {
     /// labels on the next poll, so a crash cannot leave two LORE chats.
     /// Manager makes chat creation idempotent per workspace and ticket.
     #[allow(clippy::too_many_arguments)]
-    async fn ensure_lore_chat(
+    pub(super) async fn ensure_lore_chat(
         &self,
         store: &SharedStore,
         ticket: &Ticket,
@@ -803,332 +716,6 @@ impl NexusNode {
     /// Where the operator reviews exactly the submitted head: its diff against
     /// the default branch as GitHub reports it. Never built from the base LORE
     /// reported, which could hide changes the docs PR would merge.
-    async fn docs_compare_link(&self, store: &SharedStore, record: &DocsRecord) -> Option<String> {
-        let head = record.head.as_deref()?;
-        let (github, owner, repo) = self.docs_github(store).await?;
-        let base = match github.get_default_branch(&owner, &repo).await {
-            Ok(base) => base,
-            Err(error) => {
-                warn!(%error, "Cannot read the default branch for the docs review link");
-                return None;
-            }
-        };
-        Some(format!(
-            "https://github.com/{owner}/{repo}/compare/{base}...{head}"
-        ))
-    }
-
-    /// Tell the operator, once per docs revision, that LORE's docs await a decision.
-    async fn notify_lore_docs_ready(
-        &self,
-        store: &SharedStore,
-        ticket: &Ticket,
-        record: &DocsRecord,
-    ) {
-        let key = Self::lore_delivery_key(&ticket.id);
-        let mut delivery: LoreDelivery = store.get_typed(&key).await.unwrap_or_default();
-        if delivery.ready_notified == Some(record.revision) {
-            return;
-        }
-        let head = record.head.as_deref().unwrap_or_default();
-        let compare = self.docs_compare_link(store, record).await;
-        if !NotificationService::from_env().is_configured() {
-            warn!(ticket_id = %ticket.id, "No notification channel is configured; operators find docs awaiting a decision with `openflows gate docs --pending`");
-        }
-        let reason = format!(
-            "LORE docs revision {} on {} ({} files reported by LORE; the controller re-checks them on GitHub before publishing) awaiting approval{}: openflows gate docs --tenant {} --ticket {} --verdict approve|reject --revision {} --head {} --notes <notes>",
-            record.revision,
-            record.branch.as_deref().unwrap_or_default(),
-            record.files.len(),
-            compare
-                .as_deref()
-                .map(|link| format!(" (review exactly this head: {link})"))
-                .unwrap_or_default(),
-            store.tenant(),
-            ticket.id,
-            record.revision,
-            head
-        );
-        let live_slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let worker_id = Self::lore_slot_for(&ticket.id, &live_slots)
-            .filter(|(_, _, bound)| *bound)
-            .map(|(id, _, _)| id);
-        self.notify_awaiting_human(
-            store,
-            &ticket.id,
-            worker_id.as_deref(),
-            &reason,
-            compare.or_else(|| ticket.issue_url.clone()),
-        )
-        .await;
-        delivery.ready_notified = Some(record.revision);
-        store.set(&key, json!(delivery)).await;
-        info!(ticket_id = %ticket.id, revision = record.revision, head, "LORE docs awaiting operator decision");
-    }
-
-    /// The approved head of `record` if its seal verifies. Otherwise the
-    /// operator is told, once per record version, why nothing will be opened
-    /// or merged and how to approve again.
-    async fn verified_docs_head(
-        &self,
-        store: &SharedStore,
-        ticket: &Ticket,
-        record: &DocsRecord,
-    ) -> Option<String> {
-        let Some(keys) = self.docs_gate_keys.as_ref() else {
-            warn!(ticket_id = %ticket.id, "No docs gate secret (OPENFLOWS_DOCS_GATE_SECRET or CODER_CHAT_HOOK_SECRET) is configured; NEXUS cannot verify docs approvals and will not open docs PRs");
-            return None;
-        };
-        let error = match keys.verify(record, &ticket.id) {
-            Ok(head) => return Some(head.to_string()),
-            Err(error) => error,
-        };
-        error!(ticket_id = %ticket.id, %error, "Refusing to open or merge a docs PR without a valid operator approval");
-        let key = Self::lore_delivery_key(&ticket.id);
-        let mut delivery: LoreDelivery = store.get_typed(&key).await.unwrap_or_default();
-        if delivery.seal_alert != Some(record.version) {
-            let reason = format!(
-                "{error:#}. The docs PR will be neither opened nor merged. If you approved it, approve it again with `openflows gate docs --tenant {tenant} --ticket {id} --verdict approve --revision {revision} --head {head}`; otherwise reject it with `--verdict reject`.",
-                tenant = store.tenant(),
-                id = ticket.id,
-                revision = record.revision,
-                head = record.head.as_deref().unwrap_or_default(),
-            );
-            self.notify_awaiting_human(store, &ticket.id, None, &reason, ticket.issue_url.clone())
-                .await;
-            delivery.seal_alert = Some(record.version);
-            store.set(&key, json!(delivery)).await;
-        }
-        None
-    }
-
-    /// Send approved docs back to LORE because the controller will not publish
-    /// them as they are, and tell the operator who approved them.
-    async fn refuse_docs_publication(
-        &self,
-        store: &SharedStore,
-        ticket: &Ticket,
-        record: &DocsRecord,
-        reason: String,
-    ) {
-        if Self::docs_event(
-            store,
-            &ticket.id,
-            record,
-            DocsEvent::Rework {
-                reason: reason.clone(),
-            },
-        )
-        .await
-        .is_some()
-        {
-            let notice = format!(
-                "NEXUS refused to publish the approved LORE docs for {}: {reason} LORE was asked to fix it; review the next submission.",
-                ticket.id
-            );
-            self.notify_awaiting_human(store, &ticket.id, None, &notice, ticket.issue_url.clone())
-                .await;
-        }
-    }
-
-    /// Open (or find) the docs PR for an approved record and record it. The
-    /// approval seal must verify, the branch on GitHub must still be at the
-    /// approved head, and GitHub's own diff of that head against the default
-    /// branch must touch documentation only (the file list LORE submitted is
-    /// not trusted); otherwise the docs go back to LORE for a new review. The
-    /// PR always targets the default branch: an open PR from the docs branch
-    /// into any other base is never adopted (VESSEL hands it to a human).
-    async fn publish_docs_pr(&self, store: &SharedStore, ticket: &Ticket, record: &DocsRecord) {
-        let Some(approved_head) = self.verified_docs_head(store, ticket, record).await else {
-            return;
-        };
-        let Some(branch) = record.branch.clone() else {
-            return;
-        };
-        let Some((github, owner, repo)) = self.docs_github(store).await else {
-            return;
-        };
-        match github.get_branch_head(&owner, &repo, &branch).await {
-            Ok(Some(head)) if head == approved_head => {}
-            Ok(current) => {
-                let reason = format!(
-                    "Branch {branch} is at {} on GitHub, not the approved head {approved_head}. Make the branch hold exactly the documentation you want reviewed, push, and submit again.",
-                    current.as_deref().unwrap_or("nothing (deleted)")
-                );
-                Self::docs_event(store, &ticket.id, record, DocsEvent::Rework { reason }).await;
-                return;
-            }
-            Err(error) => {
-                warn!(ticket_id = %ticket.id, %error, "Cannot read docs branch head; retrying next poll");
-                return;
-            }
-        }
-        let base = match github.get_default_branch(&owner, &repo).await {
-            Ok(base) => base,
-            Err(error) => {
-                warn!(ticket_id = %ticket.id, %error, "Cannot read default branch; retrying next poll");
-                return;
-            }
-        };
-        match github
-            .compare_file_paths(&owner, &repo, &base, &approved_head)
-            .await
-        {
-            Ok(Some(paths)) if paths.is_empty() => {
-                let reason = format!(
-                    "The approved head {approved_head} changes nothing relative to {base}. Commit the documentation on {branch}, push, and submit again."
-                );
-                self.refuse_docs_publication(store, ticket, record, reason)
-                    .await;
-                return;
-            }
-            Ok(Some(paths)) => {
-                let outside = non_docs_paths(paths.iter().map(String::as_str));
-                if !outside.is_empty() {
-                    error!(ticket_id = %ticket.id, head = %approved_head, files = ?outside, "Approved docs head changes files that are not documentation");
-                    let reason = format!(
-                        "On GitHub the approved head {approved_head} changes files that are not documentation relative to {base}: {}. Make {branch} change documentation only (based on {base}), push, and submit again.",
-                        outside.join(", ")
-                    );
-                    self.refuse_docs_publication(store, ticket, record, reason)
-                        .await;
-                    return;
-                }
-            }
-            Ok(None) => {
-                let reason = format!(
-                    "The approved head {approved_head} changes too many files relative to {base} for GitHub to list them all. Split the documentation into a smaller change, push, and submit again."
-                );
-                self.refuse_docs_publication(store, ticket, record, reason)
-                    .await;
-                return;
-            }
-            Err(error) => {
-                warn!(ticket_id = %ticket.id, %error, "Cannot compare the docs head with the default branch; retrying next poll");
-                return;
-            }
-        }
-        let number = match github
-            .find_open_pr_by_head(&owner, &repo, &branch, &base)
-            .await
-        {
-            Ok(Some(pr)) => pr.number,
-            Ok(None) => {
-                let title = format!("docs({}): {}", ticket.id, ticket.title);
-                let body = format!(
-                    "{}\n\n---\nLORE documentation for {}, revision {} at `{approved_head}`, approved by the operator. VESSEL merges it only at that head.",
-                    record.report, ticket.id, record.revision
-                );
-                match github
-                    .create_pull_request(&owner, &repo, &title, &branch, &base, Some(&body))
-                    .await
-                {
-                    Ok(number) => number,
-                    Err(error) => {
-                        warn!(ticket_id = %ticket.id, %error, "Could not open docs PR; retrying next poll");
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                warn!(ticket_id = %ticket.id, %error, "Cannot look up docs PR; retrying next poll");
-                return;
-            }
-        };
-        if Self::docs_event(store, &ticket.id, record, DocsEvent::Published { number })
-            .await
-            .is_some()
-        {
-            info!(ticket_id = %ticket.id, pr_number = number, "Opened docs PR at the approved head");
-        }
-    }
-
-    /// Follow a published docs PR: a merge (by VESSEL or a human) closes the
-    /// record, and a PR closed without merging abandons it.
-    async fn reconcile_docs_pr(&self, store: &SharedStore, ticket: &Ticket, record: &DocsRecord) {
-        let Some(number) = record.pr_number else {
-            return;
-        };
-        let Some((github, owner, repo)) = self.docs_github(store).await else {
-            return;
-        };
-        let pr = match github.get_pull_request(&owner, &repo, number).await {
-            Ok(pr) => pr,
-            Err(error) => {
-                debug!(ticket_id = %ticket.id, %error, "Cannot read docs PR; retrying next poll");
-                return;
-            }
-        };
-        match pr.state {
-            pocketflow_core::PrState::Open => {}
-            pocketflow_core::PrState::Merged => {
-                let sha = github
-                    .confirmed_merge_sha(&owner, &repo, number)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                Self::docs_event(store, &ticket.id, record, DocsEvent::Merged { number, sha })
-                    .await;
-            }
-            pocketflow_core::PrState::Closed => {
-                let reason = format!("Docs PR #{number} was closed without merging");
-                if Self::docs_event(
-                    store,
-                    &ticket.id,
-                    record,
-                    DocsEvent::Abandoned {
-                        reason: reason.clone(),
-                    },
-                )
-                .await
-                .is_some()
-                {
-                    let reason = format!(
-                        "{reason}; the docs record is closed. Reopen it with `openflows gate docs --tenant {} --ticket {} --reopen <reason>` to document it again.",
-                        store.tenant(),
-                        ticket.id
-                    );
-                    self.notify_awaiting_human(
-                        store,
-                        &ticket.id,
-                        None,
-                        &reason,
-                        ticket.issue_url.clone(),
-                    )
-                    .await;
-                }
-            }
-        }
-    }
-
-    /// Release the LORE slot bound to `ticket` (destroying its workspace) and
-    /// forget its chat. Returns whether no LORE slot remains bound. A failed
-    /// teardown keeps the slot reserved and is retried on the next poll.
-    async fn release_lore_slot(&self, store: &SharedStore, ticket: &Ticket, why: &str) -> bool {
-        let live_slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let Some((worker_id, _, true)) = Self::lore_slot_for(&ticket.id, &live_slots) else {
-            return true;
-        };
-        self.release_worker_slot(store, &worker_id).await;
-        let released = store
-            .get_typed::<HashMap<String, WorkerSlot>>(KEY_WORKER_SLOTS)
-            .await
-            .unwrap_or_default()
-            .get(&worker_id)
-            .is_some_and(|slot| matches!(slot.status, WorkerStatus::Idle));
-        if released {
-            store.del(&Self::lore_chat_key(&ticket.id)).await;
-            store
-                .del(&full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, "lore"))
-                .await;
-            info!(ticket_id = %ticket.id, worker_id, why, "Released LORE slot");
-        }
-        released
-    }
-
     /// A crashed LORE workspace that needs replacing: release the slot (which
     /// destroys the workspace) and forget the chat, so the docs driver binds,
     /// provisions and re-delivers on its next poll. The ticket is untouched.
@@ -1159,38 +746,4 @@ impl NexusNode {
         delivery.crashes += 1;
         store.set(&key, json!(delivery)).await;
     }
-
-    /// Closed docs: release LORE and drop delivery state. Returns whether
-    /// nothing is left to clean up.
-    async fn finish_lore_docs(&self, store: &SharedStore, ticket: &Ticket) -> bool {
-        if !self.release_lore_slot(store, ticket, "docs closed").await {
-            return false;
-        }
-        store.del(&Self::lore_delivery_key(&ticket.id)).await;
-        true
-    }
-
-    /// A worker that serves terminal tickets (LORE) keeps its slot while it
-    /// still has work on one: terminal-ticket recycling must not reclaim it.
-    /// An unreadable docs record keeps the slot too; recovery retries.
-    pub(crate) async fn terminal_work_outstanding(
-        store: &SharedStore,
-        worker_id: &str,
-        ticket_id: &str,
-    ) -> bool {
-        if !RoleTraits::of(worker_id).serves_terminal_tickets {
-            return false;
-        }
-        match store.docs_record(ticket_id).await {
-            Ok(record) => record.phase.needs_lore() && !record.paused,
-            Err(error) => {
-                warn!(worker_id, ticket_id, %error, "Cannot read docs record; keeping LORE slot");
-                true
-            }
-        }
-    }
 }
-
-/// Marker the removed inline LORE wrote for documented tickets
-/// (`ticket:{id}:lore_done`). Read only by the one-time cutover; remove with it.
-const LEGACY_LORE_DONE_KEY: &str = "lore_done";
