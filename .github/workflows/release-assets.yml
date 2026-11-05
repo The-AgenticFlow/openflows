@@ -187,7 +187,7 @@ jobs:
           printf '%s\n' "${VERSION}" > RELEASE_VERSION
           tar -czf "dist/${TAG}-setup.tar.gz" --transform "s,^,${TAG}/," \
             RELEASE_VERSION .env.example deploy/local docker-compose*.yml \
-            scripts/setup.sh scripts/prod.sh scripts/connected-local-github.py
+            scripts/setup.sh scripts/setup-release.sh scripts/prod.sh scripts/connected-local-github.py
           cd dist
           sha256sum "${TAG}-setup.tar.gz" > "${TAG}-setup.tar.gz.sha256"
 
