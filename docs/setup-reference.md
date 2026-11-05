@@ -82,7 +82,7 @@ CODER_EXTERNAL_AUTH_0_TYPE=github
 CODER_EXTERNAL_AUTH_0_CLIENT_ID=<your-github-app-client-id>
 CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=<your-github-app-client-secret>
 CODER_EXTERNAL_AUTH_0_SCOPES=repo
-CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/<your-app-slug>/installations/new
+CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/your-app-slug/installations/new
 ```
 
 > **Set these before starting Docker** — Coder reads them from `.env` at startup, and won't start with empty GitHub App credentials.

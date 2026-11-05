@@ -347,6 +347,10 @@ stage_env() {
     if is_placeholder "$(env_get CODER_SESSION_TOKEN)"; then
         env_set CODER_SESSION_TOKEN ""
     fi
+    # An unquoted <placeholder> stops prod.sh from loading .env. Older .env.example files had one.
+    if is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"; then
+        env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL ""
+    fi
     ok ".env ready"
 }
 

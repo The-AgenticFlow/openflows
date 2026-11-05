@@ -97,6 +97,22 @@ expect_has "already linked: checks" "$(linked_calls self-managed true)" checked
 expect_lacks "not linked, no terminal: nothing to check yet" "$(linked_calls self-managed false)" checked
 expect_lacks "the shared App: the console checks instead" "$(linked_calls connected-local true)" checked
 
+echo "A new .env loads as shell code, as prod.sh does"
+loads() { if bash -c 'set -euo pipefail; set -a; source "$1"' _ "$1" >/dev/null 2>&1; then echo yes; else echo no; fi; }
+case "$(loads "${ROOT}/.env.example")" in yes) pass ".env.example" ;; *) fail ".env.example does not load" ;; esac
+cleaned_env() {   # cleaned_env LINE — what stage_env leaves of an .env copied before this was fixed
+    (
+        ENV_FILE="${WORK}/old.env"; printf '%s\n' "$1" >"$ENV_FILE"
+        stage_env >/dev/null 2>&1
+        loads "$ENV_FILE"
+        env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL
+    ) | paste -sd' ' -
+}
+case "$(cleaned_env 'CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/<your-app-slug>/installations/new')" in
+    "yes ") pass "an old placeholder is cleared" ;; *) fail "an old placeholder stays" ;; esac
+case "$(cleaned_env 'CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/mine/installations/new')" in
+    "yes https://github.com/apps/mine/installations/new") pass "a real install link stays" ;; *) fail "a real install link was changed" ;; esac
+
 echo "The setup log"
 log_mode() {
     (
