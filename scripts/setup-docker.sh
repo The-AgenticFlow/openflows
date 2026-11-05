@@ -25,6 +25,8 @@ shared_app_leftover() {
 }
 stage_docker() {
     step "Starting Redis + Coder"
+    mkdir -p "$BIN_DIR" 2>/dev/null || true   # by us: when Docker creates it for its mount, root owns it
+    [ -w "$BIN_DIR" ] || die "Cannot write to .dev-binaries." "Make it yours:  sudo chown -R \"\$(id -u):\$(id -g)\" ${BIN_DIR}"
     local out i line args=() leftover=""
     while IFS= read -r line; do args+=("$line"); done < <(compose_files)
     args+=(up -d)
