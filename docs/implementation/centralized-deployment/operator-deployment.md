@@ -1,5 +1,7 @@
 # Operator deployment
 
+For the portable Docker/Kubernetes runtime, its ownership and secret-delivery decisions are documented in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md). The runbooks below describe the operator procedures for each deployment profile.
+
 Choose one runbook. Do not combine their secret stores, configuration, or
 provisioning backends.
 
