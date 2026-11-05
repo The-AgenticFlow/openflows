@@ -5,7 +5,7 @@
 # before Coder starts. Create ./.dev-binaries first so it stays owned by your user.
 services:
   openflows-binaries:
-    image: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+    image: ${OPENFLOWS_IMAGE_REPO:-ghcr.io/the-agenticflow/openflows}:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
     # Workspaces run linux/amd64, so their programs must too, whatever the host.
     platform: linux/amd64
     user: "${OPENFLOWS_HOST_UID:-1000}:${OPENFLOWS_HOST_GID:-1000}"
@@ -27,7 +27,7 @@ services:
         printf '%s\n' "$$OPENFLOWS_IMAGE_REF" > /out/IMAGE
         echo "Installed OpenFlows programs from $$OPENFLOWS_IMAGE_REF"
     environment:
-      OPENFLOWS_IMAGE_REF: ghcr.io/the-agenticflow/openflows:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
+      OPENFLOWS_IMAGE_REF: ${OPENFLOWS_IMAGE_REPO:-ghcr.io/the-agenticflow/openflows}:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}
     volumes:
       - ./.dev-binaries:/out
     restart: "no"

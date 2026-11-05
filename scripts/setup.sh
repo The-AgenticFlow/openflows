@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # OpenFlows one-command setup.
 #
-#   ./scripts/setup.sh [owner/repo] [--source | --compose] [--name TEAM] [--fleet N]
+#   ./scripts/setup.sh [owner/repo] [--source | --compose | --binary] [--name TEAM] [--fleet N]
 #                      [--update-workspaces]
 #
 #   --source   compile OpenFlows from this checkout (default; needs Rust)
-#   --compose  use the published images, no compiling (Linux hosts);
-#              OPENFLOWS_VERSION in .env picks the version (empty = latest release)
+#   --compose  use the published images, no compiling
+#   --binary   use the release's binaries, no compiling (default in a setup kit)
+#              For both, OPENFLOWS_VERSION in .env picks the version (empty = latest release)
 #   --update-workspaces  after an upgrade, update running workspaces without asking
 #   N = FORGE-SENTINEL pairs; asked when omitted
 #
@@ -14,7 +15,7 @@
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
-# Stages: preflight → .env → [image] → GitHub App → Docker → Coder admin/token →
+# Stages: preflight → .env → [image or release] → GitHub App → Docker → Coder admin/token →
 #         LLM model → bootstrap → tenant → doctor.
 #
 # Non-interactive use: pass owner/repo, and set OPENFLOWS_LLM_PROVIDER /
@@ -25,8 +26,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
-IMAGE_REPO="ghcr.io/the-agenticflow/openflows"
-BIN_DIR="${ROOT}/.dev-binaries"
+LAST_RELEASE_WITHOUT_SHARED_APP=1.8.1    # its Manager image predates the console sign-in
+BIN_DIR="${ROOT}/.dev-binaries"          # programs for the workspaces (always linux/amd64)
+HOST_BIN_DIR="${BIN_DIR}/host"           # programs for this machine, when those can't run here
+RELEASE_REPO="${OPENFLOWS_RELEASE_REPO:-The-AgenticFlow/openflows}"
+WORKSPACE_TARGET=x86_64-unknown-linux-gnu
 TOTAL=8
 STEP=0
 
@@ -223,6 +227,12 @@ env_set() { # env_set KEY VALUE — replace the line or append
     cat "$tmp" >"$ENV_FILE" && rm -f "$tmp"
     chmod 600 "$ENV_FILE"
 }
+# image_repo — where the images come from, in the order Compose reads it: shell, .env, default.
+image_repo() {
+    local repo
+    if [ "${OPENFLOWS_IMAGE_REPO+x}" = x ]; then repo="$OPENFLOWS_IMAGE_REPO"; else repo="$(env_get OPENFLOWS_IMAGE_REPO)"; fi
+    printf '%s' "${repo:-ghcr.io/the-agenticflow/openflows}"
+}
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
@@ -271,30 +281,16 @@ install_coder() {
 stage_preflight() {
     step "Checking your machine"
     local missing=()
-    if [ "$MODE" = compose ]; then
-        # Setup runs the image's x86-64 glibc programs on this machine as well as in the workspaces.
-        if [ "$(uname -s)" != Linux ]; then
-            die "--compose currently needs a Linux host." \
-                "The published programs are Linux binaries that setup runs on this machine." \
-                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
-        fi
-        case "$(uname -m)" in
-            x86_64|amd64) ;;
-            *) die "--compose currently needs an x86-64 (amd64) host, not $(uname -m)." \
-                   "Workspaces run linux/amd64 programs, which setup also runs on this machine." \
-                   "Use the source install instead:  ./scripts/setup.sh ${REPO} --source" ;;
-        esac
-        local glibc
-        glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')"
-        if [ -z "$glibc" ] || [ "$(printf '%s\n' 2.34 "$glibc" | sort -V | head -1)" != 2.34 ]; then
-            die "--compose needs glibc 2.34 or newer on this machine (found: ${glibc:-none})." \
-                "The published programs are built against glibc (e.g. Ubuntu 22.04+, Debian 12+)." \
-                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
-        fi
+    if [ "$MODE" != source ] && [ -z "$(host_target)" ]; then
+        die "No OpenFlows release programs for $(uname -s) $(uname -m)." \
+            "Supported: Linux x86-64 and ARM64, macOS Intel and Apple Silicon." \
+            "Build from source instead:  ./scripts/setup.sh ${REPO} --source"
     fi
     have curl    || missing+=("curl      → install with your package manager")
     have python3 || missing+=("python3   → install with your package manager")
     if [ "$MODE" = source ]; then
+        [ -d "${ROOT}/crates" ] || die "--source needs a checkout of the repository; this folder is a setup kit." \
+            "Install from the release instead:  ./scripts/setup.sh ${REPO} --binary"
         have cargo || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh   (or skip compiling: --compose)")
     fi
     if ! have docker; then
@@ -354,57 +350,8 @@ stage_env() {
     ok ".env ready"
 }
 
-# ── stage 2b: published image (--compose) ───────────────────────────────────
-image_ref() { # image_ref → the exact image the stack runs, e.g. ghcr.io/…/openflows:1.8.1@sha256:…
-    printf '%s:%s@%s' "$IMAGE_REPO" "$(env_get OPENFLOWS_VERSION)" "$(env_get OPENFLOWS_IMAGE_DIGEST)"
-}
-
-latest_release_version() { # latest published release, e.g. 1.8.1
-    curl -fsS -m 20 "https://api.github.com/repos/The-AgenticFlow/openflows/releases/latest" 2>/dev/null \
-        | json tag_name | sed -n 's/^openflows-\([0-9][0-9.]*\)$/\1/p'
-}
-
-stage_image() {
-    step "OpenFlows image (no compiling)"
-    local version digest pinned label
-    version="$(env_get OPENFLOWS_VERSION)"
-    if [ -z "$version" ]; then
-        version="$(latest_release_version)"
-        [ -n "$version" ] || die "Could not look up the latest OpenFlows release." \
-            "Check your connection, or set OPENFLOWS_VERSION in .env (e.g. 1.8.1)."
-        info "No OPENFLOWS_VERSION set — using the latest release, ${version}"
-    fi
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "OPENFLOWS_VERSION must look like 1.8.1 (got '${version}')."
-
-    pinned="$(env_get OPENFLOWS_IMAGE_DIGEST)"
-    if [ -n "$pinned" ]; then
-        docker pull -q --platform linux/amd64 "${IMAGE_REPO}@${pinned}" >"$LOG_FILE" 2>&1 \
-            || die "Image ${IMAGE_REPO}@${pinned} was not found." \
-                "Check OPENFLOWS_IMAGE_DIGEST in .env against the release notes, or clear it to use ${version}'s current image."
-        digest="$pinned"
-    else
-        docker pull -q --platform linux/amd64 "${IMAGE_REPO}:${version}" >"$LOG_FILE" 2>&1 \
-            || die "No published image for OpenFlows ${version}." \
-                "Pick a version that has one: https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows"
-        digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE_REPO}:${version}" \
-            | sed -n "s|^${IMAGE_REPO}@||p" | head -1)"
-        [ -n "$digest" ] || die "Could not read the digest of ${IMAGE_REPO}:${version}."
-    fi
-    # Docker ignores the tag when a digest is given, so a digest left over from
-    # another version would otherwise install that version silently.
-    label="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${IMAGE_REPO}@${digest}" 2>/dev/null || true)"
-    if [ -n "$label" ] && [ "$label" != "$version" ]; then
-        die "OPENFLOWS_IMAGE_DIGEST is for version ${label}, not ${version}." \
-            "Clear OPENFLOWS_IMAGE_DIGEST in .env, or set OPENFLOWS_VERSION=${label}."
-    fi
-
-    env_set OPENFLOWS_VERSION "$version"
-    env_set OPENFLOWS_IMAGE_DIGEST "$digest"
-    env_set OPENFLOWS_HOST_UID "$(id -u)"
-    env_set OPENFLOWS_HOST_GID "$(id -g)"
-    mkdir -p "$BIN_DIR"   # created by us, not by Docker, so it stays owned by this user
-    ok "OpenFlows ${B}${version}${N} · ${digest:0:19}…"
-}
+# shellcheck source=setup-release.sh
+source "${SCRIPT_DIR}/setup-release.sh"
 
 # ── stage 3: GitHub App ─────────────────────────────────────────────────────
 github_app_via_manifest() { # $1=owner → sets client id/secret/install url in .env
@@ -510,24 +457,40 @@ github_app_manual() {
     env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
 }
 
+has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_SHARED_APP" ]; }
+# pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
+pin_manager_image() {
+    local version repo pinned digest
+    version="$(env_get OPENFLOWS_VERSION)"; repo="$(image_repo)-manager"
+    pinned="$(env_get OPENFLOWS_MANAGER_IMAGE)"
+    case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
+    docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
+        || die "No published Manager image for OpenFlows ${version} (${repo}:${version})." \
+            "Pick another OPENFLOWS_VERSION, or use your own App: OPENFLOWS_GITHUB_AUTH_MODE=self-managed."
+    digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+        | sed -n "s|^${repo}@||p" | head -1)"
+    [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
+    env_set OPENFLOWS_MANAGER_IMAGE "${repo}:${version}@${digest}"
+}
+
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
     local auth_mode
     auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     if [ -z "$auth_mode" ]; then
-        # connected-local still compiles the local Manager (docker compose --build), so
-        # --compose (no compiling) defaults to the user's own App.
-        if [ "$MODE" = compose ] || { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; }; then
+        if { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; } \
+            || { [ "$MODE" != source ] && ! has_shared_app "$(env_get OPENFLOWS_VERSION)"; }; then
             auth_mode=self-managed
         else
             auth_mode=connected-local
         fi
     fi
-    if [ "$auth_mode" = connected-local ] && [ "$MODE" = compose ]; then
-        die "The shared OpenFlows GitHub App (connected-local) does not work with --compose yet." \
-            "It still compiles the local Manager from source (docker compose --build)." \
-            "Use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env," \
-            "or install from source:  ./scripts/setup.sh ${REPO} --source"
+    if [ "$auth_mode" = connected-local ] && [ "$MODE" != source ]; then
+        has_shared_app "$(env_get OPENFLOWS_VERSION)" \
+            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App (connected-local) without compiling." \
+                "Set a version newer than ${LAST_RELEASE_WITHOUT_SHARED_APP} as OPENFLOWS_VERSION in .env," \
+                "or use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env."
+        pin_manager_image
     fi
     env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
     if [ "$auth_mode" = connected-local ]; then
@@ -596,20 +559,27 @@ compose_base_files() {
 }
 
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
+# compose_files — the -f arguments for this install, one per line; none for plain `docker compose`.
+# connected-local adds the local Manager (from its image unless compiling); the images
+# file copies the programs into .dev-binaries before Coder starts.
+compose_files() {
+    local extra=()
+    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
+        extra+=(-f docker-compose.connected-local.yml)
+        [ "$MODE" = source ] || extra+=(-f docker-compose.manager-image.yml)
+    fi
+    [ "$MODE" = compose ] && extra+=(-f docker-compose.images.yml)
+    if [ "${#extra[@]}" -gt 0 ]; then
+        compose_base_files
+        printf '%s\n' "${extra[@]}"
+    fi
+}
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i args=()
-    # connected-local adds the local Manager; the images file copies the programs into
-    # .dev-binaries before Coder starts. Without either, run plain `docker compose`.
-    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(-f docker-compose.connected-local.yml)
-    [ "$MODE" = compose ] && args+=(-f docker-compose.images.yml)
-    if [ "${#args[@]}" -gt 0 ]; then
-        local base=() line
-        while IFS= read -r line; do base+=("$line"); done < <(compose_base_files)
-        args=("${base[@]}" "${args[@]}")
-    fi
+    local out i line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
     args+=(up -d)
-    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && args+=(--build)
+    [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] && [ "$MODE" = source ] && args+=(--build)
     # Compose prefers shell variables over .env; pass the image from .env so a leftover
     # export (e.g. from an earlier upgrade) cannot copy a different version.
     local image_env=()
@@ -618,6 +588,7 @@ stage_docker() {
         "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
         "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
     if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
@@ -629,9 +600,8 @@ stage_docker() {
         [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
             || die "The OpenFlows programs were not copied from $(image_ref)." \
                 "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
-        "${BIN_DIR}/openflows" --version >/dev/null 2>&1 \
-            || die "The OpenFlows programs from the image do not run on this machine." \
-                "They need an x86-64 Linux with glibc 2.34 or newer." \
+        "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs do not run on this machine." \
                 "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
         ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
     fi
@@ -641,8 +611,14 @@ stage_docker() {
 # stage_connected_local_authorization — the team App is configured by the
 # OpenFlows release. Contributors install it, approve their own GitHub account,
 # and choose the requested repository in the local browser console.
+manager_repo_list() { # the repositories available to the signed-in GitHub user and the App
+    local line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    (cd "$ROOT" && docker compose "${args[@]}" exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null)
+}
 stage_connected_local_authorization() {
     [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ] || return 0
+    TOTAL=$((TOTAL + 1))
     step "Connect GitHub"
     local manager_url="http://127.0.0.1:3002" status
     ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
@@ -652,7 +628,7 @@ stage_connected_local_authorization() {
     printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
         || die "This OpenFlows distribution does not include the team GitHub App configuration." \
                "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
-    if (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+    if manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
         ok "GitHub user authorization ready for ${REPO}"
         return
     fi
@@ -664,7 +640,7 @@ stage_connected_local_authorization() {
     open_url "${manager_url}/#console-key=${console_key}"
     is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
     pause "Complete GitHub connection in the local console, then continue"
-    (cd "$ROOT" && docker compose -f docker-compose.yml -f docker-compose.connected-local.yml exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null) | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
+    manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
         || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
                "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
     ok "GitHub user authorization ready for ${REPO}"
@@ -901,10 +877,10 @@ stage_llm() {
 templates_ready() {
     local bin="${BIN_DIR}/openflows"
     [ -x "$bin" ] || return 1
-    if [ "$MODE" = compose ]; then
-        [ "$(env_get OPENFLOWS_SETUP_TEMPLATES_IMAGE)" = "$(image_ref)" ] || return 1
-    # Programs copied from an image (IMAGE marker) must be rebuilt from this checkout.
-    elif [ -f "${BIN_DIR}/IMAGE" ]; then
+    if [ "$MODE" != source ]; then
+        [ "$(env_get OPENFLOWS_SETUP_TEMPLATES_IMAGE)" = "$(installed_ref)" ] || return 1
+    # Programs from an image or a release (IMAGE, RELEASE markers) must be rebuilt from this checkout.
+    elif [ -f "${BIN_DIR}/IMAGE" ] || [ -f "${BIN_DIR}/RELEASE" ]; then
         return 1
     # Rebuild when any source or template is newer than the built binary.
     elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
@@ -1040,7 +1016,7 @@ offer_update() {
 
 stage_bootstrap() {
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    if [ "$MODE" = compose ]; then
+    if [ "$MODE" != source ]; then
         step "Workspace templates"
         if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
            [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
@@ -1048,7 +1024,7 @@ stage_bootstrap() {
             return
         fi
         run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
-        env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(image_ref)"
+        env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
         env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
         mark_pending_restart
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
@@ -1064,8 +1040,8 @@ stage_bootstrap() {
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
-    rm -f "${BIN_DIR}/IMAGE"
-    # The next --compose run must push the image's templates again, even for the same image.
+    rm -f "${BIN_DIR}/IMAGE" "${BIN_DIR}/RELEASE"
+    # The next --compose or --binary run must push its templates again, even for the same version.
     env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
     mark_pending_restart
     ok "binaries built, 5 templates pushed"
@@ -1170,8 +1146,8 @@ main() {
     REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --source|--compose)
-                [ -z "$MODE" ] || [ "$MODE" = "${1#--}" ] || die "Choose one install mode: --source or --compose, not both."
+            --source|--compose|--binary)
+                [ -z "$MODE" ] || [ "$MODE" = "${1#--}" ] || die "Choose one install mode: --source, --compose or --binary."
                 MODE="${1#--}"; shift ;;
             --name) NAME="${2:?--name needs a value}"; shift 2 ;;
             --fleet) FLEET="${2:?--fleet needs a value}"; shift 2 ;;
@@ -1222,18 +1198,17 @@ main() {
     # Install mode: the flag, else the mode of the previous run, else source.
     if [ -z "$MODE" ]; then
         MODE="$(env_get OPENFLOWS_SETUP_MODE)"
-        if [ -z "$MODE" ]; then
+        if [ -z "$MODE" ] && [ -f "${ROOT}/RELEASE_VERSION" ]; then
+            MODE=binary
+        elif [ -z "$MODE" ]; then
             MODE=source
-            printf '  %sInstall mode: source (compiles OpenFlows). To use the published images instead: --compose%s\n' "$D" "$N"
+            printf '  %sInstall mode: source (compiles OpenFlows). No compiling: --compose or --binary%s\n' "$D" "$N"
         fi
     fi
     case "$MODE" in
         source) ;;
-        compose)
-            TOTAL=9
-            # prod.sh rebuilds from source before each command unless given a binary to run.
-            export OPENFLOWS_BIN="${BIN_DIR}/openflows" ;;
-        *) die "Unknown install mode '${MODE}' in OPENFLOWS_SETUP_MODE (use source or compose)." ;;
+        compose|binary) TOTAL=9 ;;
+        *) die "Unknown install mode '${MODE}' in OPENFLOWS_SETUP_MODE (use source, compose or binary)." ;;
     esac
 
     stage_preflight
@@ -1241,6 +1216,7 @@ main() {
     env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
     env_set OPENFLOWS_SETUP_MODE "$MODE"
     [ "$MODE" = compose ] && stage_image
+    [ "$MODE" = binary ] && stage_release
     stage_github_app
     stage_docker
     stage_connected_local_authorization
@@ -1255,6 +1231,7 @@ main() {
     RAIL_OPEN=0
     local installed="source (compiled from this checkout)"
     [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
+    [ "$MODE" = binary ] && installed="release $(env_get OPENFLOWS_VERSION)"
     if [ -n "$UPGRADE_PENDING" ]; then
         panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
             "These workspaces still use the old version:" \

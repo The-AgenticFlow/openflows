@@ -140,6 +140,10 @@ jobs:
           persist-credentials: false
       - name: Run setup.sh tenant name tests
         run: bash tests/ci/setup-tenant-name-test.sh
+      - name: Run setup.sh release install tests
+        run: bash tests/ci/setup-binary-test.sh
+      - name: Run line-limit checker tests
+        run: bash tests/ci/check-line-limits-test.sh
 
   typos:
     name: Spelling
@@ -148,6 +152,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check for typos
         uses: crate-ci/typos@5e38bf262baaf477ca9f241b3a7cd3d277fd7df8 # master
+
+  line-limits:
+    name: Line limits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Enforce per-file line-count limits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: python3 scripts/check_line_limits.py
 
   redis-lifecycle:
     name: Redis lifecycle integration
@@ -279,6 +296,7 @@ jobs:
       - cargo-machete
       - shell-tests
       - typos
+      - line-limits
       - redis-lifecycle
       - coder-e2e
       - delegated-verification
