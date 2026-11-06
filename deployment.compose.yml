@@ -36,7 +36,7 @@ services:
     ports: ["127.0.0.1:7080:7080"]
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - 'export CODER_OAUTH2_GITHUB_CLIENT_SECRET="$$(cat /run/secrets/coder_github_secret)"; export CODER_CHAT_HOOK_SECRET="$$(cat /run/secrets/coder_hook_secret)"; exec /opt/coder server'
+      - 'export CODER_OAUTH2_GITHUB_CLIENT_SECRET="$$(cat /run/secrets/coder_github_secret)"; export CODER_CHAT_HOOK_SECRET="$$(cat /run/secrets/coder_hook_secret)"; export CODER_EXTERNAL_AUTH_0_CLIENT_SECRET="$$(cat /run/secrets/coder_external_auth_secret)"; exec /opt/coder server'
     environment:
       CODER_PG_CONNECTION_URL: postgres://coder:${CODER_PG_PASSWORD:?Set CODER_PG_PASSWORD}@coder-db:5432/coder?sslmode=disable
       CODER_ACCESS_URL: ${CODER_ACCESS_URL:?Set the browser and workspace reachable Coder URL}
@@ -54,12 +54,22 @@ services:
       # CODER_CHAT_HOOK_SECRET env var.
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-}
       CODER_CHAT_HOOK_ENABLED: "true"
+      # Coder refuses a plain-HTTP hook URL unless this is true. Set it to true
+      # only for a local, single-host install; use an HTTPS hook URL elsewhere.
+      CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-false}
+      # The workspace templates clone repositories through this external-auth
+      # provider; importing a template fails without it. It reuses the OpenFlows
+      # GitHub App (client id here, secret from the github-client-secret file).
+      CODER_EXTERNAL_AUTH_0_ID: primary-github
+      CODER_EXTERNAL_AUTH_0_TYPE: github
+      CODER_EXTERNAL_AUTH_0_SCOPES: repo
+      CODER_EXTERNAL_AUTH_0_CLIENT_ID: ${OPENFLOWS_GITHUB_CLIENT_ID:?Set OPENFLOWS_GITHUB_CLIENT_ID}
       CODER_PROVISIONER_DAEMONS: "1"
       # The Manager requests a 90-day admin key and renews it before expiry.
       # Do not extend the default lifetime of interactive user sessions.
       CODER_MAX_ADMIN_TOKEN_LIFETIME: ${CODER_MAX_ADMIN_TOKEN_LIFETIME:-2160h}
       TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
-    secrets: [coder_github_secret, coder_hook_secret]
+    secrets: [coder_github_secret, coder_hook_secret, coder_external_auth_secret]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - tf_plugin_cache:/root/.terraform.d/plugin-cache
@@ -93,6 +103,8 @@ secrets:
     file: ${OPENFLOWS_SECRET_DIR:-.openflows/secrets}/coder-github-client-secret
   coder_hook_secret:
     file: ${OPENFLOWS_SECRET_DIR:-.openflows/secrets}/coder-hook-secret
+  coder_external_auth_secret:
+    file: ${OPENFLOWS_SECRET_DIR:-.openflows/secrets}/github-client-secret
 volumes:
   coder_db_data:
   openflows_db_data:

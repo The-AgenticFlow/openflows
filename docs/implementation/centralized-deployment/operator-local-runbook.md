@@ -35,7 +35,9 @@ Edit `.env.openflows`: replace the example URLs, database passwords, GitHub
 IDs/slug, and workspace image digest. Keep local mode, the filesystem secret
 provider, and the Docker provisioner. Keep `OPENFLOWS_HOOK_URL` on the private
 `host.docker.internal` Manager route; Coder uses it for authenticated Chat
-lifecycle hooks and their JWT audience. Keep the supplied
+lifecycle hooks and their JWT audience. That URL is plain HTTP, which Coder
+refuses unless `CODER_CHAT_HOOK_ALLOW_INSECURE=true`; set it for a local
+single-host install only. Keep the supplied
 `OPENFLOWS_RUNTIME_RELAY_BASE_URL=http://127.0.0.1:7081/tenants/{tenant}`.
 Keep `OPENFLOWS_RUNTIME_MANAGER_URL=http://host.docker.internal:3002` when
 Manager runs on the Docker host. Workspaces use this private route for runtime
@@ -81,6 +83,9 @@ Create four more mode-0600 files in `.openflows/secrets`:
 | `github-app-private-key` | GitHub App PEM private key |
 | `github-webhook-secret` | App webhook secret |
 | `coder-github-client-secret` | Coder GitHub client secret |
+
+`github-client-secret` is also Coder's external-auth secret for the `primary-github`
+provider that the workspace templates need (the compose file wires it in).
 
 Setup generates the remaining Manager secrets. Do not commit or discard this
 directory; keep it with the control-plane database when backing up. If you
