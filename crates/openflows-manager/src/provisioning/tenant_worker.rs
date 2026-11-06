@@ -256,6 +256,13 @@ impl TenantProvisionWorker {
             let org = coder_client::CoderOrganizationId::new(row.3);
             if delete {
                 self.adapter.delete_workspace(&org, coder_id).await?;
+                self.tenant_runtime
+                    .retire_workspace_secret(
+                        guard.organization_id,
+                        TenantId::from_uuid(row.1),
+                        crate::id::WorkspaceId::from_uuid(row.0),
+                    )
+                    .await?;
             } else {
                 self.adapter.stop_workspace(&org, coder_id).await?;
             }
@@ -735,6 +742,9 @@ impl TenantProvisionWorker {
             if let Some(cleanup) = &self.local_workspace_cleanup {
                 cleanup.remove_workspace(&row.1, &created.id).await?;
             }
+            self.tenant_runtime
+                .retire_workspace_secret(guard.organization_id, tenant_id, workspace_id)
+                .await?;
             return self
                 .complete_worker_creation_superseded(guard, tenant_id, workspace_id)
                 .await;

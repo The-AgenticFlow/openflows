@@ -5,6 +5,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 allow = [
     "MIT",
     "Apache-2.0",
+    # Build-only dependency of kube (ar_archive_writer via psm); permissive.
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "ISC",
     "CC0-1.0",

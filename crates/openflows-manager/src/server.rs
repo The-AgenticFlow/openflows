@@ -604,17 +604,24 @@ impl ManagerServices {
                     std::sync::Arc::new(crate::runtime::redis::InMemoryRedisIsolation::default())
                 }
             };
+        let delivery = crate::runtime::delivery::resolve_delivery(
+            &config.provisioner_backend,
+            &config.secret_provider,
+        )
+        .await?;
         services.tenant_runtime = crate::runtime::tenant::TenantRuntimeRepository::with_backends(
             services.db.pool().clone(),
             provider.clone(),
             redis_isolation,
-        );
+        )
+        .with_delivery(delivery.clone());
         services.tenant_runtime.restore_redis_credentials().await?;
         services.runtime_credentials =
             crate::runtime::RuntimeCredentialService::with_secret_provider(
                 services.runtime_repo.clone(),
                 provider.clone(),
-            );
+            )
+            .with_delivery(delivery);
         // Bind the operator-configured tenant limits (platform-operator
         // configuration) into the central quota service.
         services.quotas = crate::quotas::TenantQuotaService::new(
