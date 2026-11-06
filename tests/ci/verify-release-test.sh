@@ -176,11 +176,11 @@ image_case() {
         main image ghcr.io/o/openflows 4.0.0 tree-of-tag
     )
 }
-expect_result "an image built from the tag passes" 0 "linux/arm64 was built from the tag's source" image_case 4.0.0 tagged "linux/amd64 linux/arm64"
+expect_result "an image built from the tag passes" 0 "linux/arm64 revision label tagged has the tag's source" image_case 4.0.0 tagged "linux/amd64 linux/arm64"
 expect_result "a revision with the same source passes" 0 "linux/amd64 is labelled 4.0.0" image_case 4.0.0 merge "linux/amd64"
 expect_result "an image labelled with another version fails" 1 "linux/amd64 is labelled '3.9.0', not 4.0.0" image_case 3.9.0 tagged "linux/amd64"
-expect_result "an image built from other source fails" 1 "whose source differs from the tag" image_case 4.0.0 elsewhere "linux/amd64"
-expect_result "an image without a revision fails" 1 "has no revision label" image_case 4.0.0 "" "linux/amd64"
+expect_result "a revision label from a rebuild is reported, not failed" 0 "revision label elsewhere is not the tag's source" image_case 4.0.0 elsewhere "linux/amd64"
+expect_result "a missing revision label is reported, not failed" 0 "has no revision label" image_case 4.0.0 "" "linux/amd64"
 expect_result "an image without linux/amd64 fails" 1 "has no linux/amd64 image" image_case 4.0.0 tagged "linux/arm64"
 
 echo

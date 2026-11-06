@@ -7,8 +7,9 @@
 #   verify-release.sh kit FILE.tar.gz VERSION
 #       Checksum, the files `setup.sh --binary` reads, their syntax and the kit's version.
 #   verify-release.sh image REGISTRY/OWNER/NAME VERSION TAG_TREE
-#       Every platform of the image carries the version label and was built from the
-#       tag's source tree. Reads the public registry API; no Docker needed.
+#       Every platform of the image carries the version label, and linux/amd64 exists.
+#       Reports whether the revision label matches the tag's source tree. Reads the public
+#       registry API; no Docker needed.
 #
 # Each failure prints `FAIL <artifact>: <reason>`; the exit status is 1 if any check failed.
 # Runs on Linux and macOS (bash 3.2).
@@ -25,6 +26,7 @@ failures=0
 SUBJECT=""
 fail() { printf 'FAIL %s: %s\n' "$SUBJECT" "$1"; failures=$((failures + 1)); }
 pass() { printf 'ok   %s: %s\n' "$SUBJECT" "$1"; }
+note() { printf 'note %s: %s\n' "$SUBJECT" "$1"; }
 sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
 
 # check_checksum FILE: FILE.sha256 names FILE and matches its contents.
@@ -202,11 +204,11 @@ verify_image() {
         revision="$(printf '%s' "$labels" | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
         if [ "$label" = "$version" ]; then pass "${platform} is labelled ${version}"
         else fail "${platform} is labelled '${label}', not ${version}"; fi
-        # The label can name the commit that started the build rather than the tag; the
-        # source is what matters, so compare trees.
-        if [ -z "$revision" ]; then fail "${platform} has no revision label"
-        elif [ "$(tree_of "$revision")" = "$tag_tree" ]; then pass "${platform} was built from the tag's source (${revision:0:12})"
-        else fail "${platform} was built from ${revision:0:12}, whose source differs from the tag"; fi
+        # Information only: docker-publish.yml builds the tag but its revision label names
+        # the commit that started the workflow, which differs from the tag on a rebuild.
+        if [ -z "$revision" ]; then note "${platform} has no revision label"
+        elif [ "$(tree_of "$revision")" = "$tag_tree" ]; then note "${platform} revision label ${revision:0:12} has the tag's source"
+        else note "${platform} revision label ${revision:0:12} is not the tag's source; the label names the commit that started the build"; fi
     done
     case " ${platforms} " in
         *" linux/amd64 "*) ;;

@@ -193,7 +193,7 @@ jobs:
 
       - name: Install Rosetta
         if: matrix.run_with == 'rosetta'
-        run: arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
 
       - name: Install objdump
         if: runner.os == 'Linux'
