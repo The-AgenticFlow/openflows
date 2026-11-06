@@ -145,6 +145,13 @@ out="$(doctor_output 'OPENFLOWS_SETUP_MODE=compose\nOPENFLOWS_GITHUB_AUTH_MODE=s
 expect_has "your own App" "$out" "your own App"
 expect_lacks "no repository yet: no empty line" "$out" "Repository"
 
+echo "A new App gets the permissions the agents use"
+app_manifest="$(sed -n '/"default_permissions"/,/}/p' "${ROOT}/scripts/setup.sh")"
+for permission in '"metadata": "read"' '"actions": "read"' '"checks": "read"' '"statuses": "read"' \
+    '"contents": "write"' '"issues": "write"' '"pull_requests": "write"' '"workflows": "write"'; do
+    expect_has "$permission" "$app_manifest" "$permission"
+done
+
 echo "prod.sh talks to the Coder that setup started"
 coder_url_seen() {   # coder_url_seen LINES_FOR_ENV
     (

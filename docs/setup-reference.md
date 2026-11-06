@@ -49,7 +49,7 @@ OpenFlows agents authenticate to your GitHub repos (including private ones) thro
    ```
    http://localhost:7080/external-auth/primary-github/callback
    ```
-2. Under **Permissions → Repository permissions**, set **Checks** to **Read-only**, and **Contents**, **Issues**, **Pull requests**, and **Workflows** to **Read and write**.
+2. Under **Permissions → Repository permissions**, set **Actions**, **Checks**, and **Commit statuses** to **Read-only**, and **Contents**, **Issues**, **Pull requests**, and **Workflows** to **Read and write**.
 3. Create the app, then **Install it** on your org via your install URL (`https://github.com/apps/<your-app-slug>/installations/new`).
 4. Copy three values for [Step 2](#step-2--set-up-env): the **Client ID**, a generated **Client Secret** (shown once), and your **Install URL**.
 
@@ -452,6 +452,10 @@ Grant the GitHub App **Workflows → Read and write** (this is a *different* per
 ### Agents can't create a PR ("Resource not accessible by integration")
 
 Grant the GitHub App **Pull requests → Read and write**, then **approve/update the installation** and get a fresh token — see the note in [Step 1](#step-1--create-a-github-app).
+
+### Issue sync fails with 403 ("Resource not accessible by integration")
+
+Grant the GitHub App **Issues → Read and write**, then **approve/update the installation**. Apps created by earlier versions of setup don't have it, nor **Actions**, **Checks**, or **Commit statuses** (all three **Read-only**), which agents use to read CI results.
 
 ### Controller not picking up issues
 

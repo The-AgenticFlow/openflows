@@ -381,8 +381,8 @@ print(json.dumps({
     "public": True,
     "request_oauth_on_install": False,
     "default_permissions": {
-        "metadata": "read", "checks": "read", "contents": "write", "issues": "write",
-        "pull_requests": "write", "workflows": "write",
+        "metadata": "read", "actions": "read", "checks": "read", "statuses": "read",
+        "contents": "write", "issues": "write", "pull_requests": "write", "workflows": "write",
     },
 }))
 PY
@@ -446,7 +446,8 @@ github_app_manual() {
     info "Create the app by hand:"
     info "  1. Open  ${new_url}"
     info "  2. Callback URL:  $(public_url)/external-auth/$(auth_id)/callback"
-    info "  3. Permissions → Repository: Contents, Pull requests, Workflows = Read and write"
+    info "  3. Permissions → Repository: Contents, Issues, Pull requests, Workflows = Read and write;"
+    info "     Actions, Checks, Commit statuses = Read-only"
     info "  4. Create the app, generate a Client secret, then paste below."
     is_tty || die "GitHub App credentials are missing and no terminal is attached." \
         "Create the app (steps above), then set in .env:" \
