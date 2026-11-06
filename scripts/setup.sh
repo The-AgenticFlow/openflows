@@ -381,7 +381,7 @@ print(json.dumps({
     "public": True,
     "request_oauth_on_install": False,
     "default_permissions": {
-        "metadata": "read", "contents": "write",
+        "metadata": "read", "checks": "read", "contents": "write", "issues": "write",
         "pull_requests": "write", "workflows": "write",
     },
 }))
