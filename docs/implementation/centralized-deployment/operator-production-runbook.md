@@ -1,14 +1,12 @@
 # AWS operator runbook
 
+The hosted contract, including AWS Secrets Manager as the default and an explicit non-AWS path, is in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md).
+
+> **Current blocker:** Hosted Kubernetes deployment is not yet validated. The role templates still create Docker containers, and hosted mode rejects the Docker backend. Follow the architecture contract and its implementation issues for the target design; do not use an arbitrary backend name to bypass the hosted-mode check. Remove this notice only after the hosted release gates pass.
+
 Deploy **staging**, validate it, then deploy **production** with separate
 resources and credentials. The local Compose stack is not a production
 deployment.
-
-> **Current blocker:** This repository does not yet ship a validated isolated
-> provisioner backend or an AWS deployment manifest/Helm chart. Hosted mode
-> rejects the shared Docker backend. The steps below become executable only
-> when an infrastructure release supplies those missing pieces. Do not use an
-> arbitrary backend name to bypass the check.
 
 ## 1. Provision each environment
 
