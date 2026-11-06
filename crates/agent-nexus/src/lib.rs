@@ -345,10 +345,16 @@ impl NexusNode {
         if let Some(runtime) = &self.runtime_control {
             return runtime.github_api_token().await;
         }
-        self.resolve_github_token()
-            .ok()
-            .filter(|token| !token.is_empty())
-            .or_else(|| self.resolve_github_token_from_env_or_file())
+        // Connected-local workspaces expose the rotating device-flow user
+        // token through the external-auth token file. Prefer it over the
+        // startup registry snapshot so long-running API calls follow refresh
+        // and cannot accidentally use a stale or broader credential.
+        self.resolve_github_token_from_env_or_file()
+            .or_else(|| {
+                self.resolve_github_token()
+                    .ok()
+                    .filter(|token| !token.is_empty())
+            })
             .context("GitHub token is not configured")
     }
 

@@ -38,7 +38,15 @@ impl Default for VesselConfig {
 impl VesselConfig {
     pub fn from_registry(registry_path: impl AsRef<Path>) -> Result<Self> {
         let registry = Registry::load(registry_path)?;
-        let github_token = registry.resolve_github_token("vessel")?;
+        // Connected-local templates refresh the device-flow user token in the
+        // Coder external-auth token file. Resolve that live credential first;
+        // the registry remains the hosted/static fallback.
+        let github_token = config::EnvConfig::from_env()
+            .ok()
+            .and_then(|config| config.github.resolve_token())
+            .or_else(|| registry.resolve_github_token("vessel").ok())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("GitHub token is not configured"))?;
 
         Ok(Self {
             ci_poll: CiPollConfig::default(),
