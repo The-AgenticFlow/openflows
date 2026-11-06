@@ -142,6 +142,8 @@ jobs:
         run: bash tests/ci/setup-tenant-name-test.sh
       - name: Run setup.sh release install tests
         run: bash tests/ci/setup-binary-test.sh
+      - name: Run release verification tests
+        run: bash tests/ci/verify-release-test.sh
       - name: Run line-limit checker tests
         run: bash tests/ci/check-line-limits-test.sh
 
