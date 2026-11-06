@@ -8,7 +8,6 @@ members = [
     "crates/agent-forge",
     "crates/agent-vessel",
     "crates/agent-sentinel",
-    "crates/agent-lore",
     "crates/provisioner",
     "crates/coder-client",
     "crates/openflows-harness",

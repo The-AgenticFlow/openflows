@@ -87,6 +87,24 @@ enum Commands {
         #[command(subcommand)]
         action: VerifyAction,
     },
+    /// Post-merge documentation gate (LORE)
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Print the documentation gate record for this ticket
+    Status,
+    /// Submit the pushed, clean docs branch for operator review. After the
+    /// operator approves, the controller opens and merges the docs PR.
+    Submit {
+        /// Summary of the documentation changes for the operator
+        #[arg(long)]
+        report: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -512,6 +530,16 @@ async fn main() -> Result<()> {
             action: VerifyAction::List { pair_id },
         } => {
             store.verify_list(pair_id.as_deref()).await?;
+        }
+        Commands::Docs {
+            action: DocsAction::Status,
+        } => {
+            store.docs_status(&ticket).await?;
+        }
+        Commands::Docs {
+            action: DocsAction::Submit { report },
+        } => {
+            store.docs_submit(&ticket, &role, &report).await?;
         }
     }
 
