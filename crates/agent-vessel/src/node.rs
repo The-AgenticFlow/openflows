@@ -27,8 +27,10 @@ use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
+use crate::merger::{is_merge_conflict_message, is_merge_refused_pending_review};
 use crate::pr_monitor::{
-    build_directive, classify, collect_rework, PrMonitorState, ReworkEvidence,
+    applicable_reviews, build_directive, candidate_review_state, classify, collect_rework,
+    is_authorized_head_approval, PrMonitorState, ReworkEvidence,
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
@@ -990,6 +992,7 @@ impl Node for VesselNode {
                         repo,
                         pr_number,
                         &pr_info.head_sha,
+                        evidence.as_ref(),
                     )
                     .await?;
                 let ready = if reconciled {
@@ -2106,6 +2109,16 @@ impl VesselNode {
                         );
                         self.handle_conflicts(owner, repo, pr_info).await
                     }
+                    Ok(result) if is_merge_refused_pending_review(&result.message) => {
+                        let message = &result.message;
+                        warn!(pr_number, %message, "GitHub refused the merge; waiting for a reviewer to re-review or dismiss the change request");
+                        Ok(VesselOutcome::Reviews {
+                            ticket_id,
+                            pr_number,
+                            state: PrMonitorState::NeedsReview.as_str().to_string(),
+                            head_sha: Some(pr_info.head_sha.clone()),
+                        })
+                    }
                     Ok(result) => Ok(VesselOutcome::MergeBlocked {
                         ticket_id,
                         pr_number,
@@ -2587,35 +2600,15 @@ impl VesselNode {
             .list_pr_reviews(owner, repo, pr_info.number)
             .await
             .unwrap_or_default();
-        let review_state = github::effective_review_state(&reviews);
+        let applicable = applicable_reviews(&reviews, &pr_info.head_sha, evidence);
+        let review_state = candidate_review_state(&applicable, &pr_info.head_sha);
         if review_state == github::PrReviewState::ChangesRequested {
-            let has_unaddressed = github::latest_review_per_user(&reviews)
-                .into_iter()
-                .any(|r| {
-                    r.state_enum() == github::PrReviewState::ChangesRequested
-                        && !crate::pr_monitor::is_feedback_addressed(
-                            r.commit_id.as_deref(),
-                            r.submitted_at.as_deref(),
-                            &pr_info.head_sha,
-                            evidence,
-                        )
-                });
-            if has_unaddressed {
-                return true;
-            }
+            return true;
         }
 
-        // 4. Inline review comments (only considered rework if PR is not approved on current head
-        // by an authorized reviewer — stale approvals or outside drive-by approvals do not hide feedback)
-        let is_authorized_head_approved = review_state == github::PrReviewState::Approved
-            && github::latest_review_per_user(&reviews)
-                .into_iter()
-                .any(|r| {
-                    r.state_enum() == github::PrReviewState::Approved
-                        && r.is_authorized_reviewer()
-                        && (r.commit_id.as_deref() == Some(&pr_info.head_sha)
-                            || r.commit_id.is_none())
-                });
+        // 4. Inline review comments are rework only while the current head lacks an
+        // authorized approval. Stale approvals and outside drive-by approvals do not hide feedback.
+        let is_authorized_head_approved = review_state == github::PrReviewState::Approved;
 
         if !is_authorized_head_approved {
             let comments = self
@@ -2644,7 +2637,9 @@ impl VesselNode {
     /// self-review, so an `APPROVED` review can only originate from a distinct
     /// account. That approval satisfies the `pr_human` merge gate without a
     /// manual operator CLI entry, provided that:
-    /// - no reviewer currently requests changes (fail closed),
+    /// - no reviewer has an unaddressed change request (fail closed); change
+    ///   requests that rework has addressed are dropped first, see
+    ///   [`applicable_reviews`],
     /// - the approving reviewer is an `OWNER`, `MEMBER`, or `COLLABORATOR`, and
     /// - their latest review is `APPROVED` on exactly `head_sha`.
     ///
@@ -2662,6 +2657,7 @@ impl VesselNode {
         repo: &str,
         pr_number: u64,
         head_sha: &str,
+        evidence: Option<&ReworkEvidence>,
     ) -> Result<bool> {
         if state.phase != config::lifecycle::Phase::Submit
             || (state.pr_human.is_some() && state.pr_decision.is_some())
@@ -2676,20 +2672,26 @@ impl VesselNode {
                 return Ok(false);
             }
         };
-        // Any reviewer currently requesting changes vetoes reconciliation.
-        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+        // Any reviewer with an unaddressed change request vetoes reconciliation.
+        // Change requests already addressed by rework are dropped first, so they
+        // cannot hide another reviewer's valid approval of the current head.
+        let applicable = applicable_reviews(&reviews, head_sha, evidence);
+        if applicable
+            .iter()
+            .any(|r| r.state_enum() == github::PrReviewState::ChangesRequested)
+        {
             return Ok(false);
         }
+        // The rework evidence is what marks those change requests as addressed.
+        // While one is still on GitHub, later passes need the evidence too.
+        let relies_on_rework_evidence =
+            applicable.len() != github::latest_review_per_user(&reviews).len();
         // The effective approver: an authorized reviewer whose *latest* review
         // approves the current head. Stale approvals of older commits and
         // drive-by approvals from outside accounts do not count.
-        let Some(approver) = github::latest_review_per_user(&reviews)
+        let Some(approver) = applicable
             .into_iter()
-            .filter(|r| {
-                r.state_enum() == github::PrReviewState::Approved
-                    && r.is_authorized_reviewer()
-                    && r.commit_id.as_deref() == Some(head_sha)
-            })
+            .filter(|r| is_authorized_head_approval(r, head_sha))
             .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
             .and_then(|r| r.user.clone())
         else {
@@ -2775,7 +2777,9 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        self.clear_address_review_dispatched(store, pr_number).await;
+        if !relies_on_rework_evidence {
+            self.clear_address_review_dispatched(store, pr_number).await;
+        }
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -3877,13 +3881,6 @@ impl VesselNode {
     }
 }
 
-fn is_merge_conflict_message(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("merge conflict")
-        || lower.contains("merge_conflict")
-        || (lower.contains("405") && lower.contains("method not allowed"))
-}
-
 /// Build the lightweight `/ci_fix` chat directive for FORGE.
 ///
 /// This is a **pointer**, not a dump of the whole CI output: it names the PR, the
@@ -3953,6 +3950,9 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reconcile_rework;
+    use reconcile_rework::run_reconcile_with_evidence;
 
     #[tokio::test]
     async fn merge_reservation_clears_only_for_definitive_rejection() {
@@ -4063,10 +4063,7 @@ mod tests {
     }
 
     async fn run_reconcile(node: &VesselNode, store: &SharedStore) -> bool {
-        let state = store.lifecycle("T-42").await.unwrap();
-        node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head")
-            .await
-            .unwrap()
+        run_reconcile_with_evidence(node, store, None).await
     }
 
     #[tokio::test]

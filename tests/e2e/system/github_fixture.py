@@ -6,7 +6,8 @@ from urllib.parse import parse_qs, urlsplit
 from git_repository import Repository, git
 
 TOKENS = {'ci-forge-token': 'forge', 'ci-sentinel-token': 'sentinel',
-    'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator'}
+    'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator',
+    'ci-reviewer-token': 'reviewer'}
 
 
 class GitHub:
@@ -136,7 +137,7 @@ class GitHub:
                 if method == 'GET':
                     return 200, self.page(reviews, query)
                 if method == 'POST':
-                    self.require_role(role, ['sentinel', 'operator', 'vessel'])
+                    self.require_role(role, ['sentinel', 'operator', 'vessel', 'reviewer'])
                     states = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED'}
                     if body.get('event') not in states or body.get('comments'):
                         self.fail(422, 'Unsupported review event or inline comments')
