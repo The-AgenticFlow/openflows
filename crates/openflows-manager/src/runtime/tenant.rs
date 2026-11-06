@@ -61,6 +61,7 @@ pub struct TenantRuntimeRepository {
     pool: PgPool,
     secret_provider: std::sync::Arc<dyn SecretProvider>,
     redis_isolation: std::sync::Arc<dyn crate::runtime::redis::RedisIsolationBackend>,
+    delivery: std::sync::Arc<dyn crate::runtime::delivery::SecretDelivery>,
 }
 
 impl TenantRuntimeRepository {
@@ -71,6 +72,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -84,6 +86,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -96,7 +99,17 @@ impl TenantRuntimeRepository {
             pool,
             secret_provider,
             redis_isolation,
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
+    }
+
+    /// Select how bundles reach workspaces; defaults to mounting the store file.
+    pub fn with_delivery(
+        mut self,
+        delivery: std::sync::Arc<dyn crate::runtime::delivery::SecretDelivery>,
+    ) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -318,6 +331,43 @@ impl TenantRuntimeRepository {
         Ok(())
     }
 
+    /// Remove one workspace's delivered copy and store object after its Coder
+    /// workspace is deleted. Safe to repeat.
+    pub async fn retire_workspace_secret(
+        &self,
+        org_id: OrganizationId,
+        tenant_id: TenantId,
+        workspace_id: WorkspaceId,
+    ) -> Result<(), ManagerError> {
+        let target = crate::runtime::delivery::DeliveryTarget {
+            organization_id: org_id,
+            tenant_id,
+            workspace_id,
+        };
+        self.delivery.remove(&target).await?;
+        let store_ref: Option<String> =
+            sqlx::query_scalar("SELECT runtime_secret_ref FROM workspaces WHERE id = $1")
+                .bind(workspace_id.0)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        if let Some(reference) = store_ref {
+            match self.secret_provider.delete(&reference).await {
+                Ok(()) | Err(crate::secrets::SecretError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(ManagerError::Config(format!(
+                        "cannot delete workspace secret: {error}"
+                    )))
+                }
+            }
+            sqlx::query("UPDATE workspaces SET runtime_secret_ref = NULL WHERE id = $1")
+                .bind(workspace_id.0)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Remove every secret-provider object owned by a tenant. Database rows
     /// remain as a sanitized audit trail, with their credentials revoked.
     pub async fn delete_tenant_secrets(
@@ -325,6 +375,21 @@ impl TenantRuntimeRepository {
         org_id: OrganizationId,
         tenant_id: TenantId,
     ) -> Result<(), ManagerError> {
+        let workspaces: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM workspaces WHERE organization_id = $1 AND tenant_id = $2",
+        )
+        .bind(org_id.0)
+        .bind(tenant_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+        for id in workspaces {
+            let target = crate::runtime::delivery::DeliveryTarget {
+                organization_id: org_id,
+                tenant_id,
+                workspace_id: WorkspaceId::from_uuid(id),
+            };
+            self.delivery.remove(&target).await?;
+        }
         let refs: Vec<String> = sqlx::query_scalar(
             "SELECT secret_ref FROM tenant_hook_keys
               WHERE organization_id = $1 AND tenant_id = $2 AND secret_ref IS NOT NULL
@@ -361,7 +426,7 @@ impl TenantRuntimeRepository {
         Ok(())
     }
 
-    /// Assemble the per-workspace mounted secret file. Only this method reads
+    /// Assemble the per-workspace credential bundle and deliver it. Only this method reads
     /// the component secrets; templates receive the opaque returned reference.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_workspace_secret(
@@ -514,7 +579,15 @@ impl TenantRuntimeRepository {
         .bind(workspace_id.0)
         .execute(&self.pool)
         .await?;
-        Ok(stored_secret_ref)
+        // The row keeps the durable reference; the template gets the delivery handle.
+        let target = crate::runtime::delivery::DeliveryTarget {
+            organization_id: org_id,
+            tenant_id,
+            workspace_id,
+        };
+        self.delivery
+            .deliver(&target, &stored_secret_ref, &payload)
+            .await
     }
 
     /// Look up a tenant's Redis credential (namespace + username + generation),

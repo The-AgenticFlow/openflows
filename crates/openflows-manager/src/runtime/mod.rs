@@ -15,6 +15,7 @@
 
 pub mod broker;
 pub mod credentials;
+pub mod delivery;
 pub mod permissions;
 pub mod redis;
 pub mod repository;

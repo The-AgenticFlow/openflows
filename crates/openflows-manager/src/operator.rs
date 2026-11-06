@@ -442,20 +442,20 @@ pub(crate) const CODER_USER_SCOPES: &str = "coder:all";
 
 /// Operator-only recovery for a hosted workspace whose single-use bootstrap
 /// was consumed and whose process no longer has its rotating refresh token.
-/// The new bootstrap is written only to the existing mounted secret bundle.
+/// The new bootstrap is written only to the existing workspace secret bundle.
 pub async fn repair_runtime(workspace_id: uuid::Uuid) -> Result<()> {
     use zeroize::Zeroize;
 
     let db = crate::db::Db::connect(&setting("OPENFLOWS_DATABASE_URL")?).await?;
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT role, runtime_secret_ref FROM workspaces
+    let row: Option<(String, Option<String>, uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        "SELECT role, runtime_secret_ref, organization_id, tenant_id FROM workspaces
           WHERE id=$1 AND desired_state IN ('running','provisioning')
             AND observed_state NOT IN ('deleted','deleting')",
     )
     .bind(workspace_id)
     .fetch_optional(db.pool())
     .await?;
-    let (role, bundle_ref) = row.context("recoverable workspace not found")?;
+    let (role, bundle_ref, org_id, tenant_id) = row.context("recoverable workspace not found")?;
     if !matches!(
         role.as_str(),
         "nexus" | "forge" | "sentinel" | "vessel" | "lore"
@@ -493,6 +493,18 @@ pub async fn repair_runtime(workspace_id: uuid::Uuid) -> Result<()> {
         );
         let bytes = Zeroizing::new(serde_json::to_vec(&payload)?);
         provider.replace(&bundle_ref, &bytes).await?;
+        // The mounted copy is the delivered one, so refresh it as well.
+        let backend = std::env::var(crate::config::PROVISIONER_BACKEND_ENV)
+            .unwrap_or_else(|_| crate::config::DEFAULT_PROVISIONER_BACKEND.to_string());
+        let target = crate::runtime::delivery::DeliveryTarget {
+            organization_id: crate::id::OrganizationId::from_uuid(org_id),
+            tenant_id: crate::id::TenantId::from_uuid(tenant_id),
+            workspace_id: crate::id::WorkspaceId::from_uuid(workspace_id),
+        };
+        crate::runtime::delivery::resolve_delivery(&backend, &provider_name)
+            .await?
+            .deliver(&target, &bundle_ref, &bytes)
+            .await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
