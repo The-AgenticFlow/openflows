@@ -331,15 +331,15 @@ PY
 )"
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
-      API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
-      API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
-    else
       if [ "${var.connected_local}" = "true" ]; then
-        python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
-        GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
+        API_TOKEN="$GIT_TOKEN"
       else
-        GIT_TOKEN="${data.coder_parameter.hosted.value == "true" || var.connected_local ? "" : data.coder_external_auth.github[0].access_token}"
+        API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+        API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
       fi
+    else
+      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
       API_TOKEN="$GIT_TOKEN"
     fi
     if [ -z "$GIT_TOKEN" ]; then
@@ -377,20 +377,19 @@ PY
       sudo rm -f /root/.git-credentials
     fi
 
-    # Resolve the expected account from the inherited token via the GitHub API
-    # (the coder_external_auth data source does not expose the login). Honor
-    # GITHUB_API_BASE so self-hosted setups match the rest of the system.
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+    # Resolve the local user identity from GitHub. Hosted installation tokens
+    # do not expose /user, so hosted commits use the App bot identity.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ] && [ "${var.connected_local}" != "true" ]; then
       # Installation tokens are repository-scoped and intentionally do not
       # expose a personal /user identity. Commits are authored as the App bot.
       EXPECTED_LOGIN="openflows[bot]"
     else
       EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
-        || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+        || { log "FATAL: could not resolve the GitHub user identity"; exit 1; }
     fi
     if [ -z "$EXPECTED_LOGIN" ]; then
-      log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
+      log "FATAL: resolved an empty GitHub user identity"
       exit 1
     fi
 
@@ -753,7 +752,6 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
     "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.repo_url.value}",
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
@@ -779,8 +777,3 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" || var.connected_local ? 0 : 1
-  id       = "primary-github"
-  optional = true
-}

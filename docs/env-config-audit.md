@@ -27,16 +27,10 @@ the new centralized `crates/config/src/env.rs` layer.
 | `CODER_ADMIN_USERNAME` | coder-client/bootstrap | in-use | `CoderConfig.admin_username` (default `admin`) |
 | `CODER_ADMIN_EMAIL` | coder-client/bootstrap | in-use | `CoderConfig.admin_email` (default `admin@openflows.dev`) |
 | `CODER_ADMIN_PASSWORD` | coder-client/bootstrap | in-use | `CoderConfig.admin_password` (Option; no baked-in default — bootstrapper applies a secure fallback only when absent/weak) |
-| `CODER_GITHUB_TOKEN` | — (removed) | **removed** | `CoderConfig.github_token` deleted with the PAT flow (#205); controller/agents use the tenant's linked external-auth token |
+| `CODER_GITHUB_TOKEN` | — (removed) | **removed** | `CoderConfig.github_token` deleted with the PAT flow (#205); controller/agents use the Manager-brokered App token |
 | `CODER_IMAGE_TAG` | binary/doctor | in-use | `CoderConfig.image_tag` (default `v2.37.1`) |
 | `CODER_TRANSPORT_VERBOSE` | provisioner/transport | confusing | **Excluded from centralized layer** |
 | `CODER_WORKSPACE_ID` | openflows-harness/store | confusing | **Excluded from centralized layer** (read inline with default only) |
-| `CODER_EXTERNAL_AUTH_0_CLIENT_ID` | .env.example, docker-compose | in-use | `CoderConfig.external_auth_client_id` (canonical; `CODER_EXTERNAL_AUTH_0_ID` remains an inline read in binary/doctor) |
-| `CODER_EXTERNAL_AUTH_0_CLIENT_SECRET` | .env.example, docker-compose | in-use | `CoderConfig.external_auth_client_secret` (canonical; `CODER_EXTERNAL_AUTH_0_SECRET` remains an inline read in binary/doctor) |
-| `CODER_EXTERNAL_AUTH_0_ID` | .env.example, binary/doctor | in-use · inline | OIDC external-auth provider ID (inline read; not centralized) |
-| `CODER_EXTERNAL_AUTH_0_TYPE` | .env.example | in-use · Coder-side | External-auth provider type (e.g. `github`); Coder config, not centralized |
-| `CODER_EXTERNAL_AUTH_0_SCOPES` | .env.example | in-use · Coder-side | External-auth requested scopes (e.g. `repo`); Coder config, not centralized |
-| `CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL` | .env.example | in-use · Coder-side | GitHub App install URL surfaced in the Coder UI; not centralized |
 | `REDIS_URL` | binary, debug, doctor, harness | required (harness) | `InfraConfig.redis_url` (Option; `effective_redis_url()` default `redis://localhost:6379`; harness requires it) |
 | `A2A_RELAY_ADDR` | agent-nexus/a2a, harness/a2a_client | in-use · duplicated | `InfraConfig.a2a_relay_addr` (default `127.0.0.1:3000`) |
 | `OPENFLOWS_TENANT` | coder-client, pocketflow-core, nexus, harness, binary | required (controller/harness) | `TenantConfig.tenant` (Option; `effective_tenant()` default `default`; required in controller) |
@@ -52,10 +46,10 @@ the new centralized `crates/config/src/env.rs` layer.
 | `AGENTFLOW_WORKSPACE_ROOT` | agent-lore, agent-vessel | in-use · legacy-alias | `AgentConfig.workspace_root` (canonical) |
 | `WORKSPACE_ROOT` | agent-nexus, agent-vessel | legacy-alias | `AgentConfig.legacy_workspace_root` (deprecated) |
 | `HOME` / `USERPROFILE` | coder-client, nexus, vessel, binary | in-use (platform) | Use `dirs` semantics / `TenantConfig.openflows_home()` |
-| `GITHUB_TOKEN` | — (removed) | **removed** | `GithubConfig.token` deleted with the PAT flow (#205); resolves solely from `CODER_EXTERNAL_AUTH_*_TOKEN` |
+| `GITHUB_TOKEN` | — (removed) | **removed** | `GithubConfig.token` deleted with the PAT flow (#205); resolves from `OPENFLOWS_GITHUB_API_TOKEN_FILE` |
 | `GITHUB_REPOSITORY` | coder-client, nexus, binary | in-use · runtime-injected | `GithubConfig.repository`; no longer an operator-set `.env` value — derived per-tenant and injected into the tenant's nexus workspace (#213) |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | — (removed) | **removed** | `GithubConfig.personal_access_token` deleted with the PAT flow (#205) |
-| `CODER_EXTERNAL_AUTH_<ID>_TOKEN` / `_ACCESS_TOKEN` / `_TOKEN_FILE` | config/env | in-use · injected | Tenant user's linked external-auth token, read by `GithubConfig::external_auth_token()` as the sole source in `resolve_token()`; `<ID>` derived from `CODER_EXTERNAL_AUTH_0_ID` (default `primary-github`) uppercased (`PRIMARY_GITHUB`) |
+| `OPENFLOWS_GITHUB_API_TOKEN_FILE` | workspace templates, config/env | in-use · injected | Manager-brokered App user token file, read by `GithubConfig::resolve_token()` |
 | `GITHUB_API_BASE` | github/rest | in-use | `GithubConfig.api_base` (default `https://api.github.com`); `GithubRestClient::new` resolves it via `GithubConfig::init_from_env()` |
 | `USE_AI_GATEWAY` | config/registry | in-use | `AgentConfig.use_ai_gateway` (lenient string; `"true"`/`"1"` enabled via `use_ai_gateway_enabled()`, consistent with `registry::resolve_ai_gateway_enabled`) |
 | `DEFAULT_CLI` | config/registry | in-use | keep (registry-specific) |

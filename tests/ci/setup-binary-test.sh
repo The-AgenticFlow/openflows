@@ -223,23 +223,19 @@ expect_shared 1.8.1 no
 expect_shared 1.7.0 no
 expect_shared 1.8.2 yes
 expect_shared 1.10.0 yes
-files_for() {   # files_for MODE AUTH_MODE
+files_for() {   # files_for MODE
     (
         ROOT="${WORK}/files-$RANDOM"; mkdir -p "$ROOT"; ENV_FILE="${ROOT}/.env"; MODE="$1"
-        printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\n' "$2" >"$ENV_FILE"
-        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
+        : >"$ENV_FILE"
+        unset COMPOSE_FILE
         compose_files | grep -v '^-f$' | paste -sd' ' -
     )
 }
-expect_eq "source, own App: plain compose" "$(files_for source self-managed)" ""
-expect_eq "source, shared App: compiles the Manager" "$(files_for source connected-local)" \
+expect_eq "source: compiles the Manager" "$(files_for source)" \
     "docker-compose.yml docker-compose.connected-local.yml"
-expect_eq "binary, own App: plain compose" "$(files_for binary self-managed)" ""
-expect_eq "binary, shared App: Manager image" "$(files_for binary connected-local)" \
+expect_eq "binary: Manager image" "$(files_for binary)" \
     "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml"
-expect_eq "compose, own App: images" "$(files_for compose self-managed)" \
-    "docker-compose.yml docker-compose.images.yml"
-expect_eq "compose, shared App: images and Manager image" "$(files_for compose connected-local)" \
+expect_eq "compose: images and Manager image" "$(files_for compose)" \
     "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml docker-compose.images.yml"
 
 echo "prod.sh runs the installed programs"

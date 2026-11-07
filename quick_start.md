@@ -2,28 +2,18 @@
 
 Turn GitHub issues into reviewed pull requests, on your own machine. For what OpenFlows is, see the [README](README.md).
 
-## Choose the GitHub authorization mode
+## GitHub access
 
-The default is `connected-local`: OpenFlows supplies the team-owned GitHub App,
-and the local Manager guides you through installing it, approving your GitHub
-account, and selecting a repository. You do not create an App or enter a client
-ID, App slug, client secret, or private key.
-
-If you want to use your own GitHub App, set this before running setup:
-
-```bash
-OPENFLOWS_GITHUB_AUTH_MODE=self-managed ./scripts/setup.sh owner/repo
-```
-
-That keeps the existing Coder external-auth flow. Follow the [self-managed App
-setup instructions](docs/setup-reference.md) for its credentials and
-installation.
+OpenFlows uses its shared GitHub App for local runs. Install the App on the
+repository, authorize your GitHub account in the local Manager at
+<http://localhost:3002>, and select the repository. The App and your account
+must both have access. You do not create an App or provide its secrets.
 
 ## You need
 
 - Docker (running), `curl`, `python3`
 - Rust (`cargo`), only for `--source`
-- A GitHub account with access to the repository and permission to install the OpenFlows App there (or approval from its owner). To use your own App instead, an account that can create a GitHub App on the repo's owner
+- A GitHub account with access to the repository and permission to install the OpenFlows App there (or approval from its owner)
 - An API key for an LLM provider (Anthropic, OpenAI, OpenRouter or Google)
 
 ## Choose how to install
@@ -34,8 +24,8 @@ installation.
 | Needs Rust | No | No | Yes |
 | First run | A few minutes | A few minutes | About 10 minutes |
 | Host | Linux or macOS, x86-64 or ARM64 | Same | Linux or macOS |
-| Version | Any release after 1.8.1 | Any release (macOS, ARM64: after 1.8.1) | This checkout |
-| GitHub App | The team's shared App, or your own | Same (shared App: after 1.8.1) | Same |
+| Version | A release newer than 1.8.1 | A release newer than 1.8.1 | This checkout |
+| GitHub App | OpenFlows shared App | OpenFlows shared App | OpenFlows shared App |
 
 All three need Docker: Coder and the workspaces run in it. Workspaces run `linux/amd64`, which Docker emulates on ARM64 (slower).
 
@@ -55,13 +45,6 @@ curl -fsSL "https://github.com/The-AgenticFlow/openflows/releases/download/openf
 cd "openflows-${VERSION}" && ./scripts/setup.sh owner/repo
 ```
 
-> **Version 1.8.1 or older with `--compose`?** Those releases have no shared App without compiling. Create `.env` and switch to your own App first:
->
-> ```bash
-> cp .env.example .env
-> sed -i 's/^OPENFLOWS_GITHUB_AUTH_MODE=.*/OPENFLOWS_GITHUB_AUTH_MODE=self-managed/' .env
-> ```
-
 Without a flag, setup uses the mode of your last run, or `--source` the first time. That is the whole setup. The script is safe to re-run: it checks what is already done and continues from there. If something is missing, it stops and tells you exactly what to do.
 
 It will:
@@ -69,22 +52,18 @@ It will:
 1. Check your machine (and install the `coder` CLI if missing).
 2. Create `.env` and generate secrets.
 3. With `--binary` or `--compose`: pick the OpenFlows version, then verify its checksums or pin its image digest.
-4. Set up GitHub access:
-   - Shared App (default): open the local OpenFlows console, install the team-owned **OpenFlows GitHub App** on a repository, authorize your GitHub account using its device code, then choose that repository. No personal App, App secret, client ID, or App slug is needed.
-   - Your own App (`OPENFLOWS_GITHUB_AUTH_MODE=self-managed`): your browser opens, you click **Create GitHub App**, then install it on your repo.
-5. Start Redis and Coder in Docker (plus the local Manager when using the shared App).
+4. Start Redis, Coder, and the local Manager in Docker.
+5. Open the local Manager console, install the **OpenFlows GitHub App** on the repository, authorize your GitHub account using its device code, then choose that repository.
 6. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
-7. Add your **LLM** provider and model (asks for the API key).
+7. Register the local Coder OAuth application, then add your **LLM** provider and model (asks for the API key).
 8. Push the workspace templates. With `--source` it builds the binaries first (about 10 minutes the first time); otherwise it uses the installed programs.
-9. Connect your repo. With the shared App, the local Manager renews your GitHub App user token when needed and supplies it to the workspaces; with your own App, you click **Authorize** once to link GitHub to your Coder account.
+9. Connect your repo. The local Manager renews your GitHub App user token when needed and supplies it to the workspaces.
 
-With the shared App, setup pauses and opens the Manager console at <http://localhost:3002>. There:
+Setup pauses and opens the Manager console at <http://localhost:3002>. There:
 
 1. Click **Install OpenFlows App** and choose your repository.
 2. Click **Connect GitHub** and approve the device code. Your repositories appear only after this.
 3. Select your repository, click **Use selected repository**, then press Enter in the terminal.
-
-If the console asks for its key, reopen it with `xdg-open "http://127.0.0.1:3002/#console-key=$(cat ~/.config/openflows/console-key)"` (macOS: `open`).
 
 Maintainers can verify the team App with a disposable repository: approve the
 device code, confirm the repository appears in the console, and run one test

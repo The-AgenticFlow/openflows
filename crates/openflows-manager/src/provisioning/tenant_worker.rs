@@ -15,6 +15,8 @@
 //!   records a sanitized error and requires the tenant-capable adapter/backend
 //!   that a licensed deployment supplies.
 
+mod runtime_secret;
+
 use crate::coder::CoderAdapter;
 use crate::error::ManagerError;
 use crate::id::{OrganizationId, ReleaseId, TenantId};
@@ -565,6 +567,8 @@ impl TenantProvisionWorker {
         // heartbeat. Do not replace a consumed bootstrap while that same
         // authenticated runtime is completing startup.
         if self.runtime_session_pending_readiness(workspace_id).await? {
+            self.recover_pending_worker(guard.organization_id, tenant_id, workspace_id, &row.2)
+                .await?;
             return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
         let owner: (String,) = sqlx::query_as(
@@ -913,11 +917,8 @@ impl TenantProvisionWorker {
                 "OWNER_MIGRATION_REQUIRED",
             ));
         };
-        if deployment
-            != std::env::var("CODER_URL")
-                .unwrap_or_default()
-                .trim_end_matches('/')
-        {
+        let configured_deployment = crate::routes::coder_identity::deployment_identity()?;
+        if !crate::routes::coder_identity::same_deployment(&deployment, &configured_deployment) {
             self.record_error(guard, tenant_id, "CODER_DEPLOYMENT_MISMATCH")
                 .await?;
             return Ok(TenantProvisionOutcome::NotReady(
@@ -977,6 +978,12 @@ impl TenantProvisionWorker {
             return self.mark_tenant_running(guard, tenant_id, nexus_ws).await;
         }
         if self.runtime_session_pending_readiness(nexus_ws).await? {
+            if self
+                .recover_stalled_nexus(org_id, tenant_id, nexus_ws, &coder_org)
+                .await?
+            {
+                return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+            }
             return Ok(TenantProvisionOutcome::NotReady(
                 tenant_id,
                 err::NEXUS_NOT_READY,
@@ -1007,10 +1014,13 @@ impl TenantProvisionWorker {
                     .workspace_startup_failed(&coder_org, existing)
                     .await?
                 {
-                    return Ok(TenantProvisionOutcome::NotReady(
-                        tenant_id,
-                        err::NEXUS_START_FAILED,
-                    ));
+                    // A failed startup may have consumed or expired its
+                    // single-use bootstrap. Issue a fresh bundle before
+                    // asking Coder to restart the same workspace.
+                    self.ensure_workspace_runtime_secret(org_id, tenant_id, nexus_ws)
+                        .await?;
+                    self.adapter.restart_workspace(&coder_org, existing).await?;
+                    return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
                 }
                 return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
             }
@@ -1653,33 +1663,6 @@ impl TenantProvisionWorker {
             ));
         }
         Ok(digest)
-    }
-
-    async fn ensure_workspace_runtime_secret(
-        &self,
-        org_id: OrganizationId,
-        tenant_id: TenantId,
-        workspace_id: crate::id::WorkspaceId,
-    ) -> Result<String, ManagerError> {
-        // A workspace can be rebuilt after its single-use bootstrap has been
-        // consumed. The mounted bundle is then deliberately scrubbed, so
-        // reusing it would make the next startup fail with AUTH_FAILED. This
-        // is called when preparing a new startup, never while adopting an
-        // existing Nexus startup during a provisioning retry.
-        let bootstrap_ref = self
-            .runtime_credentials
-            .ensure_bootstrap_ref(workspace_id)
-            .await?;
-        self.tenant_runtime
-            .prepare_workspace_secret(
-                org_id,
-                tenant_id,
-                workspace_id,
-                &bootstrap_ref,
-                &self.manager_url,
-                &self.runtime_redis_url,
-            )
-            .await
     }
 
     async fn record_error(

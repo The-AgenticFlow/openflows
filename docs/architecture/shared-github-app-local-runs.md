@@ -1,6 +1,6 @@
 # Shared GitHub App for SaaS and local runs
 
-Status: approved product contract; connected-local implementation under review.
+Status: implemented for local runs; hosted installation-token behavior remains separate.
 
 ## Two credential paths
 
@@ -20,7 +20,7 @@ and renewal happen directly between the local Manager and GitHub.
 
 ## Local journey
 
-1. A contributor selects connected local mode during setup.
+1. Setup starts the local Manager with the shared App configuration.
 2. The local Manager requests a device code from GitHub and displays the
    verification address and user code. The contributor authorizes the App.
 3. The Manager polls within GitHub's required interval and stores the returned
@@ -45,10 +45,8 @@ never enter checked-in files, Terraform state, logs, prompts, or SaaS runtime
 tables. Sign-out removes the local credentials. If GitHub returns a rotated
 refresh token, persist it atomically before another refresh can begin.
 
-The existing self-managed App path remains available by explicit mode choice.
-The connected-local rollout flag defaults off. Hosted SaaS workspaces keep
-their current installation-token path, organization bindings, and Coder
-provisioning behavior.
+Hosted SaaS workspaces keep their installation-token path, organization
+bindings, and Coder provisioning behavior.
 
 ## Acceptance
 

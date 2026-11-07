@@ -34,7 +34,6 @@ pub async fn index() -> Html<&'static str> {
   <section id="local-github-section">
     <h2>Connect GitHub for this computer</h2>
     <p id="local-github-help">Checking connected-local GitHub availability…</p>
-    <label>Local console key <input id="local-console-key" type="password" autocomplete="off" placeholder="Paste the key from ~/.config/openflows/console-key"></label>
     <button id="install-app" disabled>Install OpenFlows App</button>
     <button id="connect-local-github" disabled>Connect GitHub</button>
     <button class="secondary" id="refresh-local-github">Refresh</button>
@@ -44,7 +43,7 @@ pub async fn index() -> Html<&'static str> {
       <select id="local-repositories" disabled><option value="">Connect GitHub first</option></select>
     </label>
     <button class="secondary" id="use-local-repository" disabled>Use selected repository</button>
-    <p>The OpenFlows App is owned by OpenFlows. You approve access for your GitHub account and choose a repository that you can access.</p>
+    <p>The OpenFlows App is owned by OpenFlows. You approve access for your GitHub account and choose a repository that you can access. Local agents receive your App user token and can access repositories allowed by both your account and the App.</p>
   </section>
 
   <section id="browser-signin-section">
@@ -108,6 +107,12 @@ pub async fn index() -> Html<&'static str> {
 </main>
 <script>
 const $ = id => document.getElementById(id);
+if (new URLSearchParams(window.location.search).get('github-installation') === 'complete') {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('github-installation');
+  history.replaceState(null, '', url.pathname + url.search + url.hash);
+  $('local-github-output').textContent = 'OpenFlows App installation completed. Checking repository access…';
+}
 let csrfToken = null;
 let organizationId = null;
 let connection = null;
@@ -121,17 +126,6 @@ let selectedOrg = null;
 let localGithub = null;
 let localDevice = null;
 let localDeviceTimer = null;
-let consoleKey = new URLSearchParams(window.location.hash.slice(1)).get('console-key') || sessionStorage.getItem('openflows-console-key');
-if (consoleKey) {
-  sessionStorage.setItem('openflows-console-key', consoleKey);
-  if (window.location.hash) history.replaceState(null, '', window.location.pathname + window.location.search);
-}
-$('local-console-key').value = consoleKey || '';
-$('local-console-key').onchange = () => {
-  consoleKey = $('local-console-key').value.trim();
-  if (consoleKey) sessionStorage.setItem('openflows-console-key', consoleKey);
-  else sessionStorage.removeItem('openflows-console-key');
-};
 
 function controls() {
   for (const id of ['create-org', 'refresh-orgs']) $(id).disabled = busy || !signedIn;
@@ -276,7 +270,7 @@ async function refreshLocalGithub() {
     }
     if (!localGithub.enabled) {
       show('local-github-help', 'Connected-local mode is disabled for this deployment.');
-      show('local-github-output', 'This Manager is running the hosted or self-managed path.');
+      show('local-github-output', 'This Manager is running in hosted mode.');
       controls(); return;
     }
     if (!localGithub.configured) {
@@ -350,7 +344,7 @@ function showConnection(value) {
 }
 async function request(url, options = {}) {
   if (url.startsWith('/api/v1/local/github/') && url !== '/api/v1/local/github/') {
-    options.headers = { ...options.headers, 'X-OpenFlows-Console-Key': consoleKey || '' };
+    options.headers = { ...options.headers, 'X-OpenFlows-Local-Console': '1' };
   }
   const response = await fetch(url, { credentials: 'include', ...options });
   const text = await response.text();
@@ -483,7 +477,9 @@ $('retry-operation').onclick = () => action(async () => {
   watchOperation(result.operation_id);
 }, 'operation-output');
 $('install-app').onclick = () => {
-  if (localGithub?.installation_url) window.open(localGithub.installation_url, '_blank', 'noopener');
+  if (!localGithub?.installation_url) return;
+  window.open(localGithub.installation_url, '_blank', 'noopener');
+  show('local-github-help', 'Finish installing the App in the GitHub tab, then return here. Repository access refreshes when you return.');
 };
 $('refresh-local-github').onclick = () => action(refreshLocalGithub, 'local-github-output');
 $('connect-local-github').onclick = () => action(async () => {
@@ -520,6 +516,9 @@ $('use-local-repository').onclick = () => {
 };
 window.addEventListener('pagehide', cancelOperation);
 window.addEventListener('pagehide', clearLocalDevicePoll);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshLocalGithub();
+});
 for (const id of ['create-org', 'start', 'status', 'me']) {
   const handler = $(id).onclick;
   $(id).onclick = () => action(handler);

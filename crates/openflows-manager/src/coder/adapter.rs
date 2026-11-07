@@ -770,8 +770,15 @@ impl CoderAdapter for RealCoderAdapter {
                 .get_workspace(workspace_id)
                 .await
                 .map_err(ManagerError::from)?;
-            if ws.is_running() {
+            if ws.is_agent_ready() {
                 return Ok(());
+            }
+            if matches!(ws.agent_lifecycle_state(), coder_client::types::AgentLifecycleState::Unknown(ref state) if state == "start_error")
+            {
+                return Err(ManagerError::api(
+                    "TENANT_WS_START_ERROR",
+                    format!("workspace {workspace_id} agent startup failed"),
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ManagerError::api(

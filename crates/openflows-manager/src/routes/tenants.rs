@@ -60,11 +60,22 @@ pub async fn create_tenant(
     let repository_id = match (body.repository_url.as_deref(), body.repository_id) {
         (Some(url), None) => {
             let repository_name = parse_github_repository_url(url)?;
-            services
-                .connections
-                .accessible_repository_id(org_id, &repository_name)
+            if state.connected_local_enabled() {
+                sync_local_repository(
+                    &state,
+                    services,
+                    org_id,
+                    principal.user_id,
+                    &repository_name,
+                )
                 .await?
-                .ok_or_else(|| ManagerError::not_found("accessible GitHub repository"))?
+            } else {
+                services
+                    .connections
+                    .accessible_repository_id(org_id, &repository_name)
+                    .await?
+                    .ok_or_else(|| ManagerError::not_found("accessible GitHub repository"))?
+            }
         }
         (None, Some(repository_id)) if repository_id > 0 => repository_id,
         (Some(_), Some(_)) => {
@@ -101,6 +112,98 @@ pub async fn create_tenant(
         })),
     )
         .into_response())
+}
+
+/// Bind a repository only after the signed-in user's App token confirms the
+/// installation and repository. Local setup does not use the hosted App
+/// callback, so its verified installation must be recorded here.
+async fn sync_local_repository(
+    state: &AppState,
+    services: &crate::server::ManagerServices,
+    org_id: crate::id::OrganizationId,
+    actor: crate::id::UserId,
+    repository_name: &str,
+) -> Result<i64, ManagerError> {
+    let (membership, org_state) = services.org_repo.membership_and_org(org_id, actor).await?;
+    crate::organizations::policy::Policy::require_developer(
+        membership.as_ref(),
+        org_state.as_ref(),
+    )?;
+    let credentials = state.local_github().ok_or_else(|| {
+        ManagerError::api(
+            "CONNECTED_LOCAL_UNAVAILABLE",
+            "local GitHub is not connected",
+        )
+    })?;
+    let token = credentials.access_token().await?;
+    let client_id = state.local_github_client_id().ok_or_else(|| {
+        ManagerError::api(
+            "CONNECTED_LOCAL_UNAVAILABLE",
+            "local GitHub App is not configured",
+        )
+    })?;
+    let app_slug = state.local_github_app_slug().ok_or_else(|| {
+        ManagerError::api(
+            "CONNECTED_LOCAL_UNAVAILABLE",
+            "local GitHub App is not configured",
+        )
+    })?;
+    let github = crate::auth::local_github::LocalGithubAuth::new(client_id.to_owned())?
+        .with_api_base(state.github_api_base().to_owned());
+    let installation = github
+        .repository_installation(&token, app_slug, repository_name)
+        .await?
+        .ok_or_else(|| ManagerError::not_found("accessible GitHub repository"))?;
+    if !matches!(installation.account_type.as_str(), "User" | "Organization") {
+        return Err(ManagerError::api(
+            "GITHUB_INSTALLATION_INVALID",
+            "GitHub returned an unsupported installation account type",
+        ));
+    }
+    let mut tx = services.db.pool().begin().await?;
+    let connection_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO github_connections
+            (id, organization_id, app_id, installation_id, github_account_id,
+             account_type, account_login, status, access_generation, connected_by,
+             verified_at, last_reconciled_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'active', 1, $7, now(), now())
+         ON CONFLICT (app_id, installation_id) DO UPDATE
+         SET last_reconciled_at = now(), updated_at = now()
+         WHERE github_connections.organization_id = EXCLUDED.organization_id
+           AND github_connections.status = 'active'
+         RETURNING id",
+    )
+    .bind(org_id.0)
+    .bind(installation.app_id)
+    .bind(installation.installation_id)
+    .bind(installation.account_id)
+    .bind(&installation.account_type)
+    .bind(&installation.account_login)
+    .bind(actor.0)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let connection_id = connection_id.ok_or_else(|| {
+        ManagerError::api(
+            "GITHUB_INSTALLATION_BOUND",
+            "this App installation is already bound to another organization or is inactive",
+        )
+    })?;
+    sqlx::query(
+        "INSERT INTO github_repositories
+            (organization_id, connection_id, github_repository_id, full_name, accessible, last_seen_at)
+         VALUES ($1, $2, $3, $4, true, now())
+         ON CONFLICT (connection_id, github_repository_id) DO UPDATE
+         SET full_name = EXCLUDED.full_name, accessible = true,
+             last_seen_at = now(), updated_at = now()",
+    )
+    .bind(org_id.0)
+    .bind(connection_id)
+    .bind(installation.repository.id)
+    .bind(&installation.repository.full_name)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(installation.repository.id)
 }
 
 fn parse_github_repository_url(value: &str) -> Result<String, ManagerError> {

@@ -12,8 +12,7 @@ use envconfig::Envconfig;
 use std::fmt;
 use std::path::PathBuf;
 
-/// Serializes env mutation across config tests so test modules that touch
-/// `GITHUB_*`/`CODER_EXTERNAL_AUTH_*` env vars never race.
+/// Serializes environment mutation across config tests.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -42,15 +41,6 @@ pub struct CoderConfig {
 
     #[envconfig(from = "CODER_IMAGE_TAG", default = "v2.37.1")]
     pub image_tag: String,
-
-    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_ID")]
-    pub external_auth_id: Option<String>,
-
-    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_CLIENT_ID")]
-    pub external_auth_client_id: Option<String>,
-
-    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_CLIENT_SECRET")]
-    pub external_auth_client_secret: Option<String>,
 }
 
 impl CoderConfig {
@@ -196,12 +186,6 @@ impl fmt::Debug for CoderConfig {
             .field("admin_password", &"<redacted>")
             .field("admin_username", &self.admin_username)
             .field("image_tag", &self.image_tag)
-            .field("external_auth_id", &self.external_auth_id)
-            .field("external_auth_client_id", &self.external_auth_client_id)
-            .field(
-                "external_auth_client_secret",
-                &redact(&self.external_auth_client_secret),
-            )
             .finish()
     }
 }
@@ -319,48 +303,13 @@ impl GithubConfig {
         )
     }
 
-    /// Normalize a Coder external-auth provider id to the injected env suffix:
-    /// uppercase, `-`/`.`→`_` (e.g. `primary-github` → `PRIMARY_GITHUB`).
-    pub fn normalize_external_auth_id(id: &str) -> String {
-        id.to_uppercase().replace(['-', '.'], "_")
-    }
-
-    /// Read the tenant user's external-auth token injected by Coder
-    /// (`_ACCESS_TOKEN`, then `_TOKEN`, then `_TOKEN_FILE`).
-    pub fn external_auth_token(&self) -> Option<String> {
-        let id = CoderConfig::init_from_env()
-            .ok()
-            .and_then(|c| c.external_auth_id.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "primary-github".to_string());
-        let base = format!(
-            "CODER_EXTERNAL_AUTH_{}",
-            Self::normalize_external_auth_id(&id)
-        );
-        for var in [format!("{}_ACCESS_TOKEN", base), format!("{}_TOKEN", base)] {
-            if let Ok(v) = std::env::var(&var) {
-                let v = v.trim().to_string();
-                if !v.is_empty() {
-                    return Some(v);
-                }
-            }
-        }
-        if let Ok(path) = std::env::var(format!("{}_TOKEN_FILE", base)) {
-            if let Ok(v) = std::fs::read_to_string(path) {
-                let v = v.trim().to_string();
-                if !v.is_empty() {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolve the GitHub token for the controller/agents. External auth
-    /// (the tenant user's linked GitHub App token) is the sole source — the
-    /// PAT flow has been removed. Returns `None` when not configured.
+    /// Read the token supplied by the local Manager broker. Workspace
+    /// templates mount this file; no Coder external-auth grant is involved.
     pub fn resolve_token(&self) -> Option<String> {
-        self.external_auth_token()
+        let path = std::env::var("OPENFLOWS_GITHUB_API_TOKEN_FILE").ok()?;
+        let token = std::fs::read_to_string(path).ok()?;
+        let token = token.trim();
+        (!token.is_empty()).then(|| token.to_owned())
     }
 }
 
@@ -716,100 +665,21 @@ mod tests {
     }
 
     #[test]
-    fn github_resolve_token_uses_external_auth() {
+    fn github_resolve_token_reads_manager_file() {
         let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::capture(&[
-            "CODER_EXTERNAL_AUTH_0_ID",
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN",
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN",
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE",
-        ]);
+        let guard = EnvGuard::capture(&["OPENFLOWS_GITHUB_API_TOKEN_FILE"]);
         guard.unset_all();
-
-        // No external-auth token → None (no PAT fallback exists anymore).
         assert_eq!(EnvConfig::from_env().unwrap().github.resolve_token(), None);
-
-        // `_TOKEN` is used.
-        std::env::set_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN", "ea-token");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "app-user-token\n").unwrap();
+        std::env::set_var("OPENFLOWS_GITHUB_API_TOKEN_FILE", file.path());
         assert_eq!(
             EnvConfig::from_env()
                 .unwrap()
                 .github
                 .resolve_token()
                 .as_deref(),
-            Some("ea-token")
-        );
-
-        // `_ACCESS_TOKEN` is preferred over `_TOKEN`.
-        std::env::remove_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN");
-        std::env::set_var(
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN",
-            "ea-access-token",
-        );
-        assert_eq!(
-            EnvConfig::from_env()
-                .unwrap()
-                .github
-                .resolve_token()
-                .as_deref(),
-            Some("ea-access-token")
-        );
-
-        // `_TOKEN_FILE` (a path to a file) is read as the final tier.
-        std::env::remove_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN");
-        let dir = std::env::temp_dir();
-        let file = dir.join("kilo-ea-token-file-test");
-        std::fs::write(&file, "file-token\n").ok();
-        std::env::set_var(
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE",
-            file.to_str().unwrap(),
-        );
-        assert_eq!(
-            EnvConfig::from_env()
-                .unwrap()
-                .github
-                .resolve_token()
-                .as_deref(),
-            Some("file-token")
-        );
-        let _ = std::fs::remove_file(&file);
-    }
-
-    #[test]
-    fn github_normalize_external_auth_id() {
-        assert_eq!(
-            GithubConfig::normalize_external_auth_id("primary-github"),
-            "PRIMARY_GITHUB"
-        );
-        assert_eq!(
-            GithubConfig::normalize_external_auth_id("github.com"),
-            "GITHUB_COM"
-        );
-        assert_eq!(
-            GithubConfig::normalize_external_auth_id("primary_github"),
-            "PRIMARY_GITHUB"
-        );
-    }
-
-    #[test]
-    fn github_resolve_token_honors_custom_external_auth_id() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let guard = EnvGuard::capture(&[
-            "CODER_EXTERNAL_AUTH_0_ID",
-            "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN",
-            "CODER_EXTERNAL_AUTH_CUSTOM_GITHUB_TOKEN",
-        ]);
-        guard.unset_all();
-
-        std::env::set_var("CODER_EXTERNAL_AUTH_0_ID", "custom-github");
-        std::env::set_var("CODER_EXTERNAL_AUTH_CUSTOM_GITHUB_TOKEN", "custom-ea-token");
-        // The default-named var is ignored when a custom id is configured.
-        std::env::set_var("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN", "wrong");
-        let cfg = EnvConfig::from_env().unwrap();
-        assert_eq!(
-            cfg.github.resolve_token().as_deref(),
-            Some("custom-ea-token"),
-            "custom CODER_EXTERNAL_AUTH_0_ID must drive the env var name"
+            Some("app-user-token")
         );
     }
 

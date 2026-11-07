@@ -30,7 +30,9 @@ fn configured() -> Result<(String, String, String), ManagerError> {
     let base = std::env::var("CODER_URL").map_err(|_| failure())?;
     let url = url::Url::parse(&base).map_err(|_| failure())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+    let local_docker = std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local")
+        && url.host_str() == Some("coder");
+    if !(url.scheme() == "https" || (url.scheme() == "http" && (loopback || local_docker)))
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -45,6 +47,57 @@ fn configured() -> Result<(String, String, String), ManagerError> {
         return Err(failure());
     }
     Ok((base.trim_end_matches('/').into(), client, secret))
+}
+fn browser_base(internal: &str) -> Result<String, ManagerError> {
+    let base = std::env::var("OPENFLOWS_CODER_PUBLIC_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| internal.to_owned());
+    let url = url::Url::parse(&base).map_err(|_| failure())?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(failure());
+    }
+    Ok(base.trim_end_matches('/').into())
+}
+
+/// Stable identity for the Coder deployment. `CODER_URL` may be an internal
+/// Docker transport address, while links are established through the public
+/// browser address.
+pub(crate) fn deployment_identity() -> Result<String, ManagerError> {
+    let internal = std::env::var("CODER_URL").unwrap_or_default();
+    if internal.is_empty() {
+        return Ok(internal);
+    }
+    browser_base(&internal)
+}
+
+pub(crate) fn same_deployment(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return left == right;
+    }
+    let Ok(left) = url::Url::parse(left.trim_end_matches('/')) else {
+        return false;
+    };
+    let Ok(right) = url::Url::parse(right.trim_end_matches('/')) else {
+        return false;
+    };
+    let loopback =
+        |host: Option<&str>| matches!(host, Some("localhost" | "127.0.0.1" | "[::1]" | "::1"));
+    let local_docker_alias = std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local")
+        && ((left.host_str() == Some("coder") && loopback(right.host_str()))
+            || (right.host_str() == Some("coder") && loopback(left.host_str())));
+    left.scheme() == right.scheme()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && (left.host_str() == right.host_str()
+            || (loopback(left.host_str()) && loopback(right.host_str()))
+            || local_docker_alias)
 }
 fn client() -> Result<reqwest::Client, ManagerError> {
     reqwest::Client::builder()
@@ -61,6 +114,43 @@ pub async fn user_access_token(
     services: &crate::server::ManagerServices,
     user_id: crate::id::UserId,
 ) -> Result<Zeroizing<String>, ManagerError> {
+    if std::env::var("OPENFLOWS_CONNECTED_LOCAL_ENABLED").as_deref() == Ok("true") {
+        let token_ref =
+            std::env::var("OPENFLOWS_CODER_OPERATOR_TOKEN_REF").map_err(|_| failure())?;
+        let token = Zeroizing::new(
+            String::from_utf8(
+                services
+                    .secret_provider
+                    .get(&token_ref)
+                    .await
+                    .map_err(|_| failure())?,
+            )
+            .map_err(|_| failure())?,
+        );
+        let coder_url = std::env::var("CODER_URL").map_err(|_| failure())?;
+        let response = client()?
+            .get(format!(
+                "{}/api/v2/users/me",
+                coder_url.trim_end_matches('/')
+            ))
+            .header("Coder-Session-Token", token.trim())
+            .send()
+            .await
+            .map_err(|_| failure())?;
+        let identity: serde_json::Value = response.json().await.map_err(|_| failure())?;
+        let linked: Option<String> =
+            sqlx::query_scalar("SELECT coder_user_id FROM coder_user_links WHERE user_id=$1")
+                .bind(user_id.0)
+                .fetch_optional(services.db.pool())
+                .await?;
+        if linked.as_deref() == identity["id"].as_str() && linked.is_some() {
+            return Ok(token);
+        }
+        return Err(ManagerError::api(
+            "CODER_REAUTH_REQUIRED",
+            "the local Coder token does not belong to the linked tenant owner",
+        ));
+    }
     let (base, client_id, client_secret_ref) = configured()?;
     let refresh_ref: Option<String> = sqlx::query_scalar(
         "SELECT coder_refresh_secret_ref FROM coder_user_links WHERE user_id=$1",
@@ -168,6 +258,7 @@ pub async fn start(
         return Err(failure());
     }
     let (base, client_id, _) = configured()?;
+    let browser_base = browser_base(&base)?;
     let state_value = random();
     let browser = random();
     let verifier = random();
@@ -184,7 +275,8 @@ pub async fn start(
         "{}/auth/coder/callback",
         services.auth_config.public_url.trim_end_matches('/')
     );
-    let mut url = url::Url::parse(&format!("{base}/oauth2/authorize")).map_err(|_| failure())?;
+    let mut url =
+        url::Url::parse(&format!("{browser_base}/oauth2/authorize")).map_err(|_| failure())?;
     url.query_pairs_mut().extend_pairs([
         ("client_id", client_id.as_str()),
         ("response_type", "code"),
@@ -230,6 +322,7 @@ pub async fn callback(
     })?);
     let code = query.code.ok_or_else(failure)?;
     let (base, client_id, secret_ref) = configured()?;
+    let deployment = browser_base(&base)?;
     let secret = Zeroizing::new(services.secret_provider.get(&secret_ref).await.map_err(
         |error| {
             tracing::warn!(stage = "client_secret", %error, "Coder account link callback failed");
@@ -329,7 +422,7 @@ pub async fn callback(
     .fetch_optional(services.db.pool())
     .await?;
     if let Some((existing_url, existing_id, _)) = &existing {
-        if existing_url != &base || existing_id != id {
+        if !same_deployment(existing_url, &deployment) || existing_id != id {
             return Err(ManagerError::Conflict(
                 "Coder account already linked; ownership changes require an explicit migration"
                     .into(),
@@ -342,7 +435,7 @@ pub async fn callback(
              WHERE coder_url=$1 AND coder_user_id=$2 AND user_id<>$3
         )",
     )
-    .bind(&base)
+    .bind(&deployment)
     .bind(id)
     .bind(principal.user_id.0)
     .fetch_one(services.db.pool())
@@ -399,10 +492,10 @@ pub async fn callback(
     // the database link unrepairable after a successful OAuth exchange.
     let mut tx = services.db.pool().begin().await?;
     let inserted = sqlx::query("INSERT INTO coder_user_links(user_id,coder_url,coder_user_id,coder_refresh_secret_ref) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-        .bind(principal.user_id.0).bind(&base).bind(id).bind(&refresh_ref).execute(&mut *tx).await?;
+        .bind(principal.user_id.0).bind(&deployment).bind(id).bind(&refresh_ref).execute(&mut *tx).await?;
     if inserted.rows_affected() == 0 {
         let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coder_user_links WHERE user_id=$1 AND coder_url=$2 AND coder_user_id=$3)")
-            .bind(principal.user_id.0).bind(&base).bind(id).fetch_one(&mut *tx).await?;
+            .bind(principal.user_id.0).bind(&deployment).bind(id).fetch_one(&mut *tx).await?;
         if !same {
             // The INSERT was a no-op because (coder_url, coder_user_id) is
             // already claimed by a *different* OpenFlows user. The earlier
@@ -416,9 +509,10 @@ pub async fn callback(
                 "This Coder account is already linked to another OpenFlows user".into(),
             ));
         }
-        sqlx::query("UPDATE coder_user_links SET coder_refresh_secret_ref=$2 WHERE user_id=$1")
+        sqlx::query("UPDATE coder_user_links SET coder_refresh_secret_ref=$2, coder_url=$3 WHERE user_id=$1")
             .bind(principal.user_id.0)
             .bind(&refresh_ref)
+            .bind(&deployment)
             .execute(&mut *tx)
             .await?;
     }

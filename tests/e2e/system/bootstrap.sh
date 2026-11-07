@@ -95,6 +95,12 @@ export TF_VAR_docker_network="${project}_default"
 export TF_VAR_workspace_image="$project-workspace:ci"
 export TF_VAR_github_api_base=http://github-fixture:8080
 export TF_VAR_github_git_base="$GITHUB_GIT_BASE"
+printf '%s' ci-broker-key >"$scratch/broker-key"
+chmod 600 "$scratch/broker-key"
+export TF_VAR_connected_local=true
+export TF_VAR_connected_local_broker_secret_host_path="$scratch/broker-key"
+export TF_VAR_connected_local_helper_host_path="$PWD/scripts/connected-local-github.py"
+export TF_VAR_connected_local_manager_url=http://github-fixture:8080
 export OPENFLOWS_E2E_OAUTH_URL="http://$("${compose[@]}" port oauth 8080)"
 export OPENFLOWS_E2E_ARTIFACTS="$artifacts"
 export OPENFLOWS_E2E_GITHUB_URL="http://$("${compose[@]}" port github-fixture 8080)"

@@ -37,21 +37,13 @@ operating system:
 
 Native copies live in `.dev-binaries/host/`. Docker emulates `linux/amd64` on ARM64.
 
-## GitHub App modes
+## GitHub App
 
-`OPENFLOWS_GITHUB_AUTH_MODE` selects the mode (#466). The epic's `shared` and
-`custom` are named `connected-local` and `self-managed`.
-
-| Mode | Value | Who holds the App secrets | GitHub handled by | Manager comes from |
-| --- | --- | --- | --- | --- |
-| Shared | `connected-local` (default) | The OpenFlows team's App; no App secret on the user's machine | Local Manager | Source: compiled. Compose, binary: the published `openflows-manager` image |
-| Custom | `self-managed` | The user: their own App, credentials only in their `.env` | Coder external auth | Not used |
-
-The Manager is a separate program, not packaged in the `openflows` archives. Its
-image has the same version as the release and is pinned by digest. The first
-usable version is the one after 1.8.1; setup rejects `connected-local` on older
-versions without compiling. When the mode is unset, setup picks `self-managed` if
-App credentials are present or the version has no shared App.
+Local installations use the OpenFlows team's shared App. The local Manager
+handles device authorization and brokers the signed-in user's App token. The
+Manager image has the same version as the release and is pinned by digest.
+Releases 1.8.1 and older lack the required Manager image, so setup requires a
+newer release or a source build.
 
 ## Versions
 
@@ -79,7 +71,7 @@ App credentials are present or the version has no shared App.
 | More than one of `--source`, `--compose`, `--binary` | Rejected before anything starts |
 | `--binary` or `--compose` on an unsupported OS or CPU | Rejected; suggests `--source` |
 | `--source` in a setup kit | Rejected; suggests `--binary` |
-| `--binary` or `--compose` with `connected-local` on 1.8.1 or older | Rejected; suggests a newer version or `self-managed` |
+| `--binary` or `--compose` on 1.8.1 or older | Rejected; suggests a newer version or `--source` |
 | Native programs needed, and the release has no files | Rejected; suggests a newer version or `--source` |
 | Archive that fails checksum verification | Rejected; nothing installed |
 | `OPENFLOWS_VERSION` not in `X.Y.Z` form | Rejected |
