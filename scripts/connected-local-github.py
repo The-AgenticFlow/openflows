@@ -16,6 +16,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 TOKEN_FILE = pathlib.Path("/home/coder/.config/openflows/github-api-token")
 REPOSITORY_FILE = TOKEN_FILE.with_name("repository")
@@ -34,7 +35,10 @@ def repository_name():
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    value = re.sub(r"^(https://github\.com/|git@github\.com:)", "", value)
+    if value.startswith("git@") and ":" in value:
+        value = value.split(":", 1)[1]
+    elif "://" in value:
+        value = urlsplit(value).path.lstrip("/")
     value = value.removesuffix(".git").strip("/")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         raise RuntimeError("connected-local repository is not configured")
