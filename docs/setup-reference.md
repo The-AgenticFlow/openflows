@@ -49,7 +49,7 @@ OpenFlows agents authenticate to your GitHub repos (including private ones) thro
    ```
    http://localhost:7080/external-auth/primary-github/callback
    ```
-2. Under **Permissions → Repository permissions**, set **Checks** to **Read-only**, and **Contents**, **Issues**, **Pull requests**, and **Workflows** to **Read and write**.
+2. Under **Permissions → Repository permissions**, set **Actions**, **Checks**, and **Commit statuses** to **Read-only**, and **Contents**, **Issues**, **Pull requests**, and **Workflows** to **Read and write**.
 3. Create the app, then **Install it** on your org via your install URL (`https://github.com/apps/<your-app-slug>/installations/new`).
 4. Copy three values for [Step 2](#step-2--set-up-env): the **Client ID**, a generated **Client Secret** (shown once), and your **Install URL**.
 
@@ -82,7 +82,7 @@ CODER_EXTERNAL_AUTH_0_TYPE=github
 CODER_EXTERNAL_AUTH_0_CLIENT_ID=<your-github-app-client-id>
 CODER_EXTERNAL_AUTH_0_CLIENT_SECRET=<your-github-app-client-secret>
 CODER_EXTERNAL_AUTH_0_SCOPES=repo
-CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/<your-app-slug>/installations/new
+CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/your-app-slug/installations/new
 ```
 
 > **Set these before starting Docker** — Coder reads them from `.env` at startup, and won't start with empty GitHub App credentials.
@@ -273,6 +273,8 @@ The workspace templates are built into the `openflows` program, so the image's p
 
 Run setup with the other flag. It replaces the programs and pushes their templates. Accept setup's offer to update the workspaces, or run `coder update <workspace>` afterwards.
 
+Switching from the shared App to your own App also removes the local Manager and its database container. The database's data stays, so you can switch back.
+
 ### Host requirements
 
 Linux or macOS, x86-64 or ARM64. Workspaces always run `linux/amd64` (Docker emulates it on ARM64, which is slower), and setup also runs `openflows` on your machine. When the workspaces' programs can't run there (macOS, ARM64, glibc older than 2.34), setup downloads a native copy from the release into `.dev-binaries/host/`. Releases 1.8.1 and older have no files to download, so on those machines they need `--source`.
@@ -451,6 +453,10 @@ Grant the GitHub App **Workflows → Read and write** (this is a *different* per
 
 Grant the GitHub App **Pull requests → Read and write**, then **approve/update the installation** and get a fresh token — see the note in [Step 1](#step-1--create-a-github-app).
 
+### Issue sync fails with 403 ("Resource not accessible by integration")
+
+Grant the GitHub App **Issues → Read and write**, then **approve/update the installation**. Apps created by earlier versions of setup don't have it, nor **Actions**, **Checks**, or **Commit statuses** (all three **Read-only**), which agents use to read CI results.
+
 ### Controller not picking up issues
 
 1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
@@ -518,6 +524,12 @@ The download doesn't match the release's checksum, so nothing was installed. Run
 ### "The OpenFlows programs do not run on this machine"
 
 Your system can't run the release's program for this platform. Install with `--source`.
+
+### Setup says your GitHub App is not installed
+
+With your own App, setup checks that the App is installed on the repo's owner, using the GitHub account you linked in Coder. Install it from `CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL` in `.env`, then re-run setup. If it is installed, check that you linked the right account.
+
+Coder lists the accounts an App is on, not their repositories, so setup can't confirm the repo itself. It prints a link where you can check that the repo is selected.
 
 ### Setup waits at "Connecting owner/repo" and never finishes
 
