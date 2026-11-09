@@ -261,6 +261,9 @@ function setLocalRepositories(repositories) {
   controls();
 }
 async function refreshLocalGithub() {
+  // Returning from GitHub makes this tab visible again. Keep the device code
+  // on screen while polling, instead of replacing it with status guidance.
+  if (localDevice) return;
   try {
     localGithub = await request('/api/v1/local/github');
     $('login').disabled = !!localGithub.enabled;
