@@ -8,7 +8,7 @@ import urllib.error
 from unittest.mock import patch
 
 
-HELPER = pathlib.Path(__file__).resolve().parents[3] / "scripts/connected-local-github.py"
+HELPER = pathlib.Path(__file__).resolve().parents[2] / "scripts/connected-local-github.py"
 
 
 class ConnectedLocalHelperTest(unittest.TestCase):
