@@ -625,7 +625,7 @@ impl TenantProvisionWorker {
         let mut parameters = vec![
             coder_client::types::WorkspaceParameterValue {
                 name: "hosted".into(),
-                value: "true".into(),
+                value: self.hosted_workspace().to_string(),
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "runtime_secret_ref".into(),
@@ -1070,7 +1070,7 @@ impl TenantProvisionWorker {
                 &[
                     coder_client::types::WorkspaceParameterValue {
                         name: "hosted".into(),
-                        value: "true".into(),
+                        value: self.hosted_workspace().to_string(),
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "runtime_secret_ref".into(),
@@ -1632,6 +1632,9 @@ impl TenantProvisionWorker {
         release_id: ReleaseId,
         role: Role,
     ) -> Result<String, ManagerError> {
+        if !self.hosted_workspace() {
+            return Ok(String::new());
+        }
         let (_, roles) = self
             .release_repo
             .get_release(release_id)
@@ -1663,6 +1666,10 @@ impl TenantProvisionWorker {
             ));
         }
         Ok(digest)
+    }
+
+    fn hosted_workspace(&self) -> bool {
+        std::env::var("OPENFLOWS_MODE").as_deref() == Ok("hosted")
     }
 
     async fn record_error(
