@@ -28,7 +28,8 @@ services:
       OPENFLOWS_SECRET_PROVIDER: filesystem
       OPENFLOWS_SECRET_DIR: /run/openflows-local/secrets
       OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR: ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}
-      OPENFLOWS_PROVISIONER_SECRET_DIR: /run/openflows-local/secrets/provisioners
+      OPENFLOWS_PROVISIONER_SECRET_DIR: ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}/secrets/provisioners
+      OPENFLOWS_PROVISIONER_NETWORK: ${COMPOSE_PROJECT_NAME:-openflows}_default
       OPENFLOWS_CODER_HOOK_SECRET_REF: coder-hook-secret
       OPENFLOWS_CODER_OPERATOR_TOKEN_REF: coder-operator-token
       OPENFLOWS_CODER_OAUTH_CLIENT_SECRET_REF: coder-oauth-client-secret
@@ -49,6 +50,7 @@ services:
       REDIS_URL: redis://redis:6379
     volumes:
       - ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}:/run/openflows-local
+      - ${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}:${OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR:?}
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - redis

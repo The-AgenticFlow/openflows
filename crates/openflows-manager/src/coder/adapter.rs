@@ -298,7 +298,7 @@ impl CoderAdapter for RealCoderAdapter {
     }
     async fn verify_capabilities(&self) -> Result<CoderCapabilities, ManagerError> {
         // Version: `GET /api/v2/buildinfo` is unauthenticated. We compare the
-        // reported version prefix against the pinned baseline. Because live
+        // reported version against the minimum supported baseline. Because live
         // deployment access is an operator gate, a failure here maps to
         // an explicit not-ready state, never a privileged fallback.
         let buildinfo: Result<serde_json::Value, _> = {
@@ -313,7 +313,7 @@ impl CoderAdapter for RealCoderAdapter {
             Ok(v) => v
                 .get("version")
                 .and_then(|x| x.as_str())
-                .map(|v| v.starts_with(&self.version_baseline) || v == self.version_baseline)
+                .map(|v| coder_version_meets_baseline(v, &self.version_baseline))
                 .unwrap_or(false),
             Err(_) => false,
         };
@@ -910,6 +910,34 @@ fn daemon_is_online(daemon: &coder_client::CoderProvisionerDaemon, key_name: &st
     daemon.key_name.as_deref() == Some(key_name)
         && matches!(daemon.status.as_deref(), Some("idle" | "busy"))
 }
+
+fn coder_version_meets_baseline(actual: &str, baseline: &str) -> bool {
+    fn parse(value: &str) -> Option<((u64, u64, u64), bool)> {
+        let value = value.strip_prefix('v').unwrap_or(value);
+        let (version, _) = value.split_once('+').unwrap_or((value, ""));
+        let (core, prerelease) = version.split_once('-').unwrap_or((version, ""));
+        let mut parts = core.split('.').map(str::parse::<u64>);
+        let numbers = (
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+            parts.next()?.ok()?,
+        );
+        parts
+            .next()
+            .is_none()
+            .then_some((numbers, !prerelease.is_empty()))
+    }
+    match (parse(actual), parse(baseline)) {
+        (Some((actual, actual_pre)), Some((baseline, baseline_pre))) => {
+            actual > baseline || (actual == baseline && (!actual_pre || baseline_pre))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[path = "adapter_version_tests.rs"]
+mod version_tests;
 
 impl RealCoderAdapter {
     /// Bounded polling of a template version's import job until it succeeds. A failed or timed

@@ -125,6 +125,17 @@ Install the `coder` CLI version offered by the local Coder server and rerun
 setup. Template names are scoped to the default Coder organization; the push
 command selects that organization explicitly.
 
+### Organization provisioning reports a Coder prerequisite
+
+`CODER_VERSION_UNMET` means the Manager cannot confirm its minimum supported
+Coder version. Check the Coder server's `/api/v2/buildinfo` version and the
+Manager's `OPENFLOWS_CODER_VERSION_BASELINE`; newer compatible releases pass
+the minimum-version check. `PROVISIONER_NOT_READY` can mean the Docker
+provisioner cannot mount its secret or resolve Coder. The local Compose file
+mounts the provisioner secret directory at its host path and attaches new
+provisioners to the Compose network. Inspect the provisioner container logs
+for the specific startup failure, then retry the operation.
+
 ### Port already in use
 
 Find the process occupying the reported Redis, Coder, or Manager port. Stop
