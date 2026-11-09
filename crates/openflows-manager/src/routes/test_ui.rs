@@ -140,9 +140,9 @@ function controls() {
   $('tenant-status').disabled = busy || !tenantId;
   const connected = localGithub?.configured && localGithub?.authorized;
   $('install-app').disabled = busy || !localGithub?.installation_url;
-  $('connect-local-github').disabled = busy || !!localDevice || !localGithub?.configured || (connected && signedIn);
-  $('connect-local-github').textContent = connected ? 'Sign in to Manager' : 'Connect GitHub';
-  $('logout-local-github').disabled = busy || !connected;
+  $('connect-local-github').disabled = busy || !!localDevice || !localGithub?.configured;
+  $('connect-local-github').textContent = connected && signedIn ? 'Switch GitHub account' : connected ? 'Sign in to Manager' : 'Connect GitHub';
+  $('logout-local-github').disabled = busy || !connected || !signedIn;
   $('local-repositories').disabled = busy || !connected;
   $('use-local-repository').disabled = busy || !connected || !$('local-repositories').value;
 }
@@ -283,6 +283,11 @@ async function refreshLocalGithub() {
       show('local-github-output', 'No GitHub authorization is saved on this computer.');
       setLocalRepositories([]); controls(); return;
     }
+    if (!signedIn) {
+      show('local-github-help', 'GitHub is connected on this computer. Select Sign in to Manager to create a browser session or switch accounts.');
+      show('local-github-output', 'Sign in to Manager to view repositories available to your GitHub account and the App.');
+      setLocalRepositories([]); controls(); return;
+    }
     show('local-github-help', 'GitHub is connected for this computer. Choose a repository shared by you and the OpenFlows App.');
     const repositories = await request('/api/v1/local/github/repositories');
     setLocalRepositories(repositories);
@@ -310,8 +315,8 @@ async function pollLocalGithub() {
     if (response.status === 'authorized') {
       clearLocalDevicePoll();
       log('GitHub authorization completed.');
-      await refreshLocalGithub();
       await refreshSession();
+      await refreshLocalGithub();
       continueLocalSignIn();
       return;
     }
@@ -523,7 +528,7 @@ for (const id of ['create-org', 'start', 'status', 'me']) {
   const handler = $(id).onclick;
   $(id).onclick = () => action(handler);
 }
-controls(); refreshSession(); refreshLocalGithub();
+controls(); refreshLocalGithub().then(refreshSession).then(refreshLocalGithub);
 </script>
 </body>
 </html>"###,

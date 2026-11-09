@@ -104,6 +104,12 @@ logs when a worker stays in `start_error`.
 Check that the App is installed on that repository and your GitHub account
 can access it. Return to the local console and refresh GitHub access. If the
 user authorization expired or was revoked, use **Connect GitHub** again.
+If GitHub's installation return lands on the hosted Manager with an
+authentication error, the App installation may still have completed. Return
+to the local console and refresh. The installation return is not proof of
+repository access; the local Manager checks GitHub using the signed-in user's
+App token. To change accounts on one computer, select **Switch GitHub account**
+and approve the device code while signed in to the intended GitHub account.
 
 ### GitHub credential request fails during worker startup
 
