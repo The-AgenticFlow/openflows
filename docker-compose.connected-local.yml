@@ -17,6 +17,11 @@ services:
       OPENFLOWS_MODE: local
       OPENFLOWS_RELEASE_NAME: ${OPENFLOWS_RELEASE_NAME:?}
       OPENFLOWS_CONNECTED_LOCAL_ENABLED: "true"
+      TF_VAR_connected_local: "true"
+      TF_VAR_connected_local_broker_secret_host_path: ${TF_VAR_connected_local_broker_secret_host_path:?}
+      TF_VAR_connected_local_helper_host_path: ${TF_VAR_connected_local_helper_host_path:?}
+      TF_VAR_connected_local_manager_url: http://openflows-local-manager:3002
+      TF_VAR_docker_network: ${COMPOSE_PROJECT_NAME:-openflows}_default
       OPENFLOWS_AUTH_ALLOW_LOOPBACK: "true"
       OPENFLOWS_AUTH_COOKIE_SECURE: "false"
       OPENFLOWS_PUBLIC_URL: http://localhost:3002
