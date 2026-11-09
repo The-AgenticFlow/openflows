@@ -441,6 +441,78 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn user_and_app_repository_access_is_rechecked_after_removal() {
+        let app_has_repository = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let visible = app_has_repository.clone();
+        let app = Router::new()
+            .route(
+                "/user/installations",
+                get(|headers: HeaderMap| async move {
+                    let user = headers.get("authorization").unwrap().to_str().unwrap();
+                    let id = if user == "Bearer alice-token" { 1 } else { 2 };
+                    Json(serde_json::json!({"installations": [{
+                        "id": id, "app_id": 10, "app_slug": "openflows-test",
+                        "account": {"id": id, "login": "owner", "type": "User"}
+                    }]}))
+                }),
+            )
+            .route(
+                "/user/installations/{id}/repositories",
+                get(move |Path(id): Path<i64>, headers: HeaderMap| {
+                    let visible = visible.clone();
+                    async move {
+                        let user = headers.get("authorization").unwrap().to_str().unwrap();
+                        let repositories = if id == 1 && user == "Bearer alice-token" && visible.load(Ordering::SeqCst) {
+                            vec![serde_json::json!({"id": 101, "full_name": "alice/private", "private": true})]
+                        } else if id == 2 && user == "Bearer bob-token" {
+                            vec![serde_json::json!({"id": 202, "full_name": "bob/private", "private": true})]
+                        } else {
+                            vec![]
+                        };
+                        Json(serde_json::json!({"repositories": repositories}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let github = LocalGithubAuth::new("public-id".into())
+            .unwrap()
+            .with_api_base(base);
+
+        assert_eq!(
+            github.accessible_repositories("alice-token").await.unwrap()[0].id,
+            101
+        );
+        assert_eq!(
+            github.accessible_repositories("bob-token").await.unwrap()[0].id,
+            202
+        );
+        assert!(github
+            .repository_installation("alice-token", "openflows-test", "bob/private")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(github
+            .repository_installation("bob-token", "openflows-test", "alice/private")
+            .await
+            .unwrap()
+            .is_none());
+        app_has_repository.store(false, Ordering::SeqCst);
+        assert!(github
+            .accessible_repositories("alice-token")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(github
+            .repository_installation("alice-token", "openflows-test", "alice/private")
+            .await
+            .unwrap()
+            .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn device_refresh_and_repository_access_use_public_client_and_user_token() {
         let app = Router::new()
             .route(

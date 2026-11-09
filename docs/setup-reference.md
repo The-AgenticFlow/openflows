@@ -107,7 +107,7 @@ user authorization expired or was revoked, use **Connect GitHub** again.
 
 ### GitHub credential request fails during worker startup
 
-Check the Manager logs for the `/api/v1/runtime/github-credentials` response.
+For local workspaces, check the Manager logs for the `/api/v1/local/github-credential` response.
 A GitHub availability failure is retryable; a revoked authorization requires
 connecting GitHub again. Restart a failed worker through OpenFlows or Coder's
 workspace build path. Its bootstrap token is single use, so restarting only
