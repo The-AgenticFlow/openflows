@@ -54,7 +54,11 @@ in the organization's namespace (`OPENFLOWS_K8S_NAMESPACE_PREFIX`, default
 `create`, `patch` and `delete` on `secrets` in those namespaces and nothing
 cluster-wide, and the namespaces must already exist. Tenants of one
 organization share that namespace, so tenant separation relies on RBAC and on
-each workspace mounting only the Secret it is given. On the `docker`
+each workspace mounting only the Secret it is given. The shipped templates
+bind-mount a host file, so they cannot use that Secret yet: the Manager refuses
+to start on the `kubernetes` backend unless `OPENFLOWS_K8S_RUNTIME_DELIVERY=1`
+is set, and that should only be set with a template that mounts the Secret's
+`runtime.json` key at `/run/openflows/runtime.json`. On the `docker`
 backend with a non-filesystem store, set an absolute
 `OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
 Manager refuses to start without it.

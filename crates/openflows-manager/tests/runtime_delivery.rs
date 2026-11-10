@@ -9,13 +9,19 @@ use common::{
     insert_connection, insert_organization_with_owner, insert_repository, insert_running_tenant,
     insert_running_workspace, insert_user, TestDb,
 };
+use openflows_manager::coder::{MockCoderAdapter, MockCoderConfig};
 use openflows_manager::error::ManagerError;
 use openflows_manager::id::{OrganizationId, TenantId, WorkspaceId};
+use openflows_manager::operations;
+use openflows_manager::provisioning::TenantProvisionWorker;
+use openflows_manager::quotas::TenantQuotaService;
+use openflows_manager::repositories::OrganizationsRepository;
 use openflows_manager::runtime::delivery::{DeliveryTarget, SecretDelivery};
 use openflows_manager::runtime::repository::RuntimeRepository;
 use openflows_manager::runtime::tenant::TenantRuntimeRepository;
 use openflows_manager::runtime::RuntimeCredentialService;
 use openflows_manager::secrets::{InMemorySecretProvider, SecretProvider};
+use openflows_manager::templates::repository::ReleaseRepository;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -309,4 +315,76 @@ async fn deleting_one_workspace_retires_its_copy_and_store_object() {
         .retire_workspace_secret(ctx.org, ctx.tenant, ctx.workspace)
         .await
         .unwrap();
+}
+
+/// The worker needs the delivery-wired repositories, not fresh ones, so the
+/// retire step is observable through `RecordingDelivery`.
+fn worker(ctx: &Ctx) -> TenantProvisionWorker {
+    let pool = ctx._db.pool().clone();
+    TenantProvisionWorker::new(
+        pool.clone(),
+        OrganizationsRepository::new(pool.clone()),
+        TenantQuotaService::new(pool.clone(), Default::default()),
+        ctx.tenants.clone(),
+        ctx.creds.clone(),
+        ReleaseRepository::new(pool),
+        Arc::new(MockCoderAdapter::new(MockCoderConfig::default())),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn deleting_a_workspace_that_never_got_a_coder_id_still_retires_its_secrets() {
+    let ctx = setup().await;
+    let pool = ctx._db.pool().clone();
+    // `insert_running_workspace` leaves coder_workspace_id NULL, which is what a
+    // failed Coder creation leaves behind after the bundle was already delivered.
+    prepare(&ctx, ctx.tenant, ctx.workspace).await;
+    let store_ref: String =
+        sqlx::query_scalar("SELECT runtime_secret_ref FROM workspaces WHERE id = $1")
+            .bind(ctx.workspace.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(ctx.delivery.bundle(ctx.workspace).is_some());
+    sqlx::query("UPDATE workspaces SET desired_state = 'deleting' WHERE id = $1")
+        .bind(ctx.workspace.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let op = operations::create(
+        &pool,
+        &operations::NewOperation {
+            organization_id: ctx.org,
+            resource_type: "workspace".into(),
+            resource_id: Some(ctx.workspace.0),
+            kind: "workspace.delete".into(),
+            idempotency_ref: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    worker(&ctx).run_once().await.unwrap();
+
+    assert!(
+        ctx.delivery.bundle(ctx.workspace).is_none(),
+        "the delivered copy must not outlive the workspace"
+    );
+    assert!(
+        ctx.provider.get(&store_ref).await.is_err(),
+        "the stored bundle must not outlive the workspace"
+    );
+    let (observed, op_state): (String, String) = sqlx::query_as(
+        "SELECT w.observed_state, o.state FROM workspaces w JOIN operations o ON o.resource_id = w.id
+          WHERE o.id = $1",
+    )
+    .bind(op.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (observed.as_str(), op_state.as_str()),
+        ("deleted", "succeeded")
+    );
 }

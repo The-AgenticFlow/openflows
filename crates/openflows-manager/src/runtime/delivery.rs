@@ -19,6 +19,11 @@ pub const NAMESPACE_PREFIX_ENV: &str = "OPENFLOWS_K8S_NAMESPACE_PREFIX";
 const DEFAULT_NAMESPACE_PREFIX: &str = "openflows-";
 /// Key of the bundle inside the Secret; mounted as `runtime.json`.
 pub const SECRET_KEY: &str = "runtime.json";
+/// Where a workspace runtime reads its bundle, on both delivery backends.
+pub const RUNTIME_BUNDLE_PATH: &str = "/run/openflows/runtime.json";
+/// Opt-in for Kubernetes delivery. The handle is a Secret name, so a template
+/// that bind-mounts a host path gets nothing until it mounts the Secret instead.
+pub const K8S_DELIVERY_ENV: &str = "OPENFLOWS_K8S_RUNTIME_DELIVERY";
 const FIELD_MANAGER: &str = "openflows-manager";
 
 /// The workspace a bundle is delivered to; names and labels derive from these IDs only.
@@ -138,27 +143,32 @@ impl SecretDelivery for FileDelivery {
     }
 }
 
-// Write to a sibling file then rename, so a reader never sees a partial bundle.
+// Write the bundle in place. A workspace bind-mounts this single file, and a
+// rename would swap the inode under a running container, which then keeps
+// reading the old bytes after a rotation. The filesystem store writes in place
+// for the same reason.
 fn write_private(dest: &Path, mode: u32, bundle: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    // Unique per call so concurrent delivers to one workspace cannot collide.
-    let tmp = dest.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    let _ = std::fs::remove_file(&tmp);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .mode(0o600)
-        .open(&tmp)?;
+        .open(dest)?;
     file.write_all(bundle)?;
     file.sync_all()?;
     // Wider than 0600 only when the operator opts in for the workspace user.
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    std::fs::rename(&tmp, dest)
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode))
 }
 
 /// One labelled Secret per workspace in its organization's namespace. The Coder
 /// provisioner cannot read Secrets; it is handed only the Secret name.
+///
+/// Contract: the workspace template must mount that Secret's `runtime.json` key
+/// at [`RUNTIME_BUNDLE_PATH`]. A template that passes the name to a host-path
+/// mount starts without a bundle, so this adapter stays behind
+/// [`K8S_DELIVERY_ENV`] until a template does the mount.
 #[derive(Clone)]
 pub struct KubernetesSecretDelivery {
     client: Client,
@@ -273,6 +283,7 @@ pub async fn resolve_delivery(
     }
     match (backend, dir) {
         ("kubernetes", _) => {
+            kubernetes_opt_in(std::env::var(K8S_DELIVERY_ENV).ok().as_deref())?;
             let prefix = std::env::var(NAMESPACE_PREFIX_ENV)
                 .unwrap_or_else(|_| DEFAULT_NAMESPACE_PREFIX.to_string());
             Ok(std::sync::Arc::new(
@@ -280,16 +291,9 @@ pub async fn resolve_delivery(
             ))
         }
         (_, Some(dir)) => {
-            let mode = match std::env::var("OPENFLOWS_SECRET_FILE_MODE") {
-                Ok(raw) => {
-                    u32::from_str_radix(raw.trim().trim_start_matches("0o"), 8).map_err(|_| {
-                        ManagerError::Config(
-                            "OPENFLOWS_SECRET_FILE_MODE must be an octal mode such as 0644".into(),
-                        )
-                    })?
-                }
-                Err(_) => 0o600,
-            };
+            let mode = crate::secrets::file_mode_from_env()
+                .map_err(|e| ManagerError::Config(e.to_string()))?
+                .unwrap_or(crate::secrets::DEFAULT_SECRET_FILE_MODE);
             Ok(std::sync::Arc::new(FileDelivery::new(dir, mode)?))
         }
         (_, None)
@@ -301,6 +305,20 @@ pub async fn resolve_delivery(
         _ => Err(ManagerError::Config(format!(
             "secret provider '{secret_provider}' with the docker backend needs {DELIVERY_DIR_ENV} \
              (an absolute host directory for per-workspace bundle files)"
+        ))),
+    }
+}
+
+/// Kubernetes delivery is refused unless the deployment asked for it, because
+/// nothing in this repository mounts the Secret yet.
+fn kubernetes_opt_in(flag: Option<&str>) -> Result<(), ManagerError> {
+    match flag.map(str::trim) {
+        Some("1") | Some("true") => Ok(()),
+        _ => Err(ManagerError::Config(format!(
+            "runtime secret delivery on the kubernetes backend needs {K8S_DELIVERY_ENV}=1 and a \
+             workspace template that mounts the delivered Secret at {RUNTIME_BUNDLE_PATH}; the \
+             shipped templates bind-mount a host file, so they would treat the Secret name as a \
+             path and start without a bundle"
         ))),
     }
 }
@@ -351,6 +369,41 @@ mod tests {
         d.remove(&t).await.unwrap();
         d.remove(&t).await.unwrap();
         assert!(!Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn redelivery_keeps_the_inode_a_live_mount_reads() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = FileDelivery::new(dir.path(), 0o600).unwrap();
+        let t = target();
+        let path = d.deliver(&t, "arn:aws:x", b"first").await.unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        // A workspace mounts this one file and keeps it open, so a redelivery
+        // has to write through the same inode or the container sees stale bytes.
+        let mut mounted = std::fs::File::open(&path).unwrap();
+        d.deliver(&t, "arn:aws:x", b"second").await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "inode moved"
+        );
+        let mut seen = String::new();
+        mounted.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "second", "the existing mount reads the new bundle");
+    }
+
+    #[test]
+    fn kubernetes_delivery_needs_an_explicit_opt_in() {
+        assert!(kubernetes_opt_in(Some("1")).is_ok());
+        assert!(kubernetes_opt_in(Some(" true ")).is_ok());
+        assert!(kubernetes_opt_in(Some("0")).is_err());
+        let message = kubernetes_opt_in(None).unwrap_err().to_string();
+        assert!(
+            message.contains(K8S_DELIVERY_ENV) && message.contains(RUNTIME_BUNDLE_PATH),
+            "the failure names the flag and the mount path: {message}"
+        );
     }
 
     #[tokio::test]

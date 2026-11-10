@@ -15,6 +15,7 @@ pub mod release_provider;
 pub mod source;
 pub mod tenant_worker;
 pub mod worker;
+pub mod workspace_lifecycle;
 
 pub use release_provider::{ReleaseProvider, ReleaseProviderError};
 pub use source::{ReleaseCache, ReleaseSource, ResolvedRelease};
