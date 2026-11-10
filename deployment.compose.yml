@@ -88,6 +88,17 @@ services:
       timeout: 3s
       retries: 3
     restart: unless-stopped
+  # The Console UI, pulled from GHCR. It proxies Manager's /api/v1 and /auth
+  # through itself, so it only needs the host Manager's URL at runtime. The
+  # Manager itself runs on the host (see the comment on runtime-relay), so the
+  # container reaches it via host.docker.internal (host-gateway on Linux).
+  console:
+    image: ghcr.io/the-agenticflow/openflows-console:${CONSOLE_IMAGE_TAG:-develop}
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      OPENFLOWS_MANAGER_URL: ${OPENFLOWS_MANAGER_URL:-http://host.docker.internal:3002}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
 secrets:
   coder_github_secret:
     file: ${OPENFLOWS_SECRET_DIR:-.openflows/secrets}/coder-github-client-secret
