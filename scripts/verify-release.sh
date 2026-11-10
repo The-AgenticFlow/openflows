@@ -107,8 +107,10 @@ verify_archive() {
     if [ "$how" = alpine ] && ! docker pull -q "$ALPINE_IMAGE" >/dev/null 2>&1; then
         fail "could not pull ${ALPINE_IMAGE}"; rm -rf -- "$work"; return
     fi
-    out="$(run_program "$how" "$dir" openflows --version 2>&1)"
-    if [ "$out" = "openflows ${version}" ]; then pass "openflows --version prints ${version} (${how})"
+    local rc=0
+    out="$(run_program "$how" "$dir" openflows --version 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then fail "openflows --version exited with status ${rc} (${how})"
+    elif [ "$out" = "openflows ${version}" ]; then pass "openflows --version prints ${version} (${how})"
     else fail "openflows --version printed '${out}', not 'openflows ${version}' (${how})"; fi
     for program in openflows-doctor openflows-harness; do
         if run_program "$how" "$dir" "$program" --help >/dev/null 2>&1; then pass "${program} runs (${how})"
@@ -117,11 +119,25 @@ verify_archive() {
     rm -rf -- "$work"
 }
 
-# Files setup.sh reads from a setup kit, besides each Compose file it names.
-KIT_FILES="RELEASE_VERSION .env.example scripts/setup.sh scripts/setup-release.sh scripts/prod.sh scripts/connected-local-github.py"
+# Files setup.sh reads from a setup kit. The scripts it sources or runs, and the Compose
+# files they name, are found by reading setup.sh, so a file moved between scripts is still checked.
+KIT_FILES="RELEASE_VERSION .env.example scripts/setup.sh scripts/connected-local-github.py"
+
+# kit_scripts DIR sourced|run: the scripts setup.sh loads with `source`, or runs as programs.
+kit_scripts() {
+    local line name
+    grep -Eo '(source )?"\$\{SCRIPT_DIR\}/[A-Za-z0-9_-][A-Za-z0-9._-]*\.(sh|py)"' "${1}/scripts/setup.sh" 2>/dev/null | sort -u | while read -r line; do
+        name="${line##*/}"; name="${name%\"}"
+        case "$2:$line" in
+            sourced:source*) echo "scripts/${name}" ;;
+            run:source*) ;;
+            run:*) echo "scripts/${name}" ;;
+        esac
+    done
+}
 
 verify_kit() {
-    local file="$1" version="$2" work dir path kit_version compose ref
+    local file="$1" version="$2" work dir path kit_version compose ref sourced
     SUBJECT="$(basename "$file")"
     if [ "$SUBJECT" != "openflows-${version}-setup.tar.gz" ]; then
         fail "expected the name openflows-${version}-setup.tar.gz"
@@ -136,20 +152,33 @@ verify_kit() {
     for path in $KIT_FILES; do
         [ -f "${dir}/${path}" ] || fail "missing ${path}"
     done
+    sourced="$(kit_scripts "$dir" sourced)"
+    for path in $sourced; do
+        [ -f "${dir}/${path}" ] || fail "missing ${path}, which setup.sh sources"
+    done
+    # Users start setup.sh themselves, and setup.sh runs the others as programs: each needs
+    # its executable bit, or the step stops with "permission denied".
+    for path in scripts/setup.sh $(kit_scripts "$dir" run); do
+        if [ ! -f "${dir}/${path}" ]; then fail "missing ${path}, which setup.sh runs"
+        elif [ ! -x "${dir}/${path}" ]; then fail "${path} is not executable"
+        fi
+    done
     kit_version="$(cat "${dir}/RELEASE_VERSION" 2>/dev/null)"
     if [ "$kit_version" = "$version" ]; then pass "RELEASE_VERSION is ${version}"
     else fail "RELEASE_VERSION is '${kit_version}', not ${version}"; fi
 
     # Every Compose file setup.sh can select, and every ./deploy path those files mount.
     # docker-compose.override.yml is the user's own optional file, not part of a release.
+    # shellcheck disable=SC2086 # $sourced is a list of paths without spaces
     while read -r compose; do
         [ -n "$compose" ] || continue
-        if [ ! -f "${dir}/${compose}" ]; then fail "missing ${compose}, which setup.sh uses"; continue; fi
+        if [ ! -f "${dir}/${compose}" ]; then fail "missing ${compose}, which setup uses"; continue; fi
         while read -r ref; do
             [ -z "$ref" ] || [ -e "${dir}/${ref#./}" ] || fail "missing ${ref#./}, which ${compose} mounts"
         done < <(grep -Eo '\./deploy/[A-Za-z0-9._/-]+' "${dir}/${compose}" | sort -u)
-    done < <(grep -Eho 'docker-compose[A-Za-z0-9.-]*\.yml' "${dir}/scripts/setup.sh" 2>/dev/null | grep -v '^docker-compose\.override\.' | sort -u)
-    for path in scripts/setup.sh scripts/setup-release.sh scripts/prod.sh; do
+    done < <(cd "$dir" && grep -Eho 'docker-compose[A-Za-z0-9.-]*\.yml' scripts/setup.sh $sourced 2>/dev/null \
+                | grep -v '^docker-compose\.override\.' | sort -u)
+    for path in scripts/setup.sh $sourced $(kit_scripts "$dir" run); do
         [ -f "${dir}/${path}" ] || continue
         bash -n "${dir}/${path}" 2>/dev/null || fail "${path} has a syntax error"
     done

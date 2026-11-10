@@ -37,15 +37,15 @@ export PATH="${WORK}/bin:${PATH}"
 
 GNU_TYPE='ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked'
 
-# archive VERSION TARGET [TYPE] [GLIBC] [PRINTED_VERSION]: build a fake archive and its checksum.
+# archive VERSION TARGET [TYPE] [GLIBC] [PRINTED_VERSION] [EXIT_STATUS]: build a fake archive and its checksum.
 archive() {
-    local version="$1" target="$2" type="${3:-$GNU_TYPE}" glibc="${4:-2.17}" printed="${5:-$1}"
+    local version="$1" target="$2" type="${3:-$GNU_TYPE}" glibc="${4:-2.17}" printed="${5:-$1}" status="${6:-0}"
     local name="openflows-${version}-${target}" dir bin
     dir="${WORK}/build/${name}"
     rm -rf -- "$dir"; mkdir -p "$dir"
     for bin in openflows openflows-doctor openflows-harness; do
         printf '#!/bin/sh\n# type=%s glibc=%s\n' "$type" "$glibc" >"${dir}/${bin}"
-        if [ "$bin" = openflows ]; then printf 'echo "openflows %s"\n' "$printed" >>"${dir}/${bin}"; fi
+        if [ "$bin" = openflows ]; then printf 'echo "openflows %s"\nexit %s\n' "$printed" "$status" >>"${dir}/${bin}"; fi
         chmod +x "${dir}/${bin}"
     done
     mkdir -p "${WORK}/dist"
@@ -86,6 +86,9 @@ expect_result "a checksum file naming another file fails" 1 "checksum file names
 f="$(archive 2.0.4 "$T" "$GNU_TYPE" 2.17 2.0.3)"
 expect_result "programs from another version fail" 1 "printed 'openflows 2.0.3', not 'openflows 2.0.4'" bash "$SCRIPT" archive "$f" 2.0.4 "$T"
 
+f="$(archive 2.0.41 "$T" "$GNU_TYPE" 2.17 2.0.41 1)"
+expect_result "a program that prints the version but fails" 1 "openflows --version exited with status 1" bash "$SCRIPT" archive "$f" 2.0.41 "$T"
+
 f="$(archive 2.0.5 "$T" 'ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked')"
 expect_result "programs for another CPU fail" 1 "openflows is not built for ${T}" bash "$SCRIPT" archive "$f" 2.0.5 "$T"
 
@@ -111,12 +114,17 @@ expect_result "an unknown target fails" 1 "unknown target riscv64" bash "$SCRIPT
 
 echo "Setup kit"
 # kit VERSION: a setup kit packed the way release-assets.yml packs it, from this checkout.
+# The paths release-assets.yml packs into the kit, read from its `tar` command so this test
+# follows the workflow. RELEASE_VERSION is written by the workflow, so it is left out here.
+KIT_PATHS="$(awk '/-setup\.tar\.gz" --transform/ {on=1; next} on {print; if ($0 !~ /\\$/) exit}' \
+    "${ROOT}/.github/workflows/release-assets.yml" | sed 's/\\$//' | tr -s ' \n' ' ' | sed 's/RELEASE_VERSION//')"
+[ -n "$KIT_PATHS" ] || { echo "could not read the kit's files from release-assets.yml"; exit 1; }
 kit() {
     local version="$1" tag="openflows-${1}" dir
     dir="${WORK}/kit/${tag}"
     rm -rf -- "${WORK}/kit"; mkdir -p "$dir"
-    (cd "$ROOT" && tar -cf - .env.example deploy/local docker-compose*.yml \
-        scripts/setup.sh scripts/setup-release.sh scripts/prod.sh scripts/connected-local-github.py) | tar -xf - -C "$dir"
+    # shellcheck disable=SC2086 # the paths include a glob, as in the workflow
+    (cd "$ROOT" && tar -cf - $KIT_PATHS) | tar -xf - -C "$dir"
     printf '%s\n' "$version" >"${dir}/RELEASE_VERSION"
 }
 pack_kit() { # pack_kit VERSION: archive the kit folder and write its checksum
@@ -135,13 +143,22 @@ kit 3.0.2; rm "${WORK}/kit/openflows-3.0.2/scripts/setup-release.sh"
 expect_result "a kit missing a script fails" 1 "missing scripts/setup-release.sh" bash "$SCRIPT" kit "$(pack_kit 3.0.2)" 3.0.2
 
 kit 3.0.3; rm "${WORK}/kit/openflows-3.0.3/docker-compose.manager-image.yml"
-expect_result "a kit missing a Compose file setup.sh uses fails" 1 "missing docker-compose.manager-image.yml, which setup.sh uses" bash "$SCRIPT" kit "$(pack_kit 3.0.3)" 3.0.3
+expect_result "a kit missing a Compose file setup uses fails" 1 "missing docker-compose.manager-image.yml, which setup uses" bash "$SCRIPT" kit "$(pack_kit 3.0.3)" 3.0.3
 
 kit 3.0.4; rm -r "${WORK}/kit/openflows-3.0.4/deploy"
 expect_result "a kit missing files Compose mounts fails" 1 "which docker-compose.yml mounts" bash "$SCRIPT" kit "$(pack_kit 3.0.4)" 3.0.4
 
 kit 3.0.5; printf 'if then\n' >>"${WORK}/kit/openflows-3.0.5/scripts/prod.sh"
 expect_result "a kit with a broken script fails" 1 "scripts/prod.sh has a syntax error" bash "$SCRIPT" kit "$(pack_kit 3.0.5)" 3.0.5
+
+kit 3.0.7; rm "${WORK}/kit/openflows-3.0.7/scripts/setup-docker.sh"
+expect_result "a kit missing a script setup.sh sources fails" 1 "missing scripts/setup-docker.sh, which setup.sh sources" bash "$SCRIPT" kit "$(pack_kit 3.0.7)" 3.0.7
+
+kit 3.0.8; chmod -x "${WORK}/kit/openflows-3.0.8/scripts/prod.sh"
+expect_result "a kit whose prod.sh is not executable fails" 1 "scripts/prod.sh is not executable" bash "$SCRIPT" kit "$(pack_kit 3.0.8)" 3.0.8
+
+kit 3.0.9; chmod -x "${WORK}/kit/openflows-3.0.9/scripts/setup.sh"
+expect_result "a kit whose setup.sh is not executable fails" 1 "scripts/setup.sh is not executable" bash "$SCRIPT" kit "$(pack_kit 3.0.9)" 3.0.9
 
 kit 3.0.6; f="$(pack_kit 3.0.6)"; printf 'x' >>"$f"
 expect_result "a changed kit fails its checksum" 1 "checksum does not match" bash "$SCRIPT" kit "$f" 3.0.6
