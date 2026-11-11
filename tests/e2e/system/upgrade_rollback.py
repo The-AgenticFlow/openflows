@@ -8,13 +8,16 @@ setup kit (the files release-assets.yml packs), not from this checkout.
 
 1. Install 9.0.0, create a tenant, record Redis state.
 2. Restart Redis, PostgreSQL and Coder; state, workspace and controller survive.
-3. Upgrade to 9.1.0 without consent: programs and templates change, the running
-   workspace keeps the old ones, and setup reports the upgrade incomplete (exit 3).
-4. Re-run with --update-workspaces: the workspace runs 9.1.0, nothing is pending.
-5. Upgrades that fail (missing release, bad checksum) leave 9.1.0 running.
-6. Roll back to 9.0.0 with the workspace stopped: it moves to the 9.0.0 templates and
-   stays stopped; started, it runs 9.0.0.
-7. Restart again; state survives the round trip.
+3. Upgrade to 9.1.0 with the workspace running: programs and templates change, the
+   workspace keeps 9.0.0 and setup reports it pending (the condition for exit 3).
+   Stopped, setup moves it to the 9.1.0 templates and leaves it stopped; started, it
+   runs 9.1.0.
+4. Upgrades that fail (missing release, bad checksum) leave 9.1.0 running. Restart.
+5. Roll back to 9.0.0 with the workspace running: the same pending report; then
+   --update-workspaces updates it and it runs 9.0.0.
+6. Restart again; state survives the round trip.
+
+Every step adds versions, template versions and Redis state to upgrade-evidence.json.
 """
 import functools
 import hashlib
@@ -205,6 +208,25 @@ def running_programs(ssh_name):
     return out.split()[0]
 
 
+def template_versions(organization):
+    return {t['name']: t['active_version_id']
+        for t in pb.coder(f"/organizations/{organization['id']}/templates")}
+
+
+def record(label, organization, name):
+    """Save versions, template versions and Redis state for this step (#528 evidence)."""
+    w = workspace(name)
+    evidence.setdefault('states', []).append({
+        'after': label,
+        'installed_release': (BIN / 'RELEASE').read_text().strip(),
+        'template_versions': template_versions(organization),
+        'workspace': {'status': w['latest_build']['status'], 'outdated': w['outdated'],
+                      'template_version_id': w['latest_build']['template_version_id']},
+        'redis': {'marker': redis('GET', MARKER_KEY), 'persistent_keys': persistent_keys()},
+    })
+    (ARTIFACTS / 'upgrade-evidence.json').write_text(json.dumps(evidence, indent=2))
+
+
 def check_state(marker, keys, ssh_name, label):
     assert redis('GET', MARKER_KEY) == marker, f'Redis marker lost after {label}'
     missing = sorted(set(keys) - set(persistent_keys()))
@@ -223,6 +245,53 @@ def wait_build(name, status):
     return pb.wait(f'{name} did not reach {status}', done, 600)
 
 
+def move(target, programs, previous, finish, ctx):
+    """Upgrade or roll back to TARGET with the workspace running, then finish it.
+
+    finish='stopped': stop the workspace and re-run setup, which moves it to the new
+    templates without starting it. finish='update': re-run with --update-workspaces.
+    """
+    organization, name, ssh_name, marker, keys = ctx
+    label = 'upgrade' if target == NEW else 'rollback'
+    before = template_versions(organization)
+    run_setup(target, 'stage_release; stage_bootstrap; offer_update', f'setup-{label}.log')
+    assert installed() == {'release': target, **programs}, installed()
+    after = template_versions(organization)
+    assert all(after[t] != v for t, v in before.items()), f'templates were not replaced on {label}'
+    assert workspace(name)['outdated'] is True, f'{name} is not outdated after the {label}'
+    pending = run_setup(target, 'offer_update', f'setup-{label}-pending.log')[1]
+    assert pending and name in pending.split(), f'setup did not report {name} pending: {pending!r}'
+    assert running_programs(ssh_name) == previous['openflows'], f'{name} changed programs without consent'
+    check_state(marker, keys, ssh_name, f'the {label} to {target} (workspace not yet updated)')
+    record(f'{label} to {target}, workspace still running the old version', organization, name)
+    step(f'{label.capitalize()} to {target}: programs and all 5 templates replaced; {name} still runs the old '
+         f'programs and setup reports "{pending}" pending, the condition for setup.sh to exit with status 3.')
+
+    if finish == 'stopped':
+        pb.coder(f"/workspaces/{workspace(name)['id']}/builds", {'transition': 'stop'})
+        wait_build(name, 'stopped')
+        pending = run_setup(target, 'stage_bootstrap; offer_update', f'setup-{label}-stopped.log')[1]
+        stopped = workspace(name)
+        assert stopped['latest_build']['status'] == 'stopped', f'setup started the stopped {name}'
+        assert stopped['outdated'] is False, f'the stopped {name} did not move to the {target} templates'
+        assert pending == '', f'still pending after the {label}: {pending!r}'
+        record(f'{label} to {target}, stopped workspace moved', organization, name)
+        step(f'Stopped {name}; setup moved it to the {target} templates, left it stopped, nothing pending.')
+        pb.coder(f"/workspaces/{stopped['id']}/builds", {'transition': 'start'})
+    else:
+        pending = run_setup(target, 'stage_bootstrap; offer_update', f'setup-{label}-update.log',
+            update_workspaces=True)[1]
+        assert pending == '', f'still pending after --update-workspaces: {pending!r}'
+        step(f'With --update-workspaces, setup updated {name} to the {target} templates; nothing pending.')
+    wait_build(name, 'running')
+    assert workspace(name)['outdated'] is False
+    controller_healthy(ssh_name)
+    assert running_programs(ssh_name) == programs['openflows'], f'{name} does not run {target}'
+    check_state(marker, keys, ssh_name, f'the {label} to {target}')
+    record(f'{label} to {target} complete', organization, name)
+    step(f'{name} runs {target}; tenant and Redis state kept.')
+
+
 def run():
     make_kit()
     os.environ['OPENFLOWS_RELEASE_BASE_URL'] = serve_releases()
@@ -237,7 +306,7 @@ def run():
     run_setup(OLD, 'stage_release', 'setup-install.log')
     assert installed() == {'release': OLD, **old}, installed()
     os.environ['PATH'] = f'{BIN}:{os.environ["PATH"]}'
-    ws, templates, organization, ssh_name = pb.setup_tenant()
+    ws, _, organization, ssh_name = pb.setup_tenant()
     name = ws['name']
     set_env_value('CODER_URL', pb.CODER)
     set_env_value('CODER_SESSION_TOKEN', os.environ['CODER_SESSION_TOKEN'])
@@ -247,65 +316,39 @@ def run():
     redis('SET', MARKER_KEY, marker)
     keys = persistent_keys()
     assert MARKER_KEY in keys
+    ctx = (organization, name, ssh_name, marker, keys)
+    record(f'install of {OLD}', organization, name)
     step(f'Installed {OLD} from the setup kit; {name} runs its programs; {len(keys)} persistent Redis keys recorded.')
 
     # 2. Restart the stack.
     restart_stack('install')
     check_state(marker, keys, ssh_name, 'the first restart')
+    record('first restart', organization, name)
 
-    # 3. Upgrade without consent: setup stops short and reports it.
-    versions_before = {t['name']: t['active_version_id'] for t in templates}
-    code, pending = run_setup(NEW, 'stage_release; stage_bootstrap; offer_update', 'setup-upgrade.log')
-    assert installed() == {'release': NEW, **new}, installed()
-    versions_after = {t['name']: t['active_version_id'] for t in pb.coder(f"/organizations/{organization['id']}/templates")}
-    assert all(versions_after[t] != v for t, v in versions_before.items()), 'templates were not updated'
-    assert workspace(name)['outdated'] is True
-    assert pending and name in pending.split(), f'setup did not report {name} pending: {pending!r}'
-    assert running_programs(ssh_name) == old['openflows'], 'the running workspace changed programs without consent'
-    step(f'Upgrade to {NEW} without consent: programs and 5 templates replaced, {name} still runs {OLD}, '
-         f'setup reports "{pending}" pending (exit 3).')
+    # 3. Upgrade; the stopped workspace moves to the new templates.
+    move(NEW, new, old, 'stopped', ctx)
 
-    # 4. Finish the upgrade.
-    code, pending = run_setup(NEW, 'stage_bootstrap; offer_update', 'setup-upgrade-finish.log', update_workspaces=True)
-    assert pending == '', f'upgrade still pending: {pending!r}'
-    wait_build(name, 'running')
-    assert workspace(name)['outdated'] is False
-    controller_healthy(ssh_name)
-    assert running_programs(ssh_name) == new['openflows'], f'{name} does not run {NEW}'
-    check_state(marker, keys, ssh_name, f'the upgrade to {NEW}')
-    step(f'With --update-workspaces, {name} moved to the {NEW} templates and runs {NEW}; nothing pending (exit 0).')
-
-    # 5. Failed upgrades keep 9.1.0.
+    # 4. Failed upgrades keep 9.1.0.
     for version, reason in (('9.2.0', 'missing release'), ('9.2.1', 'bad checksum')):
         code, _ = run_setup(version, 'stage_release', f'setup-failed-{version}.log', check=False)
         assert code != 0, f'setup accepted the {reason}'
         assert installed() == {'release': NEW, **new}, f'the {reason} changed the installed programs'
         assert running_programs(ssh_name) == new['openflows']
-        step(f'Upgrade to {version} ({reason}) stopped with exit {code}; {NEW} still installed and running.')
+        record(f'failed upgrade to {version} ({reason})', organization, name)
+        step(f'Upgrade to {version} ({reason}) stopped with status {code}; {NEW} still installed and running.')
     set_env_value('OPENFLOWS_VERSION', NEW)
+    restart_stack('upgrade')
+    check_state(marker, keys, ssh_name, 'the restart after the upgrade')
+    record('restart after the upgrade', organization, name)
 
-    # 6. Roll back with the workspace stopped.
-    pb.coder(f"/workspaces/{workspace(name)['id']}/builds", {'transition': 'stop'})
-    wait_build(name, 'stopped')
-    code, pending = run_setup(OLD, 'stage_release; stage_bootstrap; offer_update', 'setup-rollback.log')
-    assert installed() == {'release': OLD, **old}, installed()
-    stopped = workspace(name)
-    assert stopped['latest_build']['status'] == 'stopped', 'rollback started a stopped workspace'
-    assert stopped['outdated'] is False, 'the stopped workspace was not moved to the rolled-back templates'
-    assert pending == '', f'rollback reported pending workspaces: {pending!r}'
-    pb.coder(f"/workspaces/{stopped['id']}/builds", {'transition': 'start'})
-    wait_build(name, 'running')
-    controller_healthy(ssh_name)
-    assert running_programs(ssh_name) == old['openflows'], f'{name} does not run {OLD} after rollback'
-    check_state(marker, keys, ssh_name, f'the rollback to {OLD}')
-    step(f'Rolled back to {OLD} with {name} stopped: it moved to the rolled-back templates, stayed stopped, '
-         f'and runs {OLD} once started.')
+    # 5. Roll back; --update-workspaces updates the running workspace.
+    move(OLD, old, new, 'update', ctx)
 
-    # 7. Restart after the round trip.
+    # 6. Restart after the round trip.
     restart_stack('rollback')
     check_state(marker, keys, ssh_name, 'the final restart')
+    record('final restart', organization, name)
 
-    (ARTIFACTS / 'upgrade-evidence.json').write_text(json.dumps(evidence, indent=2))
     pb.coder(f"/workspaces/{workspace(name)['id']}/builds", {'transition': 'delete'})
     print('Upgrade, restart, failed upgrade and rollback of a running stack passed.', flush=True)
 

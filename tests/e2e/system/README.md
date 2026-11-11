@@ -156,13 +156,14 @@ bash tests/e2e/system/bootstrap.sh upgrade
 
 1. Install 9.0.0, create a tenant and record a Redis marker and every Redis key without an expiry.
 2. Restart Redis, PostgreSQL and Coder. The marker, the keys, the workspace and its controller survive.
-3. Upgrade to 9.1.0 without consent. The programs and all five templates change, the running workspace keeps 9.0.0, and setup reports it pending, which is what makes `setup.sh` exit with status 3.
-4. Re-run with `--update-workspaces`. The workspace is updated and runs 9.1.0; nothing is pending.
-5. Upgrade to a release with no files, then to one with a bad checksum. Both stop, and 9.1.0 stays installed and running.
-6. Stop the workspace and roll back to 9.0.0. The workspace moves to the rolled-back templates and stays stopped; started, it runs 9.0.0.
-7. Restart the stack again; the state from step 1 is still there.
+3. Upgrade to 9.1.0 with the workspace running. The programs and all five templates change, the workspace keeps 9.0.0, and setup reports it pending, the condition on which `setup.sh` exits with status 3. Stopped, setup moves it to the 9.1.0 templates and leaves it stopped; started, it runs 9.1.0.
+4. Upgrade to a release with no files, then to one with a bad checksum. Both stop, and 9.1.0 stays installed and running. Restart the stack.
+5. Roll back to 9.0.0 with the workspace running. Setup again reports it pending; with `--update-workspaces` it updates the workspace, which then runs 9.0.0.
+6. Restart the stack again; the state from step 1 is still there.
 
-Redis keeps its data across restarts in this scenario only (`upgrade.compose.yml`, `--appendonly yes` on a volume, as in the production `docker-compose.yml`). Evidence is saved in `target/ci-artifacts/upgrade-rollback/`: each setup run's output and `.setup.log`, and `upgrade-evidence.json` with the program checksums of both releases and every step that passed.
+The test runs the stages rather than `setup.sh` itself, so it checks the pending list `main()` exits 3 on, not the exit status.
+
+Redis keeps its data across restarts in this scenario only (`upgrade.compose.yml`, `--appendonly yes` on a volume, as in the production `docker-compose.yml`). Evidence is saved in `target/ci-artifacts/upgrade-rollback/`: each setup run's output and `.setup.log`, and `upgrade-evidence.json` with the program checksums of both releases, every step that passed, and after each step the installed release, the five template versions, the workspace's status and template version, and the Redis marker and keys.
 
 The two releases come from one build, so this checks what an upgrade does to a running stack, not the behaviour differences between real releases.
 
