@@ -16,11 +16,15 @@ impl TenantProvisionWorker {
         guard: &LeaseGuard,
         delete: bool,
     ) -> Result<TenantProvisionOutcome, ManagerError> {
+        // `coder_organization_id` stays optional: retiring the runtime bundle
+        // must not depend on the organization having been mapped to Coder yet,
+        // because a workspace can hold delivered credentials before creation
+        // ever reached Coder.
         let row: (
             uuid::Uuid,
             uuid::Uuid,
             Option<String>,
-            String,
+            Option<String>,
             String,
             String,
         ) = sqlx::query_as(
@@ -54,7 +58,13 @@ impl TenantProvisionWorker {
             )));
         }
         if let Some(coder_id) = &row.2 {
-            let org = coder_client::CoderOrganizationId::new(row.3);
+            let coder_org = row.3.as_deref().ok_or_else(|| {
+                ManagerError::Config(
+                    "workspace has a Coder workspace id but its organization has no Coder organization id"
+                        .into(),
+                )
+            })?;
+            let org = coder_client::CoderOrganizationId::new(coder_org);
             if delete {
                 self.adapter.delete_workspace(&org, coder_id).await?;
             } else {
