@@ -146,6 +146,26 @@ After changing configuration, the driver reads each fresh template version's sto
 
 Chat state and messages are collected in a `finally` block on success, failure, and chat timeout, before the stack is removed. Inspect `chat-state.json` and `chat.json`; unavailable diagnostic endpoints are recorded in `chat-diagnostics-errors.json` without replacing the original scenario failure. `cleanup.log` preserves removal errors. Cleanup checks that run-owned volume names and image tags are gone, allows resources already removed by Compose, and fails if resources remain or Docker cannot confirm their removal.
 
+## Upgrade and rollback of a running stack
+
+```bash
+bash tests/e2e/system/bootstrap.sh upgrade
+```
+
+`upgrade_rollback.py` runs setup's own stages (`stage_release`, `stage_bootstrap`, `offer_update`) from a copy of the setup kit, the files `release-assets.yml` packs, against the real Coder stack. Two candidate releases, 9.0.0 and 9.1.0, are served from a local folder through `OPENFLOWS_RELEASE_BASE_URL`. They hold the programs this run built; 9.1.0's carry a trailing marker so the test can tell which ones a workspace runs, and 9.1.0 uses a re-tagged workspace image so its five templates differ, as a release that changes its templates does.
+
+1. Install 9.0.0, create a tenant and record a Redis marker and every Redis key without an expiry.
+2. Restart Redis, PostgreSQL and Coder. The marker, the keys, the workspace and its controller survive.
+3. Upgrade to 9.1.0 without consent. The programs and all five templates change, the running workspace keeps 9.0.0, and setup reports it pending, which is what makes `setup.sh` exit with status 3.
+4. Re-run with `--update-workspaces`. The workspace is updated and runs 9.1.0; nothing is pending.
+5. Upgrade to a release with no files, then to one with a bad checksum. Both stop, and 9.1.0 stays installed and running.
+6. Stop the workspace and roll back to 9.0.0. The workspace moves to the rolled-back templates and stays stopped; started, it runs 9.0.0.
+7. Restart the stack again; the state from step 1 is still there.
+
+Redis keeps its data across restarts in this scenario only (`upgrade.compose.yml`, `--appendonly yes` on a volume, as in the production `docker-compose.yml`). Evidence is saved in `target/ci-artifacts/upgrade-rollback/`: each setup run's output and `.setup.log`, and `upgrade-evidence.json` with the program checksums of both releases and every step that passed.
+
+The two releases come from one build, so this checks what an upgrade does to a running stack, not the behaviour differences between real releases.
+
 ## Why Python is used here
 
 Python implements the disposable HTTP providers and the test driver. Its standard library provides HTTP servers, JSON, subprocess execution, and bounded waits, so these helpers need no additional Python packages. Coder still executes real tools, Git still commits and merges real changes, and the OpenFlows controller and harness remain the Rust binaries compiled from the candidate revision. Production workspace creation and startup use the bundled Terraform and shell scripts.
