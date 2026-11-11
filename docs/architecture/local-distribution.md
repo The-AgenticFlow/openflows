@@ -80,5 +80,6 @@ newer release or a source build.
 | `OPENFLOWS_IMAGE_DIGEST` from another version | Rejected (checked against the image's version label) |
 | Second install on the same machine without its own `COMPOSE_PROJECT_NAME` | Takes over the first install's containers; must be avoided (documented) |
 
-See also: [setup reference](../setup-reference.md#install-without-compiling---compose---binary),
+See also: [release checklist and rollback](../operations/release-checklist.md),
+[setup reference](../setup-reference.md#install-without-compiling---compose---binary),
 [shared GitHub App for local runs](shared-github-app-local-runs.md).

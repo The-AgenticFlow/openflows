@@ -95,6 +95,17 @@ pub(crate) fn root_routes() -> Vec<ApiRoute> {
         },
         ApiRoute {
             methods: &["GET"],
+            path: "/metrics",
+            tag: "health",
+            summary: "Request metrics (Prometheus text format)",
+            auth: Auth::None,
+            is_json: false,
+            success: 200,
+            description: Some("Returns 503 unless OPENFLOWS_MANAGER_METRICS=true. Labels hold only the method, route template and status; serve it on an internal network."),
+            router: get(crate::metrics::metrics),
+        },
+        ApiRoute {
+            methods: &["GET"],
             path: "/auth/login",
             tag: "browser",
             summary: "Login page",
@@ -848,9 +859,12 @@ pub fn router() -> Router<AppState> {
     // OpenAPI reference: generated spec served at `/openapi.json` and a
     // browsable Swagger UI at `/swagger-ui/`. Public by design; the document
     // contains no credentials or runtime tokens.
-    root.nest("/api/v1", api).merge(
-        SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
-    )
+    // Counts every matched request under its route template (crate::metrics).
+    root.nest("/api/v1", api)
+        .merge(
+            SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
+        )
+        .layer(axum::middleware::from_fn(crate::metrics::track))
 }
 
 #[derive(Serialize)]
