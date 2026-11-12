@@ -170,7 +170,16 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-        run: python3 scripts/check_line_limits.py
+        run: |
+          # Release promotion (develop -> main) carries the whole integration
+          # delta, so the bounded-growth gate does not apply there:
+          # grandfathered files legitimately grow between release cuts. Keep
+          # the strict check for the feature PRs that target develop.
+          if [[ "${{ github.base_ref }}" == "main" && "${{ github.head_ref }}" == "develop" ]]; then
+            echo "Release promotion PR (develop -> main): skipping per-file line limits."
+            exit 0
+          fi
+          python3 scripts/check_line_limits.py
 
   redis-lifecycle:
     name: Redis lifecycle integration
