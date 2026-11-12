@@ -2611,6 +2611,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "workspace-assets",
 ]
 
 [[package]]
@@ -2684,6 +2685,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "workspace-assets",
  "zeroize",
 ]
 
@@ -5198,6 +5200,16 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace-assets"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+# The immutable workspace artifact bundle: role personas, skills, commands,
+# standards and hooks. Compiled into every binary that publishes or serves them
+# (the controller and the Manager), so both describe the same release.
+[package]
+name = "workspace-assets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+flate2 = "1"
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = "0.4"

@@ -23,6 +23,7 @@ path = "src/bin/doctor.rs"
 [dependencies]
 pocketflow-core = { version = "0.1.0", path = "../crates/pocketflow-core" }
 config          = { version = "0.2.0", path = "../crates/config" }
+workspace-assets = { version = "0.1.0", path = "../crates/workspace-assets" }
 agent-nexus     = { version = "0.1.0", path = "../crates/agent-nexus" }
 agent-forge     = { version = "0.1.0", path = "../crates/agent-forge" }
 agent-vessel    = { version = "0.1.0", path = "../crates/agent-vessel" }

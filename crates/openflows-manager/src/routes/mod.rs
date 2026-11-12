@@ -14,6 +14,7 @@ use serde::Serialize;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod agent_activity;
+pub mod artifacts;
 pub mod audit;
 pub mod auth;
 pub mod coder_hooks;
@@ -798,6 +799,28 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             success: 200,
             description: Some("Authenticated by a workspace runtime credential."),
             router: post(runtime::send_chat_message),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/runtime/artifacts",
+            tag: "runtime",
+            summary: "Download the workspace artifact bundle",
+            auth: Auth::Bearer,
+            is_json: false,
+            success: 200,
+            description: Some("The immutable persona, skill, command, standard and hook bundle of the running release, as a gzipped tar. Authenticated by a workspace runtime credential; the digest is returned in the x-artifact-digest header."),
+            router: get(artifacts::current),
+        },
+        ApiRoute {
+            methods: &["GET"],
+            path: "/runtime/artifacts/{digest}",
+            tag: "runtime",
+            summary: "Download a pinned workspace artifact bundle",
+            auth: Auth::Bearer,
+            is_json: false,
+            success: 200,
+            description: Some("Serves the bundle only when its digest matches the pinned value, so a workspace never runs assets from an unexpected release."),
+            router: get(artifacts::pinned),
         },
         ApiRoute {
             methods: &["POST"],
