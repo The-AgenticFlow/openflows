@@ -35,6 +35,10 @@ struct Deployment {
     operator_token_issued_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+mod recovery;
+
+pub use recovery::repair_runtime;
+
 fn setting(key: &str) -> Result<String> {
     std::env::var(key)
         .ok()
@@ -439,68 +443,6 @@ async fn bootstrap(
 // coder:all remains bounded by the linked user's Coder permissions; never
 // expose its access or refresh token to a runtime or browser.
 pub(crate) const CODER_USER_SCOPES: &str = "coder:all";
-
-/// Operator-only recovery for a hosted workspace whose single-use bootstrap
-/// was consumed and whose process no longer has its rotating refresh token.
-/// The new bootstrap is written only to the existing mounted secret bundle.
-pub async fn repair_runtime(workspace_id: uuid::Uuid) -> Result<()> {
-    use zeroize::Zeroize;
-
-    let db = crate::db::Db::connect(&setting("OPENFLOWS_DATABASE_URL")?).await?;
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT role, runtime_secret_ref FROM workspaces
-          WHERE id=$1 AND desired_state IN ('running','provisioning')
-            AND observed_state NOT IN ('deleted','deleting')",
-    )
-    .bind(workspace_id)
-    .fetch_optional(db.pool())
-    .await?;
-    let (role, bundle_ref) = row.context("recoverable workspace not found")?;
-    if !matches!(
-        role.as_str(),
-        "nexus" | "forge" | "sentinel" | "vessel" | "lore"
-    ) {
-        bail!("runtime repair requires a hosted agent workspace");
-    }
-    let bundle_ref = bundle_ref.context("workspace has no mounted runtime secret")?;
-    let provider_name = setting("OPENFLOWS_SECRET_PROVIDER")?;
-    let provider: std::sync::Arc<dyn crate::secrets::SecretProvider> =
-        crate::server::resolve_secret_provider(&provider_name)
-            .await?
-            .into();
-    let repo = crate::runtime::RuntimeRepository::new(db.pool().clone());
-    let credentials =
-        crate::runtime::RuntimeCredentialService::with_secret_provider(repo, provider.clone());
-    let mut bootstrap = credentials
-        .issue_bootstrap(crate::id::WorkspaceId::from_uuid(workspace_id))
-        .await?;
-    let result = async {
-        let bytes = Zeroizing::new(provider.get(&bundle_ref).await?);
-        let mut payload: Value = serde_json::from_slice(&bytes)?;
-        let object = payload
-            .as_object_mut()
-            .context("mounted runtime secret is not a JSON object")?;
-        object.insert(
-            "bootstrap_token".into(),
-            Value::String(bootstrap.raw_secret.clone()),
-        );
-        object.insert(
-            "manager_url".into(),
-            Value::String(
-                crate::config::runtime_manager_url(&setting("OPENFLOWS_PUBLIC_URL")?)
-                    .map_err(anyhow::Error::msg)?,
-            ),
-        );
-        let bytes = Zeroizing::new(serde_json::to_vec(&payload)?);
-        provider.replace(&bundle_ref, &bytes).await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    bootstrap.raw_secret.zeroize();
-    result?;
-    println!("Runtime bootstrap reissued for workspace {workspace_id}. Restart that Coder workspace to register a new session.");
-    Ok(())
-}
 
 /// Reconcile the deployment's Coder hook verifier with the hook secret used
 /// by Coder. The secret is accepted only on stdin and never echoed or logged.

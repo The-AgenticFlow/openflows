@@ -21,6 +21,8 @@ use sqlx::PgPool;
 use tracing::warn;
 use zeroize::Zeroizing;
 
+mod tenant_delivery;
+
 /// The Redis username prefix for tenant-scoped clients.
 pub const TENANT_REDIS_USER_PREFIX: &str = "tenant";
 
@@ -68,6 +70,7 @@ pub struct TenantRuntimeRepository {
     pool: PgPool,
     secret_provider: std::sync::Arc<dyn SecretProvider>,
     redis_isolation: std::sync::Arc<dyn crate::runtime::redis::RedisIsolationBackend>,
+    delivery: std::sync::Arc<dyn crate::runtime::delivery::SecretDelivery>,
 }
 
 impl TenantRuntimeRepository {
@@ -78,6 +81,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -91,6 +95,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -103,6 +108,7 @@ impl TenantRuntimeRepository {
             pool,
             secret_provider,
             redis_isolation,
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -467,50 +473,7 @@ impl TenantRuntimeRepository {
         Ok(())
     }
 
-    /// Remove every secret-provider object owned by a tenant. Database rows
-    /// remain as a sanitized audit trail, with their credentials revoked.
-    pub async fn delete_tenant_secrets(
-        &self,
-        org_id: OrganizationId,
-        tenant_id: TenantId,
-    ) -> Result<(), ManagerError> {
-        let refs: Vec<String> = sqlx::query_scalar(
-            "SELECT secret_ref FROM tenant_hook_keys
-              WHERE organization_id = $1 AND tenant_id = $2 AND secret_ref IS NOT NULL
-             UNION
-             SELECT runtime_secret_ref FROM workspaces
-              WHERE organization_id = $1 AND tenant_id = $2 AND runtime_secret_ref IS NOT NULL
-             UNION
-             SELECT b.secret_ref FROM workspace_bootstrap_credentials b
-               JOIN workspaces w ON w.id = b.workspace_id
-              WHERE w.organization_id = $1 AND w.tenant_id = $2",
-        )
-        .bind(org_id.0)
-        .bind(tenant_id.0)
-        .fetch_all(&self.pool)
-        .await?;
-        for reference in refs {
-            match self.secret_provider.delete(&reference).await {
-                Ok(()) | Err(crate::secrets::SecretError::NotFound(_)) => {}
-                Err(error) => {
-                    return Err(ManagerError::Config(format!(
-                        "cannot delete tenant secret: {error}"
-                    )))
-                }
-            }
-        }
-        sqlx::query(
-            "UPDATE tenant_hook_keys SET revoked_at = COALESCE(revoked_at, now()), updated_at = now()
-              WHERE organization_id = $1 AND tenant_id = $2",
-        )
-        .bind(org_id.0)
-        .bind(tenant_id.0)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Assemble the per-workspace mounted secret file. Only this method reads
+    /// Assemble the per-workspace credential bundle and deliver it. Only this method reads
     /// the component secrets; templates receive the opaque returned reference.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_workspace_secret(
@@ -682,7 +645,14 @@ impl TenantRuntimeRepository {
         .bind(workspace_id.0)
         .execute(&self.pool)
         .await?;
-        Ok(stored_secret_ref)
+        self.deliver_workspace_bundle(
+            org_id,
+            tenant_id,
+            workspace_id,
+            &stored_secret_ref,
+            &payload,
+        )
+        .await
     }
 
     /// Look up a tenant's Redis credential (namespace + username + generation),

@@ -146,29 +146,10 @@ pub async fn resolve_secret_provider(
 ) -> Result<Box<dyn crate::secrets::SecretProvider>, ManagerError> {
     match name {
         IN_MEMORY_SECRET_PROVIDER => Ok(Box::new(crate::secrets::InMemorySecretProvider::new())),
-        FILESYSTEM_SECRET_PROVIDER => {
-            let root = std::env::var("OPENFLOWS_SECRET_DIR").map_err(|_| {
-                ManagerError::Config(
-                    "filesystem secret provider requires OPENFLOWS_SECRET_DIR".into(),
-                )
-            })?;
-            let mut provider = crate::secrets::FilesystemSecretProvider::new(root)
-                .map_err(|e| ManagerError::Config(e.to_string()))?;
-            // Optional: make mounted secret files readable by the workspace
-            // user on Linux hosts (see FilesystemSecretProvider).
-            if let Ok(raw) = std::env::var("OPENFLOWS_SECRET_FILE_MODE") {
-                let mode =
-                    u32::from_str_radix(raw.trim().trim_start_matches("0o"), 8).map_err(|_| {
-                        ManagerError::Config(
-                            "OPENFLOWS_SECRET_FILE_MODE must be an octal mode such as 0644".into(),
-                        )
-                    })?;
-                provider = provider
-                    .with_file_mode(mode)
-                    .map_err(|e| ManagerError::Config(e.to_string()))?;
-            }
-            Ok(Box::new(provider))
-        }
+        FILESYSTEM_SECRET_PROVIDER => Ok(Box::new(
+            crate::secrets::FilesystemSecretProvider::from_env()
+                .map_err(|e| ManagerError::Config(e.to_string()))?,
+        )),
         AWS_SECRETS_MANAGER_SECRET_PROVIDER => {
             let prefix = std::env::var("OPENFLOWS_AWS_SECRETS_PREFIX").map_err(|_| {
                 ManagerError::Config(
@@ -604,17 +585,24 @@ impl ManagerServices {
                     std::sync::Arc::new(crate::runtime::redis::InMemoryRedisIsolation::default())
                 }
             };
+        let delivery = crate::runtime::delivery::resolve_delivery(
+            &config.provisioner_backend,
+            &config.secret_provider,
+        )
+        .await?;
         services.tenant_runtime = crate::runtime::tenant::TenantRuntimeRepository::with_backends(
             services.db.pool().clone(),
             provider.clone(),
             redis_isolation,
-        );
+        )
+        .with_delivery(delivery.clone());
         services.tenant_runtime.restore_redis_credentials().await?;
         services.runtime_credentials =
             crate::runtime::RuntimeCredentialService::with_secret_provider(
                 services.runtime_repo.clone(),
                 provider.clone(),
-            );
+            )
+            .with_delivery(delivery);
         // Bind the operator-configured tenant limits (platform-operator
         // configuration) into the central quota service.
         services.quotas = crate::quotas::TenantQuotaService::new(

@@ -103,6 +103,11 @@ Files created before the setting need `chmod 644` (or
 `setfacl -m u:1000:r <file>`). macOS Docker Desktop maps ownership and does
 not need this.
 
+With the filesystem store the Manager mounts the store file itself. To keep
+the store elsewhere, set `OPENFLOWS_RUNTIME_DELIVERY_DIR` to an absolute host
+directory; the Manager then writes one bundle file per workspace there, with
+the same `OPENFLOWS_SECRET_FILE_MODE` rule (mode 0700 directory when widened).
+
 ## 3. Start
 
 If you will create or restart local Coder workspaces, first build the Linux
