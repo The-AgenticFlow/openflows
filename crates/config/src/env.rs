@@ -406,11 +406,36 @@ impl AgentConfig {
     }
 }
 
+/// Secrets that seal operator approvals at the LORE documentation gate
+/// (see `crate::docs_lifecycle::DocsGateKeys`). Optional: without them the
+/// gate falls back to `CODER_CHAT_HOOK_SECRET`, from which a separate seal key
+/// is derived.
+#[derive(Clone, Envconfig)]
+pub struct DocsGateConfig {
+    /// Dedicated docs gate secret (>= 32 bytes).
+    #[envconfig(from = "OPENFLOWS_DOCS_GATE_SECRET")]
+    pub secret: Option<String>,
+    /// The previous secret during a rotation: approvals sealed with it still
+    /// verify, new approvals use [`DocsGateConfig::secret`].
+    #[envconfig(from = "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS")]
+    pub previous_secret: Option<String>,
+}
+
+impl fmt::Debug for DocsGateConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocsGateConfig")
+            .field("secret", &redact(&self.secret))
+            .field("previous_secret", &redact(&self.previous_secret))
+            .finish()
+    }
+}
+
 /// Aggregate environment configuration loaded once at startup.
 #[derive(Debug, Clone)]
 pub struct EnvConfig {
     pub coder: CoderConfig,
     pub hooks: CoderHooksConfig,
+    pub docs_gate: DocsGateConfig,
     pub infra: InfraConfig,
     pub tenant: TenantConfig,
     pub github: GithubConfig,
@@ -488,10 +513,13 @@ impl EnvConfig {
             AgentConfig::init_from_env().map_err(|e| anyhow::anyhow!("Agent config: {e}"))?;
         let hooks =
             CoderHooksConfig::init_from_env().map_err(|e| anyhow::anyhow!("Hooks config: {e}"))?;
+        let docs_gate = DocsGateConfig::init_from_env()
+            .map_err(|e| anyhow::anyhow!("Docs gate config: {e}"))?;
 
         Ok(Self {
             coder,
             hooks,
+            docs_gate,
             infra,
             tenant,
             github,
@@ -620,6 +648,54 @@ mod tests {
                 "USE_AI_GATEWAY={v}"
             );
         }
+    }
+
+    #[test]
+    fn docs_gate_keys_prefer_the_dedicated_secret_and_refuse_short_ones() {
+        use crate::docs_lifecycle::DocsGateKeys;
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_CHAT_HOOK_SECRET",
+            "OPENFLOWS_DOCS_GATE_SECRET",
+            "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS",
+        ]);
+        guard.unset_all();
+        let hook = "h".repeat(32);
+        let dedicated = "d".repeat(32);
+
+        assert!(DocsGateKeys::from_env().unwrap().is_none());
+
+        std::env::set_var("CODER_CHAT_HOOK_SECRET", &hook);
+        let fallback = DocsGateKeys::from_env().unwrap().unwrap();
+        assert_eq!(fallback.key_id(), DocsGateKeys::new(&hook).key_id());
+
+        std::env::set_var("OPENFLOWS_DOCS_GATE_SECRET", &dedicated);
+        std::env::set_var("OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS", &hook);
+        let keys = DocsGateKeys::from_env().unwrap().unwrap();
+        assert_eq!(keys.key_id(), DocsGateKeys::new(&dedicated).key_id());
+        let old_seal = DocsGateKeys::new(&hook).seal("T-1", 1, "abc");
+        let record = crate::docs_lifecycle::DocsRecord {
+            revision: 1,
+            head: Some("abc".into()),
+            decision: Some(crate::docs_lifecycle::DocsDecision {
+                actor: "human".into(),
+                approved: true,
+                report: String::new(),
+                revision: 1,
+                head: "abc".into(),
+                seal: old_seal,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            keys.verify(&record, "T-1").is_ok(),
+            "rotation keeps old seals valid"
+        );
+
+        std::env::set_var("OPENFLOWS_DOCS_GATE_SECRET", "too-short");
+        let error = DocsGateKeys::from_env().unwrap_err().to_string();
+        assert!(error.contains("OPENFLOWS_DOCS_GATE_SECRET"), "{error}");
+        drop(guard);
     }
 
     #[test]

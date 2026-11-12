@@ -161,6 +161,11 @@ impl NotificationService {
         }
     }
 
+    /// Whether any notification channel is configured.
+    pub fn is_configured(&self) -> bool {
+        !self.channels.is_empty()
+    }
+
     /// Send a notification to all configured channels (fire-and-forget).
     /// Errors are logged but do not propagate.
     pub async fn notify(&self, msg: &NotificationMessage) {

@@ -68,7 +68,7 @@ The **Agent Harness (B)** — hooks, commands, skills — never touches Redis; i
 
 ### 3.1 `ns:{tenant}:` prefixing
 
-Every key is written and read as **`ns:{tenant}:{key}`**. `SharedStore::ns_key()` (`pocketflow-core/src/store.rs:192`) prepends the tenant namespace to the logical key name, so a store instance built for tenant `acme` can structurally never address tenant `globex`'s keys — collision is impossible at the key-name layer, not merely discouraged.
+Every key is written and read as **`ns:{tenant}:{key}`**, except the few controller-only keys under **`ctl:{tenant}:`** (operator decisions workspaces must not rewrite, such as `ticket:{id}:docs_control`). Hosted tenants give workspaces a Redis user limited to `ns:{tenant}:*` and only the NEXUS workspace a controller user that can also reach `ctl:{tenant}:*`; local single-user Redis does not separate them. The purge, wipe and Manager namespace-clear paths remove both prefixes. `SharedStore::ns_key()` (`pocketflow-core/src/store.rs:192`) prepends the tenant namespace to the logical key name, so a store instance built for tenant `acme` can structurally never address tenant `globex`'s keys — collision is impossible at the key-name layer, not merely discouraged.
 
 Tenant resolution (`new_redis_with_tenant`, `store.rs:179`), in priority order:
 
@@ -167,7 +167,10 @@ All keys are shown relative to their `ns:{tenant}:` prefix. This is the complete
 |----------|-------|
 | Controller (`NexusNode`) | `tickets`, `worker_slots`, `pending_prs`, `registry_json`, `control:*`, `ticket:{id}:status`, `ticket:{id}:chat:*`, heartbeat |
 | Controller (`VesselNode`) | `pending_prs`, `repository`, `ci_readiness`, `ticket:{id}:deployment` |
-| Controller (`LoreNode`) | event ring buffer (`ticket_merged`) + `ticket:{id}:deployment` |
+| Controller (`NexusNode`, LORE driver) | `tickets` (merged), `ticket:{id}:docs`, `ticket:{id}:docs_delivery`, `ticket:{id}:deployment`, `ticket:{id}:chat:lore`, `docs:cutover_v1`, `docs:reopened` |
+| Harness (LORE) | `ticket:{id}:dispatch:lore`, `ticket:{id}:docs` |
+| Controller (`VesselNode`, docs PRs) | `ticket:{id}:docs` (read; records `rework` and `merged`), `ctl:{tenant}:ticket:{id}:docs_control` (read) |
+| Operator CLI (`openflows gate docs`) | `ticket:{id}:docs`, `ctl:{tenant}:ticket:{id}:docs_control` (the operator's latest docs decision; both written in one atomic step) |
 | Harness (FORGE/SENTINEL/VESSEL) | `ticket:{id}:dispatch:*`, `ticket:{id}:status`, `ticket:{id}:gate:*`, `ticket:{id}:handoff` |
 | SENTINEL | `pair:{id}:verification` (A2A result), `ticket:{id}:review:*` |
 

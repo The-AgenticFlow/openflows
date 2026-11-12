@@ -72,6 +72,21 @@ class Repository:
         git('check-ref-format', f'refs/heads/{branch}')
         return git('--git-dir', str(self.bare), 'rev-parse', '--verify', f'refs/heads/{branch}')
 
+    def revision(self, name):
+        """An exact commit SHA, or the head of a branch name."""
+        if len(name) == 40 and all(c in '0123456789abcdef' for c in name):
+            self.require_commit(name)
+            return name
+        return self.head(name)
+
+    def changed_files(self, base, head):
+        """What `head` changes since its merge base with `base`, as GitHub lists it."""
+        statuses = {'A': 'added', 'M': 'modified', 'D': 'removed', 'T': 'changed'}
+        raw = git('--git-dir', str(self.bare), 'diff', '--no-renames', '--name-status', '-z',
+            f'{self.revision(base)}...{self.revision(head)}').split('\0')
+        return [{'filename': path, 'status': statuses.get(status[:1], 'modified')}
+            for status, path in zip(raw[0::2], raw[1::2]) if path]
+
     def require_commit(self, sha):
         if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha):
             raise ValueError('Expected an exact commit SHA')

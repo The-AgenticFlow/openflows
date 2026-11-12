@@ -88,6 +88,14 @@ variable "coder_url" {
   description = "Coder server URL for API calls"
 }
 
+# Host path to the dev binaries (openflows-harness), as for the other roles.
+# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
+variable "dev_binary_host_path" {
+  description = "Absolute host path to the .dev-binaries directory"
+  type        = string
+  default     = ""
+}
+
 variable "harness_version" {
   type        = string
   default     = "harness-edge"
@@ -197,6 +205,41 @@ PY
       sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
       rm -f /home/coder/.git-credentials
       sudo rm -f /root/.git-credentials
+    fi
+
+    # LORE commits and pushes its docs branch, so it needs an author identity.
+    # Resolve it exactly as FORGE does: hosted installation tokens commit as
+    # the App bot; otherwise use the inherited GitHub account.
+    # Without a token yet (first run before "Login with GitHub"), keep booting:
+    # the repository step below reports the missing access, and the identity
+    # is set on the next start once the token exists.
+    EXPECTED_LOGIN=""
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      EXPECTED_LOGIN="openflows[bot]"
+    elif [ -n "$GIT_TOKEN" ]; then
+      # Retry transient GitHub failures (outage, rate limit) before giving up,
+      # so one blip does not fail the workspace; NEXUS parks LORE if it keeps
+      # failing to come up.
+      for attempt in 1 2 3 4 5; do
+        EXPECTED_LOGIN=$(curl -fsSL --max-time 20 -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') && break
+        EXPECTED_LOGIN=""
+        log "GitHub identity lookup failed (attempt $attempt/5); retrying"
+        sleep $((attempt * 5))
+      done
+      if [ -z "$EXPECTED_LOGIN" ]; then
+        log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"
+        exit 1
+      fi
+    fi
+    if [ -n "$EXPECTED_LOGIN" ]; then
+      log "GitHub identity resolved: $EXPECTED_LOGIN"
+      git config --global user.name "$EXPECTED_LOGIN"
+      git config --global user.email "$EXPECTED_LOGIN@users.noreply.github.com"
+      sudo -H git config --global user.name "$EXPECTED_LOGIN"
+      sudo -H git config --global user.email "$EXPECTED_LOGIN@users.noreply.github.com"
+    else
+      log "WARNING: no GitHub token yet — git author identity not configured; LORE cannot push until 'Login with GitHub' is completed"
     fi
 
     # Acquire the repository. Prefer the golden offline seed from the shared
@@ -392,6 +435,16 @@ resource "docker_container" "workspace" {
     container_path = "/home/coder/.openflows/artifacts"
     volume_name    = "openflows-artifacts-${local.tenant}"
     read_only      = true
+  }
+
+  # Dev binaries for local testing; the startup script prefers them over a download.
+  dynamic "volumes" {
+    for_each = var.dev_binary_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows-dev"
+      host_path      = var.dev_binary_host_path
+      read_only      = true
+    }
   }
 
   dynamic "volumes" {

@@ -5,6 +5,7 @@
 
 use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
+use config::docs_lifecycle::{DocsEvent, DocsGateKeys, DocsPhase, DocsRecord};
 use config::lifecycle::{Event, Phase};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
@@ -102,6 +103,9 @@ pub fn authorize_gate_approver(role: &str) -> Result<()> {
     Ok(())
 }
 
+mod docs;
+pub use docs::{authorize_docs_author, DocsSubmission};
+
 impl HarnessStore {
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
@@ -149,7 +153,7 @@ impl HarnessStore {
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
         let phase = Phase::parse(phase)?;
         let head = if phase == Phase::Testing {
-            Some(Self::checkout_head()?)
+            Some(Self::clean_head("Commit all work before testing")?)
         } else {
             None
         };
@@ -160,19 +164,21 @@ impl HarnessStore {
         Ok(())
     }
 
-    fn checkout_head() -> Result<String> {
+    /// HEAD of a clean checkout; `guidance` tells the caller how to fix a dirty one.
+    fn clean_head(guidance: &str) -> Result<String> {
+        Self::clean_head_in(Path::new("."), guidance)
+    }
+
+    fn clean_head_in(dir: &Path, guidance: &str) -> Result<String> {
         let dirty = std::process::Command::new("git")
+            .current_dir(dir)
             .args(["status", "--porcelain"])
             .output()?;
         anyhow::ensure!(
             dirty.status.success() && dirty.stdout.is_empty(),
-            "Commit all work before testing; checkout must be clean"
+            "{guidance}; checkout must be clean"
         );
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()?;
-        anyhow::ensure!(head.status.success(), "Cannot identify checkout HEAD");
-        Ok(String::from_utf8(head.stdout)?.trim().to_string())
+        Self::git(dir, &["rev-parse", "HEAD"]).context("Cannot identify checkout HEAD")
     }
 
     pub async fn gate_decide(
@@ -379,6 +385,20 @@ impl HarnessStore {
             .await?;
 
         Ok(())
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> Result<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
 
     /// Record that a merge completed (vessel).

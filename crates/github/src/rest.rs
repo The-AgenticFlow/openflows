@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use config::Envconfig;
+use docs::PrFileResponse;
 use pocketflow_core::{CiStatus, MergeMethod, MergeResult, PrInfo, PrState};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
+mod docs;
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
@@ -1322,6 +1324,9 @@ fn is_status_api_forbidden(err: &anyhow::Error) -> bool {
 }
 
 fn extract_ticket_id(title: &str, body: &Option<String>, branch: &str) -> Option<String> {
+    if let Some(ticket) = docs::docs_branch_ticket(branch) {
+        return ticket;
+    }
     let patterns = [
         regex::Regex::new(r"T-(\d+)").ok(),
         regex::Regex::new(r"#(\d+)").ok(),
@@ -1544,12 +1549,6 @@ struct MergeResponse {
 #[derive(Deserialize)]
 struct ContentEntry {
     name: String,
-}
-
-#[derive(Deserialize)]
-struct PrFileResponse {
-    filename: String,
-    status: String,
 }
 
 #[derive(Debug, Deserialize)]
