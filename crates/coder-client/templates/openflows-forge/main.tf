@@ -233,23 +233,27 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
-    # Provision the OpenFlows hook harness for the agent CLI so the agent
-    # loop is controllable end-to-end: session start reads the dispatch,
-    # tool-use guards enforce policy, and Stop refuses to end the session
-    # until the flow artifacts (status/handoff/PR) exist.
+    # Install the role hooks and wire them into the agent CLI loop. Deferred to
+    # a function because the scripts arrive with the artifact bundle, which a
+    # hosted workspace fetches only after it registers below. Session start then
+    # reads the dispatch, tool-use guards enforce policy, and Stop refuses to
+    # end the session until the flow artifacts (status/handoff/PR) exist.
+    install_hook_surface() {
     ROLE="${data.coder_parameter.role.value}"
     ROLE_BASE="$${ROLE%-*}"   # forge-1 -> forge
-    HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
+    HOOKS_SRC="$ASSETS_DIR/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
-      # The artifacts volume (/home/coder/.openflows) is a host bind mount
-      # owned by root, so these operations must run via sudo as the coder
-      # user cannot create directories or write inside a root-owned mount.
+      # The bundle is unpacked by root, so the coder user cannot create the
+      # hook directory or copy into it without sudo. Replace the directory
+      # rather than copy over it, so a hook dropped by a later release cannot
+      # be registered from a previous boot.
+      sudo rm -rf "$HOOKS_DIR"
       sudo mkdir -p "$HOOKS_DIR"
       sudo cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
       sudo chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
       sudo chown -R coder:coder "$HOOKS_DIR" 2>/dev/null || true
-      log "Installed $ROLE_BASE hooks from artifacts volume"
+      log "Installed $ROLE_BASE hooks from the artifact bundle"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
     fi
@@ -298,6 +302,7 @@ settings["hooks"] = hooks
 json.dump(settings, open(settings_path, "w"), indent=2)
 print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
 PYEOF
+    }
 
     # Inherit the controller-spawner's GitHub identity from Coder external
     # auth (the tenant's linked GitHub App token). The workspace owner IS the
@@ -408,6 +413,28 @@ PY
     # (/home/coder/workspace), so it never makes the destination non-empty and
     # blocks `git clone`/`cp -a` below. Never write the token anywhere.
     echo "$EXPECTED_LOGIN" > /home/coder/.openflows-gh-identity 2>/dev/null || true
+
+    # Immutable role assets: the persona, skills, commands, standards and hooks.
+    # A hosted workspace fetches the bundle of this release from the Manager and
+    # verifies its digest before installing anything, so it never depends on
+    # another workspace having published them. Local mode reads the tenant
+    # artifacts volume that the Nexus workspace seeds.
+    ASSETS_DIR="/home/coder/.openflows/artifacts"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      ASSETS_DIR="/home/coder/.openflows/bundle"
+      sudo mkdir -p "$ASSETS_DIR"
+      sudo chown coder:coder "$ASSETS_DIR"
+      log "Installing the workspace artifact bundle from the Manager"
+      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
+      # registration above, so it never appears in a process argument.
+      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
+        --manager-url "$OF_MANAGER_URL"; then
+        log "FATAL: cannot install the workspace artifact bundle"
+        exit 1
+      fi
+    fi
+
+    install_hook_surface
 
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
@@ -572,7 +599,7 @@ PY
       exit 1
     fi
 
-    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    INSTRUCTION_ROOT="$ASSETS_DIR/orchestration"
     PERSONA="$INSTRUCTION_ROOT/agent/agents/$ROLE_BASE.agent.md"
     if [ ! -f "$PERSONA" ]; then
       log "FATAL: hosted instruction bundle is missing $PERSONA"

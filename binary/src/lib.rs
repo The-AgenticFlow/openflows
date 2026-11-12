@@ -2,7 +2,6 @@
 //!
 //! Shared modules used by the `openflows` and `openflows-doctor` binaries.
 
-pub mod bundled;
 pub mod debug;
 pub mod doctor;
 pub mod nodes;

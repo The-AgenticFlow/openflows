@@ -2,76 +2,50 @@ use anyhow::{Context, Result};
 use config::Envconfig;
 use tracing::{info, warn};
 
-use crate::bundled::bundled_files;
+use workspace_assets::files as bundled_files;
 
-/// Publish binary-owned hooks into the shared artifacts volume before workers
+pub use workspace_assets::BundledFile;
+
+/// Publish the bundle's hooks into the shared artifacts volume before workers
 /// start. No checkout of the OpenFlows repository is required at runtime.
+///
+/// The layout comes from [`workspace_assets::tree`], the same source the
+/// Manager serves as an archive, so the volume and the endpoint can never hand
+/// a workspace different content.
 pub fn publish_worker_hooks(artifacts_dir: &std::path::Path) -> Result<()> {
-    for file in bundled_files()
-        .into_iter()
-        .filter(|file| file.relative_path.starts_with("plugin/hooks/"))
-    {
-        let target = artifacts_dir.join(file.relative_path);
-        std::fs::create_dir_all(target.parent().unwrap())?;
-        std::fs::write(&target, file.content)
-            .with_context(|| format!("Cannot publish worker hook {}", target.display()))?;
-    }
-    Ok(())
+    publish_paths(artifacts_dir, "plugin/hooks/")
 }
 
-/// Publish the complete binary-owned instruction bundle for hosted workers.
+/// Publish the complete instruction bundle (personas, skills, commands,
+/// standards, hooks and the per-role skill manifests) for hosted workers.
 /// Worker templates materialize the role persona, commands, standards and
 /// skills into the customer checkout before emitting their readiness heartbeat.
 pub fn publish_worker_instructions(artifacts_dir: &std::path::Path) -> Result<()> {
-    let files = bundled_files();
-    let registry = files
-        .iter()
-        .find(|file| file.relative_path == "agent/registry.json")
-        .context("Bundled agent registry is missing")?;
-    let registry: serde_json::Value =
-        serde_json::from_str(registry.content).context("Bundled agent registry is invalid")?;
-    for file in files {
-        let target = artifacts_dir.join("orchestration").join(file.relative_path);
+    publish_paths(artifacts_dir, "orchestration/")
+}
+
+fn publish_paths(artifacts_dir: &std::path::Path, prefix: &str) -> Result<()> {
+    for file in workspace_assets::tree()
+        .into_iter()
+        .filter(|file| file.relative_path.starts_with(prefix))
+    {
+        let target = artifacts_dir.join(&file.relative_path);
         std::fs::create_dir_all(target.parent().unwrap())?;
         std::fs::write(&target, file.content)
-            .with_context(|| format!("Cannot publish worker instruction {}", target.display()))?;
-    }
-    // Materialize one tiny manifest per role so startup scripts install only
-    // the skills granted by the registry, without requiring jq or a source
-    // checkout inside the workspace.
-    for role in registry["team"]
-        .as_array()
-        .context("Bundled agent registry has no team array")?
-    {
-        let id = role["id"]
-            .as_str()
-            .context("Bundled agent registry role has no id")?;
-        let skills = role["skills"]
-            .as_array()
-            .context("Bundled agent registry role has no skills")?
-            .iter()
-            .map(|skill| {
-                skill
-                    .as_str()
-                    .context("Bundled agent registry skill is not a string")
-            })
-            .collect::<Result<Vec<_>>>()?
-            .join("\n");
-        let target = artifacts_dir
-            .join("orchestration/agent/roles")
-            .join(format!("{id}.skills"));
-        std::fs::create_dir_all(target.parent().unwrap())?;
-        std::fs::write(&target, format!("{skills}\n"))?;
+            .with_context(|| format!("Cannot publish worker artifact {}", target.display()))?;
+        if file.relative_path.ends_with(".sh") {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                    .with_context(|| format!("Cannot set permissions on {}", target.display()))?;
+            }
+        }
     }
     Ok(())
 }
 
 const ORCHESTRATION_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-pub struct BundledFile {
-    pub relative_path: &'static str,
-    pub content: &'static str,
-}
 
 pub struct OrchestrationResolver {
     candidates: Vec<std::path::PathBuf>,

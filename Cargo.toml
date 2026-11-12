@@ -4,6 +4,7 @@ members = [
     "crates/pocketflow-core",
     "crates/github",
     "crates/config",
+    "crates/workspace-assets",
     "crates/agent-nexus",
     "crates/agent-forge",
     "crates/agent-vessel",
