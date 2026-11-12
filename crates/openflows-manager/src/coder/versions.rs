@@ -4,7 +4,7 @@
 ///
 /// A release is acceptable when it is strictly newer than the baseline, or
 /// when it matches the baseline and is not an unstable prerelease while the
-/// baseline is stable. Any unparseable value fails closed.
+/// baseline is stable. Any unparsable value fails closed.
 pub(super) fn coder_version_meets_baseline(actual: &str, baseline: &str) -> bool {
     fn parse(value: &str) -> Option<((u64, u64, u64), bool)> {
         let value = value.strip_prefix('v').unwrap_or(value);
