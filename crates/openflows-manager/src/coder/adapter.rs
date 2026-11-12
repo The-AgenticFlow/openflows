@@ -536,6 +536,18 @@ impl CoderAdapter for RealCoderAdapter {
                     version_name
                 )));
             }
+            if !existing.template_id.is_empty() && existing.template_id != template_id.0 {
+                return Err(ManagerError::api(
+                    "CODER_SCOPE_MISMATCH",
+                    "existing template version belongs to a different Coder template",
+                ));
+            }
+            if !existing.organization_id.is_empty() && existing.organization_id != org.0 {
+                return Err(ManagerError::api(
+                    "CODER_SCOPE_MISMATCH",
+                    "existing template version belongs to a different Coder organization",
+                ));
+            }
             // Verify the version's import job succeeded. Rediscover by stable
             // identity; never adopt a same-name version from another template.
             let job_id = existing

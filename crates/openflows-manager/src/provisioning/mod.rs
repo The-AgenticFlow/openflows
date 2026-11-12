@@ -12,12 +12,18 @@
 pub mod docker;
 pub mod local_workspace_cleanup;
 pub mod release_provider;
+pub mod selection;
 pub mod source;
 pub mod tenant_worker;
 pub mod worker;
 pub mod workspace_lifecycle;
 
 pub use release_provider::{ReleaseProvider, ReleaseProviderError};
+pub use selection::{
+    compatibility_target_from_env, record_workspace_and_tenant_pin, release_target,
+    resolve_backend_env, resolve_nexus_release_for_tenant, resolve_worker_release_for_tenant,
+    validate_artifacts_for_target, WorkspaceReleaseSpec,
+};
 pub use source::{ReleaseCache, ReleaseSource, ResolvedRelease};
 pub use tenant_worker::{err as tenant_err, TenantProvisionOutcome, TenantProvisionWorker};
 pub use worker::{err, OrgProvisionOutcome, OrgProvisionWorker};

@@ -65,6 +65,8 @@ pub struct OrgProvisionWorker {
     pub release_id: Option<crate::id::ReleaseId>,
     /// The provisioner backend adapter name (operator config).
     pub provisioner_backend: String,
+    /// Target compatibility contract for template selection & validation.
+    pub compatibility_target: crate::templates::ReleaseCompatibilityTarget,
     /// The Coder version baseline required for readiness.
     pub version_baseline: String,
 }
@@ -82,6 +84,12 @@ impl OrgProvisionWorker {
         provisioner_backend: String,
         version_baseline: String,
     ) -> Self {
+        let compatibility_target = match provisioner_backend.as_str() {
+            "kubernetes" => crate::templates::ReleaseCompatibilityTarget::kubernetes_default(
+                crate::templates::backend::DEFAULT_ARCHITECTURE,
+            ),
+            _ => crate::templates::ReleaseCompatibilityTarget::docker_default(),
+        };
         OrgProvisionWorker {
             pool,
             orgs,
@@ -91,8 +99,17 @@ impl OrgProvisionWorker {
             artifacts,
             release_id,
             provisioner_backend,
+            compatibility_target,
             version_baseline,
         }
+    }
+
+    pub fn with_compatibility_target(
+        mut self,
+        target: crate::templates::ReleaseCompatibilityTarget,
+    ) -> Self {
+        self.compatibility_target = target;
+        self
     }
 
     pub async fn run_forever(&self) -> Result<(), ManagerError> {
@@ -204,6 +221,16 @@ impl OrgProvisionWorker {
                 err::RELEASE_NOT_CONFIGURED,
             ));
         }
+        if let Err(e) =
+            super::selection::validate_artifacts_for_target(&artifacts, &self.compatibility_target)
+        {
+            self.record_not_ready(guard, org_id, err::RELEASE_NOT_CONFIGURED, &e.to_string())
+                .await?;
+            return Ok(OrgProvisionOutcome::NotReady(
+                org_id,
+                err::RELEASE_NOT_CONFIGURED,
+            ));
+        }
 
         // 3. Capabilities.
         if !guard.set_step(step::VERIFY_CAPABILITIES).await? {
@@ -294,7 +321,13 @@ impl OrgProvisionWorker {
         }
         if let Err(e) = self
             .releases
-            .publish_for_org(org_id, release_id, self.adapter.as_ref(), &artifacts)
+            .publish_for_org_backend(
+                org_id,
+                release_id,
+                &self.compatibility_target,
+                self.adapter.as_ref(),
+                &artifacts,
+            )
             .await
         {
             let terminal = matches!(&e, ManagerError::Api(api) if api.code == err::IMPORT_FAILED || api.code == "IMPORT_CANCELLED");
