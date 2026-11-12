@@ -65,7 +65,7 @@ Users roll back the same way they upgrade:
 2. Clear `OPENFLOWS_IMAGE_DIGEST` (Compose installs).
 3. Run `./scripts/setup.sh` again.
 
-Setup downloads and verifies the previous programs, pushes their templates and offers to update the workspaces. Until every workspace runs the previous templates, setup exits with status 3 and offers the rest again on each run. Redis and Coder data are kept. The program swap, including rollback after an upgrade, is tested by `tests/ci/setup-binary-test.sh`. The full stack round trip is tracked in #528.
+Setup downloads and verifies the previous programs, pushes their templates and offers to update the workspaces. Until every workspace runs the previous templates, setup exits with status 3 and offers the rest again on each run. Redis and Coder data are kept. The program swap, including rollback after an upgrade, is tested by `tests/ci/setup-binary-test.sh`. The round trip on a running stack, including restarts and failed upgrades, is the `Upgrade and rollback container E2E` job (`tests/e2e/system/bootstrap.sh upgrade`).
 
 ### Fix forward
 
