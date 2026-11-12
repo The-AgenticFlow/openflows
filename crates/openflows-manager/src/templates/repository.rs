@@ -598,6 +598,125 @@ impl ReleaseRepository {
         Ok(affected == 1)
     }
 
+    /// Atomically verify/set the tenant pin and record the workspace pin in one
+    /// transaction.
+    ///
+    /// Locks the tenant row with `FOR UPDATE` so concurrent provisioning
+    /// requests cannot pin a workspace to an outdated release after another
+    /// request has already pinned the tenant to a different release or backend.
+    pub async fn record_workspace_and_tenant_pin(
+        &self,
+        organization_id: OrganizationId,
+        tenant_id: TenantId,
+        workspace_id: WorkspaceId,
+        release_id: ReleaseId,
+        backend: ProvisionerBackend,
+        version_id: &str,
+    ) -> Result<(), ManagerError> {
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let row: Option<(Option<uuid::Uuid>, Option<String>)> = sqlx::query_as(
+            "SELECT pinned_release_id, pinned_backend
+               FROM tenants
+              WHERE organization_id = $1 AND id = $2
+              FOR UPDATE",
+        )
+        .bind(organization_id.0)
+        .bind(tenant_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?;
+
+        let Some((existing_release_uuid, existing_backend_str)) = row else {
+            return Err(ManagerError::api(
+                crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                "tenant not found when recording release pin",
+            ));
+        };
+        let existing_release = existing_release_uuid.map(ReleaseId::from_uuid);
+        let existing_backend = existing_backend_str
+            .map(|b| {
+                b.parse::<ProvisionerBackend>().map_err(|_| {
+                    ManagerError::Service(anyhow::anyhow!(
+                        "unknown pinned_backend in database: {b}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // A legacy tenant with a release pin and NULL backend belongs to Docker.
+        let effective_backend = existing_backend.or_else(|| {
+            existing_release
+                .is_some()
+                .then_some(ProvisionerBackend::Docker)
+        });
+        if let Some(pinned_backend) = effective_backend {
+            if pinned_backend != backend {
+                return Err(ManagerError::api(
+                    crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                    format!(
+                        "tenant is pinned to backend '{}' and cannot use '{}'",
+                        pinned_backend, backend
+                    ),
+                ));
+            }
+        }
+        if let Some(pinned_release) = existing_release {
+            if pinned_release != release_id {
+                return Err(ManagerError::api(
+                    crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                    "tenant is pinned to a different release",
+                ));
+            }
+        }
+
+        if existing_release.is_none() || existing_backend.is_none() {
+            sqlx::query(
+                "UPDATE tenants
+                    SET pinned_release_id = COALESCE(pinned_release_id, $3),
+                        pinned_backend = COALESCE(pinned_backend, $4),
+                        updated_at = now()
+                  WHERE organization_id = $1 AND id = $2",
+            )
+            .bind(organization_id.0)
+            .bind(tenant_id.0)
+            .bind(release_id.0)
+            .bind(backend.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
+        }
+
+        let affected = sqlx::query(
+            "UPDATE workspaces
+                SET pinned_release_id = $3,
+                    pinned_backend = $4,
+                    pinned_version_id = COALESCE($5, pinned_version_id),
+                    updated_at = now()
+              WHERE organization_id = $1
+                AND id = $2
+                AND (pinned_backend IS NULL OR pinned_backend = $4::text)
+                AND (pinned_version_id IS NULL OR pinned_backend IS NOT NULL OR $4::text = 'docker')",
+        )
+        .bind(organization_id.0)
+        .bind(workspace_id.0)
+        .bind(release_id.0)
+        .bind(backend.as_str())
+        .bind(version_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        if affected != 1 {
+            return Err(ManagerError::api(
+                crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                "workspace is pinned to a different backend",
+            ));
+        }
+
+        tx.commit().await.map_err(ManagerError::from)?;
+        Ok(())
+    }
+
     /// Bind an organization to an approved release (the release it is
     /// reconciled against).
     pub async fn bind_org_release(

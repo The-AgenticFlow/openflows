@@ -349,24 +349,15 @@ pub async fn record_workspace_and_tenant_pin(
     spec: &WorkspaceReleaseSpec,
 ) -> Result<(), ManagerError> {
     release_repo
-        .set_tenant_pin_if_unset(org_id, tenant_id, spec.release_id, spec.backend)
-        .await?;
-    let updated = release_repo
-        .set_workspace_pin(
+        .record_workspace_and_tenant_pin(
             org_id,
+            tenant_id,
             workspace_id,
             spec.release_id,
             spec.backend,
-            Some(&spec.version_id.0),
+            &spec.version_id.0,
         )
-        .await?;
-    if !updated {
-        return Err(ManagerError::api(
-            err::RELEASE_NOT_RESOLVED,
-            "workspace is pinned to a different backend",
-        ));
-    }
-    Ok(())
+        .await
 }
 
 #[cfg(test)]

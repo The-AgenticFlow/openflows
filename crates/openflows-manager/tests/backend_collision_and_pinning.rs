@@ -640,3 +640,113 @@ async fn migration_0024_backfills_legacy_docker_pins_on_existing_db() {
             .unwrap();
     assert_eq!(ws_backend.as_deref(), Some("docker"));
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn record_workspace_and_tenant_pin_rejects_stale_release_after_concurrent_pin() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let repo = ReleaseRepository::new(pool.clone());
+    let releases = ReleaseService::new(pool.clone(), repo.clone());
+
+    let (org_id, conn, repo_id) = seed_org_with_coder(pool, "race-pin-org", "race-org").await;
+    let docker_target = ReleaseCompatibilityTarget::docker_default();
+
+    let (r1_artifacts, _d1) = build_dual_backend_artifacts("2026.11.4-r1");
+    let (r1_id, _) = releases
+        .import_release(r1_artifacts, "local://race-r1")
+        .await
+        .unwrap();
+    repo.approve_configured_release(r1_id).await.unwrap();
+    repo.upsert_org_template_version_for_backend(
+        org_id,
+        r1_id,
+        ProvisionerBackend::Docker,
+        Role::Nexus,
+        "tpl-nexus",
+        "ver-r1-nexus",
+        "job-r1",
+        "ready",
+        None,
+    )
+    .await
+    .unwrap();
+    repo.bind_org_release(org_id, r1_id).await.unwrap();
+
+    let tenant_id = seed_tenant(pool, org_id, conn, repo_id, "race-tenant").await;
+    let stale_ws = WorkspaceId::from_uuid(
+        common::insert_running_workspace(pool, org_id.0, tenant_id.0, "forge", 1)
+            .await
+            .unwrap(),
+    );
+    let winner_ws = seed_workspace(pool, org_id, tenant_id, None, None, None).await;
+
+    // Request 1 resolves R1 before the org is promoted to R2.
+    let r1_spec = resolve_nexus_release_for_tenant(pool, &repo, org_id, tenant_id, &docker_target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r1_spec.release_id, r1_id);
+
+    // Org is promoted to R2 and Request 2 wins the tenant pin for R2.
+    let (r2_artifacts, _d2) = build_dual_backend_artifacts("2026.11.4-r2");
+    let (r2_id, _) = releases
+        .import_release(r2_artifacts, "local://race-r2")
+        .await
+        .unwrap();
+    repo.approve_configured_release(r2_id).await.unwrap();
+    repo.upsert_org_template_version_for_backend(
+        org_id,
+        r2_id,
+        ProvisionerBackend::Docker,
+        Role::Nexus,
+        "tpl-nexus",
+        "ver-r2-nexus",
+        "job-r2",
+        "ready",
+        None,
+    )
+    .await
+    .unwrap();
+    repo.bind_org_release(org_id, r2_id).await.unwrap();
+
+    let r2_spec = resolve_nexus_release_for_tenant(pool, &repo, org_id, tenant_id, &docker_target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r2_spec.release_id, r2_id);
+
+    record_workspace_and_tenant_pin(pool, &repo, org_id, tenant_id, winner_ws, &r2_spec)
+        .await
+        .unwrap();
+
+    // Request 1 resumes with stale R1 spec: it must fail and must NOT pin stale_ws to R1.
+    let err = record_workspace_and_tenant_pin(pool, &repo, org_id, tenant_id, stale_ws, &r1_spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+
+    let stale_pin: (Option<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT pinned_release_id, pinned_backend, pinned_version_id FROM workspaces WHERE id = $1",
+    )
+    .bind(stale_ws.0)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_pin, (None, None, None));
+
+    // Tenant pin remains R2 / Docker, and pinning a workspace with R2 succeeds.
+    assert_eq!(
+        repo.get_tenant_pin(org_id, tenant_id).await.unwrap(),
+        Some((Some(r2_id), Some(ProvisionerBackend::Docker)))
+    );
+    let worker_ws = WorkspaceId::from_uuid(
+        common::insert_running_workspace(pool, org_id.0, tenant_id.0, "forge", 2)
+            .await
+            .unwrap(),
+    );
+    record_workspace_and_tenant_pin(pool, &repo, org_id, tenant_id, worker_ws, &r2_spec)
+        .await
+        .unwrap();
+}
