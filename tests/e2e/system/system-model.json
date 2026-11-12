@@ -27,7 +27,8 @@
       "/address_review\nstate: changes_requested",
       "Review plan revision",
       "Testing review for",
-      "## PR Review \u2014 Ticket"
+      "## PR Review \u2014 Ticket",
+      "Document merged ticket"
     ],
     "routes": [
       {
@@ -523,6 +524,43 @@
           },
           {
             "text": "Completed this step; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains": "Document merged ticket T-001",
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness dispatch read; openflows-harness docs status; git fetch origin && git checkout -B lore/T-001 origin/main && git branch --show-current && cat answer.txt",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/CHANGELOG.md",
+              "content": "# Changelog\n\n## Unreleased\n\n- T-001: answer.txt now returns 42 (LORE_DOCS_T001).\n"
+            },
+            "requires": {
+              "contains": "lore/T-001"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "git add CHANGELOG.md && git commit -m 'docs(T-001): record the answer fix in the changelog' && git push origin lore/T-001 && printf 'Changelog entry for T-001.\\n' > /tmp/docs-report.md && openflows-harness docs submit --report /tmp/docs-report.md",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Submitted docs revision 1 for T-001; waiting for the operator decision.",
+            "requires": {
+              "contains": "submitted"
+            }
           }
         ]
       }
