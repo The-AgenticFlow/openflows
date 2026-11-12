@@ -148,6 +148,24 @@ After changing configuration, the driver reads each fresh template version's sto
 
 Chat state and messages are collected in a `finally` block on success, failure, and chat timeout, before the stack is removed. Inspect `chat-state.json` and `chat.json`; unavailable diagnostic endpoints are recorded in `chat-diagnostics-errors.json` without replacing the original scenario failure. `cleanup.log` preserves removal errors. Cleanup checks that run-owned volume names and image tags are gone, allows resources already removed by Compose, and fails if resources remain or Docker cannot confirm their removal.
 
+## Clean install in each mode
+
+```bash
+bash tests/e2e/system/bootstrap.sh install source    # or compose, binary
+```
+
+`clean_install.py` packs the programs this run built as the candidate release their version names (`openflows --version`), the way a release is: an archive with its `.sha256`, the setup kit (the files `release-assets.yml` packs), and an image holding the same programs with the `org.opencontainers.image.version` label, pushed to a throwaway local registry. It then installs the candidate on a clean stack in one mode:
+
+| Mode | How the programs are installed |
+| --- | --- |
+| `source` | The programs built from this checkout, as `--source` compiles them |
+| `binary` | Setup's `stage_release`, run from the kit, downloads the archive from `OPENFLOWS_RELEASE_BASE_URL` and verifies its checksum |
+| `compose` | Setup's `stage_image`, run from the kit, pulls the image and pins its digest; the kit's `openflows-binaries` Compose service copies the programs out |
+
+In every mode the installed programs must match the candidate and report its version, `openflows-doctor` must pass and see the configured model, a tenant must start, and a command must run in its workspace with those programs. `clean-install-evidence.json` in `target/ci-artifacts/clean-install-<mode>/` records the platform (OS, kernel, Docker and runner image), the version, the candidate's checksums, the image digest in Compose mode, the doctor output and the workspace command's output.
+
+The image is built from the prebuilt programs, not from the repository's `Dockerfile`; the release workflow builds and checks that image.
+
 ## Upgrade and rollback of a running stack
 
 ```bash

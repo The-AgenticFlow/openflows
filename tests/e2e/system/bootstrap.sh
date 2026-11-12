@@ -10,6 +10,14 @@ case "$scenario" in
     system) category=connected-system; driver=connected_system.py; model=system-model.json ;;
     # Upgrade, restart and rollback of a running stack (#528); Redis persists as in production.
     upgrade) category=upgrade-rollback; driver=upgrade_rollback.py; model=bootstrap-model.json ;;
+    # One candidate release installed on a clean stack in one mode (#527): source, compose or binary.
+    install)
+        export OPENFLOWS_E2E_MODE="${2:-}"
+        case "$OPENFLOWS_E2E_MODE" in
+            source|compose|binary) ;;
+            *) printf 'Usage: %s install source|compose|binary\n' "$0" >&2; exit 2 ;;
+        esac
+        category="clean-install-$OPENFLOWS_E2E_MODE"; driver=clean_install.py; model=bootstrap-model.json ;;
     *) printf 'Unknown E2E scenario: %s\n' "$scenario" >&2; exit 2 ;;
 esac
 project="openflows-${scenario}-$(date +%s)-$$"
