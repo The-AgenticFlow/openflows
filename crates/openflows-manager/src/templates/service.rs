@@ -4,18 +4,77 @@
 use crate::coder::{CoderAdapter, PublishOutcome, PublishedTemplate};
 use crate::error::ManagerError;
 use crate::id::{OrganizationId, ReleaseId};
+use crate::templates::backend::{
+    validate_role_variant, ProvisionerBackend, ReleaseCompatibilityTarget,
+};
 use crate::templates::packaging::{Role, TemplateManifest};
 use crate::templates::repository::ReleaseRepository;
 use serde_json::json;
 use sqlx::PgPool;
+use std::collections::BTreeMap;
 
 /// The role archives of a release as resolved from the operator-configured
-/// artifact source (a role -> packaged archive bytes mapping).
+/// artifact source (a role -> packaged archive bytes mapping, plus optional
+/// per-backend variant archives).
 #[derive(Clone, Debug)]
 pub struct ReleaseArtifacts {
     pub manifest: TemplateManifest,
-    /// role -> deterministic archive bytes
-    pub archives: std::collections::BTreeMap<Role, Vec<u8>>,
+    /// role -> deterministic archive bytes (Docker / single-backend compatibility)
+    pub archives: BTreeMap<Role, Vec<u8>>,
+    /// (backend, role) -> deterministic archive bytes
+    pub variant_archives: BTreeMap<(ProvisionerBackend, Role), Vec<u8>>,
+}
+
+impl ReleaseArtifacts {
+    /// Construct artifacts from a single-backend (Docker) role -> archive map.
+    pub fn new(manifest: TemplateManifest, archives: BTreeMap<Role, Vec<u8>>) -> Self {
+        let variant_archives = archives
+            .iter()
+            .map(|(&role, bytes)| ((ProvisionerBackend::Docker, role), bytes.clone()))
+            .collect();
+        Self {
+            manifest,
+            archives,
+            variant_archives,
+        }
+    }
+
+    /// Construct artifacts from a `(backend, role) -> archive` map.
+    pub fn from_backend_archives(
+        manifest: TemplateManifest,
+        variant_archives: BTreeMap<(ProvisionerBackend, Role), Vec<u8>>,
+    ) -> Self {
+        let mut archives = BTreeMap::new();
+        for ((backend, role), bytes) in &variant_archives {
+            if *backend == ProvisionerBackend::Docker {
+                archives.insert(*role, bytes.clone());
+            }
+        }
+        if archives.is_empty() {
+            for ((_, role), bytes) in &variant_archives {
+                archives.entry(*role).or_insert_with(|| bytes.clone());
+            }
+        }
+        Self {
+            manifest,
+            archives,
+            variant_archives,
+        }
+    }
+
+    /// Look up the archive bytes for `(backend, role)`.
+    pub fn archive_for(&self, backend: ProvisionerBackend, role: Role) -> Option<&[u8]> {
+        self.variant_archives
+            .get(&(backend, role))
+            .map(Vec::as_slice)
+            .or_else(|| {
+                if backend == ProvisionerBackend::Docker {
+                    self.archives.get(&role).map(Vec::as_slice)
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -50,20 +109,33 @@ impl ReleaseService {
             return Ok((ReleaseId::from_uuid(existing.id), digest));
         }
 
-        // Validate every required role archive is present and matches its digest.
-        for role in &manifest.required_roles {
-            let entry = manifest
-                .roles
-                .get(role)
-                .ok_or_else(|| ManagerError::InvalidInput("missing role entry".into()))?;
-            let archive = artifacts.archives.get(role).ok_or_else(|| {
-                ManagerError::InvalidInput(format!(
-                    "artifact source did not provide archive for role '{}'",
-                    role.as_str()
-                ))
-            })?;
-            super::packaging::verify_archive_digest(archive, &entry.sha256)?;
-            super::packaging::validate_archive(archive)?;
+        // Validate every required role archive across all backends present in
+        // the manifest.
+        let backends = manifest.backends();
+        if backends.is_empty() {
+            return Err(ManagerError::InvalidInput(
+                "manifest contains no backend variants".into(),
+            ));
+        }
+        for backend in backends {
+            for role in &manifest.required_roles {
+                let entry = manifest.variant(backend, *role).ok_or_else(|| {
+                    ManagerError::InvalidInput(format!(
+                        "missing '{}' variant for role '{}'",
+                        backend,
+                        role.as_str()
+                    ))
+                })?;
+                let archive = artifacts.archive_for(backend, *role).ok_or_else(|| {
+                    ManagerError::InvalidInput(format!(
+                        "artifact source did not provide archive for role '{}' ({})",
+                        role.as_str(),
+                        backend
+                    ))
+                })?;
+                super::packaging::verify_archive_digest(archive, &entry.sha256)?;
+                super::packaging::validate_archive(archive)?;
+            }
         }
 
         // A release label is an immutable operator-visible identity. Returning
@@ -99,9 +171,7 @@ impl ReleaseService {
     }
 
     /// Publish the required roles of `release_id` into `organization_id` using
-    /// `adapter`. Each role is published idempotently (retry-safe) and its
-    /// import must succeed before the publication is considered ready. The
-    /// exact template/version/import-job IDs are persisted and verified.
+    /// `adapter` for the default Docker compatibility target.
     pub async fn publish_for_org(
         &self,
         organization_id: OrganizationId,
@@ -109,9 +179,31 @@ impl ReleaseService {
         adapter: &dyn CoderAdapter,
         artifacts: &ReleaseArtifacts,
     ) -> Result<Vec<Role>, ManagerError> {
-        let (release, roles) = self
+        self.publish_for_org_backend(
+            organization_id,
+            release_id,
+            &ReleaseCompatibilityTarget::docker_default(),
+            adapter,
+            artifacts,
+        )
+        .await
+    }
+
+    /// Publish the required roles of `release_id` into `organization_id` for a
+    /// specific compatibility target. Every required role variant is validated
+    /// against `target` and verified against the persisted release digest
+    /// before calling `adapter.ensure_template_version`.
+    pub async fn publish_for_org_backend(
+        &self,
+        organization_id: OrganizationId,
+        release_id: ReleaseId,
+        target: &ReleaseCompatibilityTarget,
+        adapter: &dyn CoderAdapter,
+        artifacts: &ReleaseArtifacts,
+    ) -> Result<Vec<Role>, ManagerError> {
+        let (release, variants) = self
             .repo
-            .get_release(release_id)
+            .get_release_variants(release_id)
             .await?
             .ok_or_else(|| ManagerError::not_found("template release"))?;
 
@@ -122,21 +214,33 @@ impl ReleaseService {
             ));
         }
 
-        // The artifact bytes must be exactly the immutable release recorded in
-        // the database. Never publish independently supplied bytes under an
-        // existing release identity.
+        // The artifact bytes must match the immutable release recorded in the
+        // database and satisfy the target's compatibility contract before we
+        // publish anything to Coder.
         for role in &artifacts.manifest.required_roles {
-            let entry = roles
-                .get(role)
-                .ok_or_else(|| ManagerError::InvalidInput("missing role entry".into()))?;
+            let entry = variants.get(&(target.backend, *role)).ok_or_else(|| {
+                ManagerError::InvalidInput(format!(
+                    "release '{}' has no '{}' variant for required role '{}'",
+                    release.version,
+                    target.backend,
+                    role.as_str()
+                ))
+            })?;
+            validate_role_variant(entry, target)?;
             let archive = artifacts
-                .archives
-                .get(role)
-                .ok_or_else(|| ManagerError::InvalidInput("missing role archive".into()))?;
+                .archive_for(target.backend, *role)
+                .ok_or_else(|| {
+                    ManagerError::InvalidInput(format!(
+                        "artifact source did not provide archive for role '{}' ({})",
+                        role.as_str(),
+                        target.backend
+                    ))
+                })?;
             if crate::templates::packaging::sha256_hex(archive) != entry.sha256 {
                 return Err(ManagerError::InvalidInput(format!(
-                    "role '{}' archive does not match persisted release",
-                    role.as_str()
+                    "role '{}' ({}) archive does not match persisted release",
+                    role.as_str(),
+                    target.backend
                 )));
             }
         }
@@ -146,18 +250,18 @@ impl ReleaseService {
 
         let mut published_roles = Vec::new();
         for role in &artifacts.manifest.required_roles {
-            if !roles.contains_key(role) {
-                return Err(ManagerError::InvalidInput("missing role entry".into()));
-            }
-            let archive = artifacts.archives.get(role).ok_or_else(|| {
-                ManagerError::InvalidInput(format!(
-                    "artifact source did not provide archive for role '{}'",
-                    role.as_str()
-                ))
-            })?;
+            let archive = artifacts
+                .archive_for(target.backend, *role)
+                .ok_or_else(|| {
+                    ManagerError::InvalidInput(format!(
+                        "artifact source did not provide archive for role '{}' ({})",
+                        role.as_str(),
+                        target.backend
+                    ))
+                })?;
 
             let template_name = role.template_name();
-            let version_name = release_id.to_string();
+            let version_name = version_name_for_backend(release_id, target.backend);
             let result = adapter
                 .ensure_template_version(&coder_org, &template_name, &version_name, archive)
                 .await?;
@@ -172,9 +276,10 @@ impl ReleaseService {
             // ready; the adapter already errors on failed/timed-out imports, so
             // reaching here means the import succeeded.
             self.repo
-                .upsert_org_template_version(
+                .upsert_org_template_version_for_backend(
                     organization_id,
                     release_id,
+                    target.backend,
                     *role,
                     &template_id.0,
                     &version_id.0,
@@ -187,6 +292,7 @@ impl ReleaseService {
             if result.outcome == PublishOutcome::Created {
                 tracing::info!(
                     role = role.as_str(),
+                    backend = target.backend.as_str(),
                     template_id = %template_id.0,
                     version_id = %version_id.0,
                     "published template role"
@@ -194,6 +300,7 @@ impl ReleaseService {
             } else {
                 tracing::info!(
                     role = role.as_str(),
+                    backend = target.backend.as_str(),
                     version_id = %version_id.0,
                     "reconciled existing template role"
                 );
@@ -230,13 +337,34 @@ impl ReleaseService {
         Ok(())
     }
 
-    /// Promote an approved release to an organization: bind the org to it and
-    /// publish its roles. Promotion never silently upgrades existing pins; a
-    /// separate explicit operation rebuilds pinned workspaces.
+    /// Promote an approved release to an organization using the default Docker
+    /// compatibility target.
     pub async fn promote_to_org(
         &self,
         organization_id: OrganizationId,
         release_id: ReleaseId,
+        adapter: &dyn CoderAdapter,
+        artifacts: &ReleaseArtifacts,
+    ) -> Result<(), ManagerError> {
+        self.promote_to_org_for_backend(
+            organization_id,
+            release_id,
+            &ReleaseCompatibilityTarget::docker_default(),
+            adapter,
+            artifacts,
+        )
+        .await
+    }
+
+    /// Promote an approved release to an organization for a specific
+    /// compatibility target: bind the org to it and publish its roles.
+    /// Promotion never silently upgrades existing pins; a separate explicit
+    /// operation rebuilds pinned workspaces.
+    pub async fn promote_to_org_for_backend(
+        &self,
+        organization_id: OrganizationId,
+        release_id: ReleaseId,
+        target: &ReleaseCompatibilityTarget,
         adapter: &dyn CoderAdapter,
         artifacts: &ReleaseArtifacts,
     ) -> Result<(), ManagerError> {
@@ -250,7 +378,7 @@ impl ReleaseService {
                 "only an approved release can be promoted".into(),
             ));
         }
-        self.publish_for_org(organization_id, release_id, adapter, artifacts)
+        self.publish_for_org_backend(organization_id, release_id, target, adapter, artifacts)
             .await?;
         let mut tx = self.pool.begin().await?;
         // Keep the lock order identical to the readiness worker: organization
@@ -282,7 +410,7 @@ impl ReleaseService {
         organization_id: OrganizationId,
     ) -> Result<Vec<serde_json::Value>, ManagerError> {
         let rows = sqlx::query_as::<_, crate::templates::repository::OrgTemplateVersionRow>(
-            "SELECT id, organization_id, release_id, role, coder_template_id,
+            "SELECT id, organization_id, release_id, backend, role, coder_template_id,
                     coder_version_id, import_job_id, status, error_code, created_at, updated_at
                FROM organization_template_versions
               WHERE organization_id = $1",
@@ -295,6 +423,7 @@ impl ReleaseService {
             .into_iter()
             .map(|r| {
                 json!({
+                    "backend": r.backend,
                     "role": r.role,
                     "status": r.status,
                     "error_code": r.error_code,
@@ -351,6 +480,19 @@ pub fn internal_org_name(organization_id: OrganizationId) -> String {
     }
 
     format!("of-{encoded}")
+}
+
+/// Derive the Coder template version name for a release and backend.
+///
+/// Docker preserves the bare release UUID for compatibility with existing
+/// deployments, pinned workspaces, and rollback; non-Docker backends include
+/// their backend suffix so variants published into the same Coder organization
+/// never collide on version name.
+pub fn version_name_for_backend(release_id: ReleaseId, backend: ProvisionerBackend) -> String {
+    match backend {
+        ProvisionerBackend::Docker => release_id.to_string(),
+        ProvisionerBackend::Kubernetes => format!("{release_id}-{}", backend.as_str()),
+    }
 }
 
 #[cfg(test)]

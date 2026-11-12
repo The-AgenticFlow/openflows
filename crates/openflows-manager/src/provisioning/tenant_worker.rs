@@ -19,7 +19,7 @@ mod runtime_secret;
 
 use crate::coder::CoderAdapter;
 use crate::error::ManagerError;
-use crate::id::{OrganizationId, ReleaseId, TenantId};
+use crate::id::{OrganizationId, TenantId};
 use crate::operations::{self, LeaseGuard};
 use crate::quotas::TenantQuotaService;
 use crate::repositories::OrganizationsRepository;
@@ -100,6 +100,7 @@ pub struct TenantProvisionWorker {
     pub manager_url: String,
     pub runtime_redis_url: String,
     pub local_workspace_cleanup: Option<super::local_workspace_cleanup::LocalWorkspaceCleanup>,
+    pub compatibility_target: crate::templates::ReleaseCompatibilityTarget,
 }
 
 impl TenantProvisionWorker {
@@ -124,7 +125,16 @@ impl TenantProvisionWorker {
             manager_url: "http://127.0.0.1:3002".into(),
             runtime_redis_url: "redis://127.0.0.1:6379".into(),
             local_workspace_cleanup: None,
+            compatibility_target: crate::templates::ReleaseCompatibilityTarget::docker_default(),
         }
+    }
+
+    pub fn with_compatibility_target(
+        mut self,
+        target: crate::templates::ReleaseCompatibilityTarget,
+    ) -> Self {
+        self.compatibility_target = target;
+        self
     }
 
     pub fn with_runtime_endpoints(
@@ -485,16 +495,6 @@ impl TenantProvisionWorker {
         ).bind(row.0).bind(guard.organization_id.0).fetch_one(&self.pool).await?;
         let org = coder_client::CoderOrganizationId::new(row.2);
         let owner = crate::coder::types::CoderOwnerId::new(owner.0);
-        let release_id = self
-            .release_repo
-            .get_org_binding(guard.organization_id)
-            .await?
-            .ok_or_else(|| {
-                ManagerError::api(
-                    err::RELEASE_NOT_RESOLVED,
-                    "template release is not published",
-                )
-            })?;
         let role = match row.1.as_str() {
             "nexus" => Role::Nexus,
             "forge" => Role::Forge,
@@ -508,22 +508,24 @@ impl TenantProvisionWorker {
                 .bind(row.0)
                 .fetch_one(&self.pool)
                 .await?;
-        let version = self
-            .release_repo
-            .get_org_template_version(guard.organization_id, release_id, role)
-            .await?
-            .ok_or_else(|| {
-                ManagerError::api(err::RELEASE_NOT_RESOLVED, "template version is not ready")
-            })?;
-        let template =
-            coder_client::CoderTemplateId::new(version.coder_template_id.ok_or_else(|| {
-                ManagerError::api(err::RELEASE_NOT_RESOLVED, "template id missing")
-            })?);
-        let version_id =
-            coder_client::CoderTemplateVersionId::new(version.coder_version_id.ok_or_else(
-                || ManagerError::api(err::RELEASE_NOT_RESOLVED, "template version id missing"),
-            )?);
-        let workspace_image_digest = self.role_image_digest(release_id, role).await?;
+        let spec = super::selection::resolve_worker_release_for_tenant(
+            &self.pool,
+            &self.release_repo,
+            guard.organization_id,
+            tenant_id,
+            role,
+            &self.compatibility_target,
+        )
+        .await?;
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            guard.organization_id,
+            tenant_id,
+            workspace_id,
+            &spec,
+        )
+        .await?;
         let runtime_secret_ref = self
             .ensure_workspace_runtime_secret(
                 guard.organization_id,
@@ -542,7 +544,7 @@ impl TenantProvisionWorker {
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "workspace_image_digest".into(),
-                value: workspace_image_digest,
+                value: spec.image_digest.clone(),
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "role".into(),
@@ -590,8 +592,8 @@ impl TenantProvisionWorker {
             .create_tenant_workspace_with_parameters(
                 &org,
                 &owner,
-                &template,
-                &version_id,
+                &spec.template_id,
+                &spec.version_id,
                 &worker_workspace_name(&row.1, row.0),
                 &parameters,
             )
@@ -949,18 +951,34 @@ impl TenantProvisionWorker {
         if !guard.set_step(step::CREATE_NEXUS).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        let (template_id, version_id, workspace_image_digest) =
-            match self.resolve_nexus_template(org_id).await? {
-                Some(x) => x,
-                None => {
-                    self.record_error(guard, tenant_id, err::RELEASE_NOT_RESOLVED)
-                        .await?;
-                    return Ok(TenantProvisionOutcome::NotReady(
-                        tenant_id,
-                        err::RELEASE_NOT_RESOLVED,
-                    ));
-                }
-            };
+        let spec = match super::selection::resolve_nexus_release_for_tenant(
+            &self.pool,
+            &self.release_repo,
+            org_id,
+            tenant_id,
+            &self.compatibility_target,
+        )
+        .await?
+        {
+            Some(x) => x,
+            None => {
+                self.record_error(guard, tenant_id, err::RELEASE_NOT_RESOLVED)
+                    .await?;
+                return Ok(TenantProvisionOutcome::NotReady(
+                    tenant_id,
+                    err::RELEASE_NOT_RESOLVED,
+                ));
+            }
+        };
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            org_id,
+            tenant_id,
+            nexus_ws,
+            &spec,
+        )
+        .await?;
         // Coder workspace names are limited and must be lowercase. Keep the
         // name deterministic for retry adoption while staying within Coder's
         // 32-character limit.
@@ -976,8 +994,8 @@ impl TenantProvisionWorker {
             .create_tenant_workspace_with_parameters(
                 &coder_org,
                 &owner,
-                &template_id,
-                &version_id,
+                &spec.template_id,
+                &spec.version_id,
                 &workspace_name,
                 &[
                     coder_client::types::WorkspaceParameterValue {
@@ -990,7 +1008,7 @@ impl TenantProvisionWorker {
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "workspace_image_digest".into(),
-                        value: workspace_image_digest,
+                        value: spec.image_digest.clone(),
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "tenant".into(),
@@ -1505,79 +1523,6 @@ impl TenantProvisionWorker {
             ));
         }
         Ok(())
-    }
-
-    async fn resolve_nexus_template(
-        &self,
-        org_id: OrganizationId,
-    ) -> Result<
-        Option<(
-            coder_client::CoderTemplateId,
-            coder_client::CoderTemplateVersionId,
-            String,
-        )>,
-        ManagerError,
-    > {
-        let release_id: Option<ReleaseId> = self.release_repo.get_org_binding(org_id).await?;
-        let Some(release_id) = release_id else {
-            return Ok(None);
-        };
-        let row = self
-            .release_repo
-            .get_org_template_version(org_id, release_id, Role::Nexus)
-            .await?;
-        match row {
-            Some(r) if r.status == "ready" => match (r.coder_template_id, r.coder_version_id) {
-                (Some(t), Some(v)) => Ok(Some((
-                    coder_client::CoderTemplateId::new(t),
-                    coder_client::CoderTemplateVersionId::new(v),
-                    self.role_image_digest(release_id, Role::Nexus).await?,
-                ))),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
-        }
-    }
-
-    async fn role_image_digest(
-        &self,
-        release_id: ReleaseId,
-        role: Role,
-    ) -> Result<String, ManagerError> {
-        if !self.hosted_workspace() {
-            return Ok(String::new());
-        }
-        let (_, roles) = self
-            .release_repo
-            .get_release(release_id)
-            .await?
-            .ok_or_else(|| ManagerError::api(err::RELEASE_NOT_RESOLVED, "release missing"))?;
-        // Older local releases may have been imported before the operator
-        // configured the image digest. Allow the explicit deployment setting
-        // to repair that metadata during provisioning; hosted releases still
-        // require a digest either in the release or in this setting.
-        let configured_digest = std::env::var("OPENFLOWS_WORKSPACE_IMAGE_DIGEST").ok();
-        let digest = roles
-            .get(&role)
-            .and_then(|entry| entry.image_digest.as_deref())
-            .map(str::to_owned)
-            .or(configured_digest)
-            .ok_or_else(|| {
-                ManagerError::api(
-                    err::RELEASE_NOT_RESOLVED,
-                    "hosted template release is missing its workspace image digest; set OPENFLOWS_WORKSPACE_IMAGE_DIGEST",
-                )
-            })?;
-        let valid = digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        if !valid {
-            return Err(ManagerError::api(
-                err::RELEASE_NOT_RESOLVED,
-                "hosted template release has an invalid workspace image digest",
-            ));
-        }
-        Ok(digest)
     }
 
     fn hosted_workspace(&self) -> bool {

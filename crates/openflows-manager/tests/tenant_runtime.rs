@@ -55,22 +55,21 @@ fn build_release_artifacts() -> (ReleaseArtifacts, tempfile::TempDir) {
         archives.insert(role, archive);
         roles.insert(
             role,
-            RoleManifestEntry {
+            RoleManifestEntry::docker(
                 role,
-                archive: role.archive_name(),
+                role.archive_name(),
                 sha256,
-                parameter_schema_version: 1,
-                image_digest: Some(format!("sha256:{}", "a".repeat(64))),
-            },
+                1,
+                Some(format!("sha256:{}", "a".repeat(64))),
+            ),
         );
     }
-    let manifest = TemplateManifest {
-        schema_version: 1,
-        release: "2026.10.0".into(),
-        required_roles: vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
+    let manifest = TemplateManifest::from_v1_roles(
+        "2026.10.0",
+        vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
         roles,
-    };
-    (ReleaseArtifacts { manifest, archives }, dir)
+    );
+    (ReleaseArtifacts::new(manifest, archives), dir)
 }
 
 /// A ready-to-run harness: an isolated database, a ready organization with a

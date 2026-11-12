@@ -24,8 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output)?;
     let manifest = artifacts.manifest.to_canonical_json()?;
     fs::write(output.join("manifest.json"), &manifest)?;
-    for (role, archive) in artifacts.archives {
-        fs::write(output.join(role.archive_name()), archive)?;
+    for ((backend, role), entry) in artifacts.manifest.all_variants() {
+        let archive = artifacts
+            .archive_for(backend, role)
+            .ok_or_else(|| format!("missing archive for {} ({})", role.as_str(), backend))?;
+        fs::write(output.join(&entry.archive), archive)?;
     }
     println!("manifest_sha256={}", sha256_hex(&manifest));
     Ok(())
