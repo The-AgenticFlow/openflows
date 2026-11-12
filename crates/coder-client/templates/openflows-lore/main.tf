@@ -88,6 +88,14 @@ variable "coder_url" {
   description = "Coder server URL for API calls"
 }
 
+# Host path to the dev binaries (openflows-harness), as for the other roles.
+# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
+variable "dev_binary_host_path" {
+  description = "Absolute host path to the .dev-binaries directory"
+  type        = string
+  default     = ""
+}
+
 variable "harness_version" {
   type        = string
   default     = "harness-edge"
@@ -427,6 +435,16 @@ resource "docker_container" "workspace" {
     container_path = "/home/coder/.openflows/artifacts"
     volume_name    = "openflows-artifacts-${local.tenant}"
     read_only      = true
+  }
+
+  # Dev binaries for local testing; the startup script prefers them over a download.
+  dynamic "volumes" {
+    for_each = var.dev_binary_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows-dev"
+      host_path      = var.dev_binary_host_path
+      read_only      = true
+    }
   }
 
   dynamic "volumes" {
