@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod mock;
 pub mod types;
+pub mod versions;
 
 pub use adapter::{CoderAdapter, RealCoderAdapter};
 pub use mock::{MockCoderAdapter, MockCoderConfig};
