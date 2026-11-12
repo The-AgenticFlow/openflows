@@ -267,6 +267,25 @@ jobs:
           path: target/ci-artifacts/production-bootstrap/
           if-no-files-found: error
 
+  upgrade-rollback:
+    name: Upgrade and rollback container E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Upgrade, restart, fail an upgrade and roll back a running stack with setup's stages
+        run: bash tests/e2e/system/bootstrap.sh upgrade
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: upgrade-rollback
+          path: target/ci-artifacts/upgrade-rollback/
+          if-no-files-found: error
+
   connected-system:
     name: Connected issue-to-merge E2E
     runs-on: ubuntu-24.04
