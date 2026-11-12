@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 pub const DELIVERY_DIR_ENV: &str = "OPENFLOWS_RUNTIME_DELIVERY_DIR";
 /// Prefix of the per-organization workspace namespace on the Kubernetes backend.
 pub const NAMESPACE_PREFIX_ENV: &str = "OPENFLOWS_K8S_NAMESPACE_PREFIX";
-const DEFAULT_NAMESPACE_PREFIX: &str = "openflows-";
+pub(crate) const DEFAULT_NAMESPACE_PREFIX: &str = "openflows-";
 /// Key of the bundle inside the Secret; mounted as `runtime.json`.
 pub const SECRET_KEY: &str = "runtime.json";
 /// Where a workspace runtime reads its bundle, on both delivery backends.
@@ -185,11 +185,13 @@ impl KubernetesSecretDelivery {
 
     /// Connect with the in-cluster or kubeconfig identity.
     pub async fn connect(namespace_prefix: String) -> Result<Self, ManagerError> {
-        let client = Client::try_default().await.map_err(|e| {
-            ManagerError::Config(format!(
-                "kubernetes runtime secret delivery needs cluster access: {e}"
-            ))
-        })?;
+        let client = crate::runtime::isolation::cluster_client()
+            .await
+            .map_err(|e| {
+                ManagerError::Config(format!(
+                    "kubernetes runtime secret delivery needs cluster access: {e}"
+                ))
+            })?;
         Ok(Self::new(client, namespace_prefix))
     }
 

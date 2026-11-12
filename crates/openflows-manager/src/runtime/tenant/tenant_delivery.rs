@@ -30,6 +30,15 @@ impl TenantRuntimeRepository {
         self
     }
 
+    /// Select how tenant namespaces are walled; defaults to none (Docker and local).
+    pub fn with_isolation(
+        mut self,
+        isolation: std::sync::Arc<dyn crate::runtime::isolation::TenantIsolation>,
+    ) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
     /// Hand `bundle` to the delivery backend and return the handle the template
     /// receives. The workspace row keeps the durable store reference.
     pub(super) async fn deliver_workspace_bundle(
@@ -40,6 +49,8 @@ impl TenantRuntimeRepository {
         store_reference: &str,
         bundle: &[u8],
     ) -> Result<String, ManagerError> {
+        // The namespace and its rules must exist before the first Secret lands in it.
+        self.isolation.ensure_tenant(org_id, tenant_id).await?;
         self.delivery
             .deliver(
                 &delivery_target(org_id, tenant_id, workspace_id),
@@ -151,6 +162,6 @@ impl TenantRuntimeRepository {
         .bind(tenant_id.0)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        self.isolation.remove_tenant(org_id, tenant_id).await
     }
 }

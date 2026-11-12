@@ -557,7 +557,6 @@ impl ManagerServices {
             })?),
             None => None,
         };
-
         let services = Self::from_db_with_app_config(
             db,
             auth_config,
@@ -595,7 +594,8 @@ impl ManagerServices {
             provider.clone(),
             redis_isolation,
         )
-        .with_delivery(delivery.clone());
+        .with_delivery(delivery.clone())
+        .with_isolation(crate::runtime::isolation::resolve(config).await?);
         services.tenant_runtime.restore_redis_credentials().await?;
         services.runtime_credentials =
             crate::runtime::RuntimeCredentialService::with_secret_provider(

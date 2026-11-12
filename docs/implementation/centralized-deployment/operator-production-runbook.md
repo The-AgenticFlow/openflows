@@ -51,10 +51,12 @@ Workspaces receive their runtime credential bundle separately from the secret
 store. On the `kubernetes` backend the Manager creates one Secret per workspace
 in the organization's namespace (`OPENFLOWS_K8S_NAMESPACE_PREFIX`, default
 `openflows-`, followed by the organization ID). The Manager identity needs
-`create`, `patch` and `delete` on `secrets` in those namespaces and nothing
-cluster-wide, and the namespaces must already exist. Tenants of one
-organization share that namespace, so tenant separation relies on RBAC and on
-each workspace mounting only the Secret it is given. The shipped templates
+`create`, `patch` and `delete` on `secrets` in those namespaces. The Manager
+also creates and walls each namespace, and refuses to start in hosted mode unless
+the cluster enforces the network rules; [tenant isolation](tenant-isolation.md)
+lists the extra permissions and settings. Tenants of one organization share that
+namespace, so tenant separation relies on those rules, on RBAC and on each
+workspace mounting only the Secret it is given. The shipped templates
 bind-mount a host file, so they cannot use that Secret yet: the Manager refuses
 to start on the `kubernetes` backend unless `OPENFLOWS_K8S_RUNTIME_DELIVERY=1`
 is set, and that should only be set with a template that mounts the Secret's
