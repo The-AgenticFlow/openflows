@@ -493,7 +493,35 @@ pub struct FilesystemSecretProvider {
 /// Default secret file mode: owner read/write only.
 pub const DEFAULT_SECRET_FILE_MODE: u32 = 0o600;
 
+/// `OPENFLOWS_SECRET_FILE_MODE` shared by the secret store and the per-workspace
+/// delivery directory. Unset keeps each caller's default.
+pub fn file_mode_from_env() -> Result<Option<u32>, SecretError> {
+    match std::env::var("OPENFLOWS_SECRET_FILE_MODE") {
+        Ok(raw) => u32::from_str_radix(raw.trim().trim_start_matches("0o"), 8)
+            .map(Some)
+            .map_err(|_| {
+                SecretError::Rejected(
+                    "OPENFLOWS_SECRET_FILE_MODE must be an octal mode such as 0644".into(),
+                )
+            }),
+        Err(_) => Ok(None),
+    }
+}
+
 impl FilesystemSecretProvider {
+    /// Build from `OPENFLOWS_SECRET_DIR`, honouring the optional
+    /// `OPENFLOWS_SECRET_FILE_MODE` override for the workspace user.
+    pub fn from_env() -> Result<Self, SecretError> {
+        let root = std::env::var("OPENFLOWS_SECRET_DIR").map_err(|_| {
+            SecretError::Rejected("filesystem secret provider requires OPENFLOWS_SECRET_DIR".into())
+        })?;
+        let mut provider = Self::new(root)?;
+        if let Some(mode) = file_mode_from_env()? {
+            provider = provider.with_file_mode(mode)?;
+        }
+        Ok(provider)
+    }
+
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, SecretError> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(|e| {

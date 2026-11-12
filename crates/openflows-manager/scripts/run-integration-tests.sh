@@ -55,7 +55,7 @@ echo "==> Running manager PostgreSQL integration tests (connection URL omitted)"
   DEFAULT_RELAY_URL='http://127.0.0.1:7081/tenants/{tenant}'
   OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" \
     OPENFLOWS_RUNTIME_RELAY_BASE_URL="${OPENFLOWS_RUNTIME_RELAY_BASE_URL:-$DEFAULT_RELAY_URL}" \
-    cargo test --locked --test tenant_runtime -- --ignored --test-threads=4
+    cargo test --locked --test tenant_runtime --test runtime_delivery -- --ignored --test-threads=4
   cargo test --locked --test ready --test health
 )
 
