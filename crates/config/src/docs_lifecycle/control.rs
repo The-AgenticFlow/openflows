@@ -16,7 +16,7 @@
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
-use super::DocsRecord;
+use super::{DocsEvent, DocsRecord};
 
 /// An approved docs revision and the head the operator approved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +59,26 @@ impl DocsControl {
             paused: record.paused,
             version: record.version,
             ts: record.ts,
+        }
+    }
+
+    /// The operator's latest decision after an operator `event` produced
+    /// `next`. Only a decision can grant an approval; any other operator
+    /// action (pause, resume, restart, skip, reopen) keeps the approval
+    /// already in force, or revokes it if `next` no longer carries it. The
+    /// record is workspace-writable, so a sealed approval a workspace restored
+    /// after a rejection must never be promoted by a non-decision.
+    pub fn after_operator(previous: Option<&Self>, event: &DocsEvent, next: &DocsRecord) -> Self {
+        let derived = Self::from_record(next);
+        if matches!(event, DocsEvent::Decide { .. }) {
+            return derived;
+        }
+        let approved = previous
+            .and_then(|p| p.approved.clone())
+            .filter(|kept| derived.approved.as_ref() == Some(kept));
+        Self {
+            approved,
+            ..derived
         }
     }
 

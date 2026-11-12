@@ -10,6 +10,11 @@ use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
+/// A second key for [`SharedStore::compare_and_set`] to write with the record,
+/// and how to derive its new value from the new record and its current value.
+type Companion<'a, T> = Option<(String, DeriveCompanion<'a, T>)>;
+type DeriveCompanion<'a, T> = Box<dyn FnOnce(&T, Option<Value>) -> Result<Value> + Send + 'a>;
+
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
 const RING_BUFFER_SIZE: usize = 1000;
@@ -533,7 +538,7 @@ impl SharedStore {
                 Ok(current)
             },
             |current, ts| current.apply(actor, event, ts),
-            |_| Ok(None),
+            None,
         )
         .await
     }
@@ -552,8 +557,10 @@ impl SharedStore {
     /// Shared atomic write for versioned records: decode and check the current
     /// value, apply the reducer, and commit only if the stored bytes are
     /// unchanged. Any conflict or reducer error is returned, never retried.
-    /// `companion` may name a second key and value derived from the new
-    /// record; it is written in the same atomic step, or not at all.
+    /// `companion` may name a second key whose new value is derived from the
+    /// new record and the companion's current value. It is written in the
+    /// same atomic step, or not at all, and the commit also fails if the
+    /// companion changed after it was read.
     async fn compare_and_set<T: Serialize>(
         &self,
         key: &str,
@@ -561,7 +568,7 @@ impl SharedStore {
         conflict: &'static str,
         load: impl FnOnce(Option<Value>) -> Result<T>,
         apply: impl FnOnce(&T, u64) -> Result<T>,
-        companion: impl FnOnce(&T) -> Result<Option<(String, Value)>>,
+        companion: Companion<'_, T>,
     ) -> Result<T> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -571,7 +578,12 @@ impl SharedStore {
                 let mut map = b.map.write().await;
                 let current = load(map.get(key).cloned())?;
                 let next = apply(&current, ts)?;
-                let extra = companion(&next)?;
+                let extra = companion
+                    .map(|(extra_key, derive)| {
+                        let value = derive(&next, map.get(&extra_key).cloned())?;
+                        anyhow::Ok((extra_key, value))
+                    })
+                    .transpose()?;
                 map.insert(key.to_owned(), serde_json::to_value(&next)?);
                 if let Some((extra_key, value)) = extra {
                     map.insert(extra_key, value);
@@ -585,11 +597,17 @@ impl SharedStore {
                 let next = apply(&current, ts)?;
                 let mut keys = vec![key.to_owned()];
                 let mut args = vec![raw.unwrap_or_default(), serde_json::to_string(&next)?];
-                if let Some((extra_key, value)) = companion(&next)? {
+                if let Some((extra_key, derive)) = companion {
+                    let extra_raw: Option<String> =
+                        bounded_redis(op, b.client.get(&extra_key)).await?;
+                    let extra_current =
+                        extra_raw.as_deref().map(serde_json::from_str).transpose()?;
+                    args.push(derive(&next, extra_current)?.to_string());
+                    args.push(extra_raw.unwrap_or_default());
                     keys.push(extra_key);
-                    args.push(value.to_string());
                 }
-                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); if KEYS[2] then redis.call('SET',KEYS[2],ARGV[3]) end; return 1";
+                // Both keys are checked against what was read, then both set.
+                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; if KEYS[2] and (redis.call('GET',KEYS[2]) or '') ~= ARGV[4] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); if KEYS[2] then redis.call('SET',KEYS[2],ARGV[3]) end; return 1";
                 let changed: i64 = bounded_redis(op, b.client.eval(script, keys, args)).await?;
                 anyhow::ensure!(changed == 1, "{conflict}");
                 // Keep the per-tenant key index in sync so `keys()` scans can

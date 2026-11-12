@@ -54,6 +54,8 @@ impl SharedStore {
             ticket,
             config::state::KEY_TICKET_DOCS,
         ));
+        // Kept for the control record: only a decision may grant approval.
+        let operator_event = event.clone();
         let mut was_closed = false;
         let next = self
             .compare_and_set(
@@ -72,12 +74,21 @@ impl SharedStore {
                     was_closed = current.phase.is_terminal();
                     current.apply(actor, event, ts)
                 },
-                |next| {
-                    Ok(record_control
-                        .then(|| serde_json::to_value(DocsControl::from_record(next)))
-                        .transpose()?
-                        .map(|value| (control_key, value)))
-                },
+                record_control.then(|| {
+                    let derive: DeriveCompanion<'_, DocsRecord> =
+                        Box::new(move |next, previous| {
+                            let previous: Option<DocsControl> = previous
+                                .map(serde_json::from_value)
+                                .transpose()
+                                .context("Malformed operator docs decision")?;
+                            Ok(serde_json::to_value(DocsControl::after_operator(
+                                previous.as_ref(),
+                                &operator_event,
+                                next,
+                            ))?)
+                        });
+                    (control_key, derive)
+                }),
             )
             .await?;
         if was_closed && !next.phase.is_terminal() {
@@ -207,6 +218,95 @@ mod tests {
         assert_eq!(control.version, rejected.version);
     }
 
+    /// After a rejection, a workspace restores the older sealed approval in the
+    /// workspace-writable record. Pausing and resuming must not promote it:
+    /// only an explicit decision grants an approval. An approval the operator
+    /// did grant survives a pause and resume.
+    async fn only_a_decision_grants_the_protected_approval(store: SharedStore) {
+        let ticket = "T-2";
+        let ready = store
+            .docs_transition(
+                ticket,
+                0,
+                "lore",
+                DocsEvent::Submit {
+                    branch: "lore/T-2".into(),
+                    head: "abc".into(),
+                    base: "main".into(),
+                    report: "changelog".into(),
+                    files: vec!["CHANGELOG.md".into()],
+                },
+            )
+            .await
+            .unwrap();
+        let decide =
+            |version_rec: &config::docs_lifecycle::DocsRecord, approved: bool| DocsEvent::Decide {
+                revision: version_rec.revision,
+                head: "abc".into(),
+                approved,
+                report: "operator notes".into(),
+                seal: "seal".into(),
+            };
+        let pause_resume = |store: SharedStore, version: u64| async move {
+            let paused = store
+                .docs_operator_transition(
+                    ticket,
+                    version,
+                    DocsEvent::Pause {
+                        reason: "hold".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .docs_operator_transition(ticket, paused.version, DocsEvent::Resume)
+                .await
+                .unwrap()
+        };
+        let approved = store
+            .docs_operator_transition(ticket, ready.version, decide(&ready, true))
+            .await
+            .unwrap();
+
+        // An approval the operator granted is kept across pause and resume.
+        let resumed = pause_resume(store.clone(), approved.version).await;
+        let control = store.docs_control(ticket).await.unwrap().unwrap();
+        assert_eq!(
+            control.approved,
+            config::docs_lifecycle::DocsControl::from_record(&approved).approved
+        );
+        assert!(!control.paused);
+
+        let rejected = store
+            .docs_operator_transition(ticket, resumed.version, decide(&resumed, false))
+            .await
+            .unwrap();
+        assert_eq!(rejected.phase, DocsPhase::Drafting);
+
+        // A workspace restores the sealed approval over the rejection.
+        let docs_key = config::state::full_ticket_key_flat(ticket, config::state::KEY_TICKET_DOCS);
+        store
+            .set(&docs_key, serde_json::to_value(&approved).unwrap())
+            .await;
+        let restored = store.docs_record(ticket).await.unwrap();
+        assert_eq!(restored.phase, DocsPhase::Approved);
+
+        let resumed = pause_resume(store.clone(), restored.version).await;
+        let control = store.docs_control(ticket).await.unwrap().unwrap();
+        assert!(control.approved.is_none(), "{control:?}");
+        let error = config::docs_lifecycle::DocsControl::confirm(Some(&control), &resumed, ticket)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not the operator's latest decision"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_decision_grants_the_protected_approval_in_memory() {
+        only_a_decision_grants_the_protected_approval(SharedStore::new_in_memory()).await;
+    }
+
     #[tokio::test]
     async fn stale_operator_commands_never_replace_a_newer_decision_in_memory() {
         stale_operator_commands_never_replace_a_newer_decision(SharedStore::new_in_memory()).await;
@@ -224,6 +324,7 @@ mod tests {
             .await
             .unwrap();
         stale_operator_commands_never_replace_a_newer_decision(store.clone()).await;
+        only_a_decision_grants_the_protected_approval(store.clone()).await;
         for pattern in [format!("ns:{tenant}:*"), format!("ctl:{tenant}:*")] {
             for key in store.raw_keys(&pattern).await {
                 store.raw_del(&key).await;
