@@ -245,7 +245,10 @@ resource "coder_agent" "main" {
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
       # The bundle is unpacked by root, so the coder user cannot create the
-      # hook directory or copy into it without sudo.
+      # hook directory or copy into it without sudo. Replace the directory
+      # rather than copy over it, so a hook dropped by a later release cannot
+      # be registered from a previous boot.
+      sudo rm -rf "$HOOKS_DIR"
       sudo mkdir -p "$HOOKS_DIR"
       sudo cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
       sudo chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true

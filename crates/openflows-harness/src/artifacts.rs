@@ -173,8 +173,70 @@ pub fn install(
             );
         }
     }
-    let files = unpack(archive, dir)?;
+    // Extract beside the target and swap only once the whole archive is on
+    // disk. A workspace volume survives restarts, so installing over the old
+    // bundle would leave files a new release dropped still readable.
+    let staging = sibling(dir, "staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("cannot clear {}", staging.display()))?;
+    }
+    let files = match unpack(archive, &staging) {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    swap_into_place(&staging, dir)?;
     Ok(Installed { digest, files })
+}
+
+/// A directory next to `dir`, so the swap is a rename on one filesystem.
+fn sibling(dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bundle");
+    dir.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// Replace `target` with `staging`. The previous bundle is kept until the new
+/// one is in place, so a failed swap leaves the workspace with the old bundle
+/// rather than with nothing.
+fn swap_into_place(staging: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let previous = sibling(target, "previous");
+    let had_previous = target.exists();
+    if had_previous {
+        if previous.exists() {
+            std::fs::remove_dir_all(&previous)
+                .with_context(|| format!("cannot clear {}", previous.display()))?;
+        }
+        std::fs::rename(target, &previous).with_context(|| {
+            format!(
+                "cannot move the previous bundle out of {}",
+                target.display()
+            )
+        })?;
+    }
+    match std::fs::rename(staging, target) {
+        Ok(()) => {
+            if had_previous {
+                let _ = std::fs::remove_dir_all(&previous);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if had_previous {
+                let _ = std::fs::rename(&previous, target);
+            }
+            Err(error)
+                .with_context(|| format!("cannot install the bundle into {}", target.display()))
+        }
+    }
 }
 
 fn unpack(archive: &[u8], dir: &Path) -> Result<usize> {
@@ -311,6 +373,29 @@ mod tests {
             assert_eq!(hook, 0o755);
             assert_eq!(persona, 0o644);
         }
+    }
+
+    #[test]
+    fn reinstalling_drops_files_the_new_bundle_no_longer_ships() {
+        let archive = sample_archive();
+        let digest = workspace_assets::digest(&archive);
+        let dir = tempfile::tempdir().unwrap();
+        install(&archive, &digest, None, dir.path()).unwrap();
+
+        // A hook or command removed by a later release must not survive.
+        let stale = dir.path().join("orchestration/plugin/commands/removed.md");
+        std::fs::write(&stale, "stale").unwrap();
+        install(&archive, &digest, None, dir.path()).unwrap();
+        assert!(!stale.exists(), "a stale file from the old bundle survived");
+
+        assert!(
+            !sibling(dir.path(), "staging").exists(),
+            "staging left behind"
+        );
+        assert!(
+            !sibling(dir.path(), "previous").exists(),
+            "previous left behind"
+        );
     }
 
     #[test]

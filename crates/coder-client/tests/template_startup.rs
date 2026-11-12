@@ -313,5 +313,12 @@ fn hosted_workers_fetch_the_artifact_bundle_instead_of_reading_shared_assets() {
             fetch < install,
             "{role} must install the bundle before it reads instructions from it"
         );
+        let harness = template
+            .find("HARNESS_BIN=\"/usr/local/bin/openflows-harness\"")
+            .expect("template installs the harness");
+        assert!(
+            harness < fetch,
+            "{role} must install openflows-harness before it runs the fetch"
+        );
     }
 }

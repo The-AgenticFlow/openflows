@@ -195,26 +195,6 @@ PY
       sudo rm -f /root/.git-credentials
     fi
 
-    # Immutable role assets: the persona, skills, commands, standards and hooks.
-    # A hosted workspace fetches the bundle of this release from the Manager and
-    # verifies its digest before installing anything, so it never depends on
-    # another workspace having published them. Local mode reads the tenant
-    # artifacts volume that the Nexus workspace seeds.
-    ASSETS_DIR="/home/coder/.openflows/artifacts"
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      ASSETS_DIR="/home/coder/.openflows/bundle"
-      sudo mkdir -p "$ASSETS_DIR"
-      sudo chown coder:coder "$ASSETS_DIR"
-      log "Installing the workspace artifact bundle from the Manager"
-      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
-      # registration above, so it never appears in a process argument.
-      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
-        --manager-url "$OF_MANAGER_URL"; then
-        log "FATAL: cannot install the workspace artifact bundle"
-        exit 1
-      fi
-    fi
-
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (docs §3.2): copy -> refresh -> checkout -> work.
     # Fall back to a direct network clone when no golden seed exists, and fail
@@ -284,6 +264,26 @@ PY
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: openflows-harness could not be installed — agent will not be able to coordinate; failing startup" >&2
       exit 1
     fi
+    # Immutable role assets: the persona, skills, commands, standards and hooks.
+    # A hosted workspace fetches the bundle of this release from the Manager and
+    # verifies its digest before installing anything, so it never depends on
+    # another workspace having published them. Local mode reads the tenant
+    # artifacts volume that the Nexus workspace seeds.
+    ASSETS_DIR="/home/coder/.openflows/artifacts"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      ASSETS_DIR="/home/coder/.openflows/bundle"
+      sudo mkdir -p "$ASSETS_DIR"
+      sudo chown coder:coder "$ASSETS_DIR"
+      log "Installing the workspace artifact bundle from the Manager"
+      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
+      # registration above, so it never appears in a process argument.
+      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
+        --manager-url "$OF_MANAGER_URL"; then
+        log "FATAL: cannot install the workspace artifact bundle"
+        exit 1
+      fi
+    fi
+
 
     # Broker-backed git credential refresh. The startup installation token is
     # short-lived, so a long-running worker's push can outlive it. Refresh the
