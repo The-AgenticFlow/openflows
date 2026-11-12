@@ -243,41 +243,21 @@ impl HostedReleaseSource {
                 .fetcher
                 .get_bytes(asset_url, self.config.max_download_bytes, self.timeout())
                 .await
-                .map_err(|e| {
-                    ManagerError::Config(format!(
-                        "failed to download archive for role '{}' ({}): {e}",
-                        role.as_str(),
-                        backend
-                    ))
-                })?;
+                .map_err(|e| super::selection::variant_source_err(role, backend, "download", e))?;
             verify_archive_digest(&archive, &entry.sha256).map_err(|e| {
-                ManagerError::Config(format!(
-                    "role '{}' ({}) archive does not match manifest digest: {e}",
-                    role.as_str(),
-                    backend
-                ))
+                super::selection::variant_source_err(
+                    role,
+                    backend,
+                    "archive does not match manifest digest",
+                    e,
+                )
             })?;
-            validate_archive(&archive).map_err(|e| {
-                ManagerError::Config(format!(
-                    "role '{}' ({}) archive is unsafe: {e}",
-                    role.as_str(),
-                    backend
-                ))
-            })?;
+            validate_archive(&archive)
+                .map_err(|e| super::selection::variant_source_err(role, backend, "archive", e))?;
             variant_archives.insert((backend, role), archive);
         }
 
-        for backend in manifest.backends() {
-            for role in &manifest.required_roles {
-                if !variant_archives.contains_key(&(backend, *role)) {
-                    return Err(ManagerError::Config(format!(
-                        "hosted release {reference} is missing required role '{}' ({})",
-                        role.as_str(),
-                        backend
-                    )));
-                }
-            }
-        }
+        super::selection::ensure_required_variants(&manifest, &variant_archives, reference)?;
 
         Ok(ResolvedRelease {
             artifacts: ReleaseArtifacts::from_backend_archives(manifest, variant_archives),

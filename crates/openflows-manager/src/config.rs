@@ -857,11 +857,7 @@ impl ManagerConfig {
             .filter(|v| !v.trim().is_empty());
         let coder_version_baseline = std::env::var(CODER_VERSION_BASELINE_ENV)
             .unwrap_or_else(|_| DEFAULT_CODER_VERSION_BASELINE.to_string());
-        let provisioner_backend = std::env::var(PROVISIONER_BACKEND_ENV)
-            .unwrap_or_else(|_| DEFAULT_PROVISIONER_BACKEND.to_string());
-        provisioner_backend
-            .parse::<crate::templates::ProvisionerBackend>()
-            .map_err(|e| e.to_string())?;
+        let provisioner_backend = crate::provisioning::resolve_backend_env()?;
         let redis_admin_url = std::env::var(REDIS_ADMIN_URL_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty());

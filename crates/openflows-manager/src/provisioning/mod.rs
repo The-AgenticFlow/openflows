@@ -20,8 +20,8 @@ pub mod workspace_lifecycle;
 
 pub use release_provider::{ReleaseProvider, ReleaseProviderError};
 pub use selection::{
-    compatibility_target_from_env, record_workspace_and_tenant_pin,
-    resolve_nexus_release_for_tenant, resolve_worker_release_for_tenant,
+    compatibility_target_from_env, record_workspace_and_tenant_pin, release_target,
+    resolve_backend_env, resolve_nexus_release_for_tenant, resolve_worker_release_for_tenant,
     validate_artifacts_for_target, WorkspaceReleaseSpec,
 };
 pub use source::{ReleaseCache, ReleaseSource, ResolvedRelease};

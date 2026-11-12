@@ -743,11 +743,7 @@ impl ManagerServices {
             .approve_configured_release(release_id)
             .await?;
 
-        let backend: crate::templates::ProvisionerBackend = config.provisioner_backend.parse()?;
-        let target = crate::provisioning::compatibility_target_from_env(
-            backend,
-            config.mode == crate::config::Mode::Hosted,
-        )?;
+        let target = crate::provisioning::release_target(&config.provisioner_backend, config.mode)?;
         let worker = crate::provisioning::OrgProvisionWorker::new(
             self.db.pool().clone(),
             self.organizations.clone(),

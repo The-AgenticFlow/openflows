@@ -61,6 +61,59 @@ pub fn compatibility_target_from_env(
     })
 }
 
+/// Resolve and validate `OPENFLOWS_PROVISIONER_BACKEND` from the environment.
+pub fn resolve_backend_env() -> Result<String, String> {
+    let raw = std::env::var(crate::config::PROVISIONER_BACKEND_ENV)
+        .unwrap_or_else(|_| crate::config::DEFAULT_PROVISIONER_BACKEND.to_string());
+    raw.parse::<ProvisionerBackend>()
+        .map_err(|e| e.to_string())?;
+    Ok(raw)
+}
+
+/// Build a [`ReleaseCompatibilityTarget`] from a configured backend string and
+/// manager [`Mode`](crate::config::Mode).
+pub fn release_target(
+    backend: &str,
+    mode: crate::config::Mode,
+) -> Result<ReleaseCompatibilityTarget, ManagerError> {
+    let parsed: ProvisionerBackend = backend.parse()?;
+    compatibility_target_from_env(parsed, mode == crate::config::Mode::Hosted)
+}
+
+/// Format a variant archive fetch/verification error for [`ReleaseSource`].
+pub fn variant_source_err(
+    role: Role,
+    backend: ProvisionerBackend,
+    detail: &str,
+    err: impl std::fmt::Display,
+) -> ManagerError {
+    ManagerError::Config(format!(
+        "role '{}' ({}) {detail}: {err}",
+        role.as_str(),
+        backend
+    ))
+}
+
+/// Verify that every backend listed in `manifest` includes all `required_roles`.
+pub fn ensure_required_variants(
+    manifest: &crate::templates::packaging::TemplateManifest,
+    archives: &std::collections::BTreeMap<(ProvisionerBackend, Role), Vec<u8>>,
+    reference: &str,
+) -> Result<(), ManagerError> {
+    for backend in manifest.backends() {
+        for role in &manifest.required_roles {
+            if !archives.contains_key(&(backend, *role)) {
+                return Err(ManagerError::Config(format!(
+                    "hosted release {reference} is missing required role '{}' ({})",
+                    role.as_str(),
+                    backend
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate all required role variants and archives in `artifacts` against
 /// `target` before touching Coder or binding an organization.
 pub fn validate_artifacts_for_target(
