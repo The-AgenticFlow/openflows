@@ -3,6 +3,1463 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.8.2] - 2026-11-12
+
+### Features
+
+- *(api)* Document Manager and Agent Nexus HTTP endpoints with utoipa
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(auth)* Complete connected-local GitHub user token flow
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(auth)* Begin connected local GitHub user tokens
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(compose)* Run the Console from its GHCR image
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(compose)* Install OpenFlows from the published images
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(config)* Add connected local rollout flag
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(harness)* Install the workspace artifact bundle from the Manager
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(local)* Add connected GitHub console journey
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(lore)* Make LORE a controller-driven docs agent
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(manager)* Serve the workspace artifact bundle by content digest
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(manager)* Select and validate template releases by backend
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Deliver workspace runtime credentials separately from the secret store
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(manager)* Opt-in request metrics, release checklist and rollback
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(manager)* Report what a tenant's agents are doing
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* Preview an invitation before accepting it
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* List an organization's operation history
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* Report Nexus runtime health on tenant status
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* Report provisioning state on organization detail
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* Show who a pending invitation is for
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(manager)* Add read endpoints for the Console
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Show the repo and App mode and check your own App
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Run the shared App without compiling
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Install from release binaries and run compose on any OS
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+### Bug Fixes
+
+- *(api)* Align OpenAPI models with serialized responses and request schemas
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(api)* Add request/response bodies, headers, and hook auth to OpenAPI
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(api)* Address remaining Greptile review findings
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(api)* Address OpenAPI review findings
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(auth)* Address connected-local review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(compose)* Address review on host support, Compose version and notes
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(compose)* Drop the template comparison; templates ship inside the programs
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(docker)* Follow registry pagination when promoting manager floating tags
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(docker)* Promote manager floating tags in a serialized job from the registry state
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(docker)* Move floating manager tags after the build and keep per-tag builds
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(docker)* Move floating manager tags only for the newest release
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(github)* Paginate list_review_comments across all pages
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(harness)* Replace the bundle on install and fetch it after the harness exists
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(harness)* Keep the runtime token out of arguments and skip retrying a 4xx
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(local)* Reconcile shared App setup with develop onboarding
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Parse worker clone URLs for broker requests
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Broker GitHub App credentials to local runtimes
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Gate account controls and persist auth mode
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Protect device sign-in and document routes
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Address connected-local review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Address connected-local review findings
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(local)* Establish Manager session after device authorization
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(lore)* Only an operator decision grants the protected docs approval
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(lore)* Commit operator docs decisions atomically; hold heads that moved during CI
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(lore)* Close the docs gate review findings
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(lore)* Resolve the docs repository from the tenant store only
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(manager)* Correct unparsable typo in coder version doc
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Claim release pin before coder create and strengthen workspace validation
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Serialize tenant and workspace release pinning
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Isolate coder template versions and harden legacy backend pinning
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Retire workspace secrets when the organization has no Coder id
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(manager)* Address 505 review on delivery mounts, cleanup and line limits
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(manager)* Let a removed member rejoin through a fresh invitation
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(scripts)* Run the dev-sync Docker build as the host user
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(setup)* Request every permission the agents use on a new App
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Give new Apps the Issues and Checks permissions
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Make prod.sh use the Coder port from .env
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Create .dev-binaries before Docker can
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Stop .env.example from breaking prod.sh
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep the setup log private
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Remove the local Manager after switching to your own App
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Repair programs that lost their permissions
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Treat an empty image repo in the shell as Compose does
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Read the image repo from .env and restore deleted programs
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep native programs and upgrades consistent
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Repair damaged programs in binary installs
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep starting workspaces pending until restarted
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Honor custom compose path separators
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Verify workspace upgrades and keep compose overrides
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep pending upgrades when Coder does not answer
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Finish upgrades for every workspace
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep pending restarts across runs; support Bash 3.2
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Push the image's templates again after a source build
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Don't fail when workspace updates are declined
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Update workspaces to the new templates; keep release-note text
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep Compose overrides for plain source installs
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Keep default tenant names distinct when normalising the repo
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(templates)* Mount dev binaries in the LORE workspace
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(templates)* Map host.docker.internal on Linux and document local setup
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(tenant)* Keep tenant workspace names within Coder's 32-character limit
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(vessel)* Wait for review when GitHub refuses a merge
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(vessel)* Keep rework evidence and require exact head approvals
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(vessel)* Keep valid approvals after rework addresses change requests
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(uncategorized)* Pass connected local template variables to Manager
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Use local workspace image for local tenants
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Accept newer Coder and connect local provisioner
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Keep local device code visible while polling
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Recover local GitHub installation and account switching
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Run credential helper test with source available
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Address second review of the Console API changes
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(uncategorized)* Address review of the Console API changes
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(uncategorized)* Let operators make mounted secret files readable by the workspace user
+
+
+
+
+
+
+
+  by @arielpetit
+
+### Refactor
+
+- *(lore)* Split the LORE driver and docs lifecycle into modules
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(manager)* Move Coder version compare into versions module
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(manager)* Keep grandfathered files within PR line limits
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Split tenant secret delivery out of tenant.rs
+
+
+
+
+
+
+
+  by @onelrian
+
+- *(manager)* Name the provisioning row type (clippy::type_complexity)
+
+
+
+
+
+
+
+  by @arielpetit
+
+- *(setup)* Move the release install code to its own file
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Move LORE docs code into focused modules under the line caps
+
+
+
+
+
+
+
+  by @ndefokou
+
+### Documentation
+
+- *(api)* Add OpenAPI reference verification screenshots
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(compose)* Tell compose users to switch to their own GitHub App
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(setup)* Say why the shared App needs compiling with compose
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Clarify workspace bootstrap ordering
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Update the release flow and shared App steps
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Document binary installs and the distribution contract
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Summarize connected-local live test
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Simplify Coder Premium feature table
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Explain Coder Premium requirements for organization provisioning
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Explain GitHub auth mode before setup
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Explain local Manager Coder token setup
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Document the compose install and distribution modes
+
+
+
+
+
+
+
+  by @lele-maxwell
+
+- *(uncategorized)* Keep rollout flag out of implementation plan
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Keep connected local plan out of implementation index
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+### Styling
+
+- *(routes)* Rustfmt after merge
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(uncategorized)* Order route modules after merging the Console endpoints
+
+
+
+
+
+
+
+  by @arielpetit
+
+### Testing
+
+- *(auth)* Cover connected-local GitHub renewal and live flow
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(auth)* Cover connected-local GitHub user token flow
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(config)* Isolate connected local default tests
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Approve docs PR as an independent reviewer
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Install one candidate release in source, compose and binary modes
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(e2e)* Cover LORE docs and the VESSEL docs PR merge in the connected system
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(e2e)* Check both directions alike and record state at every step
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(e2e)* Upgrade, restart and roll back a running stack
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(e2e)* Read brokered token in HTTP fixture
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(e2e)* Approve the reworked head with a second reviewer
+
+
+
+
+
+
+
+  by @Jagoum
+
+- *(e2e)* Verify valid and forged pair tokens on registered pair
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(e2e)* Strengthen system e2e with rework loops and human reviews
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(manager)* Run backend release selection and pinning tests in postgres runner
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(setup)* Use runner available grep in onboarding check
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(vessel)* Run two post-driving tests on an 8 MiB stack
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(vessel)* Update inline comment mocks for paginated query
+
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(uncategorized)* Run the two poll-driving tests on an 8 MiB stack
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(uncategorized)* Cover local GitHub isolation and credential denial
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Use a correctly spelled repo name in tenant name tests
+
+
+
+
+
+
+
+  by @Jagoum
+
+### Miscellaneous Tasks
+
+- *(uncategorized)* Sync connected-local branch with develop
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Sync develop into connected-local flow
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+### Build
+
+- *(docker)* Publish release tags for the manager image like release-plz
+
+
+
+
+
+
+
+  by @onelrian
+
+### Continuous Integration
+
+- *(line-limits)* Skip bounded-growth gate on develop-to-main release PRs
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(uncategorized)* Require shell-tests in the merge gate
+
+
+
+
+
+
+
+  by @Jagoum
+
+
+
+
+### Contributors
+
+- @Christiantyemele
+- @Jagoum
+- @NkwaTambe
+- @arielpetit
+- @lele-maxwell
+- @ndefokou
+- @onelrian
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.1...openflows-1.8.2
+
+
+
 ## [1.8.1] - 2026-10-29
 
 ### Bug Fixes
@@ -52,12 +1509,6 @@ All notable changes to this project will be documented in this file.
   by @onelrian
 
 
-
-
-### Contributors
-
-- @Christiantyemele
-- @onelrian
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.0...openflows-1.8.1
 
