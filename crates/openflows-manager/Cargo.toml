@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = { workspace = true }
 fs2 = "0.4"
 config = { version = "0.2.0", path = "../config" }
+workspace-assets = { version = "0.1.0", path = "../workspace-assets" }
 coder-client = { version = "0.1.0", path = "../coder-client" }
 pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 axum = { version = "0.8", features = ["http1", "json"] }
