@@ -81,10 +81,6 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
-      - name: Configure cross-linker for aarch64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
-
       # Install the Zig compiler from the official ziglang.org download and
       # verify its SHA-256 against the official digest for this version before
       # using it, and install cargo-zigbuild as a prebuilt binary from GitHub
