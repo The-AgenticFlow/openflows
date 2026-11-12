@@ -3,6 +3,46 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.8.2] - 2026-11-12
+
+### Bug Fixes
+
+- *(compose)* Address review on host support, Compose version and notes
+
+
+
+
+
+
+- *(local)* Broker GitHub App credentials to local runtimes
+
+
+
+
+
+
+- *(tenant)* Keep tenant workspace names within Coder's 32-character limit
+
+
+
+
+
+
+### Documentation
+
+- *(uncategorized)* Document the compose install and distribution modes
+
+
+
+
+
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.1...openflows-1.8.2
+
+
+
 ## [1.8.1] - 2026-10-29
 
 ### Bug Fixes
