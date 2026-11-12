@@ -7,13 +7,17 @@
 //! before the release is imported.
 
 use crate::error::ManagerError;
+use crate::templates::backend::{
+    is_valid_image_digest, validate_architecture, DEFAULT_ARCHITECTURE,
+};
 use crate::templates::packaging::{
     build_deterministic_archive, validate_archive, verify_archive_digest, Role, RoleManifestEntry,
     TemplateManifest,
 };
 use crate::templates::service::ReleaseArtifacts;
+use crate::templates::ProvisionerBackend;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Error describing a release-source configuration or validation failure.
 #[derive(Debug)]
@@ -85,46 +89,55 @@ impl ReleaseProvider {
     /// the deterministic role archives.
     pub fn load(&self) -> Result<ReleaseArtifacts, ReleaseProviderError> {
         let manifest = self.load_manifest()?;
-        let mut archives = BTreeMap::new();
-        for role in Role::ALL {
-            let dir = self.source_dir.join(format!("openflows-{}", role.as_str()));
-            if !dir.is_dir() {
-                return Err(ReleaseProviderError(format!(
-                    "template source directory '{}' missing for role '{}'",
-                    dir.display(),
-                    role.as_str()
-                )));
-            }
+        let mut variant_archives = BTreeMap::new();
+        for ((backend, role), entry) in manifest.all_variants() {
+            let dir = role_source_dir(&self.source_dir, backend, role).ok_or_else(|| {
+                ReleaseProviderError(format!(
+                    "template source directory missing for role '{}' ({})",
+                    role.as_str(),
+                    backend
+                ))
+            })?;
             let archive = build_deterministic_archive(&dir).map_err(|e| {
-                ReleaseProviderError(format!("failed to package role '{}': {e}", role.as_str()))
+                ReleaseProviderError(format!(
+                    "failed to package role '{}' ({}): {e}",
+                    role.as_str(),
+                    backend
+                ))
             })?;
             validate_archive(&archive).map_err(|e| {
                 ReleaseProviderError(format!(
-                    "packaged role '{}' failed validation: {e}",
-                    role.as_str()
+                    "packaged role '{}' ({}) failed validation: {e}",
+                    role.as_str(),
+                    backend
                 ))
             })?;
-            archives.insert(role, archive);
-        }
-
-        // Verify every required role's archive digest against the manifest.
-        for role in &manifest.required_roles {
-            let entry = manifest
-                .roles
-                .get(role)
-                .ok_or_else(|| ReleaseProviderError("manifest missing required role".into()))?;
-            let archive = archives.get(role).ok_or_else(|| {
-                ReleaseProviderError(format!("no archive for role '{}'", role.as_str()))
-            })?;
-            verify_archive_digest(archive, &entry.sha256).map_err(|e| {
+            verify_archive_digest(&archive, &entry.sha256).map_err(|e| {
                 ReleaseProviderError(format!(
-                    "role '{}' archive does not match manifest digest: {e}",
-                    role.as_str()
+                    "role '{}' ({}) archive does not match manifest digest: {e}",
+                    role.as_str(),
+                    backend
                 ))
             })?;
+            variant_archives.insert((backend, role), archive);
         }
 
-        Ok(ReleaseArtifacts { manifest, archives })
+        for backend in manifest.backends() {
+            for role in &manifest.required_roles {
+                if !variant_archives.contains_key(&(backend, *role)) {
+                    return Err(ReleaseProviderError(format!(
+                        "manifest missing required role '{}' for backend '{}'",
+                        role.as_str(),
+                        backend
+                    )));
+                }
+            }
+        }
+
+        Ok(ReleaseArtifacts::from_backend_archives(
+            manifest,
+            variant_archives,
+        ))
     }
 
     /// The immutable release identity the operator pinned (manifest digest), if
@@ -168,47 +181,137 @@ impl ReleaseProvider {
     }
 
     fn build_manifest_from_source(&self) -> Result<Vec<u8>, ReleaseProviderError> {
-        let image_digest = std::env::var("OPENFLOWS_WORKSPACE_IMAGE_DIGEST")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let image_digest = non_empty_env("OPENFLOWS_WORKSPACE_IMAGE_DIGEST");
         if let Some(digest) = image_digest.as_deref() {
-            let valid = digest.strip_prefix("sha256:").is_some_and(|hex| {
-                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-            if !valid {
+            if !is_valid_image_digest(digest) {
                 return Err(ReleaseProviderError(
                     "OPENFLOWS_WORKSPACE_IMAGE_DIGEST must be sha256 followed by 64 hexadecimal characters"
                         .into(),
                 ));
             }
         }
-        let mut roles = BTreeMap::new();
+        let architecture = validate_architecture(
+            non_empty_env("OPENFLOWS_WORKSPACE_ARCH")
+                .as_deref()
+                .unwrap_or(DEFAULT_ARCHITECTURE),
+        )
+        .map_err(|e| ReleaseProviderError(e.to_string()))?;
+        let image_repository = non_empty_env("OPENFLOWS_WORKSPACE_IMAGE_REPO");
+        let workspace_runtime_release = non_empty_env("OPENFLOWS_WORKSPACE_RUNTIME_RELEASE");
+
+        let has_kubernetes = self.source_dir.join("kubernetes").is_dir();
+        let is_v2 = has_kubernetes
+            || image_repository.is_some()
+            || workspace_runtime_release.is_some()
+            || architecture != DEFAULT_ARCHITECTURE;
+        let param_schema_version = if is_v2 { 2 } else { 1 };
+
+        let mut docker_roles = BTreeMap::new();
+        let mut variants = BTreeMap::new();
+
         for role in Role::ALL {
-            let dir = self.source_dir.join(format!("openflows-{}", role.as_str()));
+            let dir = role_source_dir(&self.source_dir, ProvisionerBackend::Docker, role)
+                .ok_or_else(|| {
+                    ReleaseProviderError(format!(
+                        "template source directory missing for role '{}' (docker)",
+                        role.as_str()
+                    ))
+                })?;
             let archive = build_deterministic_archive(&dir).map_err(|e| {
                 ReleaseProviderError(format!("failed to package role '{}': {e}", role.as_str()))
             })?;
             let sha256 = crate::templates::packaging::sha256_hex(&archive);
-            roles.insert(
+            let archive_name = if is_v2 && has_kubernetes {
+                role.archive_name_for_backend(ProvisionerBackend::Docker)
+            } else {
+                role.archive_name()
+            };
+            let entry = RoleManifestEntry {
                 role,
-                RoleManifestEntry {
-                    role,
-                    archive: role.archive_name(),
-                    sha256,
-                    parameter_schema_version: 1,
-                    image_digest: image_digest.clone(),
-                },
-            );
+                backend: ProvisionerBackend::Docker,
+                archive: archive_name,
+                sha256,
+                parameter_schema_version: param_schema_version,
+                architecture: architecture.clone(),
+                image_repository: image_repository.clone(),
+                image_digest: image_digest.clone(),
+                workspace_runtime_release: workspace_runtime_release.clone(),
+            };
+            docker_roles.insert(role, entry.clone());
+            variants.insert((ProvisionerBackend::Docker, role), entry);
         }
-        let manifest = TemplateManifest {
-            schema_version: TemplateManifest::CURRENT_SCHEMA_VERSION,
-            release: self.release_name.clone(),
-            required_roles: vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
-            roles,
+
+        if has_kubernetes {
+            for role in Role::ALL {
+                let dir = role_source_dir(&self.source_dir, ProvisionerBackend::Kubernetes, role)
+                    .ok_or_else(|| {
+                    ReleaseProviderError(format!(
+                        "template source directory missing for role '{}' (kubernetes)",
+                        role.as_str()
+                    ))
+                })?;
+                let archive = build_deterministic_archive(&dir).map_err(|e| {
+                    ReleaseProviderError(format!(
+                        "failed to package role '{}' (kubernetes): {e}",
+                        role.as_str()
+                    ))
+                })?;
+                let sha256 = crate::templates::packaging::sha256_hex(&archive);
+                let entry = RoleManifestEntry {
+                    role,
+                    backend: ProvisionerBackend::Kubernetes,
+                    archive: role.archive_name_for_backend(ProvisionerBackend::Kubernetes),
+                    sha256,
+                    parameter_schema_version: 2,
+                    architecture: architecture.clone(),
+                    image_repository: image_repository.clone(),
+                    image_digest: image_digest.clone(),
+                    workspace_runtime_release: workspace_runtime_release.clone(),
+                };
+                variants.insert((ProvisionerBackend::Kubernetes, role), entry);
+            }
+        }
+
+        let required_roles = vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel];
+        let manifest = if is_v2 {
+            TemplateManifest {
+                schema_version: TemplateManifest::CURRENT_V2_SCHEMA_VERSION,
+                release: self.release_name.clone(),
+                required_roles,
+                roles: docker_roles,
+                variants,
+            }
+        } else {
+            TemplateManifest::from_v1_roles(self.release_name.clone(), required_roles, docker_roles)
         };
         manifest
             .to_canonical_json()
             .map_err(|e| ReleaseProviderError(format!("cannot serialize manifest: {e}")))
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn role_source_dir(source_dir: &Path, backend: ProvisionerBackend, role: Role) -> Option<PathBuf> {
+    let role_dir_name = format!("openflows-{}", role.as_str());
+    match backend {
+        ProvisionerBackend::Docker => {
+            let nested = source_dir.join("docker").join(&role_dir_name);
+            if nested.is_dir() {
+                return Some(nested);
+            }
+            let flat = source_dir.join(&role_dir_name);
+            flat.is_dir().then_some(flat)
+        }
+        ProvisionerBackend::Kubernetes => {
+            let nested = source_dir.join("kubernetes").join(&role_dir_name);
+            nested.is_dir().then_some(nested)
+        }
     }
 }
 
