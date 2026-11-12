@@ -149,6 +149,66 @@ jobs:
           path: dist/*
           retention-days: 5
 
+  # Runs every archive on a machine of its own kind before anything is attached (#526).
+  # The checker comes from this workflow's commit, not from the release being checked.
+  verify:
+    name: Verify (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            run_with: native
+          # Alpine has no glibc: the musl programs must run without it.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            run_with: alpine
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            run_with: native
+          # Apple Silicon runner; the Intel programs run under Rosetta.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            run_with: rosetta
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            run_with: native
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/verify-release.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Download the archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/
+
+      - name: Install Rosetta
+        if: matrix.run_with == 'rosetta'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install objdump
+        if: runner.os == 'Linux'
+        run: command -v objdump >/dev/null || { sudo apt-get update && sudo apt-get install -y binutils; }
+
+      - name: Check the archive and run its programs
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          RUN_WITH: ${{ matrix.run_with }}
+        run: >
+          bash scripts/verify-release.sh archive
+          "dist/openflows-${VERSION}-${TARGET}.tar.gz" "${VERSION}" "${TARGET}"
+          --run-with "${RUN_WITH}"
+
   templates:
     name: Template bundles
     uses: ./.github/workflows/template-release.yml
@@ -160,7 +220,7 @@ jobs:
   attach:
     name: Attach assets and publish
     runs-on: ubuntu-latest
-    needs: [build, templates]
+    needs: [build, templates, verify]
     permissions:
       contents: write
     env:
@@ -172,6 +232,14 @@ jobs:
         with:
           ref: openflows-${{ inputs.version }}
           persist-credentials: false
+
+      # The checker from this workflow's commit, kept apart from the release's files.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: verifier
+          persist-credentials: false
+          sparse-checkout: scripts/verify-release.sh
+          sparse-checkout-cone-mode: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -190,6 +258,9 @@ jobs:
             scripts/setup.sh scripts/setup-release.sh scripts/setup-docker.sh scripts/prod.sh scripts/connected-local-github.py
           cd dist
           sha256sum "${TAG}-setup.tar.gz" > "${TAG}-setup.tar.gz.sha256"
+
+      - name: Check the setup kit
+        run: bash verifier/scripts/verify-release.sh kit "dist/${TAG}-setup.tar.gz" "${VERSION}"
 
       - name: Attach to the draft
         run: |
@@ -210,6 +281,21 @@ jobs:
             [ "${attempt}" -lt 5 ] || exit 1
             sleep 30
           done
+
+      # What users download is what was checked: compare the draft's files with ours.
+      - name: Check the uploaded files
+        run: |
+          set -euo pipefail
+          mkdir uploaded
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir uploaded --pattern '*.tar.gz' --pattern '*.sha256'
+          for file in dist/*.tar.gz dist/*.sha256; do
+            name="${file#dist/}"
+            if ! cmp -s "${file}" "uploaded/${name}"; then
+              echo "::error::${name} on the draft release differs from the checked file."
+              exit 1
+            fi
+          done
+          echo "All $(find dist -maxdepth 1 -type f | wc -l) files on the draft match the checked ones."
 
       # A published release is installable, and installs need its images. If they never
       # appear the release stays a draft; re-run this job once they exist.
@@ -234,6 +320,15 @@ jobs:
               fi
               sleep 60
             done
+          done
+
+      - name: Check the Docker images
+        if: inputs.wait_for_images
+        run: |
+          set -euo pipefail
+          TAG_TREE="$(git rev-parse 'HEAD^{tree}')"
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+            bash verifier/scripts/verify-release.sh image "ghcr.io/${image}" "${VERSION}" "${TAG_TREE}"
           done
 
       - name: Publish the release
