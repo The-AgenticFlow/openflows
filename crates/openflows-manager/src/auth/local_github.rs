@@ -89,9 +89,32 @@ struct InstallationList {
     installations: Vec<InstallationSummary>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct InstallationSummary {
     id: i64,
+    #[serde(default)]
+    app_id: Option<i64>,
+    #[serde(default)]
+    app_slug: Option<String>,
+    #[serde(default)]
+    account: Option<InstallationAccount>,
+}
+
+#[derive(Clone, Deserialize)]
+struct InstallationAccount {
+    id: i64,
+    login: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+pub struct LocalRepositoryInstallation {
+    pub repository: AccessibleRepository,
+    pub installation_id: i64,
+    pub app_id: i64,
+    pub account_id: i64,
+    pub account_login: String,
+    pub account_type: String,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +155,92 @@ impl LocalGithubAuth {
         &self,
         access_token: &str,
     ) -> Result<Vec<AccessibleRepository>, ManagerError> {
+        let installations = self.installations(access_token).await?;
+        let mut repositories = Vec::new();
+        for installation in installations {
+            repositories.extend(
+                self.installation_repositories(access_token, installation.id)
+                    .await?,
+            );
+        }
+        repositories.sort_by_key(|repo| repo.id);
+        repositories.dedup_by_key(|repo| repo.id);
+        Ok(repositories)
+    }
+
+    /// Check one repository with the App user token. GitHub enforces the
+    /// intersection of the user's access and the App installation's access.
+    pub async fn accessible_repository(
+        &self,
+        access_token: &str,
+        full_name: &str,
+    ) -> Result<Option<AccessibleRepository>, ManagerError> {
+        let response = self
+            .client
+            .get(format!("{}/repos/{}", self.api_base, full_name))
+            .bearer_auth(access_token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|_| github_unavailable())?;
+        match response.status().as_u16() {
+            200 => response
+                .json()
+                .await
+                .map(Some)
+                .map_err(|_| github_unavailable()),
+            404 => Ok(None),
+            401 => Err(auth_failed()),
+            _ => Err(github_unavailable()),
+        }
+    }
+
+    /// Find a repository and its verified installation for the configured App.
+    /// The returned metadata is sourced from GitHub using the signed-in user's
+    /// App token, never from the installation redirect's query parameters.
+    pub async fn repository_installation(
+        &self,
+        access_token: &str,
+        app_slug: &str,
+        repository_name: &str,
+    ) -> Result<Option<LocalRepositoryInstallation>, ManagerError> {
+        for installation in self.installations(access_token).await? {
+            if !installation
+                .app_slug
+                .as_deref()
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(app_slug))
+            {
+                continue;
+            }
+            let Some(app_id) = installation.app_id else {
+                continue;
+            };
+            let Some(account) = installation.account else {
+                continue;
+            };
+            if let Some(repository) = self
+                .installation_repositories(access_token, installation.id)
+                .await?
+                .into_iter()
+                .find(|repo| repo.full_name.eq_ignore_ascii_case(repository_name))
+            {
+                return Ok(Some(LocalRepositoryInstallation {
+                    repository,
+                    installation_id: installation.id,
+                    app_id,
+                    account_id: account.id,
+                    account_login: account.login,
+                    account_type: account.kind,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn installations(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<InstallationSummary>, ManagerError> {
         let mut installations = Vec::new();
         for page in 1..=100 {
             let response = self
@@ -142,11 +251,16 @@ impl LocalGithubAuth {
                 .query(&[("per_page", 100), ("page", page)])
                 .send()
                 .await
-                .map_err(|_| auth_failed())?;
+                .map_err(|_| github_unavailable())?;
             if !response.status().is_success() {
-                return Err(auth_failed());
+                return Err(if response.status().as_u16() == 401 {
+                    auth_failed()
+                } else {
+                    github_unavailable()
+                });
             }
-            let batch: InstallationList = response.json().await.map_err(|_| auth_failed())?;
+            let batch: InstallationList =
+                response.json().await.map_err(|_| github_unavailable())?;
             let count = batch.installations.len();
             installations.extend(batch.installations);
             if count < 100 {
@@ -160,40 +274,48 @@ impl LocalGithubAuth {
             }
         }
 
+        Ok(installations)
+    }
+
+    async fn installation_repositories(
+        &self,
+        access_token: &str,
+        installation_id: i64,
+    ) -> Result<Vec<AccessibleRepository>, ManagerError> {
         let mut repositories = Vec::new();
-        for installation in installations {
-            for page in 1..=100 {
-                let response = self
-                    .client
-                    .get(format!(
-                        "{}/user/installations/{}/repositories",
-                        self.api_base, installation.id
-                    ))
-                    .bearer_auth(access_token)
-                    .header("Accept", "application/vnd.github+json")
-                    .query(&[("per_page", 100), ("page", page)])
-                    .send()
-                    .await
-                    .map_err(|_| auth_failed())?;
-                if !response.status().is_success() {
-                    return Err(auth_failed());
-                }
-                let batch: RepositoryList = response.json().await.map_err(|_| auth_failed())?;
-                let count = batch.repositories.len();
-                repositories.extend(batch.repositories);
-                if count < 100 {
-                    break;
-                }
-                if page == 100 {
-                    return Err(ManagerError::api(
-                        "GITHUB_LIST_TOO_LARGE",
-                        "Too many GitHub repositories",
-                    ));
-                }
+        for page in 1..=100 {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/user/installations/{}/repositories",
+                    self.api_base, installation_id
+                ))
+                .bearer_auth(access_token)
+                .header("Accept", "application/vnd.github+json")
+                .query(&[("per_page", 100), ("page", page)])
+                .send()
+                .await
+                .map_err(|_| github_unavailable())?;
+            if !response.status().is_success() {
+                return Err(if response.status().as_u16() == 401 {
+                    auth_failed()
+                } else {
+                    github_unavailable()
+                });
+            }
+            let batch: RepositoryList = response.json().await.map_err(|_| github_unavailable())?;
+            let count = batch.repositories.len();
+            repositories.extend(batch.repositories);
+            if count < 100 {
+                break;
+            }
+            if page == 100 {
+                return Err(ManagerError::api(
+                    "GITHUB_LIST_TOO_LARGE",
+                    "Too many GitHub repositories",
+                ));
             }
         }
-        repositories.sort_by_key(|repo| repo.id);
-        repositories.dedup_by_key(|repo| repo.id);
         Ok(repositories)
     }
 
@@ -319,6 +441,78 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn user_and_app_repository_access_is_rechecked_after_removal() {
+        let app_has_repository = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let visible = app_has_repository.clone();
+        let app = Router::new()
+            .route(
+                "/user/installations",
+                get(|headers: HeaderMap| async move {
+                    let user = headers.get("authorization").unwrap().to_str().unwrap();
+                    let id = if user == "Bearer alice-token" { 1 } else { 2 };
+                    Json(serde_json::json!({"installations": [{
+                        "id": id, "app_id": 10, "app_slug": "openflows-test",
+                        "account": {"id": id, "login": "owner", "type": "User"}
+                    }]}))
+                }),
+            )
+            .route(
+                "/user/installations/{id}/repositories",
+                get(move |Path(id): Path<i64>, headers: HeaderMap| {
+                    let visible = visible.clone();
+                    async move {
+                        let user = headers.get("authorization").unwrap().to_str().unwrap();
+                        let repositories = if id == 1 && user == "Bearer alice-token" && visible.load(Ordering::SeqCst) {
+                            vec![serde_json::json!({"id": 101, "full_name": "alice/private", "private": true})]
+                        } else if id == 2 && user == "Bearer bob-token" {
+                            vec![serde_json::json!({"id": 202, "full_name": "bob/private", "private": true})]
+                        } else {
+                            vec![]
+                        };
+                        Json(serde_json::json!({"repositories": repositories}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let github = LocalGithubAuth::new("public-id".into())
+            .unwrap()
+            .with_api_base(base);
+
+        assert_eq!(
+            github.accessible_repositories("alice-token").await.unwrap()[0].id,
+            101
+        );
+        assert_eq!(
+            github.accessible_repositories("bob-token").await.unwrap()[0].id,
+            202
+        );
+        assert!(github
+            .repository_installation("alice-token", "openflows-test", "bob/private")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(github
+            .repository_installation("bob-token", "openflows-test", "alice/private")
+            .await
+            .unwrap()
+            .is_none());
+        app_has_repository.store(false, Ordering::SeqCst);
+        assert!(github
+            .accessible_repositories("alice-token")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(github
+            .repository_installation("alice-token", "openflows-test", "alice/private")
+            .await
+            .unwrap()
+            .is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn device_refresh_and_repository_access_use_public_client_and_user_token() {
         let app = Router::new()
             .route(
@@ -366,7 +560,10 @@ mod tests {
                 "/user/installations",
                 get(|headers: HeaderMap| async move {
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
-                    Json(serde_json::json!({"installations": [{"id": 42}]}))
+                    Json(serde_json::json!({"installations": [{
+                        "id": 42, "app_id": 1234, "app_slug": "openflows-test",
+                        "account": {"id": 99, "login": "acme", "type": "Organization"}
+                    }]}))
                 }),
             )
             .route(
@@ -377,6 +574,15 @@ mod tests {
                     Json(serde_json::json!({"repositories": [
                         {"id": 123, "full_name": "acme/backend", "private": true}
                     ]}))
+                }),
+            )
+            .route(
+                "/repos/acme/backend",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
+                    Json(serde_json::json!({
+                        "id": 123, "full_name": "acme/backend", "private": true
+                    }))
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -402,6 +608,30 @@ mod tests {
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].id, 123);
         assert_eq!(repos[0].full_name, "acme/backend");
+        assert_eq!(
+            github
+                .accessible_repository("user-token", "acme/backend")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            123
+        );
+        let installation = github
+            .repository_installation("user-token", "openflows-test", "acme/backend")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(installation.installation_id, 42);
+        assert_eq!(installation.app_id, 1234);
+        assert_eq!(installation.account_id, 99);
+        assert_eq!(installation.account_login, "acme");
+        assert_eq!(installation.repository.id, 123);
+        assert!(github
+            .repository_installation("user-token", "different-app", "acme/backend")
+            .await
+            .unwrap()
+            .is_none());
         server.abort();
     }
 

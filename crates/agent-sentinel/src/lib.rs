@@ -382,12 +382,12 @@ impl Node for SentinelNode {
             if decision.pr_number.is_none() {
                 continue;
             }
-            // SENTINEL shares the PR author's GitHub account (the tenant's
-            // external-auth identity), and GitHub blocks self-review, so a formal
+            // SENTINEL shares the PR author's GitHub account (the local
+            // GitHub App user identity), and GitHub blocks self-review, so a formal
             // GitHub review can never be submitted here. The lifecycle verdict is
             // authoritative, so the delivery handshake (clearing pr_delivery) must
             // complete regardless — never gate it on a GitHub call that cannot
-            // succeed, or approved PRs deadlock at merge_ready.
+            // succeed. A separate human GitHub approval is still required for merge.
             Self::record_review_delivery(store, ticket, &state, decision).await?;
             any_approved |= decision.approved;
         }

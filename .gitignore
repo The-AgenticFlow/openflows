@@ -129,4 +129,4 @@ worktrees/
 # Linux cross-build dependency cache (separate from host Cargo cache)
 .docker-cargo/
 .setup.log
-.local/provisioners/
+.local/

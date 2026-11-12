@@ -34,7 +34,8 @@ __pycache__/
 .env.local
 .env.*.local
 
-# Credentials (never include in image)
+# Credentials and local runtime state (never include in image)
+.local/
 .claude/
 *.pem
 *.key

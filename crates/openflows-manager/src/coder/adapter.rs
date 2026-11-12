@@ -298,7 +298,7 @@ impl CoderAdapter for RealCoderAdapter {
     }
     async fn verify_capabilities(&self) -> Result<CoderCapabilities, ManagerError> {
         // Version: `GET /api/v2/buildinfo` is unauthenticated. We compare the
-        // reported version prefix against the pinned baseline. Because live
+        // reported version against the minimum supported baseline. Because live
         // deployment access is an operator gate, a failure here maps to
         // an explicit not-ready state, never a privileged fallback.
         let buildinfo: Result<serde_json::Value, _> = {
@@ -313,7 +313,7 @@ impl CoderAdapter for RealCoderAdapter {
             Ok(v) => v
                 .get("version")
                 .and_then(|x| x.as_str())
-                .map(|v| v.starts_with(&self.version_baseline) || v == self.version_baseline)
+                .map(|v| super::versions::coder_version_meets_baseline(v, &self.version_baseline))
                 .unwrap_or(false),
             Err(_) => false,
         };
@@ -782,8 +782,15 @@ impl CoderAdapter for RealCoderAdapter {
                 .get_workspace(workspace_id)
                 .await
                 .map_err(ManagerError::from)?;
-            if ws.is_running() {
+            if ws.is_agent_ready() {
                 return Ok(());
+            }
+            if matches!(ws.agent_lifecycle_state(), coder_client::types::AgentLifecycleState::Unknown(ref state) if state == "start_error")
+            {
+                return Err(ManagerError::api(
+                    "TENANT_WS_START_ERROR",
+                    format!("workspace {workspace_id} agent startup failed"),
+                ));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(ManagerError::api(

@@ -1,6 +1,6 @@
 # Shared GitHub App for SaaS and local runs
 
-Status: approved product contract; connected-local implementation under review.
+Status: implemented for local runs; hosted installation-token behavior remains separate.
 
 ## Two credential paths
 
@@ -20,7 +20,7 @@ and renewal happen directly between the local Manager and GitHub.
 
 ## Local journey
 
-1. A contributor selects connected local mode during setup.
+1. Setup starts the local Manager with the shared App configuration.
 2. The local Manager requests a device code from GitHub and displays the
    verification address and user code. The contributor authorizes the App.
 3. The Manager polls within GitHub's required interval and stores the returned
@@ -45,10 +45,45 @@ never enter checked-in files, Terraform state, logs, prompts, or SaaS runtime
 tables. Sign-out removes the local credentials. If GitHub returns a rotated
 refresh token, persist it atomically before another refresh can begin.
 
-The existing self-managed App path remains available by explicit mode choice.
-The connected-local rollout flag defaults off. Hosted SaaS workspaces keep
-their current installation-token path, organization bindings, and Coder
-provisioning behavior.
+Hosted SaaS workspaces keep their installation-token path, organization
+bindings, and Coder provisioning behavior.
+
+## Operator rollout and recovery
+
+The supported local setup uses the shared OpenFlows App. In the App's GitHub
+settings, enable device flow and expiring user tokens, and grant repository
+access only to the repositories intended for OpenFlows. The local release
+needs the public App client ID and slug; the App private key and client secret
+stay on the hosted deployment. Contributors run `./scripts/setup.sh`, install
+the App on their repository, connect GitHub in the local console, and select
+that repository. A local Coder account is still needed for workspaces.
+
+To recover from expired or revoked authorization, use **Connect GitHub** in
+the local console. If a repository disappears, verify both the user's GitHub
+access and the App installation's repository selection, then refresh the
+console. If a worker failed to start, restart its Coder workspace build after
+restoring access. A Manager restart preserves the local credential file; a
+new device authorization is needed if the refresh token is no longer valid.
+
+**Disconnect** deletes the Manager's saved credential and prevents new broker
+requests. Running workspaces may retain an already issued access token until
+GitHub expires or revokes it; the workspace helper clears its cached token
+when the Manager explicitly denies renewal, with checks once per minute.
+For immediate invalidation of an issued token, revoke the App authorization
+in GitHub. Restricting user access or removing the App from a repository makes
+GitHub deny that repository's subsequent operations.
+
+For rollback, stop the local Manager and workspaces, back up the local
+credential file outside the repository, then restore the previous release and
+its matching Coder templates. Reconnect GitHub if the restored release cannot
+read the saved credential format. Check hosted SaaS separately; its App
+installation-token path is independent of local user authorization.
+
+Before declaring a rollout complete, record a live run for two GitHub users
+with different private repositories: device authorization, Git push and API
+actions, renewal across a long job, Manager restart, sign-out, revoked user
+authorization, user access removal, App repository removal, and a hosted SaaS
+regression. Record outcomes and configuration without tokens or private data.
 
 ## Acceptance
 

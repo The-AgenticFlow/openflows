@@ -5,7 +5,7 @@ use crate::auth::local_github::{DeviceChallenge, LocalGithubAuth, PollResult};
 use crate::error::ManagerError;
 use crate::server::AppState;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{header, uri::Authority, HeaderMap, HeaderValue};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -159,9 +159,12 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<LocalGithubSta
         Some(credentials) => credentials.access_token().await.is_ok(),
         None => false,
     };
-    let installation_url = state
-        .local_github_app_slug()
-        .map(|slug| format!("https://github.com/apps/{slug}/installations/new"));
+    let installation_url = state.local_github_app_slug().map(|slug| {
+        format!(
+            "https://github.com/apps/{slug}/installations/new?state={}",
+            crate::routes::connections::LOCAL_INSTALL_STATE
+        )
+    });
     Json(LocalGithubStatus {
         enabled,
         configured,
@@ -174,7 +177,7 @@ pub(crate) async fn start_device_authorization(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<DeviceAuthorization>, ManagerError> {
-    require_console_key(&headers)?;
+    require_local_console_request(&headers)?;
     let (_, github) = local_github(&state)?;
     let challenge = github.start().await?;
     Ok(Json(DeviceAuthorization {
@@ -191,7 +194,7 @@ pub(crate) async fn poll_device_authorization(
     headers: HeaderMap,
     Json(body): Json<DevicePollRequest>,
 ) -> Result<(HeaderMap, Json<DevicePollResponse>), ManagerError> {
-    require_console_key(&headers)?;
+    require_local_console_request(&headers)?;
     if body.device_code.trim().is_empty() || body.device_code.len() > 256 {
         return Err(ManagerError::InvalidInput("invalid device code".into()));
     }
@@ -270,19 +273,30 @@ pub(crate) async fn poll_device_authorization(
     }
 }
 
-fn require_console_key(headers: &HeaderMap) -> Result<(), ManagerError> {
-    let path = std::env::var("OPENFLOWS_LOCAL_CONSOLE_KEY_FILE")
-        .map_err(|_| ManagerError::api("SERVICE_UNAVAILABLE", "local console key unavailable"))?;
-    let expected = std::fs::read_to_string(path)
-        .map_err(|_| ManagerError::api("SERVICE_UNAVAILABLE", "local console key unavailable"))?;
-    let supplied = headers
-        .get("x-openflows-console-key")
+fn require_local_console_request(headers: &HeaderMap) -> Result<(), ManagerError> {
+    // The local console is exposed on the host loopback interface. A custom
+    // header prevents cross-site simple requests, while the Host check also
+    // rejects DNS rebinding through a non-loopback hostname.
+    let host = headers
+        .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !crate::auth::crypto::ct_eq(supplied.as_bytes(), expected.trim().as_bytes()) {
+        .and_then(|value| value.parse::<Authority>().ok());
+    let loopback_host = host.as_ref().is_some_and(|host| {
+        host.host().eq_ignore_ascii_case("localhost") || host.host() == "127.0.0.1"
+    });
+    let console_header = headers
+        .get("x-openflows-local-console")
+        .is_some_and(|value| value == "1");
+    let same_origin = headers.get(header::ORIGIN).is_none_or(|origin| {
+        origin.to_str().is_ok_and(|origin| {
+            host.as_ref()
+                .is_some_and(|host| origin.eq_ignore_ascii_case(&format!("http://{host}")))
+        })
+    });
+    if !loopback_host || !console_header || !same_origin {
         return Err(ManagerError::api(
             "UNAUTHORIZED",
-            "local console authorization required",
+            "request must come from the local console",
         ));
     }
     Ok(())
@@ -292,7 +306,7 @@ pub(crate) async fn repositories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RepositoryResponse>>, ManagerError> {
-    require_console_key(&headers)?;
+    require_local_console_request(&headers)?;
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -316,7 +330,7 @@ pub(crate) async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<(), ManagerError> {
-    require_console_key(&headers)?;
+    require_local_console_request(&headers)?;
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -332,6 +346,33 @@ pub(crate) async fn logout(
 mod tests {
     use super::*;
     use pocketflow_core::SharedStore;
+
+    #[test]
+    fn local_console_accepts_loopback_and_rejects_cross_site_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:3002"));
+        headers.insert("x-openflows-local-console", HeaderValue::from_static("1"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:3002"),
+        );
+        assert!(require_local_console_request(&headers).is_ok());
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://another-site.example"),
+        );
+        assert!(require_local_console_request(&headers).is_err());
+        headers.remove(header::ORIGIN);
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("another-site.example"),
+        );
+        assert!(require_local_console_request(&headers).is_err());
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3002"));
+        assert!(require_local_console_request(&headers).is_ok());
+        headers.remove("x-openflows-local-console");
+        assert!(require_local_console_request(&headers).is_err());
+    }
 
     #[tokio::test]
     async fn local_console_reports_unconnected_app_without_needing_a_broker_key() {
@@ -350,7 +391,7 @@ mod tests {
         assert!(!result.authorized);
         assert_eq!(
             result.installation_url.as_deref(),
-            Some("https://github.com/apps/openflows-test/installations/new")
+            Some("https://github.com/apps/openflows-test/installations/new?state=of-local-v1")
         );
     }
 }

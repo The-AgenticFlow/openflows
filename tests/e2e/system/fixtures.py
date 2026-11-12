@@ -226,6 +226,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/health' and self.command == 'GET':
                 self.send_json(200, {'status': 'ready'})
                 return
+            if (self.server.service == 'github' and self.command == 'POST'
+                    and path == '/api/v1/local/github-credential'):
+                if self.headers.get('Authorization') != 'Bearer ci-broker-key':
+                    raise Rejected(401, 'Invalid disposable broker key')
+                body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
+                if body.get('repository') != 'test/repo':
+                    raise Rejected(403, 'Repository outside disposable installation')
+                self.send_json(200, {'token': 'ci-operator-token'})
+                return
             token = self.headers.get('Authorization', '').removeprefix('Bearer ').removeprefix('token ')
             role = TOKENS.get(token) if self.server.service == 'github' else None
             if (self.server.service == 'model' and token != 'ci-model-key') or (self.server.service == 'github' and not role):

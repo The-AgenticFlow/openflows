@@ -16,6 +16,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 TOKEN_FILE = pathlib.Path("/home/coder/.config/openflows/github-api-token")
 REPOSITORY_FILE = TOKEN_FILE.with_name("repository")
@@ -34,7 +35,10 @@ def repository_name():
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    value = re.sub(r"^(https://github\.com/|git@github\.com:)", "", value)
+    if value.startswith("git@") and ":" in value:
+        value = value.split(":", 1)[1]
+    elif "://" in value:
+        value = urlsplit(value).path.lstrip("/")
     value = value.removesuffix(".git").strip("/")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         raise RuntimeError("connected-local repository is not configured")
@@ -50,8 +54,15 @@ def fetch():
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        token = json.load(response)["token"]
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            token = json.load(response)["token"]
+    except urllib.error.HTTPError as error:
+        # An explicit authorization denial invalidates the workspace cache.
+        # Keep the last token only for transient Manager/GitHub failures.
+        if error.code in (401, 403, 404):
+            TOKEN_FILE.unlink(missing_ok=True)
+        raise
     if not token:
         raise RuntimeError("local Manager returned an empty GitHub token")
     TOKEN_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -86,12 +97,12 @@ def main():
         )
     elif command == "watch":
         while True:
-            time.sleep(1800)
+            time.sleep(60)
             try:
                 fetch()
             except (OSError, KeyError, ValueError, RuntimeError, urllib.error.URLError):
-                # A later request or Git operation will surface GitHub/Manager
-                # denial. Never replace a working token with an error page.
+                # Explicit denial clears the token in fetch(); temporary
+                # network failures retain it for the next retry.
                 pass
     elif command == "credential":
         if len(sys.argv) > 2 and sys.argv[2] != "get":
@@ -106,6 +117,7 @@ def main():
         print("username=x-access-token")
         print("password=" + token)
     elif command == "token":
+        fetch()
         print(TOKEN_FILE.read_text().strip())
     else:
         raise RuntimeError("expected setup, watch, credential, or token")
