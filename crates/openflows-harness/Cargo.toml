@@ -38,3 +38,5 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 fred = { workspace = true, features = ["i-config"] }
+# A stub Manager for the artifact fetch tests: real HTTP, real headers.
+axum = "0.8"

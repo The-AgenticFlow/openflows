@@ -76,11 +76,12 @@ On provision, the Coder template's **startup script** runs a fixed sequence (§5
 
 1. **Install Harness A (the `openflows` binary)** — mandatory; startup fails if it is missing or not on `PATH`. It is **pulled from a GitHub Release at provision time**, not baked into a base image (except the local dev override). See §3.1 for the full release/install model.
 2. **Install the Agent Harness (B)** — pulled/provisioned as a first-class, versioned artifact and unpacked into the workspace (today the Controller's `Provisioner` copies its files in via `~/.openflows/`; the target is a packaged install with a pinned version). Under the target plugin-FS contract (see §7) this yields a self-describing `~/.openflows/` tree the Coder agent calls explicitly. See §3.1a for the release/install model.
-3. **Wire environment** — set the ticket/role/tenant/Redis/A2A variables above.
-4. **Acquire the repository** — the worker copies the repo from a shared **golden mount clone** (rather than a per-spawn network clone) and checks out the pair branch (FORGE) or the target for review (SENTINEL). See §3.2.
-5. **Start the heartbeat** daemon (writes a Redis key every 30s with a 120s TTL — see §6).
-6. **Verify the Agent Harness (B) surface** — skills, MCP, standards, and persona are installed and discoverable (see §4).
-7. **FORGE only: start the A2A executor daemon** — Harness A `openflows worker verify serve` (see §5.4).
+3. **Wire environment** — set the ticket/role/tenant/Redis/A2A variables above, then register to obtain a runtime session.
+4. **Install the role asset bundle** — a hosted workspace runs `openflows-harness artifacts fetch` and installs the persona, skills, commands, standards and hooks from the bundle the Manager serves for this release. The archive is verified against its sha256 before anything is written, so a corrupt or unexpected release fails startup instead of producing a half-configured agent. Local mode reads the tenant artifacts volume instead. See §3.3.
+5. **Acquire the repository** — the worker copies the repo from a shared **golden mount clone** (rather than a per-spawn network clone) and checks out the pair branch (FORGE) or the target for review (SENTINEL). See §3.2.
+6. **Start the heartbeat** daemon (writes a Redis key every 30s with a 120s TTL — see §6).
+7. **Verify the Agent Harness (B) surface** — skills, MCP, standards, and persona are installed and discoverable (see §4).
+8. **FORGE only: start the A2A executor daemon** — Harness A `openflows worker verify serve` (see §5.4).
 
 Under the hood, file materialization is performed by the **Provisioner** (`crates/provisioner`) over a `WorkspaceTransport` (`crates/provisioner/src/transport.rs`) that executes shell commands inside the workspace via the Coder client — because workspaces don't share a filesystem, the Controller copies artifacts *into* the workspace rather than mounting a volume.
 
@@ -161,6 +162,10 @@ Every FORGE (or SENTINEL) spawn currently runs its own `git clone`/`pull` into i
 - **Disk cost.** Each spawn holds a full physical copy on its volume; this trades network time for disk, which is the intended trade (cheap, local, offline-seedable).
 
 ---
+
+### 3.3 Role assets: one bundle, two delivery paths
+
+The role assets are compiled into the `workspace-assets` crate, so the controller and the Manager describe the same release from one definition. A hosted workspace fetches them from the Manager: `GET /api/v1/runtime/artifacts` returns a deterministic gzipped tar and reports its sha256 in `x-artifact-digest`, while `GET /api/v1/runtime/artifacts/{digest}` returns that bundle only. The fetch runs before the persona is installed, so a worker that starts before the Nexus workspace has published anything still boots with a complete bundle. The tenant artifacts volume keeps one job, the golden repository seed in §3.2.
 
 ## 4. Provisioning: installing the Agent Harness (B)
 

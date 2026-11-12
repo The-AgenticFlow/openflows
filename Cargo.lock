@@ -2620,6 +2620,7 @@ version = "1.2.1"
 dependencies = [
  "a2a-protocol",
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "config",

@@ -420,9 +420,13 @@ PY
     ASSETS_DIR="/home/coder/.openflows/artifacts"
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       ASSETS_DIR="/home/coder/.openflows/bundle"
+      sudo mkdir -p "$ASSETS_DIR"
+      sudo chown coder:coder "$ASSETS_DIR"
       log "Installing the workspace artifact bundle from the Manager"
+      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
+      # registration above, so it never appears in a process argument.
       if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
-        --manager-url "$OF_MANAGER_URL" --token "$OF_RUNTIME_ACCESS_TOKEN"; then
+        --manager-url "$OF_MANAGER_URL"; then
         log "FATAL: cannot install the workspace artifact bundle"
         exit 1
       fi

@@ -28,6 +28,14 @@ pub struct Installed {
     pub files: usize,
 }
 
+/// A failed download. Client errors are reported immediately; only a network
+/// failure or a server error is worth another attempt.
+#[derive(Debug)]
+struct DownloadError {
+    retryable: bool,
+    error: anyhow::Error,
+}
+
 /// Download the bundle and install it into `dir`, returning what was installed.
 ///
 /// With `pin`, the Manager must serve that exact digest. Without it, the
@@ -54,21 +62,30 @@ pub async fn fetch(
     install(&archive, &digest, pin, dir)
 }
 
-/// Run `action` up to `attempts` times, returning the first success. The last
-/// error is the one reported, so a caller sees why the retries did not help.
+/// Run `action` up to `attempts` times, returning the first success. A failure
+/// the caller marked as final is returned immediately, so a rejected request is
+/// never retried. The last error is the one reported.
 async fn with_retries<T, F, Fut>(attempts: u32, mut action: F) -> Result<T>
 where
     F: FnMut(u32) -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = std::result::Result<T, DownloadError>>,
 {
     let total = attempts.max(1);
     let mut last = None;
     for attempt in 1..=total {
         match action(attempt).await {
             Ok(value) => return Ok(value),
-            Err(error) => {
-                tracing::warn!(attempt, total, error = %error, "artifact download failed");
-                last = Some(error);
+            Err(failure) => {
+                if !failure.retryable {
+                    return Err(failure.error);
+                }
+                tracing::warn!(
+                    attempt,
+                    total,
+                    error = %failure.error,
+                    "artifact download failed"
+                );
+                last = Some(failure.error);
                 if attempt < total {
                     tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64))
                         .await;
@@ -79,32 +96,51 @@ where
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no download attempt ran")))
 }
 
-async fn download(url: &str, access_token: &str) -> Result<(Vec<u8>, String)> {
+async fn download(
+    url: &str,
+    access_token: &str,
+) -> std::result::Result<(Vec<u8>, String), DownloadError> {
     let response = reqwest::Client::new()
         .get(url)
         .bearer_auth(access_token)
         .send()
         .await
-        .with_context(|| format!("cannot reach the Manager for the artifact bundle at {url}"))?;
+        .map_err(|error| DownloadError {
+            retryable: true,
+            error: anyhow::Error::new(error).context(format!(
+                "cannot reach the Manager for the artifact bundle at {url}"
+            )),
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!(
-            "the Manager refused the artifact bundle ({status}){}{}",
-            if body.is_empty() { "" } else { ": " },
-            body.trim()
-        );
+        return Err(DownloadError {
+            // A rejected request stays rejected; only a server fault is worth
+            // another attempt.
+            retryable: status.is_server_error(),
+            error: anyhow::anyhow!(
+                "the Manager refused the artifact bundle ({status}){}{}",
+                if body.is_empty() { "" } else { ": " },
+                body.trim()
+            ),
+        });
     }
     let digest = response
         .headers()
         .get(DIGEST_HEADER)
         .and_then(|value| value.to_str().ok())
-        .context("the Manager response has no artifact digest header")?
+        .ok_or_else(|| DownloadError {
+            retryable: false,
+            error: anyhow::anyhow!("the Manager response has no artifact digest header"),
+        })?
         .to_string();
     let archive = response
         .bytes()
         .await
-        .context("cannot read the artifact bundle body")?
+        .map_err(|error| DownloadError {
+            retryable: true,
+            error: anyhow::Error::new(error).context("cannot read the artifact bundle body"),
+        })?
         .to_vec();
     Ok((archive, digest))
 }
@@ -309,15 +345,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_a_failing_download_before_reporting_it() {
+    async fn retries_a_transient_failure_before_reporting_it() {
         let mut attempts = 0;
         let result: Result<u32> = with_retries(3, |attempt| {
             attempts += 1;
             async move {
                 if attempt < 3 {
-                    bail!("transient {attempt}")
+                    Err(DownloadError {
+                        retryable: true,
+                        error: anyhow::anyhow!("transient {attempt}"),
+                    })
+                } else {
+                    Ok(attempt)
                 }
-                Ok(attempt)
             }
         })
         .await;
@@ -326,9 +366,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_request_is_not_retried() {
+        let mut attempts = 0;
+        let result: Result<u32> = with_retries(3, |_attempt| {
+            attempts += 1;
+            async move {
+                Err(DownloadError {
+                    retryable: false,
+                    error: anyhow::anyhow!("401 unauthorized"),
+                })
+            }
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("401"));
+        assert_eq!(attempts, 1, "a rejected request must not be retried");
+    }
+
+    #[tokio::test]
     async fn reports_the_last_error_after_every_attempt_fails() {
         let result: Result<u32> = with_retries(2, |attempt| async move {
-            Err::<u32, _>(anyhow::anyhow!("attempt {attempt} failed"))
+            Err(DownloadError {
+                retryable: true,
+                error: anyhow::anyhow!("attempt {attempt} failed"),
+            })
         })
         .await;
         assert!(result.unwrap_err().to_string().contains("attempt 2 failed"));
