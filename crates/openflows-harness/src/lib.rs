@@ -4,6 +4,7 @@
 //! for managing OpenFlows state, including gate approvals for phase transitions.
 
 pub mod a2a_client;
+pub mod artifacts;
 pub mod executor;
 pub mod sandbox;
 pub mod store;

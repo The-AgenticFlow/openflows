@@ -415,8 +415,10 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Shared artifacts volume — Nexus writes (skills, standards, personas),
-# forge/sentinel read (and forge writes PLAN.md for sentinel review).
+# Tenant artifacts volume. Nexus seeds the golden repository clone here and
+# publishes the instruction bundle for local workspaces; workers mount it
+# read-only. Hosted workspaces fetch the same bundle from the Manager instead,
+# so this volume only carries the repository seed there.
 resource "docker_volume" "artifacts" {
   name = "openflows-artifacts-${data.coder_parameter.tenant.value}"
 }

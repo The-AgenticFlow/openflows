@@ -2623,6 +2623,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
+ "flate2",
  "fred",
  "futures",
  "nix 0.29.0",
@@ -2631,11 +2632,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-assets",
 ]
 
 [[package]]

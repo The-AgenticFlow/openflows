@@ -265,6 +265,22 @@ PY
       sudo rm -f /root/.git-credentials
     fi
 
+    # Immutable role assets: the persona, skills, commands, standards and hooks.
+    # A hosted workspace fetches the bundle of this release from the Manager and
+    # verifies its digest before installing anything, so it never depends on
+    # another workspace having published them. Local mode reads the tenant
+    # artifacts volume that the Nexus workspace seeds.
+    ASSETS_DIR="/home/coder/.openflows/artifacts"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      ASSETS_DIR="/home/coder/.openflows/bundle"
+      log "Installing the workspace artifact bundle from the Manager"
+      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
+        --manager-url "$OF_MANAGER_URL" --token "$OF_RUNTIME_ACCESS_TOKEN"; then
+        log "FATAL: cannot install the workspace artifact bundle"
+        exit 1
+      fi
+    fi
+
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (docs §3.2): copy -> refresh -> checkout -> work.
     # Fall back to a direct network clone when no golden seed exists, and fail
@@ -386,7 +402,7 @@ PY
       exit 1
     fi
 
-    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    INSTRUCTION_ROOT="$ASSETS_DIR/orchestration"
     PERSONA="$INSTRUCTION_ROOT/agent/agents/sentinel.agent.md"
     if [ ! -f "$PERSONA" ]; then
       log "FATAL: hosted instruction bundle is missing $PERSONA"
@@ -465,9 +481,9 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared artifact files (agent definitions, skills, standards, plans).
-  # This volume is created by the Nexus workspace.  Sentinel reads the
-  # forge-written PLAN.md (and other planning gate artifacts) from here.
+  # Mount the tenant artifacts volume read-only. It carries the repository
+  # seed; hosted workspaces install the role assets from the Manager bundle, so
+  # nothing is written here for sentinel (plans travel through Redis).
   volumes {
     container_path = "/home/coder/.openflows/artifacts"
     volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"

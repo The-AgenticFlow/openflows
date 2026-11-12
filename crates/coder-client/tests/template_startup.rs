@@ -265,3 +265,45 @@ fn forge_hook_setup_runs_with_terraform_heredoc_indentation() {
         }
     }
 }
+
+#[test]
+fn hosted_workers_fetch_the_artifact_bundle_instead_of_reading_shared_assets() {
+    for (role, template) in [
+        (
+            "forge",
+            include_str!("../templates/openflows-forge/main.tf"),
+        ),
+        (
+            "sentinel",
+            include_str!("../templates/openflows-sentinel/main.tf"),
+        ),
+        (
+            "vessel",
+            include_str!("../templates/openflows-vessel/main.tf"),
+        ),
+        ("lore", include_str!("../templates/openflows-lore/main.tf")),
+    ] {
+        assert!(
+            template.contains("openflows-harness artifacts fetch --dir \"$ASSETS_DIR\""),
+            "{role} must fetch the artifact bundle from the Manager in hosted mode"
+        );
+        assert!(
+            template.contains("FATAL: cannot install the workspace artifact bundle"),
+            "{role} must fail startup when the bundle cannot be installed"
+        );
+        assert!(
+            template.contains("INSTRUCTION_ROOT=\"$ASSETS_DIR/orchestration\""),
+            "{role} must install instructions from the resolved assets directory"
+        );
+        assert!(
+            !template.contains("/home/coder/.openflows/artifacts/orchestration"),
+            "{role} still reads instructions from the shared artifacts volume"
+        );
+        let fetch = template.find("artifacts fetch").unwrap();
+        let install = template.find("INSTRUCTION_ROOT=").unwrap();
+        assert!(
+            fetch < install,
+            "{role} must install the bundle before it reads instructions from it"
+        );
+    }
+}

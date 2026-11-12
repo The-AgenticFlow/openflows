@@ -242,6 +242,22 @@ PY
       log "WARNING: no GitHub token yet — git author identity not configured; LORE cannot push until 'Login with GitHub' is completed"
     fi
 
+    # Immutable role assets: the persona, skills, commands, standards and hooks.
+    # A hosted workspace fetches the bundle of this release from the Manager and
+    # verifies its digest before installing anything, so it never depends on
+    # another workspace having published them. Local mode reads the tenant
+    # artifacts volume that the Nexus workspace seeds.
+    ASSETS_DIR="/home/coder/.openflows/artifacts"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      ASSETS_DIR="/home/coder/.openflows/bundle"
+      log "Installing the workspace artifact bundle from the Manager"
+      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
+        --manager-url "$OF_MANAGER_URL" --token "$OF_RUNTIME_ACCESS_TOKEN"; then
+        log "FATAL: cannot install the workspace artifact bundle"
+        exit 1
+      fi
+    fi
+
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (docs §3.2): copy -> refresh -> checkout -> work.
     # Fall back to a direct network clone when no golden seed exists, and fail
@@ -354,7 +370,7 @@ PY
       exit 1
     fi
 
-    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    INSTRUCTION_ROOT="$ASSETS_DIR/orchestration"
     PERSONA="$INSTRUCTION_ROOT/agent/agents/${local.role}.agent.md"
     if [ ! -f "$PERSONA" ]; then
       log "FATAL: hosted instruction bundle is missing $PERSONA"
