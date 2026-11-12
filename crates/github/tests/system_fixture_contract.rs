@@ -286,6 +286,99 @@ async fn production_github_client_observes_real_ci_and_confirmed_git_merge() -> 
     Ok(())
 }
 
+/// The calls NEXUS and VESSEL make on the LORE docs path, through the
+/// production client: branch head, compare and PR file lists from real Git,
+/// the docs PR lookup by head, and a squash merge at the approved head.
+#[tokio::test]
+async fn production_github_client_follows_the_docs_pr_path() -> Result<()> {
+    let fixture = Fixture::start().await?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let vessel = GithubRestClient::with_api_base("ci-vessel-token", &fixture.url);
+    let repository: Value = http
+        .get(format!("{}/repos/test/repo", fixture.url))
+        .bearer_auth("ci-vessel-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let remote = repository["clone_url"]
+        .as_str()
+        .context("missing Git remote")?;
+    fixture.git(fixture.root.path(), &["clone", remote, "lore"])?;
+    let checkout = fixture.root.path().join("lore");
+    let base = fixture.git(&checkout, &["rev-parse", "origin/main"])?;
+    ensure!(vessel.get_default_branch("test", "repo").await? == "main");
+    ensure!(vessel
+        .get_branch_head("test", "repo", "lore/T-1")
+        .await?
+        .is_none());
+    fixture.git(&checkout, &["switch", "-c", "lore/T-1"])?;
+    // The oracle needs the fixed answer, as on main after a feature merge.
+    std::fs::write(checkout.join("answer.txt"), "42\n")?;
+    fixture.git(&checkout, &["commit", "-am", "feature"])?;
+    fixture.git(&checkout, &["push", "origin", "HEAD:main"])?;
+    let feature = fixture.git(&checkout, &["rev-parse", "HEAD"])?;
+    std::fs::write(checkout.join("CHANGELOG.md"), "# Changelog\n\n- T-1\n")?;
+    fixture.git(&checkout, &["add", "CHANGELOG.md"])?;
+    fixture.git(&checkout, &["commit", "-m", "docs(T-1): changelog"])?;
+    fixture.git(&checkout, &["push", "origin", "HEAD"])?;
+    let docs = fixture.git(&checkout, &["rev-parse", "HEAD"])?;
+    ensure!(vessel.get_branch_head("test", "repo", "lore/T-1").await? == Some(docs.clone()));
+    ensure!(
+        vessel
+            .compare_file_paths("test", "repo", "main", &docs)
+            .await?
+            == Some(vec!["CHANGELOG.md".to_string()])
+    );
+    ensure!(
+        vessel
+            .compare_file_paths("test", "repo", &base, &docs)
+            .await?
+            == Some(vec!["CHANGELOG.md".to_string(), "answer.txt".to_string()])
+    );
+    ensure!(vessel
+        .find_open_pr_by_head("test", "repo", "lore/T-1", "main")
+        .await?
+        .is_none());
+    let pr = vessel
+        .create_pull_request("test", "repo", "docs(T-1)", "lore/T-1", "main", None)
+        .await?;
+    let found = vessel
+        .find_open_pr_by_head("test", "repo", "lore/T-1", "main")
+        .await?
+        .context("docs PR not found by head")?;
+    ensure!(found.number == pr && found.head_sha == docs);
+    ensure!(vessel.list_pr_file_paths("test", "repo", pr).await? == ["CHANGELOG.md"]);
+    ensure!(fixture.ci(remote, &docs)?);
+    http.post(format!(
+        "{}/repos/test/repo/pulls/{pr}/reviews",
+        fixture.url
+    ))
+    .bearer_auth("ci-operator-token")
+    .json(&json!({"event": "APPROVE", "commit_id": docs}))
+    .send()
+    .await?
+    .error_for_status()?;
+    let merged = vessel
+        .merge_pull_request("test", "repo", pr, "docs(T-1)", MergeMethod::Squash, &docs)
+        .await?;
+    ensure!(merged.merged);
+    let sha = merged.sha.context("missing squash SHA")?;
+    ensure!(vessel.confirmed_merge_sha("test", "repo", pr).await? == Some(sha.clone()));
+    fixture.git(&checkout, &["fetch", "origin", "main"])?;
+    ensure!(fixture.git(&checkout, &["rev-parse", "origin/main"])? == sha);
+    ensure!(fixture.git(&checkout, &["rev-parse", &format!("{sha}^")])? == feature);
+    ensure!(
+        fixture.git(&checkout, &["rev-parse", &format!("{sha}^{{tree}}")])?
+            == fixture.git(&checkout, &["rev-parse", &format!("{docs}^{{tree}}")])?
+    );
+    fixture.preserve_artifacts()?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn failed_contract_preserves_logs_and_real_acceptance_evidence_after_cleanup() -> Result<()> {
     let artifacts = tempfile::tempdir()?;

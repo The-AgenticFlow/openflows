@@ -17,7 +17,9 @@ bash tests/e2e/system/bootstrap.sh system
 7. Check that successful CI without human approval cannot trigger a merge; then approve through the public CLI and check that pending CI still blocks it.
 8. Run independent acceptance, let actual VESSEL request the merge, and verify the resulting Git tree and parent commit.
 9. Run acceptance on the merged commit and require the controller to finish the ticket and delete the role workspaces.
-10. Save evidence and delete the remaining NEXUS workspace and disposable stack.
+10. With LORE enabled in the operator registry, let NEXUS provision a real LORE workspace that pushes a changelog on `lore/T-001` and submits it; check that no docs PR exists and the LORE workspace is deleted while the docs await the operator.
+11. Approve the docs gate with `openflows gate docs`; let NEXUS open the docs PR, check that VESSEL holds it while CI is pending, then run acceptance and require VESSEL to squash-merge it at the approved head and the docs record to close.
+12. Save evidence and delete the remaining NEXUS workspace and disposable stack.
 
 The driver supplies the issue, human decisions, and independent CI results. It observes public APIs and logs; it does not write controller state, create agent workspaces itself, execute the agents' implementation commands, or request the merge. The model server returns explicit tool calls which real Coder executes under OpenFlows' phase policies.
 
