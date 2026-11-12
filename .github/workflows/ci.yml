@@ -146,6 +146,8 @@ jobs:
         run: bash tests/ci/verify-release-test.sh
       - name: Run setup.sh onboarding tests
         run: bash tests/ci/setup-onboarding-test.sh
+      - name: Test local GitHub credential cache
+        run: python3 -m unittest discover -s tests/ci -p test_connected_local_helper.py -v
       - name: Run line-limit checker tests
         run: bash tests/ci/check-line-limits-test.sh
 

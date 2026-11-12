@@ -618,11 +618,6 @@ async fn run_bootstrap() -> Result<()> {
         eprintln!("    Configure at least one model in the Coder dashboard before adding tenants.");
     }
 
-    // Verify GitHub external auth
-    if let Err(e) = coder_client::bootstrap::CoderBootstrapper::verify_external_auth_configured() {
-        eprintln!("\n  ⚠ {}", e);
-    }
-
     println!("\nBootstrap complete.");
     Ok(())
 }
@@ -807,7 +802,6 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             println!("\n  ✓ Tenant '{}' added", tenant_name);
             println!("  ✓ Fleet: {} FORGE-SENTINEL pair(s)", fleet);
             println!("  ✓ Nexus workspace: {}", workspace_id);
-            println!("  → Complete the GitHub OAuth link in the Coder dashboard for this tenant");
         }
         TenantCommands::List => {
             println!("Tenants (from Redis namespaces):");

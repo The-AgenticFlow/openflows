@@ -44,19 +44,15 @@ fn coder_config_parses_defaults_and_overrides() {
         "CODER_ADMIN_EMAIL",
         "CODER_ADMIN_PASSWORD",
         "CODER_IMAGE_TAG",
-        "CODER_EXTERNAL_AUTH_0_CLIENT_ID",
-        "CODER_EXTERNAL_AUTH_0_CLIENT_SECRET",
     ]);
     guard.unset_all();
     std::env::set_var("CODER_URL", "http://coder.internal:8080");
-    std::env::set_var("CODER_EXTERNAL_AUTH_0_CLIENT_ID", "github-app");
     let cfg = CoderConfig::init_from_env().unwrap();
     assert_eq!(cfg.url, "http://coder.internal:8080");
     assert_eq!(cfg.admin_email, "admin@openflows.dev");
     assert_eq!(cfg.admin_password, None);
     assert_eq!(cfg.admin_username, "admin");
     assert_eq!(cfg.image_tag, "v2.37.1");
-    assert_eq!(cfg.external_auth_client_id.as_deref(), Some("github-app"));
 }
 
 #[test]

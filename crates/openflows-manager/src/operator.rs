@@ -117,11 +117,7 @@ pub fn load_configuration(explicit: Option<&Path>) -> Result<()> {
         dotenvy::from_path(".env.prod").map_err(|_| anyhow!("cannot parse legacy .env.prod"))?;
         eprintln!("Using legacy .env.prod; new deployments use --config .env.openflows.");
     }
-    // The Docker provisioner runs Terraform on the Docker host. In local
-    // development, make the Linux controller binary available to published
-    // templates without requiring operators to copy an absolute path into
-    // their environment. Production deployments use released workspace images
-    // and never set this development-only variable.
+    // Local template imports mount the host's compiled controller binaries.
     if std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local")
         && std::env::var_os("TF_VAR_dev_binary_host_path").is_none()
     {
@@ -160,7 +156,8 @@ fn origin(key: &str) -> Result<String> {
     let url = url::Url::parse(&value).map_err(|_| anyhow!("{key} must be an HTTP(S) origin"))?;
     let local = std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local");
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if !(url.scheme() == "https" || (local && loopback && url.scheme() == "http"))
+    let local_coder = local && key == "CODER_URL" && url.host_str() == Some("coder");
+    if !(url.scheme() == "https" || (local && (loopback || local_coder) && url.scheme() == "http"))
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -460,7 +457,13 @@ pub async fn set_coder_hook_secret() -> Result<()> {
     let provider_name = setting("OPENFLOWS_SECRET_PROVIDER")?;
     let provider = crate::server::resolve_secret_provider(&provider_name).await?;
     let secret_ref = setting("OPENFLOWS_CODER_HOOK_SECRET_REF")?;
-    provider.replace(&secret_ref, &input).await?;
+    match provider.replace(&secret_ref, &input).await {
+        Ok(()) => {}
+        Err(crate::secrets::SecretError::NotFound(_)) => {
+            provider.put(&secret_ref, &input).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     println!("Coder lifecycle-hook secret updated. Restart Manager to load it.");
     Ok(())
 }
@@ -671,10 +674,7 @@ pub async fn setup(initialize: bool, email: Option<&str>) -> Result<()> {
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
             .is_ok_and(|age| age >= OPERATOR_ROTATION_AGE);
 
-    // An expired key cannot create its own replacement. Re-authorize with the
-    // explicitly supplied bootstrap credential, mint a bounded replacement,
-    // and atomically overwrite only the operator-key secret. This makes setup
-    // a recovery mechanism rather than leaving durable work permanently stuck.
+    // Renew expired keys using the explicit bootstrap credential.
     let token = if let (Some(token), Some(me)) = (existing_operator_token, existing_identity) {
         let user_id = field(&me, "id")?;
         if state

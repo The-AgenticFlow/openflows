@@ -186,6 +186,14 @@ fn forge_uses_only_brokered_github_credentials() {
 }
 
 #[test]
+fn nexus_uses_only_brokered_github_credentials() {
+    let template = include_str!("../templates/openflows-nexus/main.tf");
+    assert!(template.contains("OPENFLOWS_GITHUB_API_TOKEN_FILE"));
+    assert!(!template.contains("data.coder_external_auth.github"));
+    assert!(!template.contains("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN="));
+}
+
+#[test]
 fn forge_hook_setup_runs_with_terraform_heredoc_indentation() {
     let template = include_str!("../templates/openflows-forge/main.tf");
     let startup = template

@@ -159,7 +159,8 @@ def document_merged_ticket(nexus, merged):
     # The repository requires an approved review and a passing check; VESSEL
     # must hold while the check is pending, then merge once it passes.
     github('/pulls/' + str(docs_pr['number']) + '/reviews',
-        {'event': 'APPROVE', 'commit_id': docs_head, 'body': 'Human approval of the docs PR'})
+        {'event': 'APPROVE', 'commit_id': docs_head, 'body': 'Human approval of the docs PR'},
+        'ci-reviewer-token')
     github('/check-runs', {'name': 'acceptance', 'head_sha': docs_head, 'status': 'in_progress'},
         'ci-runner-token')
     pending_start = len(journal())
@@ -396,7 +397,7 @@ def run():
             'event': 'REQUEST_CHANGES',
             'commit_id': head_2,
             'body': 'REQUEST_CHANGES_ROUND_1: please address round 1 human review feedback',
-        })
+        }, 'ci-reviewer-token')
         head_3, state = wait_for_reworked_pr_review(nexus, pr['number'], head_2, 'human REQUEST_CHANGES round 1')
         assert docker('git', '--git-dir=/tmp/github/repo.git', 'show', head_3 + ':answer.txt') == '42'
         print(f'Human REQUEST_CHANGES round 1 on {head_2[:8]} triggered /address_review; FORGE pushed {head_3[:8]}.', flush=True)
@@ -407,7 +408,7 @@ def run():
             'event': 'REQUEST_CHANGES',
             'commit_id': head_3,
             'body': 'REQUEST_CHANGES_ROUND_2: please address round 2 human review feedback',
-        })
+        }, 'ci-reviewer-token')
         head_4, state = wait_for_reworked_pr_review(nexus, pr['number'], head_3, 'human REQUEST_CHANGES round 2')
         head = head_4
         assert len({head_1, head_2, head_3, head_4}) == 4
@@ -477,7 +478,8 @@ def run():
             '--head', head, '--verdict', 'approve', '--notes', 'Operator approves the verified candidate'],
             stdin=subprocess.DEVNULL, check=True, timeout=30)
         github('/pulls/' + str(pr['number']) + '/reviews',
-            {'event': 'APPROVE', 'commit_id': head, 'body': 'Human approval of the verified candidate'})
+            {'event': 'APPROVE', 'commit_id': head, 'body': 'Human approval of the verified candidate'},
+            'ci-reviewer-token')
         bootstrap.wait('Approved SENTINEL review delivery did not complete',
             lambda: not lifecycle(nexus).get('pr_delivery'), seconds=90)
         pending_start = len(journal())

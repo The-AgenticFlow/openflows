@@ -252,11 +252,8 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # Setup git credentials. Local mode uses Coder external auth (the owner's
-    # linked GitHub App token). Hosted mode never exports the external-auth
-    # token into the runtime: it sources a scoped credential from the
-    # secret-injection backend's mounted file instead, so no platform or
-    # deployment-wide credential reaches the workspace.
+    # Hosted mode uses a mounted runtime secret. Local mode requests a
+    # short-lived GitHub App user token from the local Manager.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       RUNTIME_CREDENTIAL_COPY=$(mktemp)
       chmod 600 "$RUNTIME_CREDENTIAL_COPY"
@@ -296,12 +293,8 @@ PY
       # The controller reports readiness after opening its tenant store.
       # A successful bootstrap alone does not mean the controller is running.
     else
-      if [ "${var.connected_local}" = "true" ]; then
-        python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
-        GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
-      else
-        GIT_TOKEN="${data.coder_parameter.hosted.value == "true" || var.connected_local ? "" : data.coder_external_auth.github[0].access_token}"
-      fi
+      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
     fi
     if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
@@ -309,7 +302,8 @@ PY
       chmod 600 /home/coder/.git-credentials
       echo "Configured git credentials for GitHub"
     else
-      echo "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth)"
+      echo "FATAL: No GitHub token available from the local Manager" >&2
+      exit 1
     fi
 
     if [ "${var.connected_local}" = "true" ]; then
@@ -320,7 +314,7 @@ PY
       sudo rm -f /root/.git-credentials
     fi
 
-    # git pull or clone (creds via Coder external auth)
+    # git pull or clone (credentials from the local Manager in local mode)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
@@ -494,7 +488,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
     "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.github_repository.value}",
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
+    "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
@@ -518,11 +512,7 @@ resource "docker_container" "workspace" {
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "OPENFLOWS_DOCS_GATE_SECRET=${data.coder_parameter.docs_gate_secret.value}",
     "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS=${data.coder_parameter.docs_gate_secret_previous.value}",
-    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
-    # tenant owner's linked GitHub App token). Export it here: Coder injects the
-    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
-    # env var, so without this the controller's resolve_token() would find nothing.
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${var.connected_local ? "" : data.coder_external_auth.github[0].access_token}",
+    # Agent GitHub API calls use the Manager-brokered token file.
   ])
 
   networks_advanced {
@@ -537,8 +527,3 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" || var.connected_local ? 0 : 1
-  id       = "primary-github"
-  optional = true
-}

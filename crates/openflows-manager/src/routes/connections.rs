@@ -97,6 +97,20 @@ pub struct SetupCallbackQuery {
     pub setup_action: Option<String>,
 }
 
+/// Public return marker for the shared App's connected-local installation.
+/// It carries no authorization; the local Manager verifies repository access
+/// using its own GitHub App user token after the browser returns.
+pub(crate) const LOCAL_INSTALL_STATE: &str = "of-local-v1";
+
+fn local_install_return(state: Option<&str>, installation_id: Option<i64>) -> Option<Redirect> {
+    // GitHub may drop the installation URL's state while selecting an account.
+    // An uncorrelated installation cannot complete a hosted connection flow;
+    // return its browser to the local console, where GitHub access is checked
+    // with the user's App token instead of trusting this callback's ID.
+    (state == Some(LOCAL_INSTALL_STATE) || (state.is_none() && installation_id.is_some()))
+        .then(|| Redirect::to("http://localhost:3002/?github-installation=complete"))
+}
+
 /// POST /api/v1/organizations/{org}/github/connect (admin).
 pub async fn connect(
     State(state): State<crate::server::AppState>,
@@ -161,6 +175,9 @@ pub async fn setup_callback(
     headers: HeaderMap,
     Query(q): Query<SetupCallbackQuery>,
 ) -> Result<Response, ManagerError> {
+    if let Some(redirect) = local_install_return(q.state.as_deref(), q.installation_id) {
+        return Ok(redirect.into_response());
+    }
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -346,4 +363,32 @@ fn callback_redirect(outcome: CallbackOutcome) -> Response {
         CallbackOutcome::PendingAnotherLeg => "/api/v1/me?connection=pending",
     };
     Redirect::temporary(path).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_install_state_returns_to_fixed_loopback_console() {
+        let response = local_install_return(Some(LOCAL_INSTALL_STATE), Some(123))
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "http://localhost:3002/?github-installation=complete"
+        );
+        assert_eq!(
+            local_install_return(None, Some(123))
+                .unwrap()
+                .into_response()
+                .headers()
+                .get("location")
+                .unwrap(),
+            "http://localhost:3002/?github-installation=complete"
+        );
+        assert!(local_install_return(Some("unrelated-setup-state"), Some(123)).is_none());
+        assert!(local_install_return(None, None).is_none());
+    }
 }

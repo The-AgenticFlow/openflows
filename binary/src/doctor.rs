@@ -142,20 +142,23 @@ pub async fn run_checks() -> Result<()> {
         }
     }
 
-    // 4. GitHub external auth configured (needed for agent authentication)
-    let has_github_auth = has_github_auth(&coder);
-    if has_github_auth {
-        println!(
-            "  ✓ GitHub external auth configured (CODER_EXTERNAL_AUTH_0_ID/CLIENT_ID/CLIENT_SECRET)"
-        );
-    } else {
-        println!(
-            "  ⚠ GitHub external auth not configured — optional, only needed for private repos"
-        );
-        println!("    If agents must push to private repos, create a GitHub App and set");
-        println!(
-            "         CODER_EXTERNAL_AUTH_0_ID, CODER_EXTERNAL_AUTH_0_CLIENT_ID and CODER_EXTERNAL_AUTH_0_CLIENT_SECRET in .env"
-        );
+    // 4. Local Manager GitHub authorization.
+    let manager_url = std::env::var("OPENFLOWS_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://localhost:3002".to_string());
+    let status_url = format!("{}/api/v1/local/github", manager_url.trim_end_matches('/'));
+    let manager_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    match manager_client.get(&status_url).send().await {
+        Ok(response) if response.status().is_success() => {
+            let status: serde_json::Value = response.json().await.unwrap_or_default();
+            if status["authorized"] == true {
+                println!("  ✓ Local Manager GitHub authorization ready");
+            } else {
+                println!("  ⚠ Connect GitHub in the local Manager at {manager_url}");
+            }
+        }
+        _ => println!("  ⚠ Local Manager unavailable at {manager_url}"),
     }
 
     // 5. Redis reachable
@@ -219,53 +222,4 @@ fn is_semver_tag(tag: &str) -> bool {
         i += 1;
     }
     i > 0 && i < bytes.len() && bytes[i] == b'.'
-}
-
-/// True when the Coder GitHub external-auth provider is fully configured:
-/// the provider ID plus both the GitHub App client ID and client secret.
-fn has_github_auth(cfg: &config::CoderConfig) -> bool {
-    cfg.external_auth_id.is_some()
-        && cfg.external_auth_client_id.is_some()
-        && cfg.external_auth_client_secret.is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg(id: Option<&str>, client_id: Option<&str>, secret: Option<&str>) -> config::CoderConfig {
-        config::CoderConfig {
-            url: "http://localhost:7080".to_string(),
-            session_token: None,
-            admin_email: "admin@openflows.dev".to_string(),
-            admin_password: None,
-            admin_username: "admin".to_string(),
-            image_tag: "v2.37.0".to_string(),
-            external_auth_id: id.map(str::to_string),
-            external_auth_client_id: client_id.map(str::to_string),
-            external_auth_client_secret: secret.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn has_github_auth_true_only_when_fully_configured() {
-        assert!(has_github_auth(&cfg(
-            Some("primary-github"),
-            Some("id"),
-            Some("secret")
-        )));
-        // Provider ID alone is not enough — client ID and secret are required too.
-        assert!(!has_github_auth(&cfg(
-            Some("primary-github"),
-            None,
-            Some("secret")
-        )));
-        assert!(!has_github_auth(&cfg(
-            Some("primary-github"),
-            Some("id"),
-            None
-        )));
-        assert!(!has_github_auth(&cfg(Some("primary-github"), None, None)));
-        assert!(!has_github_auth(&cfg(None, Some("id"), Some("secret"))));
-    }
 }

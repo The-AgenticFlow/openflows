@@ -236,12 +236,8 @@ PY
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
     else
-      if [ "${var.connected_local}" = "true" ]; then
-        python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
-        GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
-      else
-        GIT_TOKEN="${data.coder_parameter.hosted.value == "true" || var.connected_local ? "" : data.coder_external_auth.github[0].access_token}"
-      fi
+      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
     fi
     if [ -n "$GIT_TOKEN" ]; then
       # System-level helper so git works for BOTH the agent user (pushes) and
@@ -539,7 +535,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
     "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
     "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.repo_url.value}",
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
+    "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     "OPENFLOWS_ROLE=sentinel",
@@ -563,8 +559,3 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" || var.connected_local ? 0 : 1
-  id       = "primary-github"
-  optional = true
-}

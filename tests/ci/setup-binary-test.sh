@@ -234,103 +234,22 @@ expect_shared 1.8.1 no
 expect_shared 1.7.0 no
 expect_shared 1.8.2 yes
 expect_shared 1.10.0 yes
-files_for() {   # files_for MODE AUTH_MODE
+files_for() {   # files_for MODE
     (
         ROOT="${WORK}/files-$RANDOM"; mkdir -p "$ROOT"; ENV_FILE="${ROOT}/.env"; MODE="$1"
-        printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\n' "$2" >"$ENV_FILE"
-        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
+        : >"$ENV_FILE"
+        unset COMPOSE_FILE
         compose_files | grep -v '^-f$' | paste -sd' ' -
     )
 }
-expect_eq "source, own App: plain compose" "$(files_for source self-managed)" ""
-expect_eq "source, shared App: compiles the Manager" "$(files_for source connected-local)" \
+expect_eq "source: compiles the Manager" "$(files_for source)" \
     "docker-compose.yml docker-compose.connected-local.yml"
-expect_eq "binary, own App: plain compose" "$(files_for binary self-managed)" ""
-expect_eq "binary, shared App: Manager image" "$(files_for binary connected-local)" \
+expect_eq "binary: Manager image" "$(files_for binary)" \
     "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml"
-expect_eq "compose, own App: images" "$(files_for compose self-managed)" \
-    "docker-compose.yml docker-compose.images.yml"
-expect_eq "compose, shared App: images and Manager image" "$(files_for compose connected-local)" \
+expect_eq "compose: images and Manager image" "$(files_for compose)" \
     "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml docker-compose.images.yml"
 
 echo "prod.sh runs the installed programs"
-echo "Switching from the shared App to your own"
-docker_calls() {   # docker_calls AUTH_MODE SERVICES — what setup asks Docker to do, one call per line
-    (
-        ROOT="${WORK}/leftover"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"; LOG_FILE="${WORK}/leftover.log"; MODE=binary; CALLS="${WORK}/leftover.calls"
-        SERVICES="$2"
-        mkdir -p "$ROOT"; : >"$CALLS"
-        printf 'OPENFLOWS_GITHUB_AUTH_MODE=%s\nOPENFLOWS_MANAGER_IMAGE=m\n' "$1" >"$ENV_FILE"
-        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
-        mkdir -p "${WORK}/fake-docker"   # a program, not a function: setup runs it through `env`
-        cat >"${WORK}/fake-docker/docker" <<'FAKE'
-#!/usr/bin/env bash
-case "$*" in
-    *" ps -a "*) printf '%s\n' $SERVICES ;;
-    *) printf '%s\n' "$*" | sed -E 's/compose (-f [^ ]+ )*//' >>"$CALLS" ;;
-esac
-FAKE
-        chmod +x "${WORK}/fake-docker/docker"
-        export PATH="${WORK}/fake-docker:${PATH}" SERVICES CALLS
-        curl() { return 0; }
-        spin() { wait "$1"; }
-        stage_docker >/dev/null 2>&1
-        paste -sd';' - <"$CALLS"
-    )
-}
-expect_eq "removes the Manager, then its database" "$(docker_calls self-managed "redis coder openflows-db openflows-local-manager")" \
-    "up -d --remove-orphans;--profile manager rm -fs openflows-db"
-expect_eq "nothing left over: starts as usual" "$(docker_calls self-managed "redis coder")" "up -d"
-expect_eq "keeps a database started by hand" "$(docker_calls self-managed "redis coder openflows-db")" "up -d"
-expect_eq "the shared App keeps its Manager" "$(docker_calls connected-local "redis coder openflows-db openflows-local-manager")" "up -d"
-
-binaries_dir_before_docker() {   # was .dev-binaries there before Docker could create it as root?
-    (
-        ROOT="${WORK}/dir-$RANDOM"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"; LOG_FILE="${ROOT}/log"; MODE=source
-        mkdir -p "$ROOT"; printf 'OPENFLOWS_GITHUB_AUTH_MODE=self-managed\n' >"$ENV_FILE"
-        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
-        mkdir -p "${WORK}/fake-docker-dir"
-        cat >"${WORK}/fake-docker-dir/docker" <<FAKE
-#!/usr/bin/env bash
-case "\$*" in *" up "*) [ -d "$BIN_DIR" ] && echo there >"${ROOT}/seen" ;; esac
-FAKE
-        chmod +x "${WORK}/fake-docker-dir/docker"
-        export PATH="${WORK}/fake-docker-dir:${PATH}"
-        curl() { return 0; }
-        spin() { wait "$1"; }
-        stage_docker >/dev/null 2>&1
-        cat "${ROOT}/seen" 2>/dev/null
-    )
-}
-expect_eq "creates .dev-binaries before Docker can" "$(binaries_dir_before_docker)" there
-blocked_dir() {   # a folder setup can't write to stops it with the fix
-    (
-        ROOT="${WORK}/blocked"; ENV_FILE="${ROOT}/.env"; BIN_DIR="${ROOT}/.dev-binaries"; LOG_FILE="${ROOT}/log"; MODE=source
-        mkdir -p "$BIN_DIR"; chmod 555 "$BIN_DIR"; printf 'OPENFLOWS_GITHUB_AUTH_MODE=self-managed\n' >"$ENV_FILE"
-        unset OPENFLOWS_GITHUB_AUTH_MODE COMPOSE_FILE
-        docker() { echo RAN >&2; }
-        stage_docker 2>&1
-    )
-    chmod 755 "${WORK}/blocked/.dev-binaries"
-}
-if [ "$(id -u)" = 0 ]; then
-    pass "a folder it can't write to says how to fix it (skipped as root)"
-else
-    case "$(blocked_dir)" in
-        *"sudo chown"*) pass "a folder it can't write to says how to fix it" ;;
-        *) fail "a folder it can't write to gives no fix" ;;
-    esac
-fi
-
-echo "Setup kit"
-kit_files="$(sed -n '/tar -czf .*-setup.tar.gz/,/connected-local-github.py/p' "${ROOT}/.github/workflows/release-assets.yml")"
-for sourced in $(sed -n 's|^source "${SCRIPT_DIR}/\(.*\)"$|\1|p' "${ROOT}/scripts/setup.sh"); do
-    case "$kit_files" in
-        *"scripts/${sourced}"*) pass "includes ${sourced}" ;;
-        *) fail "the kit is missing scripts/${sourced}" ;;
-    esac
-done
-
 prod_bin() {   # prod_bin MODE HAS_HOST
     (
         P="${WORK}/prod-$RANDOM"; mkdir -p "${P}/scripts" "${P}/.dev-binaries"

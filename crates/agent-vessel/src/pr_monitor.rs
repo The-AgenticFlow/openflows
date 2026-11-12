@@ -23,9 +23,8 @@ pub enum PrMonitorState {
     ChangesRequested,
     /// Inline review comments are present (not yet approved).
     Comments,
-    /// SENTINEL has not yet submitted an approve review on GitHub — the PR must
-    /// not be merged until it does. This is the gating state that stops VESSEL
-    /// from merging a PR that never received a final review.
+    /// A separate authorized reviewer has not approved the PR on GitHub.
+    /// SENTINEL's internal review does not count as this approval.
     NeedsReview,
     /// A reviewer has approved but the PR is not yet merge-ready (e.g. CI pending).
     Approved,

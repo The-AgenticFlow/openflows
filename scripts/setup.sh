@@ -210,9 +210,7 @@ except Exception:
 # ── .env helpers ────────────────────────────────────────────────────────────
 env_get() {
     local key="$1"
-    if [ "$key" = OPENFLOWS_GITHUB_AUTH_MODE ] && [ "${!key+x}" = x ]; then
-        printf '%s' "${!key}"
-    elif [ -f "$ENV_FILE" ]; then
+    if [ -f "$ENV_FILE" ]; then
         sed -n "s/^${key}=//p" "$ENV_FILE" | tail -1
     fi
 }
@@ -236,7 +234,6 @@ image_repo() {
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
-auth_id() { local i; i="$(env_get CODER_EXTERNAL_AUTH_0_ID)"; printf '%s' "${i:-primary-github}"; }
 # URL a browser should use (CODER_ACCESS_URL when set, else the local URL)
 public_url() { local u; u="$(env_get CODER_ACCESS_URL)"; printf '%s' "${u:-$(coder_url)}"; }
 coder_url() { local u; u="$(env_get CODER_URL)"; printf '%s' "${u:-http://localhost:$(coder_port)}"; }
@@ -347,10 +344,6 @@ stage_env() {
     if is_placeholder "$(env_get CODER_SESSION_TOKEN)"; then
         env_set CODER_SESSION_TOKEN ""
     fi
-    # An unquoted <placeholder> stops prod.sh from loading .env. Older .env.example files had one.
-    if is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"; then
-        env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL ""
-    fi
     ok ".env ready"
 }
 
@@ -358,110 +351,6 @@ stage_env() {
 source "${SCRIPT_DIR}/setup-release.sh"
 
 # ── stage 3: GitHub App ─────────────────────────────────────────────────────
-github_app_via_manifest() { # $1=owner → sets client id/secret/install url in .env
-    local owner="$1" owner_type="User" port state name target manifest_file out_file code
-    owner_type="$(curl -fsS -m 10 "https://api.github.com/users/${owner}" 2>/dev/null | json type || true)"
-    if [ "$owner_type" = "Organization" ]; then
-        target="https://github.com/organizations/${owner}/settings/apps/new"
-    else
-        target="https://github.com/settings/apps/new"
-    fi
-    state="$(rand_hex 16)"
-    name="OpenFlows-${owner}-$(rand_hex 2)"
-    out_file="$(mktemp)"
-    port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
-    manifest_file="$(mktemp)"
-    NAME="$name" PORT="$port" CB="$(public_url)/external-auth/$(auth_id)/callback" python3 - >"$manifest_file" <<'PY'
-import json, os
-print(json.dumps({
-    "name": os.environ["NAME"][:34],
-    "url": "https://openflows.dev",
-    "redirect_url": f"http://localhost:{os.environ['PORT']}/created",
-    "callback_urls": [os.environ["CB"]],
-    "public": True,
-    "request_oauth_on_install": False,
-    "default_permissions": {
-        "metadata": "read", "actions": "read", "checks": "read", "statuses": "read",
-        "contents": "write", "issues": "write", "pull_requests": "write", "workflows": "write",
-    },
-}))
-PY
-    # Tiny local server: serves an auto-submitting form to GitHub, then
-    # captures the one-time `code` GitHub redirects back with.
-    PORT="$port" STATE="$state" TARGET="$target" MANIFEST_FILE="$manifest_file" OUT="$out_file" python3 - <<'PY' &
-import html, http.server, os, urllib.parse
-manifest = open(os.environ["MANIFEST_FILE"]).read()
-state, target, out = os.environ["STATE"], os.environ["TARGET"], os.environ["OUT"]
-class H(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def _send(self, body):
-        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-        self.wfile.write(body.encode())
-    def do_GET(self):
-        u = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(u.query)
-        if u.path == "/created" and q.get("state", [""])[0] == state and "code" in q:
-            open(out, "w").write(q["code"][0])
-            self._send("<h2>GitHub App created.</h2><p>Return to your terminal.</p>")
-            self.server.done = True
-        elif u.path == "/":
-            self._send(f'<form id=f method=post action="{html.escape(target)}?state={state}">'
-                       f'<input type=hidden name=manifest value="{html.escape(manifest)}"></form>'
-                       '<p>Redirecting to GitHub…</p><script>document.getElementById("f").submit()</script>')
-        else:
-            self.send_response(404); self.end_headers()
-s = http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H); s.done = False
-s.timeout = 1
-import time; end = time.time() + 600
-while not s.done and time.time() < end: s.handle_request()
-PY
-    local server_pid=$!
-    info "Opening GitHub to create the app — click 'Create GitHub App' there."
-    info "If no browser opens, visit: http://localhost:${port}/"
-    open_url "http://localhost:${port}/"
-    local i
-    for ((i = 0; i < 600; i++)); do
-        [ -s "$out_file" ] && break
-        kill -0 "$server_pid" 2>/dev/null || break
-        sleep 1
-    done
-    kill "$server_pid" 2>/dev/null || true
-    code="$(cat "$out_file" 2>/dev/null || true)"
-    rm -f "$out_file" "$manifest_file"
-    [ -n "$code" ] || return 1
-    local resp cid secret slug
-    resp="$(curl -fsS -m 30 -X POST -H 'Accept: application/vnd.github+json' "https://api.github.com/app-manifests/${code}/conversions")" || return 1
-    cid="$(printf '%s' "$resp" | json client_id)"
-    secret="$(printf '%s' "$resp" | json client_secret)"
-    slug="$(printf '%s' "$resp" | json slug)"
-    [ -n "$cid" ] && [ -n "$secret" ] && [ -n "$slug" ] || return 1
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_ID "$cid"
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_SECRET "$secret"
-    env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
-    return 0
-}
-
-github_app_manual() {
-    local owner="$1" new_url="https://github.com/settings/apps/new"
-    [ -n "$owner" ] && new_url="https://github.com/settings/apps/new  (orgs: https://github.com/organizations/${owner}/settings/apps/new)"
-    info "Create the app by hand:"
-    info "  1. Open  ${new_url}"
-    info "  2. Callback URL:  $(public_url)/external-auth/$(auth_id)/callback"
-    info "  3. Permissions → Repository: Contents, Issues, Pull requests, Workflows = Read and write;"
-    info "     Actions, Checks, Commit statuses = Read-only"
-    info "  4. Create the app, generate a Client secret, then paste below."
-    is_tty || die "GitHub App credentials are missing and no terminal is attached." \
-        "Create the app (steps above), then set in .env:" \
-        "  CODER_EXTERNAL_AUTH_0_CLIENT_ID, CODER_EXTERNAL_AUTH_0_CLIENT_SECRET, CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL"
-    local cid secret slug
-    cid="$(ask 'Client ID')"
-    secret="$(ask_secret 'Client secret')"
-    slug="$(ask 'App slug (the name in https://github.com/apps/<slug>)')"
-    [ -n "$cid" ] && [ -n "$secret" ] && [ -n "$slug" ] || die "Client ID, secret and slug are all required."
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_ID "$cid"
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_SECRET "$secret"
-    env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
-}
-
 has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_SHARED_APP" ]; }
 # pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
 pin_manager_image() {
@@ -471,7 +360,7 @@ pin_manager_image() {
     case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
     docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
         || die "No published Manager image for OpenFlows ${version} (${repo}:${version})." \
-            "Pick another OPENFLOWS_VERSION, or use your own App: OPENFLOWS_GITHUB_AUTH_MODE=self-managed."
+            "Pick an OpenFlows version with the shared App Manager image."
     digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
         | sed -n "s|^${repo}@||p" | head -1)"
     [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
@@ -480,70 +369,71 @@ pin_manager_image() {
 
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
-    local auth_mode
-    auth_mode="$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
-    if [ -z "$auth_mode" ]; then
-        if { ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; } \
-            || { [ "$MODE" != source ] && ! has_shared_app "$(env_get OPENFLOWS_VERSION)"; }; then
-            auth_mode=self-managed
-        else
-            auth_mode=connected-local
-        fi
-    fi
-    if [ "$auth_mode" = connected-local ] && [ "$MODE" != source ]; then
+    if [ "$MODE" != source ]; then
         has_shared_app "$(env_get OPENFLOWS_VERSION)" \
-            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App (connected-local) without compiling." \
-                "Set a version newer than ${LAST_RELEASE_WITHOUT_SHARED_APP} as OPENFLOWS_VERSION in .env," \
-                "or use your own App: set OPENFLOWS_GITHUB_AUTH_MODE=self-managed in .env."
+            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App support." \
+                "Set OPENFLOWS_VERSION to a release newer than ${LAST_RELEASE_WITHOUT_SHARED_APP}."
         pin_manager_image
     fi
-    env_set OPENFLOWS_GITHUB_AUTH_MODE "$auth_mode"
-    if [ "$auth_mode" = connected-local ]; then
-        local secret_dir
-        secret_dir="${HOME}/.config/openflows"
-        mkdir -p "$secret_dir" || die "Cannot create local GitHub credential directory."
-        chmod 700 "$secret_dir" || die "Cannot make local GitHub credential directory private."
-        if [ ! -f "$secret_dir/console-key" ]; then
-            python3 -c 'import secrets,sys; print(secrets.token_hex(32), file=open(sys.argv[1], "x"))' "$secret_dir/console-key" || die "Cannot create local console key."
-        fi
-        chmod 600 "$secret_dir/console-key" || die "Cannot make local console key private."
-        env_set OPENFLOWS_MODE local
-        env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
-        env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
-        env_set OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR "$secret_dir"
-        env_set OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE "$secret_dir/github-user.json"
-        env_set OPENFLOWS_LOCAL_UID "$(id -u)"
-        env_set OPENFLOWS_LOCAL_GID "$(id -g)"
-        env_set TF_VAR_connected_local true
-        env_set TF_VAR_connected_local_broker_secret_host_path "$secret_dir/github-broker-key"
-        env_set TF_VAR_connected_local_helper_host_path "$ROOT/scripts/connected-local-github.py"
-        env_set TF_VAR_connected_local_manager_url "http://openflows-local-manager:3002"
-        info "GitHub connection continues in the local OpenFlows console after the stack starts."
-        return
-    fi
-    [ "$auth_mode" = self-managed ] || die "OPENFLOWS_GITHUB_AUTH_MODE must be connected-local or self-managed."
-    env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED false
-    env_set TF_VAR_connected_local false
-    env_set TF_VAR_connected_local_broker_secret_host_path ""
-    env_set TF_VAR_connected_local_helper_host_path ""
-    if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
-        ok "already configured"
-        return
-    fi
-    local owner="${REPO%%/*}"
-    if is_tty && have python3 && github_app_via_manifest "$owner"; then
-        ok "GitHub App created and saved to .env"
-        local install_url
-        install_url="$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
-        panel "$C" "Install the app" "Choose 'Only select repositories' → ${REPO}" "${install_url}"
-        open_url "$install_url"
-        pause "Install the app on your repo, then continue"
+    local secret_dir="${HOME}/.config/openflows"
+    mkdir -p "$secret_dir" || die "Cannot create local GitHub credential directory."
+    chmod 700 "$secret_dir" || die "Cannot make local GitHub credential directory private."
+    env_set OPENFLOWS_MODE local
+    env_set CODER_OAUTH2_PROVIDER_ENABLE true
+    env_set CODER_EXPERIMENTS agent-lifecycle-hooks,oauth2
+    env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
+    env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
+    env_set OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR "$secret_dir"
+    env_set OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE "$secret_dir/github-user.json"
+    env_set OPENFLOWS_LOCAL_UID "$(id -u)"
+    env_set OPENFLOWS_LOCAL_GID "$(id -g)"
+    env_set TF_VAR_connected_local true
+    env_set TF_VAR_connected_local_broker_secret_host_path "$secret_dir/github-broker-key"
+    env_set TF_VAR_connected_local_helper_host_path "$ROOT/scripts/connected-local-github.py"
+    env_set TF_VAR_connected_local_manager_url "http://openflows-local-manager:3002"
+    # A release name is immutable. Derive a stable name from the local template
+    # sources so an edited checkout publishes a new release on the next run.
+    if [ "$MODE" = source ]; then
+        local template_digest
+        template_digest="$(python3 - "$ROOT/crates/coder-client/templates" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for path in sorted(root.rglob('*')):
+    if path.is_file():
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+print(digest.hexdigest()[:20])
+PY
+)"
+        env_set OPENFLOWS_RELEASE_NAME "local-${template_digest}"
     else
-        warn "Automatic app creation unavailable — falling back to manual steps"
-        github_app_manual "$owner"
-        ok "GitHub App saved to .env"
-        info "Install it on your repo: $(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
-        is_tty && pause "Install the app, then continue"
+        env_set OPENFLOWS_RELEASE_NAME "openflows-$(env_get OPENFLOWS_VERSION)"
+    fi
+    info "GitHub connection continues in the local OpenFlows console after the stack starts."
+}
+
+stage_manager_coder_oauth() {
+    local secret_dir="$(env_get OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR)" token_file="$secret_dir/coder-bootstrap-token" id line args=()
+    # The Manager creates its own Coder OAuth client using the already signed-in
+    # local Coder account. The token file is private and mounted only locally.
+    (umask 077; printf '%s' "$(env_get CODER_SESSION_TOKEN)" >"$token_file")
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    if ! (cd "$ROOT" && docker compose "${args[@]}" exec -T \
+        -e OPENFLOWS_CODER_BOOTSTRAP_TOKEN_FILE=/run/openflows-local/coder-bootstrap-token \
+        openflows-local-manager openflows-manager setup >"$LOG_FILE" 2>&1); then
+        tail -n 15 "$LOG_FILE" | sed 's/^/    /' >&2
+        die "Could not register the local Coder OAuth application" "Full log: $LOG_FILE"
+    fi
+    id="$(python3 - "$secret_dir/secrets/deployment.json" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())['oauth_id'])
+PY
+)"
+    if [ "$id" != "$(env_get OPENFLOWS_CODER_OAUTH_CLIENT_ID)" ]; then
+        env_set OPENFLOWS_CODER_OAUTH_CLIENT_ID "$id"
+        (cd "$ROOT" && docker compose "${args[@]}" up -d openflows-local-manager >"$LOG_FILE" 2>&1) \
+            || die "Could not apply the local Coder OAuth client" "Full log: $LOG_FILE"
     fi
 }
 
@@ -563,8 +453,90 @@ compose_base_files() {
     done
 }
 
-# shellcheck source=setup-docker.sh
-source "${SCRIPT_DIR}/setup-docker.sh"
+# ── stage 4: Docker stack ───────────────────────────────────────────────────
+# compose_files — the -f arguments for this install, one per line; none for plain `docker compose`.
+# connected-local adds the local Manager (from its image unless compiling); the images
+# file copies the programs into .dev-binaries before Coder starts.
+compose_files() {
+    local extra=()
+    extra+=(-f docker-compose.connected-local.yml)
+    [ "$MODE" = source ] || extra+=(-f docker-compose.manager-image.yml)
+    [ "$MODE" = compose ] && extra+=(-f docker-compose.images.yml)
+    if [ "${#extra[@]}" -gt 0 ]; then
+        compose_base_files
+        printf '%s\n' "${extra[@]}"
+    fi
+}
+stage_docker() {
+    step "Starting Redis + Coder"
+    mkdir -p "$BIN_DIR" 2>/dev/null || true
+    [ -w "$BIN_DIR" ] || die "Cannot write to .dev-binaries." "Make it yours: sudo chown -R \"$(id -u):$(id -g)\" ${BIN_DIR}"
+    local out i line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    args+=(up -d)
+    [ "$MODE" = source ] && args+=(--build)
+    # Compose prefers shell variables over .env; pass the image from .env so a leftover
+    # export (e.g. from an earlier upgrade) cannot copy a different version.
+    local image_env=()
+    [ "$MODE" = compose ] && image_env=(
+        "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
+        "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
+        "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
+        "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
+    if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
+        printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
+        die "docker compose up failed (see above)."
+    fi
+    ( for ((i = 0; i < 90; i++)); do curl -fs -m 3 "$(coder_url)/api/v2/buildinfo" >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1 ) &
+    spin $! "Waiting for Coder to become healthy" \
+        || die "Coder did not become healthy in 3 minutes." "Check logs: docker compose logs coder"
+    if [ "$MODE" = compose ]; then
+        [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
+            || die "The OpenFlows programs were not copied from $(image_ref)." \
+                "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
+        "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs do not run on this machine." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
+    fi
+    ok "Coder is up at ${B}$(coder_url)${N}"
+}
+
+# stage_connected_local_authorization — the team App is configured by the
+# OpenFlows release. Contributors install it, approve their own GitHub account,
+# and choose the requested repository in the local browser console.
+manager_repo_list() { # the repositories available to the signed-in GitHub user and the App
+    local line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    (cd "$ROOT" && docker compose "${args[@]}" exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null)
+}
+stage_connected_local_authorization() {
+    TOTAL=$((TOTAL + 1))
+    step "Connect GitHub"
+    local manager_url="http://127.0.0.1:3002" status
+    ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
+    spin $! "Waiting for the local OpenFlows console" \
+        || die "The local OpenFlows console did not become ready." "Check logs: docker compose logs openflows-local-manager"
+    status="$(curl -fs -m 5 "${manager_url}/api/v1/local/github" 2>/dev/null || true)"
+    printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
+        || die "This OpenFlows distribution does not include the team GitHub App configuration." \
+               "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
+    if manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+        ok "GitHub user authorization ready for ${REPO}"
+        return
+    fi
+    panel "$C" "Connect GitHub in your browser" \
+        "Open the local console, install the OpenFlows App on ${REPO}, approve GitHub, then select ${REPO}." \
+        "${manager_url}"
+    open_url "${manager_url}/"
+    is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
+    pause "Complete GitHub connection in the local console, then continue"
+    manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
+        || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
+               "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
+    ok "GitHub user authorization ready for ${REPO}"
+}
 
 # ── stage 5: Coder admin + token ────────────────────────────────────────────
 # mint_token — create a 90-day API token for the current CODER_TOKEN user (falls back to Coder's default lifetime).
@@ -939,112 +911,30 @@ stage_bootstrap() {
     if [ "$MODE" != source ]; then
         step "Workspace templates"
         if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
-           [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
+           templates_ready; then
             ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
             return
         fi
         run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
         env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
-        env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
         mark_pending_restart
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
         return
     fi
     step "Workspace templates (first run takes ~10 min)"
     if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
-       [ "$(env_get OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE)" = "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" ] && templates_ready; then
+       templates_ready; then
         ok "binaries and 5 templates already in place"
         info "Sources unchanged since the last build. Force a rebuild: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
         return
     fi
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
-    env_set OPENFLOWS_BOOTSTRAPPED_GITHUB_AUTH_MODE "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)"
     rm -f "${BIN_DIR}/IMAGE" "${BIN_DIR}/RELEASE"
     # The next --compose or --binary run must push its templates again, even for the same version.
     env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
     mark_pending_restart
     ok "binaries built, 5 templates pushed"
-}
-
-# ensure_github_link — Coder only builds workspaces once the OWNING Coder account (the token's user) has linked the GitHub App.
-ensure_github_link() {
-    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then
-        return 0
-    fi
-    local linked me user login url
-    CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    linked="$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)"
-    if [ "$linked" = "True" ]; then ok "GitHub already linked"; ensure_app_installed; return; fi
-    me="$(api GET /api/v2/users/me 2>/dev/null || true)"
-    user="$(printf '%s' "$me" | json username)"; login="$(printf '%s' "$me" | json login_type)"
-    url="$(public_url)/external-auth/$(auth_id)"
-    if [ "$login" = "password" ]; then
-        panel "$Y" "Link GitHub (one time)" \
-            "This token belongs to the password account '${user}'." \
-            "Open a private window, then:" \
-            "  1. Open  ${url}" \
-            "  2. Sign in as  $(env_get CODER_ADMIN_EMAIL)  (password: CODER_ADMIN_PASSWORD in .env)" \
-            "  3. Click the GitHub button and Authorize"
-    else
-        panel "$C" "Link GitHub (one time)" \
-            "Agents act on your repo through your GitHub account." \
-            "  1. Open  ${url}   (signed in as '${user}')" \
-            "  2. Click the GitHub button and Authorize" \
-            "  3. Install the app on ${REPO} if asked"
-        open_url "$url"
-    fi
-    if ! is_tty; then   # no terminal to wait in: tenant add offers a device-flow code and waits itself
-        warn "No terminal — continuing; the tenant step will ask you to authorize GitHub"
-        return
-    fi
-    ( for ((i = 0; i < 300; i++)); do
-        [ "$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)" = "True" ] && exit 0
-        sleep 2
-      done; exit 1 ) &
-    spin $! "Waiting for you to link GitHub (up to 10 min)" \
-        || die "GitHub was not linked in time." "Make sure the browser is signed in to Coder as '${user}' at ${url}."
-    ok "GitHub linked"
-    ensure_app_installed
-}
-# app_configure_url OWNER — where to manage your own App on OWNER. Returns 1 when it isn't
-# installed there and 2 when Coder can't tell. Coder lists accounts, not their repositories.
-app_configure_url() {
-    api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | python3 -c '
-import json, sys
-try:
-    auth = json.load(sys.stdin)
-    if not auth["app_installable"]:
-        sys.exit(2)
-    for install in auth["installations"]:
-        if install["account"]["login"].lower() == sys.argv[1].lower():
-            print(install["configure_url"])
-            sys.exit(0)
-except (ValueError, KeyError, TypeError):
-    sys.exit(2)
-sys.exit(1)' "$1"
-}
-ensure_app_installed() {
-    local owner="${REPO%%/*}" url rc=0
-    url="$(app_configure_url "$owner")" || rc=$?
-    if [ "$rc" = 1 ]; then
-        local install_url
-        install_url="$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
-        panel "$C" "Install the app" "Your GitHub App is not installed on ${owner}." "Choose 'Only select repositories' → ${REPO}" "${install_url}"
-        open_url "$install_url"
-        is_tty || die "Your GitHub App is not installed on ${owner}." \
-            "Install it from CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL in .env, then re-run setup."
-        pause "Install the app on your repo, then continue"
-        rc=0; url="$(app_configure_url "$owner")" || rc=$?
-        [ "$rc" != 1 ] || die "Your GitHub App is still not installed on ${owner}." \
-            "Install it on ${REPO}, or check you linked the GitHub account that can see it, then re-run setup."
-    fi
-    if [ "$rc" != 0 ]; then
-        warn "Could not check that your GitHub App is installed on ${owner}. Make sure it can access ${REPO}."
-        return
-    fi
-    ok "GitHub App installed on ${owner}"
-    info "It also needs access to ${REPO}: ${url}"
 }
 
 # The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
@@ -1088,7 +978,6 @@ for p in json.load(sys.stdin):
 stage_tenant() {
     step "Connecting ${REPO}"
     check_existing_tenant
-    ensure_github_link
     printf '\n'
     "${SCRIPT_DIR}/prod.sh" tenant "$REPO" --name "$NAME" --fleet "$FLEET"
     printf '\n'
@@ -1102,24 +991,6 @@ stage_tenant() {
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
-install_label() {
-    case "$MODE" in
-        compose) printf 'image %s' "$(env_get OPENFLOWS_VERSION)" ;;
-        binary) printf 'release %s' "$(env_get OPENFLOWS_VERSION)" ;;
-        *) printf 'source (compiled from this checkout)' ;;
-    esac
-}
-app_label() {
-    if [ "$(env_get OPENFLOWS_GITHUB_AUTH_MODE)" = connected-local ]; then printf 'shared OpenFlows App'; else printf 'your own App'; fi
-}
-show_install_plan() {
-    panel "$C" "Setting up" \
-        "Repository   ${REPO}" \
-        "GitHub App   $(app_label)" \
-        "Installed    $(install_label)" \
-        "Fleet        ${FLEET} FORGE-SENTINEL pair(s)"
-}
-
 main() {
     REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
@@ -1136,7 +1007,6 @@ main() {
         esac
     done
     cd "$ROOT"
-    : >"$LOG_FILE"; chmod 600 "$LOG_FILE"
     banner
     is_tty && trap 'printf "\033[?25h"' EXIT
 
@@ -1197,10 +1067,10 @@ main() {
     [ "$MODE" = compose ] && stage_image
     [ "$MODE" = binary ] && stage_release
     stage_github_app
-    show_install_plan
     stage_docker
     stage_connected_local_authorization
     stage_coder_token
+    stage_manager_coder_oauth
     stage_llm
     stage_bootstrap
     stage_tenant
@@ -1209,6 +1079,9 @@ main() {
     close_step
     printf '\n'
     RAIL_OPEN=0
+    local installed="source (compiled from this checkout)"
+    [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
+    [ "$MODE" = binary ] && installed="release $(env_get OPENFLOWS_VERSION)"
     if [ -n "$UPGRADE_PENDING" ]; then
         panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
             "These workspaces still use the old version:" \
@@ -1222,8 +1095,7 @@ main() {
     fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
-        "GitHub App   $(app_label)" \
-        "Installed    $(install_label)" \
+        "Installed    ${installed}" \
         "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \

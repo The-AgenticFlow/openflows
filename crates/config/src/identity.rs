@@ -321,8 +321,8 @@ impl IdentityManager {
                 .resolve_token()
                 .filter(|t| !t.is_empty())
                 .context(
-                    "no GitHub external-auth token for agent without github_token_env \
-                     (set CODER_EXTERNAL_AUTH_*_TOKEN)",
+                    "no Manager-brokered GitHub token for agent without github_token_env \
+                     (set OPENFLOWS_GITHUB_API_TOKEN_FILE)",
                 )?,
         };
 
@@ -466,32 +466,36 @@ mod tests {
         f
     }
 
-    /// Sets the external-auth token for the test and restores it on drop.
+    /// Supplies a temporary Manager token file and restores the environment.
     /// Holds the crate-wide `ENV_LOCK` so it never races other test modules.
     struct GithubTokenGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prior: Option<String>,
+        _file: tempfile::NamedTempFile,
     }
 
     impl Drop for GithubTokenGuard {
         fn drop(&mut self) {
             match &self.prior {
-                Some(v) => std::env::set_var(CONFIG_TEST_EA_TOKEN, v),
-                None => std::env::remove_var(CONFIG_TEST_EA_TOKEN),
+                Some(v) => std::env::set_var(CONFIG_TEST_TOKEN_FILE, v),
+                None => std::env::remove_var(CONFIG_TEST_TOKEN_FILE),
             }
         }
     }
 
-    const CONFIG_TEST_EA_TOKEN: &str = "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_TOKEN";
-    const CONFIG_TEST_EA_ID: &str = "CODER_EXTERNAL_AUTH_0_ID";
+    const CONFIG_TEST_TOKEN_FILE: &str = "OPENFLOWS_GITHUB_API_TOKEN_FILE";
 
     fn setup_test_token() -> GithubTokenGuard {
         let _lock = crate::env::ENV_LOCK.lock().unwrap();
-        let prior = std::env::var(CONFIG_TEST_EA_TOKEN).ok();
-        // No custom id so resolution targets the default `primary-github`.
-        std::env::remove_var(CONFIG_TEST_EA_ID);
-        std::env::set_var(CONFIG_TEST_EA_TOKEN, "test-token");
-        GithubTokenGuard { _lock, prior }
+        let prior = std::env::var(CONFIG_TEST_TOKEN_FILE).ok();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "test-token").unwrap();
+        std::env::set_var(CONFIG_TEST_TOKEN_FILE, file.path());
+        GithubTokenGuard {
+            _lock,
+            prior,
+            _file: file,
+        }
     }
 
     #[test]

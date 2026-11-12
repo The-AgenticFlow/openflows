@@ -151,8 +151,8 @@ expect_result "a kit missing files Compose mounts fails" 1 "which docker-compose
 kit 3.0.5; printf 'if then\n' >>"${WORK}/kit/openflows-3.0.5/scripts/prod.sh"
 expect_result "a kit with a broken script fails" 1 "scripts/prod.sh has a syntax error" bash "$SCRIPT" kit "$(pack_kit 3.0.5)" 3.0.5
 
-kit 3.0.7; rm "${WORK}/kit/openflows-3.0.7/scripts/setup-docker.sh"
-expect_result "a kit missing a script setup.sh sources fails" 1 "missing scripts/setup-docker.sh, which setup.sh sources" bash "$SCRIPT" kit "$(pack_kit 3.0.7)" 3.0.7
+kit 3.0.7; rm "${WORK}/kit/openflows-3.0.7/scripts/setup-release.sh"
+expect_result "a kit missing a script setup.sh sources fails" 1 "missing scripts/setup-release.sh, which setup.sh sources" bash "$SCRIPT" kit "$(pack_kit 3.0.7)" 3.0.7
 
 kit 3.0.8; chmod -x "${WORK}/kit/openflows-3.0.8/scripts/prod.sh"
 expect_result "a kit whose prod.sh is not executable fails" 1 "scripts/prod.sh is not executable" bash "$SCRIPT" kit "$(pack_kit 3.0.8)" 3.0.8

@@ -109,7 +109,7 @@ class GitHub:
                     return 200, self.page(comments, query)
         if route == ['pulls']:
             if method == 'POST':
-                self.require_role(role, ['forge', 'vessel'])
+                self.require_role(role, ['forge', 'vessel', 'operator'])
                 head, base = body['head'], body['base']
                 if head == base:
                     self.fail(422, 'Head and base must differ')
@@ -161,7 +161,7 @@ class GitHub:
                 # Inline review creation is unsupported, so this collection is empty.
                 return 200, []
             if route[2:] == ['merge'] and method == 'PUT':
-                self.require_role(role, ['vessel'])
+                self.require_role(role, ['vessel', 'operator'])
                 if pr['merged'] or pr['state'] != 'open':
                     self.fail(405, 'PR is not open')
                 sha = pr['head']['sha']

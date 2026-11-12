@@ -284,10 +284,7 @@ case "$CMD" in
         echo "═══════════════════════════════════════"
         echo ""
         [ -z "${OPENFLOWS_SETUP_REPO:-}" ] || echo "  Repository   ${OPENFLOWS_SETUP_REPO}"
-        case "${OPENFLOWS_GITHUB_AUTH_MODE:-}" in
-            connected-local) echo "  GitHub App   shared OpenFlows App" ;;
-            self-managed) echo "  GitHub App   your own App" ;;
-        esac
+        echo "  GitHub App   shared OpenFlows App"
         case "${OPENFLOWS_SETUP_MODE:-}" in
             compose) echo "  Installed    image ${OPENFLOWS_VERSION:-}" ;;
             binary) echo "  Installed    release ${OPENFLOWS_VERSION:-}" ;;

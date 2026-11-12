@@ -383,8 +383,7 @@ impl NexusNode {
         registry.resolve_github_token("nexus")
     }
 
-    /// Best-effort GitHub token from Coder external auth (the tenant user's
-    /// linked App token). `None` when not configured. PAT flow removed.
+    /// Best-effort GitHub token from the Manager-brokered token file.
     fn resolve_github_token_from_env_or_file(&self) -> Option<String> {
         config::EnvConfig::from_env()
             .ok()
@@ -3841,8 +3840,8 @@ Use `openflows-harness` for all coordination:
         #[allow(clippy::needless_borrow)]
         let worker_entry = registry.get(&base_id);
 
-        // Resolve the worker's GitHub token. resolve_github_token() falls back
-        // to the Coder external-auth token when no dedicated github_token_env
+        // Resolve the worker's GitHub token. resolve_github_token() reads the
+        // Manager-brokered token file when no dedicated github_token_env
         // is configured on the registry entry. We do NOT hard-fail on a
         // missing github_token_env field — that would block all v2-style
         // registry entries (which omit the deprecated v1 field).
@@ -3856,7 +3855,7 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("CODER_EXTERNAL_AUTH_*_TOKEN");
+                .unwrap_or("OPENFLOWS_GITHUB_API_TOKEN_FILE");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
                  ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \
