@@ -37,7 +37,7 @@ The Controller is fail-fast on required environment (injected by the Coder templ
 | `REDIS_URL` | SharedStore connection |
 | `OPENFLOWS_TENANT` | Tenant identifier (namespaces every Redis key) |
 
-> **Note:** No `GITHUB_TOKEN`/PAT is used. The controller's GitHub API auth (issue/PR sync, CI checks, worker token resolution) resolves the token solely from the tenant owner's **Coder external-auth token** (`CODER_EXTERNAL_AUTH_<ID>_TOKEN`/`_ACCESS_TOKEN`/`_TOKEN_FILE`). The GitHub repository URL is injected per-tenant by the nexus template (from the `github_repository` coder parameter set during `tenant add`), not supplied by the operator.
+> **Note:** No personal access token is configured. The controller obtains a scoped GitHub App user token from the local Manager through the credential helper. The GitHub repository URL is injected per tenant by the nexus template from the `github_repository` parameter set during `tenant add`.
 
 Runtime-supplied (injected per-tenant by the nexus workspace template, not operator-set startup env):
 | Variable | Purpose |
@@ -47,7 +47,7 @@ Runtime-supplied (injected per-tenant by the nexus workspace template, not opera
 | `A2A_RELAY_ADDR` | A2A relay bind address (default `127.0.0.1:3000`) |
 | `OPENFLOWS_REGISTRY_PATH` / `OPENFLOWS_REGISTRY_JSON` | Registry resolution |
 | `ARTIFACTS_DIR` | Artifact output directory |
-| GitHub auth | Tenant owner's linked external-auth token (`CODER_EXTERNAL_AUTH_*_TOKEN`), injected at runtime |
+| GitHub auth | `OPENFLOWS_GITHUB_API_TOKEN_FILE`, refreshed by the local Manager credential helper |
 | `SLACK_WEBHOOK_URL` | Slack notification webhook |
 | `DISCORD_WEBHOOK_URL` | Discord notification webhook |
 | WhatsApp variables | WhatsApp notification config |
@@ -63,8 +63,8 @@ The `run_controller()` boot sequence (`agentflow.rs:147`):
  │    into the workspace at startup — orchestration is a FILE, not a  │
  │    directory                                                        │
  │ 5. Load agent registry → env vars + registry_json store key        │
- │ 6. Construct the five role nodes (Nexus, Forge, Sentinel, Vessel,  │
- │    Lore)                                                           │
+ │ 6. Construct the role nodes (Nexus, Forge, Sentinel, Vessel);      │
+ │    LORE is driven by Nexus as a Coder chat                         │
  │ 7. Build the Flow graph with typed Action routes                   │
  │ 8. Enter the paced poll loop — one flow pass every 15s, forever,   │
  │    with self-healing (see §7)                                      │
@@ -186,16 +186,16 @@ Built in `agentflow.rs:257` with `Flow::new("nexus")`. This is the **single plac
       │  │                                                        │    │
       │  │  sentinel_spawned ─────────────────────────────────────▶│    │
       │  │                                                             │
-      │  │  merge_prs     ┌────────┐  deployed    ┌──────┐            │
-      │  └───────────────▶│ vessel │ ───────────▶│ lore │            │
-      │                    └────────┘              └──────┘            │
+      │  │  merge_prs     ┌────────┐                                  │
+      │  └───────────────▶│ vessel │ deployed ──▶ nexus (LORE polled) │
+      │                    └────────┘                                  │
       │   reject_command ──▶ nexus   │ deploy_failed ──▶ nexus         │
       │                              │ merge_blocked ──▶ nexus         │
       │                              │ awaiting_human ─▶ nexus         │
       │                              │ no_work ────────▶ nexus         │
       │                              │ ci_fix_needed ──▶ forge_pair ──┘
       │                              │ conflicts_detected ▶ forge_pair
-      │                              (lore: docs_complete / no_work ──▶ nexus)
+      │                              (LORE runs as a Coder chat, §6.5)
       └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -204,8 +204,7 @@ Built in `agentflow.rs:257` with `Flow::new("nexus")`. This is the **single plac
 - **nexus** → `forge_pair` on `work_assigned` / `approve_command`; → `vessel` on `merge_prs`; → `sentinel` on `sentinel_spawned`; → self on `reject_command`.
 - **forge_pair** → `sentinel` on `pr_opened`; → `nexus` on `planning_gate`, `review_ready`, `failed`, `no_tickets`, `suspended`.
 - **sentinel** → `vessel` on `review_approve`; → `forge_pair` on `review_reject`; → `nexus` on `no_work`.
-- **vessel** → `lore` on `deployed` (Lore is always enabled, so this branch always routes to Lore, never directly to Nexus); → `forge_pair` on `ci_fix_needed` / `conflicts_detected`; → `nexus` on `deploy_failed`, `merge_blocked`, `awaiting_human`, `no_work`.
-- **lore** → `nexus` on `docs_complete` / `no_work`.
+- **vessel** → `nexus` on `deployed` (LORE documentation is polled by Nexus as a Coder chat, §6.5); → `forge_pair` on `ci_fix_needed` / `conflicts_detected`; → `nexus` on `deploy_failed`, `merge_blocked`, `awaiting_human`, `no_work`.
 
 > **Note:** `PAUSE_SIGNAL` (`__pause__`) and `STOP_SIGNAL` (`__stop__`) terminate the pass without routing and are **not listed** in the route table — they are handled by the Flow runtime (§3.2).
 
@@ -321,24 +320,23 @@ The **only** agent allowed to merge/tear down. `lib.rs` is a facade re-exporting
 
 Returns action by priority: `awaiting_human` → `conflicts_detected` → `deployed` → `ci_fix_needed` → `deploy_failed` → `no_work`.
 
-Key helpers: `stop_coder_workspace_for_*` / `destroy_coder_workspace_for_*` (teardown + archive chats + clear slot `workspace_id`), `recycle_worker`, `process_single_pr`/`merge_without_ci`/`handle_conflicts` (local git `merge origin/<default>` + `CONFLICT_RESOLUTION.md`, with GitHub `list_conflicted_files` fallback), `assign_worker_for_ci_fix`/`assign_worker_for_conflict_rework`, `find_idle_forge_worker`, `derive_worker_id_from_branch`, attempt counters (`get_ci_fix_attempts`/`increment_ci_fix_attempts`, `get_conflict_resolution_attempts`/`increment_conflict_resolution_attempts`, `increment_merge_blocked_attempts`), `has_any_check_runs`, docs-PR short-circuit (`is_docs_pr`/`close_docs_pr_with_conflicts`), `mark_ticket_failed`/`mark_ticket_awaiting_human`, `reconcile` (startup detect of already-merged PRs), `from_env()` constructor.
+Key helpers: `stop_coder_workspace_for_*` / `destroy_coder_workspace_for_*` (teardown + archive chats + clear slot `workspace_id`), `recycle_worker`, `process_single_pr`/`merge_without_ci`/`handle_conflicts` (local git `merge origin/<default>` + `CONFLICT_RESOLUTION.md`, with GitHub `list_conflicted_files` fallback), `assign_worker_for_ci_fix`/`assign_worker_for_conflict_rework`, `find_idle_forge_worker`, `derive_worker_id_from_branch`, attempt counters (`get_ci_fix_attempts`/`increment_ci_fix_attempts`, `get_conflict_resolution_attempts`/`increment_conflict_resolution_attempts`, `increment_merge_blocked_attempts`), `has_any_check_runs`, docs PRs (`is_docs_pr`, `docs_route`/`process_docs_pr` merging only at the sealed, approved head and returning conflicts, failed CI or moved heads to the docs record as `rework`; `record_docs_outcome`), `mark_ticket_failed`/`mark_ticket_awaiting_human`, `reconcile` (startup detect of already-merged PRs), `from_env()` constructor.
 
-### 6.5 LoreNode — the documenter (`crates/agent-lore/src/lib.rs`)
+### 6.5 LORE — the documenter (Coder workspace agent)
 
-Implements `Node`; one of the **five always-constructed role nodes** — LORE is always enabled, just like Nexus, Forge, Sentinel and Vessel. It is unconditionally added to the flow graph in `agentflow.rs`, so `deployed` always routes from Vessel to Lore (Lore is never bypassed back to Nexus). Fields: `config: LoreConfig`, `adr_generator: AdrGenerator`, `changelog_manager: ChangelogManager`, `readme_manager: ReadmeManager`, `docs_manager: DocsManager`, `retrospective_generator: RetrospectiveGenerator`. Constructors: `new(workspace_root, persona_path)`, `new_with_registry(workspace_root, persona_path, registry_path)`, `from_config(config)`, `from_env()`.
+LORE is not a flow node: `deployed` routes from Vessel back to Nexus, and the flow never blocks on documentation. When the registry gives `lore` a worker slot, Nexus drives it from the per-ticket review poll (`drive_lore_docs` in `crates/agent-nexus/src/lore.rs`, under the same `review_poll_lease`) for every merged ticket, moving at most one step per poll from the docs record (`ticket:{id}:docs`, reducer `config::docs_lifecycle`):
 
-**`prep()`** — calls `get_documentation_tasks` (reads store events filtering `ticket_merged`, skipping docs PRs) → produces `LoreTask` variants (`ChangelogUpdate`, `AdrGeneration`, `Retrospective`, `DocSync`, `ReadmeUpdate`); `get_merged_tickets_from_store` (scans event ring buffer for `ticket_merged` events → `MergedTicketInfo`); `load_persona` (reads persona file from disk, `.ok()` — failure is non-fatal).
+- **drafting** — bind the LORE slot to the ticket *before* provisioning (a workspace is never reused across tickets, because its harness is bound to the ticket it was created for), provision or re-verify the `lore-{ticket}` workspace from the default branch (no A2A pair token), write the dispatch, and deliver the instruction into LORE's chat (local Coder or Manager). On the local Coder path the chat id is stored right after creation and a chat whose id was lost is adopted by its `role`/`ticket_id` labels, so a crash cannot leave two LORE chats; Manager makes creation idempotent. Instructions are keyed by revision, docs cycle and **epoch**; when the epoch changes (resume, restart, rework, reopen) Nexus replaces the workspace and chat before re-delivering.
+- **stall** — a delivered instruction with no progress for 30 minutes, while the chat is not running, is nudged up to three times; after that, or after four hours on one step even while running, Nexus parks LORE: it pauses the record, releases the slot and asks the operator to `--resume` or `--skip`.
+- **docs_ready** — LORE ran `openflows-harness docs submit`; the operator is notified once per revision with a compare link for exactly the submitted head, and Nexus releases the LORE slot and workspace, so a ticket waiting on a human never blocks docs for others.
+- **approved** — Nexus verifies the approval seal and that the branch on GitHub is at the approved head (otherwise: `rework`), then opens or finds the docs PR against the default branch and records it. No workspace is used.
+- **published** — Nexus follows the PR on GitHub: merged → `merged`, closed → `abandoned` (operator notified).
+- **paused** — Nexus releases the slot and sends nothing.
+- **merged / abandoned / skipped** — Nexus releases the slot, drops delivery state, and caches the ticket as closed; the cache is cleared when `docs:reopened` changes (written by every reopen) and at least hourly, so finished tickets cost no store reads per poll.
 
-**`exec()`** — processes each task locally (file/git):
-- `ChangelogUpdate` → `process_changelog_update` (ensure file exists, categorize from PR, add entry).
-- `AdrGeneration` → `process_adr_generation` (generate architectural decision record).
-- `Retrospective` → returns `NoWork` (stub — not yet implemented).
-- `DocSync` → `process_doc_sync`.
-- `ReadmeUpdate` → `process_readme_update`.
+Nexus hands a docs PR (head `lore/…`) to Vessel only when its record can merge it (published, unpaused) or no open record owns it. Vessel handles docs PRs before any FORGE lifecycle check (the documented ticket's lifecycle is terminal): it merges only when the record is published for that PR, the seal verifies with `CODER_CHAT_HOOK_SECRET`, and the PR head equals the approved head. Conflicts, failed CI and moved heads become `rework` on the same branch and PR; a docs PR no open record owns is marked unmanaged for a human.
 
-Failed tasks are logged at `warn` level and included as error outcomes (non-fatal).
-
-**`post()`** — if any tasks produced work (`has_work = true`): collects changed files (changelog, ADRs, etc.), calls `commit_and_push_docs` (on `lore/docs-{timestamp}` branch) then `open_docs_pr` (appends docs PR to `pending_prs`); emits `changelog_updated` and/or `adr_written` events to the ring buffer. **Always returns `docs_complete`** regardless of whether files changed or the PR open succeeded. Returns `no_work` only when `has_work` was false (no documentation tasks existed).
+On first boot, a one-time cutover (`docs:cutover_v1`) skips tickets that merged before the docs gate (and legacy `lore_done` tickets) instead of documenting them all; `--reopen` documents one on request. Role-specific rules live in `RoleTraits`: terminal-ticket recycling (`recover_orphans`, the prep recycle, `reconcile`) keeps a LORE slot while it drafts, crash recovery never counts LORE crashes against (or escalates) the merged ticket, and `create_chat_for_assignment` never drives LORE or SENTINEL slots. A worker problem on any terminal ticket never rewrites the ticket's status; the worker is released instead. Every failure is logged and retried on the next poll. See [state-machine.md](state-machine.md#documentation-gate-lore).
 
 ---
 
@@ -360,7 +358,7 @@ loop {
 
 ### 7.1 What one pass does
 
-Each iteration of the loop (each **pass**) runs `flow.run(&store)` once — that is, it walks the entire flow graph end to end: **Nexus** `prep → exec → post` (decide + apply), then routes through whichever handoff the Action selects (Forge, Sentinel, Vessel, Lore) before the pass returns. Every pass therefore re-discovers the world: re-syncs GitHub issues/PRs, re-reads the live registry, reconciles worker slots and crashed workspaces, and lets each role advance any in-flight ticket by exactly one step. Nothing about a pass assumes knowledge gained in earlier passes beyond what is persisted in the SharedStore (Redis) — statefulness lives in the store, not in the loop.
+Each iteration of the loop (each **pass**) runs `flow.run(&store)` once — that is, it walks the entire flow graph end to end: **Nexus** `prep → exec → post` (decide + apply), then routes through whichever handoff the Action selects (Forge, Sentinel, Vessel) before the pass returns. Every pass therefore re-discovers the world: re-syncs GitHub issues/PRs, re-reads the live registry, reconciles worker slots and crashed workspaces, and lets each role advance any in-flight ticket by exactly one step. Nothing about a pass assumes knowledge gained in earlier passes beyond what is persisted in the SharedStore (Redis) — statefulness lives in the store, not in the loop.
 
 ### 7.2 Why "paced" (15s) rather than event-driven or tight-loop
 

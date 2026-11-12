@@ -108,7 +108,9 @@ Paths below are relative to `/api/v1`. Every ID is resolved through the caller's
 | `POST /organizations/{org}/tenants/{tenant}/stop` | Admin/developer; set desired paused, deny new workers, 202 |
 | `DELETE /organizations/{org}/tenants/{tenant}` | Admin; 202 cleanup, optional validated purge flag |
 | `POST /organizations/{org}/tenants/{tenant}/clean` | Admin; `{reset_all:false}` or explicit true, 202; no arbitrary Redis commands |
-| `GET /organizations/{org}/tenants/{tenant}/status` | Member; safe runtime status, never credentials |
+| `GET /organizations/{org}/tenants/{tenant}/status` | Member; safe runtime status, never credentials. Includes `runtime.health` (`inactive`, `starting`, `healthy`, `unresponsive`, `restart_required`) with `registered_at` and `last_heartbeat_at` from the Nexus check-ins |
+| `GET /organizations/{org}/operations` | Member; operation history newest first, `limit`/`after` keyset paging, optional `resource_id` and `state` filters, tenant slug on tenant operations |
+| `GET /organizations/{org}/tenants/{tenant}/agent-activity` | Member; one row per managed worker chat (ticket, role, status, stable `error_code` such as `AI_USAGE_LIMIT`). Never returns conversation content or the provider's error detail |
 | `GET /operations/{operation}` | Member of operation org; sanitized steps/errors |
 | `POST /operations/{operation}/retry` | Current permission for original action; failed retryable operations only |
 | `GET /runtime/workspaces/{workspace}` | Nexus of same tenant, or that workspace's own principal |

@@ -1,5 +1,7 @@
 # Manager-Mediated Runtime Architecture
 
+The deployment and workspace ownership contract is documented in [Portable workspace runtime](portable-workspace-runtime.md). The identity and API flows below are the behavioral contract for every supported workspace backend.
+
 ## Purpose
 
 This document explains the behaviour introduced when `openflows-manager` became the authority between OpenFlows runtimes and shared infrastructure. It does not repeat product onboarding or the general platform architecture. It focuses on runtime identity, token rotation, credential brokering, hook delivery, workspace control, and agent-to-agent (A2A) communication.

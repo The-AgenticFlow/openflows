@@ -482,14 +482,15 @@ impl Registry {
         Ok(token)
     }
 
-    /// Resolve the global GitHub token from Coder external auth
-    /// (`CODER_EXTERNAL_AUTH_*`); the PAT flow has been removed.
+    /// Resolve the GitHub token from the Manager-brokered token file.
     fn resolve_global_github_token() -> Result<String> {
         crate::GithubConfig::init_from_env()
             .map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?
             .resolve_token()
             .filter(|t| !t.is_empty())
-            .context("no GitHub external-auth token available (set CODER_EXTERNAL_AUTH_*_TOKEN)")
+            .context(
+                "no Manager-brokered GitHub token available (set OPENFLOWS_GITHUB_API_TOKEN_FILE)",
+            )
     }
 }
 

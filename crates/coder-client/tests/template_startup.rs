@@ -101,6 +101,59 @@ fn hosted_runtime_bundles_are_copied_without_relaxing_host_permissions() {
 }
 
 #[test]
+fn every_template_mounts_the_runtime_bundle_where_the_harness_reads_it() {
+    // Delivery hands a template an opaque handle. This is the contract that makes
+    // the handle usable: the bundle shows up inside the container at the path the
+    // harness reads at startup, from the parameter the Manager sets, read-only.
+    const BUNDLE_PATH: &str = "/run/openflows/runtime.json";
+    for (role, template) in [
+        (
+            "nexus",
+            include_str!("../templates/openflows-nexus/main.tf"),
+        ),
+        (
+            "forge",
+            include_str!("../templates/openflows-forge/main.tf"),
+        ),
+        (
+            "sentinel",
+            include_str!("../templates/openflows-sentinel/main.tf"),
+        ),
+        (
+            "vessel",
+            include_str!("../templates/openflows-vessel/main.tf"),
+        ),
+        ("lore", include_str!("../templates/openflows-lore/main.tf")),
+    ] {
+        let volume = template
+            .split("dynamic \"volumes\"")
+            .map(|block| block.split_whitespace().collect::<Vec<_>>().join(" "))
+            .find(|block| {
+                block.contains("host_path = data.coder_parameter.runtime_secret_ref.value")
+            })
+            .unwrap_or_else(|| panic!("{role} has no runtime bundle volume"));
+        assert!(
+            volume.contains(&format!("container_path = \"{BUNDLE_PATH}\"")),
+            "{role} must mount the bundle at {BUNDLE_PATH}"
+        );
+        assert!(
+            volume.contains("host_path = data.coder_parameter.runtime_secret_ref.value"),
+            "{role} must mount the handle the Manager delivers"
+        );
+        assert!(
+            volume.contains("read_only = true"),
+            "{role} must mount the bundle read-only"
+        );
+        assert!(
+            template.contains(&format!(
+                "\"OPENFLOWS_RUNTIME_CREDENTIAL_FILE={BUNDLE_PATH}\""
+            )),
+            "{role} must point the harness at the mounted bundle"
+        );
+    }
+}
+
+#[test]
 fn sentinel_clone_fallback_uses_the_workspace_parameter() {
     let template = include_str!("../templates/openflows-sentinel/main.tf");
     assert!(template.contains(
@@ -130,6 +183,14 @@ fn forge_uses_only_brokered_github_credentials() {
     assert!(!template.contains("gh auth login"));
     assert!(!template.contains("/home/coder/.config/gh/hosts.yml"));
     assert!(!template.contains("apt-get install -y -qq gh"));
+}
+
+#[test]
+fn nexus_uses_only_brokered_github_credentials() {
+    let template = include_str!("../templates/openflows-nexus/main.tf");
+    assert!(template.contains("OPENFLOWS_GITHUB_API_TOKEN_FILE"));
+    assert!(!template.contains("data.coder_external_auth.github"));
+    assert!(!template.contains("CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN="));
 }
 
 #[test]
@@ -210,5 +271,54 @@ fn forge_hook_setup_runs_with_terraform_heredoc_indentation() {
                 hooks.join("session_start.sh").to_str().unwrap()
             );
         }
+    }
+}
+
+#[test]
+fn hosted_workers_fetch_the_artifact_bundle_instead_of_reading_shared_assets() {
+    for (role, template) in [
+        (
+            "forge",
+            include_str!("../templates/openflows-forge/main.tf"),
+        ),
+        (
+            "sentinel",
+            include_str!("../templates/openflows-sentinel/main.tf"),
+        ),
+        (
+            "vessel",
+            include_str!("../templates/openflows-vessel/main.tf"),
+        ),
+        ("lore", include_str!("../templates/openflows-lore/main.tf")),
+    ] {
+        assert!(
+            template.contains("openflows-harness artifacts fetch --dir \"$ASSETS_DIR\""),
+            "{role} must fetch the artifact bundle from the Manager in hosted mode"
+        );
+        assert!(
+            template.contains("FATAL: cannot install the workspace artifact bundle"),
+            "{role} must fail startup when the bundle cannot be installed"
+        );
+        assert!(
+            template.contains("INSTRUCTION_ROOT=\"$ASSETS_DIR/orchestration\""),
+            "{role} must install instructions from the resolved assets directory"
+        );
+        assert!(
+            !template.contains("/home/coder/.openflows/artifacts/orchestration"),
+            "{role} still reads instructions from the shared artifacts volume"
+        );
+        let fetch = template.find("artifacts fetch").unwrap();
+        let install = template.find("INSTRUCTION_ROOT=").unwrap();
+        assert!(
+            fetch < install,
+            "{role} must install the bundle before it reads instructions from it"
+        );
+        let harness = template
+            .find("HARNESS_BIN=\"/usr/local/bin/openflows-harness\"")
+            .expect("template installs the harness");
+        assert!(
+            harness < fetch,
+            "{role} must install openflows-harness before it runs the fetch"
+        );
     }
 }

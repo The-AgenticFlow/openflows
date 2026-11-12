@@ -57,16 +57,28 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     # x86_64-unknown-linux-musl. It ships the matching gcc and rust stdlib
     # so `cargo build --target x86_64-unknown-linux-musl` just works.
     # We mount the source and a throwaway CARGO_HOME to avoid polluting the
-    # host's cargo cache with linux-musl artifacts.
+    # host's cargo cache with linux-musl artifacts. Run as the host user so
+    # target/ stays writable by the host cargo build that runs after this
+    # (as root it would leave root-owned files and later builds would fail
+    # with "Permission denied"). The image's toolchain is world-readable.
     echo "  → Using Docker (messense/rust-musl-cross:x86_64-musl)"
+    mkdir -p "${CARGO_TARGET_DIR}" "${DOCKER_CARGO_HOME}"
+    # Older runs built as root; a non-root build can't overwrite those files.
+    stale_owner="$(find "${CARGO_TARGET_DIR}" "${DOCKER_CARGO_HOME}" ! -user "$(id -u)" -print -quit 2>/dev/null || true)"
+    if [ -n "$stale_owner" ]; then
+        echo "❌ ${stale_owner} is not owned by $(id -un) (left by an earlier root build)." >&2
+        echo "   Fix ownership once, then re-run:" >&2
+        echo "     sudo chown -R \"\$(id -u):\$(id -g)\" \"${CARGO_TARGET_DIR}\" \"${DOCKER_CARGO_HOME}\"" >&2
+        exit 1
+    fi
     BUILD_CMD=(docker run --rm
+        --user "$(id -u):$(id -g)"
         -v "${PROJECT_ROOT}:/src"
         -w /src
         -e CARGO_HOME=/src/.docker-cargo
         -e CARGO_TARGET_DIR=/src/target
         -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
         "messense/rust-musl-cross:x86_64-musl" cargo build)
-    mkdir -p "${DOCKER_CARGO_HOME}"
 else
     echo "❌ No cross C toolchain found for ${LINUX_TARGET}." >&2
     echo "   Install one of:" >&2

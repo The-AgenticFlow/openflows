@@ -17,7 +17,9 @@ bash tests/e2e/system/bootstrap.sh system
 7. Check that successful CI without human approval cannot trigger a merge; then approve through the public CLI and check that pending CI still blocks it.
 8. Run independent acceptance, let actual VESSEL request the merge, and verify the resulting Git tree and parent commit.
 9. Run acceptance on the merged commit and require the controller to finish the ticket and delete the role workspaces.
-10. Save evidence and delete the remaining NEXUS workspace and disposable stack.
+10. With LORE enabled in the operator registry, let NEXUS provision a real LORE workspace that pushes a changelog on `lore/T-001` and submits it; check that no docs PR exists and the LORE workspace is deleted while the docs await the operator.
+11. Approve the docs gate with `openflows gate docs`; let NEXUS open the docs PR, check that VESSEL holds it while CI is pending, then run acceptance and require VESSEL to squash-merge it at the approved head and the docs record to close.
+12. Save evidence and delete the remaining NEXUS workspace and disposable stack.
 
 The driver supplies the issue, human decisions, and independent CI results. It observes public APIs and logs; it does not write controller state, create agent workspaces itself, execute the agents' implementation commands, or request the merge. The model server returns explicit tool calls which real Coder executes under OpenFlows' phase policies.
 
@@ -145,6 +147,45 @@ The production templates accept `docker_network`, `workspace_image`, `github_api
 After changing configuration, the driver reads each fresh template version's stored variables through Coder's API and verifies the updated value. `template-variables.json` saves those non-sensitive settings. New version IDs alone are insufficient evidence that the settings were forwarded.
 
 Chat state and messages are collected in a `finally` block on success, failure, and chat timeout, before the stack is removed. Inspect `chat-state.json` and `chat.json`; unavailable diagnostic endpoints are recorded in `chat-diagnostics-errors.json` without replacing the original scenario failure. `cleanup.log` preserves removal errors. Cleanup checks that run-owned volume names and image tags are gone, allows resources already removed by Compose, and fails if resources remain or Docker cannot confirm their removal.
+
+## Clean install in each mode
+
+```bash
+bash tests/e2e/system/bootstrap.sh install source    # or compose, binary
+```
+
+`clean_install.py` packs the programs this run built as the candidate release their version names (`openflows --version`), the way a release is: an archive with its `.sha256`, the setup kit (the files `release-assets.yml` packs), and an image holding the same programs with the `org.opencontainers.image.version` label, pushed to a throwaway local registry. It then installs the candidate on a clean stack in one mode:
+
+| Mode | How the programs are installed |
+| --- | --- |
+| `source` | The programs built from this checkout, as `--source` compiles them |
+| `binary` | Setup's `stage_release`, run from the kit, downloads the archive from `OPENFLOWS_RELEASE_BASE_URL` and verifies its checksum |
+| `compose` | Setup's `stage_image`, run from the kit, pulls the image and pins its digest; the kit's `openflows-binaries` Compose service copies the programs out |
+
+In every mode the installed programs must match the candidate and report its version, `openflows-doctor` must pass and see the configured model, a tenant must start, and a command must run in its workspace with those programs. `clean-install-evidence.json` in `target/ci-artifacts/clean-install-<mode>/` records the platform (OS, kernel, Docker and runner image), the version, the candidate's checksums, the image digest in Compose mode, the doctor output and the workspace command's output.
+
+The image is built from the prebuilt programs, not from the repository's `Dockerfile`; the release workflow builds and checks that image.
+
+## Upgrade and rollback of a running stack
+
+```bash
+bash tests/e2e/system/bootstrap.sh upgrade
+```
+
+`upgrade_rollback.py` runs setup's own stages (`stage_release`, `stage_bootstrap`, `offer_update`) from a copy of the setup kit, the files `release-assets.yml` packs, against the real Coder stack. Two candidate releases, 9.0.0 and 9.1.0, are served from a local folder through `OPENFLOWS_RELEASE_BASE_URL`. They hold the programs this run built; 9.1.0's carry a trailing marker so the test can tell which ones a workspace runs, and 9.1.0 uses a re-tagged workspace image so its five templates differ, as a release that changes its templates does.
+
+1. Install 9.0.0, create a tenant and record a Redis marker and every Redis key without an expiry.
+2. Restart Redis, PostgreSQL and Coder. The marker, the keys, the workspace and its controller survive.
+3. Upgrade to 9.1.0 with the workspace running. The programs and all five templates change, the workspace keeps 9.0.0, and setup reports it pending, the condition on which `setup.sh` exits with status 3. Stopped, setup moves it to the 9.1.0 templates and leaves it stopped; started, it runs 9.1.0.
+4. Upgrade to a release with no files, then to one with a bad checksum. Both stop, and 9.1.0 stays installed and running. Restart the stack.
+5. Roll back to 9.0.0 with the workspace running. Setup again reports it pending; with `--update-workspaces` it updates the workspace, which then runs 9.0.0.
+6. Restart the stack again; the state from step 1 is still there.
+
+The test runs the stages rather than `setup.sh` itself, so it checks the pending list `main()` exits 3 on, not the exit status.
+
+Redis keeps its data across restarts in this scenario only (`upgrade.compose.yml`, `--appendonly yes` on a volume, as in the production `docker-compose.yml`). Evidence is saved in `target/ci-artifacts/upgrade-rollback/`: each setup run's output and `.setup.log`, and `upgrade-evidence.json` with the program checksums of both releases, every step that passed, and after each step the installed release, the five template versions, the workspace's status and template version, and the Redis marker and keys.
+
+The two releases come from one build, so this checks what an upgrade does to a running stack, not the behaviour differences between real releases.
 
 ## Why Python is used here
 

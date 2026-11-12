@@ -14,6 +14,30 @@ variable "docker_network" {
   default     = "openflows_default"
 }
 
+variable "connected_local" {
+  description = "Use the OpenFlows team's GitHub App with local user authorization"
+  type        = bool
+  default     = false
+}
+
+variable "connected_local_broker_secret_host_path" {
+  description = "Host path to the local Manager broker key; never the key value"
+  type        = string
+  default     = ""
+}
+
+variable "connected_local_manager_url" {
+  description = "Local Manager URL reachable from Coder workspaces"
+  type        = string
+  default     = "http://openflows-local-manager:3002"
+}
+
+variable "connected_local_helper_host_path" {
+  description = "Host path to the connected-local workspace credential helper"
+  type        = string
+  default     = ""
+}
+
 variable "workspace_image" {
   description = "Workspace image containing the tools used by the production bootstrap"
   type        = string
@@ -120,6 +144,22 @@ data "coder_parameter" "coder_chat_hook_secret" {
   mutable     = false
 }
 
+data "coder_parameter" "docs_gate_secret" {
+  name        = "docs_gate_secret"
+  description = "Optional dedicated secret (32+ bytes) for sealing operator docs approvals (OPENFLOWS_DOCS_GATE_SECRET). Controller only; empty falls back to the hook secret."
+  default     = ""
+  type        = "string"
+  mutable     = true
+}
+
+data "coder_parameter" "docs_gate_secret_previous" {
+  name        = "docs_gate_secret_previous"
+  description = "The previous docs gate secret during a rotation (OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS); approvals sealed with it still verify."
+  default     = ""
+  type        = "string"
+  mutable     = true
+}
+
 data "coder_parameter" "coder_chat_hook_url" {
   name        = "coder_chat_hook_url"
   description = "The exact hook URL Coder is configured to POST to (CODER_CHAT_HOOK_URL). When set it is the authoritative JWT audience the consumer validates against, keeping it in lockstep with Coder and preventing aud drift."
@@ -212,11 +252,8 @@ resource "coder_agent" "main" {
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # Setup git credentials. Local mode uses Coder external auth (the owner's
-    # linked GitHub App token). Hosted mode never exports the external-auth
-    # token into the runtime: it sources a scoped credential from the
-    # secret-injection backend's mounted file instead, so no platform or
-    # deployment-wide credential reaches the workspace.
+    # Hosted mode uses a mounted runtime secret. Local mode requests a
+    # short-lived GitHub App user token from the local Manager.
     if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
       RUNTIME_CREDENTIAL_COPY=$(mktemp)
       chmod 600 "$RUNTIME_CREDENTIAL_COPY"
@@ -256,7 +293,8 @@ PY
       # The controller reports readiness after opening its tenant store.
       # A successful bootstrap alone does not mean the controller is running.
     else
-      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
     fi
     if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
@@ -264,10 +302,19 @@ PY
       chmod 600 /home/coder/.git-credentials
       echo "Configured git credentials for GitHub"
     else
-      echo "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth)"
+      echo "FATAL: No GitHub token available from the local Manager" >&2
+      exit 1
     fi
 
-    # git pull or clone (creds via Coder external auth)
+    if [ "${var.connected_local}" = "true" ]; then
+      git config --global --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
+      rm -f /home/coder/.git-credentials
+      sudo rm -f /root/.git-credentials
+    fi
+
+    # git pull or clone (credentials from the local Manager in local mode)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
@@ -313,6 +360,8 @@ PY
     if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
       export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
+      export OPENFLOWS_DOCS_GATE_SECRET="${data.coder_parameter.docs_gate_secret.value}"
+      export OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS="${data.coder_parameter.docs_gate_secret_previous.value}"
     fi
     # Hosted mode already loaded the tenant-scoped Redis endpoint from the
     # mounted runtime secret above. Do not overwrite it with a Terraform
@@ -360,8 +409,10 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Shared artifacts volume — Nexus writes (skills, standards, personas),
-# forge/sentinel read (and forge writes PLAN.md for sentinel review).
+# Tenant artifacts volume. Nexus seeds the golden repository clone here and
+# publishes the instruction bundle for local workspaces; workers mount it
+# read-only. Hosted workspaces fetch the same bundle from the Manager instead,
+# so this volume only carries the repository seed there.
 resource "docker_volume" "artifacts" {
   name = "openflows-artifacts-${data.coder_parameter.tenant.value}"
 }
@@ -372,6 +423,14 @@ resource "docker_container" "workspace" {
   image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
+
+  # Linux Docker has no built-in host.docker.internal. Map it to the host
+  # gateway so workspaces can reach a Manager running on the Docker host
+  # (Docker Desktop on macOS/Windows already provides this name).
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -403,12 +462,33 @@ resource "docker_container" "workspace" {
     }
   }
 
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_broker_secret_host_path != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/local-broker-key"
+      host_path      = var.connected_local_broker_secret_host_path
+      read_only      = true
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_helper_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows/connected-local-github.py"
+      host_path      = var.connected_local_helper_host_path
+      read_only      = true
+    }
+  }
+
   env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
     # Always use internal 'coder' hostname - Coder is reachable as 'coder' from workspace containers
     "CODER_URL=http://coder:7080",
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
+    "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
+    "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.github_repository.value}",
+    "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
@@ -430,11 +510,9 @@ resource "docker_container" "workspace" {
     "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
-    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
-    # tenant owner's linked GitHub App token). Export it here: Coder injects the
-    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
-    # env var, so without this the controller's resolve_token() would find nothing.
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github[0].access_token}",
+    "OPENFLOWS_DOCS_GATE_SECRET=${data.coder_parameter.docs_gate_secret.value}",
+    "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS=${data.coder_parameter.docs_gate_secret_previous.value}",
+    # Agent GitHub API calls use the Manager-brokered token file.
   ])
 
   networks_advanced {
@@ -449,8 +527,3 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
-  id       = "primary-github"
-  optional = true
-}

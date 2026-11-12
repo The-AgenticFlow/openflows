@@ -25,7 +25,7 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post, MethodRouter},
     Json, Router,
 };
 use config::env::CoderHooksConfig;
@@ -47,6 +47,44 @@ pub struct HookServerState {
     pub bootstrap: Option<HookBootstrapContext>,
 }
 
+/// A single hooks route: OpenAPI metadata plus the axum handler. Single source
+/// of truth for both router registration and the OpenAPI document (see
+/// `crate::openapi::hooks_openapi`).
+pub(crate) struct HooksRoute {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub summary: &'static str,
+    pub description: &'static str,
+    pub router: MethodRouter<HookServerState>,
+}
+
+/// All routes served by the lifecycle hooks consumer listener.
+pub(crate) fn routes() -> Vec<HooksRoute> {
+    vec![
+        HooksRoute {
+            method: "POST",
+            path: "/experimental/hooks/chat",
+            summary: "Coder lifecycle hook webhook",
+            description: "Receives JWT-signed Coder lifecycle dispatches. Returns Coder's response schema: permission.decision (allow/deny), input_override for rewrites, and model_context feedback. Fail-closed on bad signature.",
+            router: post(handle_hook),
+        },
+        HooksRoute {
+            method: "GET",
+            path: "/experimental/hooks/health",
+            summary: "Hook consumer liveness probe",
+            description: "Returns 200 when the hook consumer is alive.",
+            router: get(handle_health),
+        },
+        HooksRoute {
+            method: "GET",
+            path: "/openapi.json",
+            summary: "Agent Nexus hooks OpenAPI specification",
+            description: "The generated OpenAPI document for the lifecycle hooks listener.",
+            router: get(crate::openapi::serve_hooks_openapi),
+        },
+    ]
+}
+
 /// Build the router serving the webhook endpoint.
 pub fn create_router(
     store: Arc<SharedStore>,
@@ -54,12 +92,9 @@ pub fn create_router(
     publisher: Option<HookKickPublisher>,
     bootstrap: Option<HookBootstrapContext>,
 ) -> Router {
-    Router::new()
-        .route("/experimental/hooks/chat", post(handle_hook))
-        .route(
-            "/experimental/hooks/health",
-            axum::routing::get(handle_health),
-        )
+    routes()
+        .into_iter()
+        .fold(Router::new(), |r, rt| r.route(rt.path, rt.router))
         .with_state(HookServerState {
             store,
             config,

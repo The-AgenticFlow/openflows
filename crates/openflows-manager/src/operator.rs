@@ -35,6 +35,10 @@ struct Deployment {
     operator_token_issued_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+mod recovery;
+
+pub use recovery::repair_runtime;
+
 fn setting(key: &str) -> Result<String> {
     std::env::var(key)
         .ok()
@@ -113,11 +117,7 @@ pub fn load_configuration(explicit: Option<&Path>) -> Result<()> {
         dotenvy::from_path(".env.prod").map_err(|_| anyhow!("cannot parse legacy .env.prod"))?;
         eprintln!("Using legacy .env.prod; new deployments use --config .env.openflows.");
     }
-    // The Docker provisioner runs Terraform on the Docker host. In local
-    // development, make the Linux controller binary available to published
-    // templates without requiring operators to copy an absolute path into
-    // their environment. Production deployments use released workspace images
-    // and never set this development-only variable.
+    // Local template imports mount the host's compiled controller binaries.
     if std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local")
         && std::env::var_os("TF_VAR_dev_binary_host_path").is_none()
     {
@@ -156,7 +156,8 @@ fn origin(key: &str) -> Result<String> {
     let url = url::Url::parse(&value).map_err(|_| anyhow!("{key} must be an HTTP(S) origin"))?;
     let local = std::env::var("OPENFLOWS_MODE").as_deref() == Ok("local");
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if !(url.scheme() == "https" || (local && loopback && url.scheme() == "http"))
+    let local_coder = local && key == "CODER_URL" && url.host_str() == Some("coder");
+    if !(url.scheme() == "https" || (local && (loopback || local_coder) && url.scheme() == "http"))
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -440,68 +441,6 @@ async fn bootstrap(
 // expose its access or refresh token to a runtime or browser.
 pub(crate) const CODER_USER_SCOPES: &str = "coder:all";
 
-/// Operator-only recovery for a hosted workspace whose single-use bootstrap
-/// was consumed and whose process no longer has its rotating refresh token.
-/// The new bootstrap is written only to the existing mounted secret bundle.
-pub async fn repair_runtime(workspace_id: uuid::Uuid) -> Result<()> {
-    use zeroize::Zeroize;
-
-    let db = crate::db::Db::connect(&setting("OPENFLOWS_DATABASE_URL")?).await?;
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT role, runtime_secret_ref FROM workspaces
-          WHERE id=$1 AND desired_state IN ('running','provisioning')
-            AND observed_state NOT IN ('deleted','deleting')",
-    )
-    .bind(workspace_id)
-    .fetch_optional(db.pool())
-    .await?;
-    let (role, bundle_ref) = row.context("recoverable workspace not found")?;
-    if !matches!(
-        role.as_str(),
-        "nexus" | "forge" | "sentinel" | "vessel" | "lore"
-    ) {
-        bail!("runtime repair requires a hosted agent workspace");
-    }
-    let bundle_ref = bundle_ref.context("workspace has no mounted runtime secret")?;
-    let provider_name = setting("OPENFLOWS_SECRET_PROVIDER")?;
-    let provider: std::sync::Arc<dyn crate::secrets::SecretProvider> =
-        crate::server::resolve_secret_provider(&provider_name)
-            .await?
-            .into();
-    let repo = crate::runtime::RuntimeRepository::new(db.pool().clone());
-    let credentials =
-        crate::runtime::RuntimeCredentialService::with_secret_provider(repo, provider.clone());
-    let mut bootstrap = credentials
-        .issue_bootstrap(crate::id::WorkspaceId::from_uuid(workspace_id))
-        .await?;
-    let result = async {
-        let bytes = Zeroizing::new(provider.get(&bundle_ref).await?);
-        let mut payload: Value = serde_json::from_slice(&bytes)?;
-        let object = payload
-            .as_object_mut()
-            .context("mounted runtime secret is not a JSON object")?;
-        object.insert(
-            "bootstrap_token".into(),
-            Value::String(bootstrap.raw_secret.clone()),
-        );
-        object.insert(
-            "manager_url".into(),
-            Value::String(
-                crate::config::runtime_manager_url(&setting("OPENFLOWS_PUBLIC_URL")?)
-                    .map_err(anyhow::Error::msg)?,
-            ),
-        );
-        let bytes = Zeroizing::new(serde_json::to_vec(&payload)?);
-        provider.replace(&bundle_ref, &bytes).await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    bootstrap.raw_secret.zeroize();
-    result?;
-    println!("Runtime bootstrap reissued for workspace {workspace_id}. Restart that Coder workspace to register a new session.");
-    Ok(())
-}
-
 /// Reconcile the deployment's Coder hook verifier with the hook secret used
 /// by Coder. The secret is accepted only on stdin and never echoed or logged.
 pub async fn set_coder_hook_secret() -> Result<()> {
@@ -518,7 +457,13 @@ pub async fn set_coder_hook_secret() -> Result<()> {
     let provider_name = setting("OPENFLOWS_SECRET_PROVIDER")?;
     let provider = crate::server::resolve_secret_provider(&provider_name).await?;
     let secret_ref = setting("OPENFLOWS_CODER_HOOK_SECRET_REF")?;
-    provider.replace(&secret_ref, &input).await?;
+    match provider.replace(&secret_ref, &input).await {
+        Ok(()) => {}
+        Err(crate::secrets::SecretError::NotFound(_)) => {
+            provider.put(&secret_ref, &input).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     println!("Coder lifecycle-hook secret updated. Restart Manager to load it.");
     Ok(())
 }
@@ -729,10 +674,7 @@ pub async fn setup(initialize: bool, email: Option<&str>) -> Result<()> {
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
             .is_ok_and(|age| age >= OPERATOR_ROTATION_AGE);
 
-    // An expired key cannot create its own replacement. Re-authorize with the
-    // explicitly supplied bootstrap credential, mint a bounded replacement,
-    // and atomically overwrite only the operator-key secret. This makes setup
-    // a recovery mechanism rather than leaving durable work permanently stuck.
+    // Renew expired keys using the explicit bootstrap credential.
     let token = if let (Some(token), Some(me)) = (existing_operator_token, existing_identity) {
         let user_id = field(&me, "id")?;
         if state

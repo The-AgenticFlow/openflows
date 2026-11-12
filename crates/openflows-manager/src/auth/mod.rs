@@ -10,6 +10,8 @@ pub mod crypto;
 pub mod csrf;
 pub mod device;
 pub mod github;
+pub mod local_credentials;
+pub mod local_github;
 pub mod oauth;
 pub mod repository;
 pub mod sessions;

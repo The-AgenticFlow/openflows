@@ -158,6 +158,9 @@ impl fmt::Display for Mode {
 
 /// The name of the environment variable that selects the deployment mode.
 pub const MODE_ENV: &str = "OPENFLOWS_MODE";
+/// Enables connected-local client behavior in local mode. Hosted deployments
+/// retain their existing SaaS credential path. The default is disabled.
+pub const CONNECTED_LOCAL_ENABLED_ENV: &str = "OPENFLOWS_CONNECTED_LOCAL_ENABLED";
 /// The environment variable carrying the Openflows control-plane database URL.
 pub const DATABASE_URL_ENV: &str = "OPENFLOWS_DATABASE_URL";
 /// The environment variable selecting the secret-provider adapter.
@@ -757,10 +760,25 @@ fn parse_positive(env: &str, default: i32) -> Result<i32, String> {
     }
 }
 
+/// Parse a strict boolean environment setting. Empty values are treated as
+/// absent and use the supplied default; ambiguous values fail closed.
+fn parse_bool(env: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(env).ok().as_deref().map(str::trim) {
+        None | Some("") => Ok(default),
+        Some("1") | Some("true") | Some("yes") | Some("on") => Ok(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Ok(false),
+        Some(_) => Err(format!("invalid {env}; expected true/false (or 1/0)")),
+    }
+}
+
 /// The foundational Manager configuration.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
     pub mode: Mode,
+    /// Whether connected-local client behavior is enabled. This is
+    /// deliberately independent from `mode`: hosted and local deployments
+    /// use the same binary but have different roles when the capability is on.
+    pub connected_local_enabled: bool,
     /// The Openflows control-plane PostgreSQL URL. Required in hosted mode;
     /// optional in local mode.
     pub database_url: Option<String>,
@@ -808,6 +826,7 @@ impl ManagerConfig {
     /// Manager must not silently fall back to local behavior.
     pub fn from_env() -> Result<Self, String> {
         let mode = Mode::parse(std::env::var(MODE_ENV).ok().as_deref())?;
+        let connected_local_enabled = parse_bool(CONNECTED_LOCAL_ENABLED_ENV, false)?;
 
         let database_url = std::env::var(DATABASE_URL_ENV)
             .ok()
@@ -838,8 +857,7 @@ impl ManagerConfig {
             .filter(|v| !v.trim().is_empty());
         let coder_version_baseline = std::env::var(CODER_VERSION_BASELINE_ENV)
             .unwrap_or_else(|_| DEFAULT_CODER_VERSION_BASELINE.to_string());
-        let provisioner_backend = std::env::var(PROVISIONER_BACKEND_ENV)
-            .unwrap_or_else(|_| DEFAULT_PROVISIONER_BACKEND.to_string());
+        let provisioner_backend = crate::provisioning::resolve_backend_env()?;
         let redis_admin_url = std::env::var(REDIS_ADMIN_URL_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty());
@@ -913,6 +931,7 @@ impl ManagerConfig {
                 }
                 Ok(ManagerConfig {
                     mode,
+                    connected_local_enabled,
                     database_url: Some(database_url),
                     secret_provider,
                     http_addr: http_addr_from_env(),
@@ -933,6 +952,7 @@ impl ManagerConfig {
             }
             Mode::Local => Ok(ManagerConfig {
                 mode,
+                connected_local_enabled,
                 database_url,
                 secret_provider,
                 http_addr: http_addr_from_env(),
@@ -963,6 +983,7 @@ fn http_addr_from_env() -> String {
 pub fn local_test_config() -> ManagerConfig {
     ManagerConfig {
         mode: Mode::Local,
+        connected_local_enabled: false,
         database_url: None,
         secret_provider: DEFAULT_SECRET_PROVIDER.to_string(),
         http_addr: "127.0.0.1:3002".to_string(),
@@ -1035,6 +1056,7 @@ mod tests {
     /// The full set of env vars the tests touch.
     const ALL_KEYS: &[&str] = &[
         MODE_ENV,
+        CONNECTED_LOCAL_ENABLED_ENV,
         DATABASE_URL_ENV,
         SECRET_PROVIDER_ENV,
         AWS_SECRETS_PREFIX_ENV,
@@ -1134,9 +1156,11 @@ mod tests {
         std::env::remove_var(MODE_ENV);
         std::env::remove_var(DATABASE_URL_ENV);
         std::env::remove_var(SECRET_PROVIDER_ENV);
+        std::env::remove_var(CONNECTED_LOCAL_ENABLED_ENV);
 
         let cfg = ManagerConfig::from_env().unwrap();
         assert_eq!(cfg.mode, Mode::Local);
+        assert!(!cfg.connected_local_enabled);
         assert_eq!(cfg.database_url, None);
         assert_eq!(cfg.secret_provider, DEFAULT_SECRET_PROVIDER);
         // Local mode resolves the dev master key (no provider ref configured).
@@ -1149,10 +1173,39 @@ mod tests {
         let _guard = EnvGuard::capture(ALL_KEYS);
         std::env::set_var(MODE_ENV, "local");
         std::env::remove_var(DATABASE_URL_ENV);
+        std::env::remove_var(CONNECTED_LOCAL_ENABLED_ENV);
 
         let cfg = ManagerConfig::from_env().unwrap();
         assert_eq!(cfg.mode, Mode::Local);
+        assert!(!cfg.connected_local_enabled);
         assert_eq!(cfg.database_url, None);
+    }
+
+    #[test]
+    fn connected_local_capability_is_opt_in_and_parsed_strictly() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+
+        std::env::set_var(MODE_ENV, "local");
+        std::env::set_var(CONNECTED_LOCAL_ENABLED_ENV, "true");
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert!(cfg.connected_local_enabled);
+
+        std::env::set_var(CONNECTED_LOCAL_ENABLED_ENV, "maybe");
+        let error = ManagerConfig::from_env().unwrap_err();
+        assert!(error.contains(CONNECTED_LOCAL_ENABLED_ENV));
+    }
+
+    #[test]
+    fn connected_local_capability_is_available_in_hosted_mode_without_changing_defaults() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::capture(ALL_KEYS);
+        set_hosted_env();
+        std::env::set_var(CONNECTED_LOCAL_ENABLED_ENV, "on");
+
+        let cfg = ManagerConfig::from_env().unwrap();
+        assert_eq!(cfg.mode, Mode::Hosted);
+        assert!(cfg.connected_local_enabled);
     }
 
     #[test]

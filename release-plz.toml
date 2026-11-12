@@ -5,9 +5,10 @@
 #   - `release-pr` : scans Conventional Commits since the last tag, computes the
 #                    next version, and opens a `release-plz-*` PR to `main` that
 #                    bumps the manifest + CHANGELOG.
-#   - `release`    : creates the package tag + GitHub Release when the main push
-#                    is the merge of a `release-plz-*` PR
-#                    (`release_always = false`).
+#   - `release`    : creates the package tag + a draft GitHub Release when the main
+#                    push is the merge of a `release-plz-*` PR
+#                    (`release_always = false`). `release-assets.yml` attaches the
+#                    binaries and publishes it.
 #
 # Release flow: only `develop` merges into `main`, which triggers `release-pr`;
 # the resulting `release-plz-*` version-bump PR merges back into `main` and
@@ -48,6 +49,8 @@ changelog_path = "./CHANGELOG.md"
 name = "openflows"
 release = true
 git_tag_name = "openflows-{{ version }}"
+# Published releases are immutable, so files can only be attached to a draft.
+git_release_draft = true
 # Release notes = the grouped changelog (from cliff.toml). Contributor
 # attribution is rendered per-change in the changelog by git commit author (see
 # the `commit` macro and `commit_preprocessors` in cliff.toml), so every

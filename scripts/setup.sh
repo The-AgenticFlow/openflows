@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # OpenFlows one-command setup.
 #
-#   ./scripts/setup.sh [owner/repo] [--name TEAM] [--fleet N]   (N = FORGE-SENTINEL pairs; asked when omitted)
+#   ./scripts/setup.sh [owner/repo] [--source | --compose | --binary] [--name TEAM] [--fleet N]
+#                      [--update-workspaces]
+#
+#   --source   compile OpenFlows from this checkout (default; needs Rust)
+#   --compose  use the published images, no compiling
+#   --binary   use the release's binaries, no compiling (default in a setup kit)
+#              For both, OPENFLOWS_VERSION in .env picks the version (empty = latest release)
+#   --update-workspaces  after an upgrade, update running workspaces without asking
+#   N = FORGE-SENTINEL pairs; asked when omitted
+#
+# Exit status: 0 done, 3 upgrade not complete (workspaces still on the old version), else failed.
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
-# Stages: preflight → .env → GitHub App → Docker → Coder admin/token →
+# Stages: preflight → .env → [image or release] → GitHub App → Docker → Coder admin/token →
 #         LLM model → bootstrap → tenant → doctor.
 #
 # Non-interactive use: pass owner/repo, and set OPENFLOWS_LLM_PROVIDER /
@@ -16,6 +26,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
+LAST_RELEASE_WITHOUT_SHARED_APP=1.8.1    # its Manager image predates the console sign-in
+BIN_DIR="${ROOT}/.dev-binaries"          # programs for the workspaces (always linux/amd64)
+HOST_BIN_DIR="${BIN_DIR}/host"           # programs for this machine, when those can't run here
+RELEASE_REPO="${OPENFLOWS_RELEASE_REPO:-The-AgenticFlow/openflows}"
+WORKSPACE_TARGET=x86_64-unknown-linux-gnu
 TOTAL=8
 STEP=0
 
@@ -29,6 +44,8 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then FANCY=1; else FANCY=0; fi   # animat
 LOG_FILE="${ROOT}/.setup.log"
 START_TIME=$SECONDS
 RAIL_OPEN=0
+UPGRADE_PENDING=""
+UPDATE_WORKSPACES=0
 STEP_START=0
 PW=66   # panel inner width
 
@@ -191,7 +208,12 @@ except Exception:
     pass' "$1"; }
 
 # ── .env helpers ────────────────────────────────────────────────────────────
-env_get() { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 || true; }
+env_get() {
+    local key="$1"
+    if [ -f "$ENV_FILE" ]; then
+        sed -n "s/^${key}=//p" "$ENV_FILE" | tail -1
+    fi
+}
 env_set() { # env_set KEY VALUE — replace the line or append
     local key="$1" val="$2" tmp
     tmp="$(mktemp)"
@@ -203,10 +225,15 @@ env_set() { # env_set KEY VALUE — replace the line or append
     cat "$tmp" >"$ENV_FILE" && rm -f "$tmp"
     chmod 600 "$ENV_FILE"
 }
+# image_repo — where the images come from, in the order Compose reads it: shell, .env, default.
+image_repo() {
+    local repo
+    if [ "${OPENFLOWS_IMAGE_REPO+x}" = x ]; then repo="$OPENFLOWS_IMAGE_REPO"; else repo="$(env_get OPENFLOWS_IMAGE_REPO)"; fi
+    printf '%s' "${repo:-ghcr.io/the-agenticflow/openflows}"
+}
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
-auth_id() { local i; i="$(env_get CODER_EXTERNAL_AUTH_0_ID)"; printf '%s' "${i:-primary-github}"; }
 # URL a browser should use (CODER_ACCESS_URL when set, else the local URL)
 public_url() { local u; u="$(env_get CODER_ACCESS_URL)"; printf '%s' "${u:-$(coder_url)}"; }
 coder_url() { local u; u="$(env_get CODER_URL)"; printf '%s' "${u:-http://localhost:$(coder_port)}"; }
@@ -251,9 +278,18 @@ install_coder() {
 stage_preflight() {
     step "Checking your machine"
     local missing=()
+    if [ "$MODE" != source ] && [ -z "$(host_target)" ]; then
+        die "No OpenFlows release programs for $(uname -s) $(uname -m)." \
+            "Supported: Linux x86-64 and ARM64, macOS Intel and Apple Silicon." \
+            "Build from source instead:  ./scripts/setup.sh ${REPO} --source"
+    fi
     have curl    || missing+=("curl      → install with your package manager")
     have python3 || missing+=("python3   → install with your package manager")
-    have cargo   || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh")
+    if [ "$MODE" = source ]; then
+        [ -d "${ROOT}/crates" ] || die "--source needs a checkout of the repository; this folder is a setup kit." \
+            "Install from the release instead:  ./scripts/setup.sh ${REPO} --binary"
+        have cargo || missing+=("cargo     → curl https://sh.rustup.rs -sSf | sh   (or skip compiling: --compose)")
+    fi
     if ! have docker; then
         missing+=("docker    → https://docs.docker.com/get-docker/")
     elif ! docker info >/dev/null 2>&1; then
@@ -286,7 +322,11 @@ stage_preflight() {
             fi
         done
     fi
-    ok "docker, compose, cargo, coder, python3, curl"
+    if [ "$MODE" = source ]; then
+        ok "docker, compose, cargo, coder, python3, curl"
+    else
+        ok "docker, compose, coder, python3, curl"
+    fi
 }
 
 # ── stage 2: .env ───────────────────────────────────────────────────────────
@@ -307,145 +347,195 @@ stage_env() {
     ok ".env ready"
 }
 
-# ── stage 3: GitHub App ─────────────────────────────────────────────────────
-github_app_via_manifest() { # $1=owner → sets client id/secret/install url in .env
-    local owner="$1" owner_type="User" port state name target manifest_file out_file code
-    owner_type="$(curl -fsS -m 10 "https://api.github.com/users/${owner}" 2>/dev/null | json type || true)"
-    if [ "$owner_type" = "Organization" ]; then
-        target="https://github.com/organizations/${owner}/settings/apps/new"
-    else
-        target="https://github.com/settings/apps/new"
-    fi
-    state="$(rand_hex 16)"
-    name="OpenFlows-${owner}-$(rand_hex 2)"
-    out_file="$(mktemp)"
-    port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
-    manifest_file="$(mktemp)"
-    NAME="$name" PORT="$port" CB="$(public_url)/external-auth/$(auth_id)/callback" python3 - >"$manifest_file" <<'PY'
-import json, os
-print(json.dumps({
-    "name": os.environ["NAME"][:34],
-    "url": "https://openflows.dev",
-    "redirect_url": f"http://localhost:{os.environ['PORT']}/created",
-    "callback_urls": [os.environ["CB"]],
-    "public": True,
-    "request_oauth_on_install": False,
-    "default_permissions": {
-        "metadata": "read", "contents": "write",
-        "pull_requests": "write", "workflows": "write",
-    },
-}))
-PY
-    # Tiny local server: serves an auto-submitting form to GitHub, then
-    # captures the one-time `code` GitHub redirects back with.
-    PORT="$port" STATE="$state" TARGET="$target" MANIFEST_FILE="$manifest_file" OUT="$out_file" python3 - <<'PY' &
-import html, http.server, os, urllib.parse
-manifest = open(os.environ["MANIFEST_FILE"]).read()
-state, target, out = os.environ["STATE"], os.environ["TARGET"], os.environ["OUT"]
-class H(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def _send(self, body):
-        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-        self.wfile.write(body.encode())
-    def do_GET(self):
-        u = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(u.query)
-        if u.path == "/created" and q.get("state", [""])[0] == state and "code" in q:
-            open(out, "w").write(q["code"][0])
-            self._send("<h2>GitHub App created.</h2><p>Return to your terminal.</p>")
-            self.server.done = True
-        elif u.path == "/":
-            self._send(f'<form id=f method=post action="{html.escape(target)}?state={state}">'
-                       f'<input type=hidden name=manifest value="{html.escape(manifest)}"></form>'
-                       '<p>Redirecting to GitHub…</p><script>document.getElementById("f").submit()</script>')
-        else:
-            self.send_response(404); self.end_headers()
-s = http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H); s.done = False
-s.timeout = 1
-import time; end = time.time() + 600
-while not s.done and time.time() < end: s.handle_request()
-PY
-    local server_pid=$!
-    info "Opening GitHub to create the app — click 'Create GitHub App' there."
-    info "If no browser opens, visit: http://localhost:${port}/"
-    open_url "http://localhost:${port}/"
-    local i
-    for ((i = 0; i < 600; i++)); do
-        [ -s "$out_file" ] && break
-        kill -0 "$server_pid" 2>/dev/null || break
-        sleep 1
-    done
-    kill "$server_pid" 2>/dev/null || true
-    code="$(cat "$out_file" 2>/dev/null || true)"
-    rm -f "$out_file" "$manifest_file"
-    [ -n "$code" ] || return 1
-    local resp cid secret slug
-    resp="$(curl -fsS -m 30 -X POST -H 'Accept: application/vnd.github+json' "https://api.github.com/app-manifests/${code}/conversions")" || return 1
-    cid="$(printf '%s' "$resp" | json client_id)"
-    secret="$(printf '%s' "$resp" | json client_secret)"
-    slug="$(printf '%s' "$resp" | json slug)"
-    [ -n "$cid" ] && [ -n "$secret" ] && [ -n "$slug" ] || return 1
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_ID "$cid"
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_SECRET "$secret"
-    env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
-    return 0
-}
+# shellcheck source=setup-release.sh
+source "${SCRIPT_DIR}/setup-release.sh"
 
-github_app_manual() {
-    local owner="$1" new_url="https://github.com/settings/apps/new"
-    [ -n "$owner" ] && new_url="https://github.com/settings/apps/new  (orgs: https://github.com/organizations/${owner}/settings/apps/new)"
-    info "Create the app by hand:"
-    info "  1. Open  ${new_url}"
-    info "  2. Callback URL:  $(public_url)/external-auth/$(auth_id)/callback"
-    info "  3. Permissions → Repository: Contents, Pull requests, Workflows = Read and write"
-    info "  4. Create the app, generate a Client secret, then paste below."
-    is_tty || die "GitHub App credentials are missing and no terminal is attached." \
-        "Create the app (steps above), then set in .env:" \
-        "  CODER_EXTERNAL_AUTH_0_CLIENT_ID, CODER_EXTERNAL_AUTH_0_CLIENT_SECRET, CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL"
-    local cid secret slug
-    cid="$(ask 'Client ID')"
-    secret="$(ask_secret 'Client secret')"
-    slug="$(ask 'App slug (the name in https://github.com/apps/<slug>)')"
-    [ -n "$cid" ] && [ -n "$secret" ] && [ -n "$slug" ] || die "Client ID, secret and slug are all required."
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_ID "$cid"
-    env_set CODER_EXTERNAL_AUTH_0_CLIENT_SECRET "$secret"
-    env_set CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL "https://github.com/apps/${slug}/installations/new"
+# ── stage 3: GitHub App ─────────────────────────────────────────────────────
+has_shared_app() { [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_SHARED_APP" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_SHARED_APP" ]; }
+# pin_manager_image — the shared App needs the local Manager: same version as OpenFlows, pinned by digest.
+pin_manager_image() {
+    local version repo pinned digest
+    version="$(env_get OPENFLOWS_VERSION)"; repo="$(image_repo)-manager"
+    pinned="$(env_get OPENFLOWS_MANAGER_IMAGE)"
+    case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
+    docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
+        || die "No published Manager image for OpenFlows ${version} (${repo}:${version})." \
+            "Pick an OpenFlows version with the shared App Manager image."
+    digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+        | sed -n "s|^${repo}@||p" | head -1)"
+    [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
+    env_set OPENFLOWS_MANAGER_IMAGE "${repo}:${version}@${digest}"
 }
 
 stage_github_app() {
     step "GitHub App (lets agents work on your repo)"
-    if ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_ID)" && ! is_placeholder "$(env_get CODER_EXTERNAL_AUTH_0_CLIENT_SECRET)"; then
-        ok "already configured"
-        return
+    if [ "$MODE" != source ]; then
+        has_shared_app "$(env_get OPENFLOWS_VERSION)" \
+            || die "OpenFlows $(env_get OPENFLOWS_VERSION) has no shared GitHub App support." \
+                "Set OPENFLOWS_VERSION to a release newer than ${LAST_RELEASE_WITHOUT_SHARED_APP}."
+        pin_manager_image
     fi
-    local owner="${REPO%%/*}"
-    if is_tty && have python3 && github_app_via_manifest "$owner"; then
-        ok "GitHub App created and saved to .env"
-        local install_url
-        install_url="$(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
-        panel "$C" "Install the app" "Choose 'Only select repositories' → ${REPO}" "${install_url}"
-        open_url "$install_url"
-        pause "Install the app on your repo, then continue"
+    local secret_dir="${HOME}/.config/openflows"
+    mkdir -p "$secret_dir" || die "Cannot create local GitHub credential directory."
+    chmod 700 "$secret_dir" || die "Cannot make local GitHub credential directory private."
+    env_set OPENFLOWS_MODE local
+    env_set CODER_OAUTH2_PROVIDER_ENABLE true
+    env_set CODER_EXPERIMENTS agent-lifecycle-hooks,oauth2
+    env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
+    env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
+    env_set OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR "$secret_dir"
+    env_set OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE "$secret_dir/github-user.json"
+    env_set OPENFLOWS_LOCAL_UID "$(id -u)"
+    env_set OPENFLOWS_LOCAL_GID "$(id -g)"
+    env_set TF_VAR_connected_local true
+    env_set TF_VAR_connected_local_broker_secret_host_path "$secret_dir/github-broker-key"
+    env_set TF_VAR_connected_local_helper_host_path "$ROOT/scripts/connected-local-github.py"
+    env_set TF_VAR_connected_local_manager_url "http://openflows-local-manager:3002"
+    # A release name is immutable. Derive a stable name from the local template
+    # sources so an edited checkout publishes a new release on the next run.
+    if [ "$MODE" = source ]; then
+        local template_digest
+        template_digest="$(python3 - "$ROOT/crates/coder-client/templates" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for path in sorted(root.rglob('*')):
+    if path.is_file():
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+print(digest.hexdigest()[:20])
+PY
+)"
+        env_set OPENFLOWS_RELEASE_NAME "local-${template_digest}"
     else
-        warn "Automatic app creation unavailable — falling back to manual steps"
-        github_app_manual "$owner"
-        ok "GitHub App saved to .env"
-        info "Install it on your repo: $(env_get CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL)"
-        is_tty && pause "Install the app, then continue"
+        env_set OPENFLOWS_RELEASE_NAME "openflows-$(env_get OPENFLOWS_VERSION)"
+    fi
+    info "GitHub connection continues in the local OpenFlows console after the stack starts."
+}
+
+stage_manager_coder_oauth() {
+    local secret_dir="$(env_get OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR)" token_file="$secret_dir/coder-bootstrap-token" id line args=()
+    # The Manager creates its own Coder OAuth client using the already signed-in
+    # local Coder account. The token file is private and mounted only locally.
+    (umask 077; printf '%s' "$(env_get CODER_SESSION_TOKEN)" >"$token_file")
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    if ! (cd "$ROOT" && docker compose "${args[@]}" exec -T \
+        -e OPENFLOWS_CODER_BOOTSTRAP_TOKEN_FILE=/run/openflows-local/coder-bootstrap-token \
+        openflows-local-manager openflows-manager setup >"$LOG_FILE" 2>&1); then
+        tail -n 15 "$LOG_FILE" | sed 's/^/    /' >&2
+        die "Could not register the local Coder OAuth application" "Full log: $LOG_FILE"
+    fi
+    id="$(python3 - "$secret_dir/secrets/deployment.json" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())['oauth_id'])
+PY
+)"
+    if [ "$id" != "$(env_get OPENFLOWS_CODER_OAUTH_CLIENT_ID)" ]; then
+        env_set OPENFLOWS_CODER_OAUTH_CLIENT_ID "$id"
+        (cd "$ROOT" && docker compose "${args[@]}" up -d openflows-local-manager >"$LOG_FILE" 2>&1) \
+            || die "Could not apply the local Coder OAuth client" "Full log: $LOG_FILE"
     fi
 }
 
+# compose_base_files — "-f FILE" for each Compose file this project normally uses. Passing
+# any -f stops Compose from reading COMPOSE_FILE and docker-compose.override.yml on its own,
+# so they are added back here before setup's own files. Prints one argument per line.
+compose_base_files() {
+    local files="${COMPOSE_FILE:-$(env_get COMPOSE_FILE)}" f
+    local sep="${COMPOSE_PATH_SEPARATOR:-$(env_get COMPOSE_PATH_SEPARATOR)}"
+    if [ -n "$files" ]; then
+        tr "${sep:-:}" '\n' <<<"$files" | awk 'NF {print "-f"; print}'
+        return
+    fi
+    printf '%s\n' -f docker-compose.yml
+    for f in docker-compose.override.yml docker-compose.override.yaml; do
+        if [ -f "${ROOT}/${f}" ]; then printf '%s\n' -f "$f"; break; fi
+    done
+}
+
 # ── stage 4: Docker stack ───────────────────────────────────────────────────
+# compose_files — the -f arguments for this install, one per line; none for plain `docker compose`.
+# connected-local adds the local Manager (from its image unless compiling); the images
+# file copies the programs into .dev-binaries before Coder starts.
+compose_files() {
+    local extra=()
+    extra+=(-f docker-compose.connected-local.yml)
+    [ "$MODE" = source ] || extra+=(-f docker-compose.manager-image.yml)
+    [ "$MODE" = compose ] && extra+=(-f docker-compose.images.yml)
+    if [ "${#extra[@]}" -gt 0 ]; then
+        compose_base_files
+        printf '%s\n' "${extra[@]}"
+    fi
+}
 stage_docker() {
     step "Starting Redis + Coder"
-    local out i
-    if ! out="$(cd "$ROOT" && docker compose up -d 2>&1)"; then
+    mkdir -p "$BIN_DIR" 2>/dev/null || true
+    [ -w "$BIN_DIR" ] || die "Cannot write to .dev-binaries." "Make it yours: sudo chown -R \"$(id -u):$(id -g)\" ${BIN_DIR}"
+    local out i line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    args+=(up -d)
+    [ "$MODE" = source ] && args+=(--build)
+    # Compose prefers shell variables over .env; pass the image from .env so a leftover
+    # export (e.g. from an earlier upgrade) cannot copy a different version.
+    local image_env=()
+    [ "$MODE" = compose ] && image_env=(
+        "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
+        "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
+        "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
+        "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
+    [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
+    if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
     fi
     ( for ((i = 0; i < 90; i++)); do curl -fs -m 3 "$(coder_url)/api/v2/buildinfo" >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1 ) &
     spin $! "Waiting for Coder to become healthy" \
         || die "Coder did not become healthy in 3 minutes." "Check logs: docker compose logs coder"
+    if [ "$MODE" = compose ]; then
+        [ "$(cat "${BIN_DIR}/IMAGE" 2>/dev/null)" = "$(image_ref)" ] \
+            || die "The OpenFlows programs were not copied from $(image_ref)." \
+                "Check logs: docker compose -f docker-compose.yml -f docker-compose.images.yml logs openflows-binaries"
+        "$OPENFLOWS_BIN" --version >/dev/null 2>&1 \
+            || die "The OpenFlows programs do not run on this machine." \
+                "Use the source install instead:  ./scripts/setup.sh ${REPO} --source"
+        ok "programs installed from the ${B}$(env_get OPENFLOWS_VERSION)${N} image"
+    fi
     ok "Coder is up at ${B}$(coder_url)${N}"
+}
+
+# stage_connected_local_authorization — the team App is configured by the
+# OpenFlows release. Contributors install it, approve their own GitHub account,
+# and choose the requested repository in the local browser console.
+manager_repo_list() { # the repositories available to the signed-in GitHub user and the App
+    local line args=()
+    while IFS= read -r line; do args+=("$line"); done < <(compose_files)
+    (cd "$ROOT" && docker compose "${args[@]}" exec -T openflows-local-manager openflows-manager github-repos 2>/dev/null)
+}
+stage_connected_local_authorization() {
+    TOTAL=$((TOTAL + 1))
+    step "Connect GitHub"
+    local manager_url="http://127.0.0.1:3002" status
+    ( for _ in {1..30}; do curl -fs -m 3 "${manager_url}/health" >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1 ) &
+    spin $! "Waiting for the local OpenFlows console" \
+        || die "The local OpenFlows console did not become ready." "Check logs: docker compose logs openflows-local-manager"
+    status="$(curl -fs -m 5 "${manager_url}/api/v1/local/github" 2>/dev/null || true)"
+    printf '%s' "$status" | python3 -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("configured") else 1)' \
+        || die "This OpenFlows distribution does not include the team GitHub App configuration." \
+               "Use an official OpenFlows release or contact the deployment operator; contributors do not supply a client ID or App slug."
+    if manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }'; then
+        ok "GitHub user authorization ready for ${REPO}"
+        return
+    fi
+    panel "$C" "Connect GitHub in your browser" \
+        "Open the local console, install the OpenFlows App on ${REPO}, approve GitHub, then select ${REPO}." \
+        "${manager_url}"
+    open_url "${manager_url}/"
+    is_tty || die "Complete GitHub connection in ${manager_url}, then re-run setup with a terminal attached."
+    pause "Complete GitHub connection in the local console, then continue"
+    manager_repo_list | awk -F '\t' -v target="$REPO" 'BEGIN { target=tolower(target) } tolower($2)==target { found=1 } END { exit !found }' \
+        || die "${REPO} is not available to both your GitHub account and the OpenFlows App." \
+               "Return to ${manager_url}, check the App installation and GitHub connection, then re-run setup."
+    ok "GitHub user authorization ready for ${REPO}"
 }
 
 # ── stage 5: Coder admin + token ────────────────────────────────────────────
@@ -674,12 +764,18 @@ stage_llm() {
 }
 
 # ── stage 7: bootstrap (templates) ──────────────────────────────────────────
-# templates_ready — true when all five openflows-* templates exist and the dev binary is newer than every source file
+# templates_ready — true when all five openflows-* templates exist and the programs are current:
+# --source: the dev binary is newer than every source file; --compose: the templates were pushed for this image.
 templates_ready() {
-    local bin="${ROOT}/.dev-binaries/openflows"
+    local bin="${BIN_DIR}/openflows"
     [ -x "$bin" ] || return 1
+    if [ "$MODE" != source ]; then
+        [ "$(env_get OPENFLOWS_SETUP_TEMPLATES_IMAGE)" = "$(installed_ref)" ] || return 1
+    # Programs from an image or a release (IMAGE, RELEASE markers) must be rebuilt from this checkout.
+    elif [ -f "${BIN_DIR}/IMAGE" ] || [ -f "${BIN_DIR}/RELEASE" ]; then
+        return 1
     # Rebuild when any source or template is newer than the built binary.
-    if [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
         return 1
     fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
@@ -688,54 +784,174 @@ names = {t.get("name") for t in json.load(sys.stdin)}
 sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
 }
 
+# openflows_workspaces — this user's OpenFlows workspaces, one
+# "<name> <status> <outdated> <id> <active template version id>" per line; fails when Coder
+# doesn't answer, so callers never mistake that for "no workspaces"
+openflows_workspaces() {
+    local body
+    body="$(api GET "/api/v2/workspaces?q=owner:me" 2>/dev/null)" || return 1
+    python3 -c '
+import sys, json
+for w in json.load(sys.stdin).get("workspaces") or []:
+    if w.get("template_name", "").startswith("openflows-"):
+        print(w["name"], w["latest_build"]["status"], "yes" if w.get("outdated") else "no",
+              w["id"], w["template_active_version_id"])' <<<"$body" 2>/dev/null
+}
+
+# mark_pending_restart — add every workspace that isn't stopped to OPENFLOWS_SETUP_PENDING_RESTART
+# (comma-separated: .env is sourced by prod.sh): one that is starting may already have copied the
+# old programs. When Coder doesn't answer it saves "*": every workspace not stopped then needs a
+# restart, since the programs were replaced anyway.
+mark_pending_restart() {
+    local names active
+    active="$(openflows_workspaces)" && active="$(awk '$2 != "stopped" {print $1}' <<<"$active")" || active="*"
+    names="$( { env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; printf '%s\n' "$active"; } \
+        | awk 'NF && !seen[$1]++' | paste -sd, -)"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$names"
+}
+
+# unmark_pending_restart NAME — drop a workspace that restarted with the new programs.
+unmark_pending_restart() {
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(env_get OPENFLOWS_SETUP_PENDING_RESTART \
+        | WS="$1" awk -v RS=, -v ORS=, 'NF && $1 != ENVIRON["WS"]' | sed 's/,$//')"
+}
+
+# wait_build BUILD_ID — wait until a workspace build finishes; succeeds only if it succeeded.
+# Times out after OPENFLOWS_SETUP_BUILD_TIMEOUT seconds (default 600).
+wait_build() {
+    local id="$1" deadline=$((SECONDS + ${OPENFLOWS_SETUP_BUILD_TIMEOUT:-600})) status
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        status="$(api GET "/api/v2/workspacebuilds/${id}" 2>/dev/null | json job.status)"
+        case "$status" in
+            succeeded) return 0 ;;
+            failed|canceled|canceling) return 1 ;;
+        esac
+        sleep 3
+    done
+    return 1
+}
+
+# update_stopped — move stopped outdated workspaces to the active template version with a
+# stop build, so they stay stopped (`coder update` would start them)
+update_stopped() {
+    local name status outdated id version build
+    while read -r name status outdated id version; do
+        if [ "$status" != stopped ] || [ "$outdated" != yes ]; then continue; fi
+        if build="$(api POST "/api/v2/workspaces/${id}/builds" \
+                "{\"transition\":\"stop\",\"template_version_id\":\"${version}\"}" 2>>"$LOG_FILE" | json id)" \
+            && [ -n "$build" ] && wait_build "$build"; then
+            ok "updated ${name} to the new templates (still stopped)"
+        else
+            warn "could not update ${name} — see Build History in the Coder dashboard"
+        fi
+    done <<<"$(openflows_workspaces || true)"
+}
+
+# offer_update — a workspace keeps its template version until it is updated (a restart reuses
+# it) and copies the programs only when it starts. Bootstrap pushes a new template version only
+# when a template changed, and saves the workspaces not stopped when it replaced the programs
+# (OPENFLOWS_SETUP_PENDING_RESTART). Stopped workspaces are updated right away; running ones
+# are updated (outdated) or restarted (programs only) with --update-workspaces or once the user
+# agrees, since that pauses their work. Whatever is left stays pending — outdated or failed in
+# Coder, restarts in .env — and is offered again on the next run; UPGRADE_PENDING tells main
+# the upgrade is not complete.
+offer_update() {
+    local all update restart pending ws
+    update_stopped
+    if ! all="$(openflows_workspaces)"; then
+        warn "Could not check the workspaces: Coder did not answer"
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
+    update="$(awk '$2 == "running" && $3 == "yes" {print $1}' <<<"$all")"
+    # Stopped or deleted workspaces copy the new programs when they next start; the others
+    # (running or still starting/stopping) stay pending until they restart.
+    pending="$(PREV="$(env_get OPENFLOWS_SETUP_PENDING_RESTART)" awk 'BEGIN {n = split(ENVIRON["PREV"], p, ","); for (i = 1; i <= n; i++) was[p[i]] = 1}
+        (($1 in was) || ("*" in was)) && $2 != "stopped" && $2 != "deleted" {print $1, $2, $3}' <<<"$all")"
+    env_set OPENFLOWS_SETUP_PENDING_RESTART "$(awk '{print $1}' <<<"$pending" | paste -sd, -)"
+    restart="$(awk '$2 == "running" && $3 == "no" {print $1}' <<<"$pending")"
+    if [ -n "$update$restart" ]; then
+        warn "Running workspaces still use the old version: $(printf '%s\n' "$update" "$restart" | awk NF | paste -sd' ' -)"
+        if [ "$UPDATE_WORKSPACES" = 1 ] || \
+           { is_tty && [[ "$(ask 'Update them now? Work in progress pauses briefly [y/N]')" =~ ^[Yy] ]]; }; then
+            for ws in $update; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder update "$ws" --use-parameter-defaults </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "updated ${ws} to the new templates"
+                    unmark_pending_restart "$ws"
+                else
+                    warn "could not update ${ws} — see ${LOG_FILE}"
+                fi
+            done
+            for ws in $restart; do
+                if CODER_URL="$(coder_url)" CODER_SESSION_TOKEN="$(env_get CODER_SESSION_TOKEN)" \
+                    coder restart "$ws" --yes </dev/null >>"$LOG_FILE" 2>&1; then
+                    ok "restarted ${ws} with the new programs"
+                    unmark_pending_restart "$ws"
+                else
+                    warn "could not restart ${ws} — see ${LOG_FILE}"
+                fi
+            done
+        elif ! is_tty; then
+            info "Not updated: no terminal to ask. Pass --update-workspaces to update them automatically."
+        fi
+    fi
+    if ! all="$(openflows_workspaces)"; then
+        UPGRADE_PENDING="(not checked — Coder did not answer)"
+        return 0
+    fi
+    # Outdated, failed or still building (a failed or timed-out update leaves one of these).
+    UPGRADE_PENDING="$( { awk '$3 == "yes" || ($2 != "running" && $2 != "stopped") {print $1}' <<<"$all"
+        env_get OPENFLOWS_SETUP_PENDING_RESTART | tr ',' '\n'; } | awk 'NF && !seen[$1]++' | paste -sd' ' -)"
+    return 0
+}
+
 stage_bootstrap() {
-    step "Workspace templates (first run takes ~10 min)"
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && templates_ready; then
+    if [ "$MODE" != source ]; then
+        step "Workspace templates"
+        if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
+           templates_ready; then
+            ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+            return
+        fi
+        run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+        env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
+        mark_pending_restart
+        ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
+        return
+    fi
+    step "Workspace templates (first run takes ~10 min)"
+    if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && \
+       templates_ready; then
         ok "binaries and 5 templates already in place"
         info "Sources unchanged since the last build. Force a rebuild: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
         return
     fi
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
+    rm -f "${BIN_DIR}/IMAGE" "${BIN_DIR}/RELEASE"
+    # The next --compose or --binary run must push its templates again, even for the same version.
+    env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE ""
+    mark_pending_restart
     ok "binaries built, 5 templates pushed"
 }
 
-# ensure_github_link — Coder only builds workspaces once the OWNING Coder account (the token's user) has linked the GitHub App.
-ensure_github_link() {
-    local linked me user login url
-    CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    linked="$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)"
-    if [ "$linked" = "True" ]; then ok "GitHub already linked"; return; fi
-    me="$(api GET /api/v2/users/me 2>/dev/null || true)"
-    user="$(printf '%s' "$me" | json username)"; login="$(printf '%s' "$me" | json login_type)"
-    url="$(public_url)/external-auth/$(auth_id)"
-    if [ "$login" = "password" ]; then
-        panel "$Y" "Link GitHub (one time)" \
-            "This token belongs to the password account '${user}'." \
-            "Open a private window, then:" \
-            "  1. Open  ${url}" \
-            "  2. Sign in as  $(env_get CODER_ADMIN_EMAIL)  (password: CODER_ADMIN_PASSWORD in .env)" \
-            "  3. Click the GitHub button and Authorize"
-    else
-        panel "$C" "Link GitHub (one time)" \
-            "Agents act on your repo through your GitHub account." \
-            "  1. Open  ${url}   (signed in as '${user}')" \
-            "  2. Click the GitHub button and Authorize" \
-            "  3. Install the app on ${REPO} if asked"
-        open_url "$url"
+# The tenant workspace is openflows-nexus-NAME and Coder caps workspace names at 32 characters
+# (letters, digits, single hyphens), so NAME gets at most 16 of them.
+tenant_name_ok() { [[ "$1" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ && "${#1}" -le 16 ]]; }
+
+# default_tenant_name owner/repo: owner-repo when that is already a valid tenant name, so
+# orgA/backend and orgB/backend do not collide. Otherwise a 9-character prefix plus a hash of the
+# repo, so repos that normalise alike (org/a.b, org/a_b) or share a long prefix stay distinct.
+default_tenant_name() {
+    local raw="${1/\//-}" name
+    name="$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+    if [ "$name" != "$raw" ] || [ "${#name}" -gt 16 ]; then
+        name="$(printf '%s-%06x' "$(printf '%s' "${name:0:9}" | sed 's/-*$//')" \
+            "$(( $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 16777216 ))")"
     fi
-    if ! is_tty; then   # no terminal to wait in: tenant add offers a device-flow code and waits itself
-        warn "No terminal — continuing; the tenant step will ask you to authorize GitHub"
-        return
-    fi
-    ( for ((i = 0; i < 300; i++)); do
-        [ "$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)" = "True" ] && exit 0
-        sleep 2
-      done; exit 1 ) &
-    spin $! "Waiting for you to link GitHub (up to 10 min)" \
-        || die "GitHub was not linked in time." "Make sure the browser is signed in to Coder as '${user}' at ${url}."
-    ok "GitHub linked"
+    printf '%s' "$name"
 }
 
 # check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a tenant name already bound
@@ -762,7 +978,6 @@ for p in json.load(sys.stdin):
 stage_tenant() {
     step "Connecting ${REPO}"
     check_existing_tenant
-    ensure_github_link
     printf '\n'
     "${SCRIPT_DIR}/prod.sh" tenant "$REPO" --name "$NAME" --fleet "$FLEET"
     printf '\n'
@@ -777,12 +992,16 @@ stage_tenant() {
 
 # ── main ────────────────────────────────────────────────────────────────────
 main() {
-    REPO=""; NAME=""; FLEET=""
+    REPO=""; NAME=""; FLEET=""; MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --source|--compose|--binary)
+                [ -z "$MODE" ] || [ "$MODE" = "${1#--}" ] || die "Choose one install mode: --source, --compose or --binary."
+                MODE="${1#--}"; shift ;;
             --name) NAME="${2:?--name needs a value}"; shift 2 ;;
             --fleet) FLEET="${2:?--fleet needs a value}"; shift 2 ;;
-            -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            --update-workspaces) UPDATE_WORKSPACES=1; shift ;;
+            -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
             -*) die "Unknown option: $1" ;;
             *) REPO="$1"; shift ;;
         esac
@@ -810,8 +1029,10 @@ main() {
         [ -n "$NAME" ] || NAME="$(env_get OPENFLOWS_SETUP_NAME)"
         [ -n "$FLEET" ] || FLEET="$(env_get OPENFLOWS_SETUP_FLEET)"
     fi
-    NAME="${NAME:-${REPO/\//-}}"   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
-    NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+    [ -n "$NAME" ] || NAME="$(default_tenant_name "$REPO")"   # new repo: derived from owner/repo
+    tenant_name_ok "$NAME" \
+        || die "Tenant name '${NAME}' does not fit Coder's workspace name rules." \
+               "Use at most 16 letters, digits and single hyphens:  ./scripts/setup.sh ${REPO} --name <short-name>"
     if [ -z "$FLEET" ] && is_tty; then   # first run, no --fleet given: ask (a re-run reuses the saved value)
         printf '\n  %sFleet = FORGE-SENTINEL pairs (a builder plus its reviewer). 1 pair works one issue at a time;\n  N pairs work N issues in parallel, using more LLM tokens and workspaces. Start small — you can add more later.%s\n' "$D" "$N"
         while true; do
@@ -823,21 +1044,58 @@ main() {
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."
 
+    # Install mode: the flag, else the mode of the previous run, else source.
+    if [ -z "$MODE" ]; then
+        MODE="$(env_get OPENFLOWS_SETUP_MODE)"
+        if [ -z "$MODE" ] && [ -f "${ROOT}/RELEASE_VERSION" ]; then
+            MODE=binary
+        elif [ -z "$MODE" ]; then
+            MODE=source
+            printf '  %sInstall mode: source (compiles OpenFlows). No compiling: --compose or --binary%s\n' "$D" "$N"
+        fi
+    fi
+    case "$MODE" in
+        source) ;;
+        compose|binary) TOTAL=9 ;;
+        *) die "Unknown install mode '${MODE}' in OPENFLOWS_SETUP_MODE (use source, compose or binary)." ;;
+    esac
+
     stage_preflight
     stage_env
     env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
+    env_set OPENFLOWS_SETUP_MODE "$MODE"
+    [ "$MODE" = compose ] && stage_image
+    [ "$MODE" = binary ] && stage_release
     stage_github_app
     stage_docker
+    stage_connected_local_authorization
     stage_coder_token
+    stage_manager_coder_oauth
     stage_llm
     stage_bootstrap
     stage_tenant
+    offer_update
 
     close_step
     printf '\n'
     RAIL_OPEN=0
+    local installed="source (compiled from this checkout)"
+    [ "$MODE" = compose ] && installed="image $(env_get OPENFLOWS_VERSION)"
+    [ "$MODE" = binary ] && installed="release $(env_get OPENFLOWS_VERSION)"
+    if [ -n "$UPGRADE_PENDING" ]; then
+        panel "$Y" "⚠ Upgrade not complete · $((SECONDS - START_TIME))s" "" \
+            "These workspaces still use the old version:" \
+            "  ${UPGRADE_PENDING}" "" \
+            "Re-run ./scripts/setup.sh (add --update-workspaces to skip the" \
+            "question), or per workspace:" \
+            "  coder update <workspace>         (new templates)" \
+            "  coder restart <workspace> --yes  (new programs)" ""
+        printf '\n'
+        exit 3
+    fi
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
+        "Installed    ${installed}" \
         "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \

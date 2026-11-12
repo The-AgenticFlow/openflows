@@ -14,6 +14,30 @@ variable "docker_network" {
   default     = "openflows_default"
 }
 
+variable "connected_local" {
+  description = "Use the OpenFlows team's GitHub App with local user authorization"
+  type        = bool
+  default     = false
+}
+
+variable "connected_local_broker_secret_host_path" {
+  description = "Host path to the local Manager broker key; never the key value"
+  type        = string
+  default     = ""
+}
+
+variable "connected_local_manager_url" {
+  description = "Local Manager URL reachable from Coder workspaces"
+  type        = string
+  default     = "http://openflows-local-manager:3002"
+}
+
+variable "connected_local_helper_host_path" {
+  description = "Host path to the connected-local workspace credential helper"
+  type        = string
+  default     = ""
+}
+
 variable "workspace_image" {
   description = "Workspace image containing the tools used by the production bootstrap"
   type        = string
@@ -209,23 +233,27 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
-    # Provision the OpenFlows hook harness for the agent CLI so the agent
-    # loop is controllable end-to-end: session start reads the dispatch,
-    # tool-use guards enforce policy, and Stop refuses to end the session
-    # until the flow artifacts (status/handoff/PR) exist.
+    # Install the role hooks and wire them into the agent CLI loop. Deferred to
+    # a function because the scripts arrive with the artifact bundle, which a
+    # hosted workspace fetches only after it registers below. Session start then
+    # reads the dispatch, tool-use guards enforce policy, and Stop refuses to
+    # end the session until the flow artifacts (status/handoff/PR) exist.
+    install_hook_surface() {
     ROLE="${data.coder_parameter.role.value}"
     ROLE_BASE="$${ROLE%-*}"   # forge-1 -> forge
-    HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
+    HOOKS_SRC="$ASSETS_DIR/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
-      # The artifacts volume (/home/coder/.openflows) is a host bind mount
-      # owned by root, so these operations must run via sudo as the coder
-      # user cannot create directories or write inside a root-owned mount.
+      # The bundle is unpacked by root, so the coder user cannot create the
+      # hook directory or copy into it without sudo. Replace the directory
+      # rather than copy over it, so a hook dropped by a later release cannot
+      # be registered from a previous boot.
+      sudo rm -rf "$HOOKS_DIR"
       sudo mkdir -p "$HOOKS_DIR"
       sudo cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
       sudo chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
       sudo chown -R coder:coder "$HOOKS_DIR" 2>/dev/null || true
-      log "Installed $ROLE_BASE hooks from artifacts volume"
+      log "Installed $ROLE_BASE hooks from the artifact bundle"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
     fi
@@ -274,6 +302,7 @@ settings["hooks"] = hooks
 json.dump(settings, open(settings_path, "w"), indent=2)
 print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
 PYEOF
+    }
 
     # Inherit the controller-spawner's GitHub identity from Coder external
     # auth (the tenant's linked GitHub App token). The workspace owner IS the
@@ -307,10 +336,15 @@ PY
 )"
       GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
       GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
-      API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
-      API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
+      if [ "${var.connected_local}" = "true" ]; then
+        API_TOKEN="$GIT_TOKEN"
+      else
+        API_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"api"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
+        API_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$API_RESPONSE")
+      fi
     else
-      GIT_TOKEN="${data.coder_parameter.hosted.value == "true" ? "" : data.coder_external_auth.github[0].access_token}"
+      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
+      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
       API_TOKEN="$GIT_TOKEN"
     fi
     if [ -z "$GIT_TOKEN" ]; then
@@ -340,20 +374,27 @@ PY
     sudo chmod 600 /root/.git-credentials
     log "Configured git credentials for GitHub push auth"
 
-    # Resolve the expected account from the inherited token via the GitHub API
-    # (the coder_external_auth data source does not expose the login). Honor
-    # GITHUB_API_BASE so self-hosted setups match the rest of the system.
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+    if [ "${var.connected_local}" = "true" ]; then
+      git config --global --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system --unset-all credential.helper 2>/dev/null || true
+      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
+      rm -f /home/coder/.git-credentials
+      sudo rm -f /root/.git-credentials
+    fi
+
+    # Resolve the local user identity from GitHub. Hosted installation tokens
+    # do not expose /user, so hosted commits use the App bot identity.
+    if [ "${data.coder_parameter.hosted.value}" = "true" ] && [ "${var.connected_local}" != "true" ]; then
       # Installation tokens are repository-scoped and intentionally do not
       # expose a personal /user identity. Commits are authored as the App bot.
       EXPECTED_LOGIN="openflows[bot]"
     else
       EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
-        || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+        || { log "FATAL: could not resolve the GitHub user identity"; exit 1; }
     fi
     if [ -z "$EXPECTED_LOGIN" ]; then
-      log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
+      log "FATAL: resolved an empty GitHub user identity"
       exit 1
     fi
 
@@ -372,6 +413,28 @@ PY
     # (/home/coder/workspace), so it never makes the destination non-empty and
     # blocks `git clone`/`cp -a` below. Never write the token anywhere.
     echo "$EXPECTED_LOGIN" > /home/coder/.openflows-gh-identity 2>/dev/null || true
+
+    # Immutable role assets: the persona, skills, commands, standards and hooks.
+    # A hosted workspace fetches the bundle of this release from the Manager and
+    # verifies its digest before installing anything, so it never depends on
+    # another workspace having published them. Local mode reads the tenant
+    # artifacts volume that the Nexus workspace seeds.
+    ASSETS_DIR="/home/coder/.openflows/artifacts"
+    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+      ASSETS_DIR="/home/coder/.openflows/bundle"
+      sudo mkdir -p "$ASSETS_DIR"
+      sudo chown coder:coder "$ASSETS_DIR"
+      log "Installing the workspace artifact bundle from the Manager"
+      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
+      # registration above, so it never appears in a process argument.
+      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
+        --manager-url "$OF_MANAGER_URL"; then
+        log "FATAL: cannot install the workspace artifact bundle"
+        exit 1
+      fi
+    fi
+
+    install_hook_surface
 
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
@@ -536,7 +599,7 @@ PY
       exit 1
     fi
 
-    INSTRUCTION_ROOT="/home/coder/.openflows/artifacts/orchestration"
+    INSTRUCTION_ROOT="$ASSETS_DIR/orchestration"
     PERSONA="$INSTRUCTION_ROOT/agent/agents/$ROLE_BASE.agent.md"
     if [ ! -f "$PERSONA" ]; then
       log "FATAL: hosted instruction bundle is missing $PERSONA"
@@ -652,6 +715,14 @@ resource "docker_container" "workspace" {
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
 
+  # Linux Docker has no built-in host.docker.internal. Map it to the host
+  # gateway so workspaces can reach a Manager running on the Docker host
+  # (Docker Desktop on macOS/Windows already provides this name).
+  host {
+    host = "host.docker.internal"
+    ip   = "host-gateway"
+  }
+
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
@@ -684,10 +755,30 @@ resource "docker_container" "workspace" {
     }
   }
 
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_broker_secret_host_path != "" ? [1] : []
+    content {
+      container_path = "/run/openflows/local-broker-key"
+      host_path      = var.connected_local_broker_secret_host_path
+      read_only      = true
+    }
+  }
+
+  dynamic "volumes" {
+    for_each = var.connected_local && var.connected_local_helper_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows/connected-local-github.py"
+      host_path      = var.connected_local_helper_host_path
+      read_only      = true
+    }
+  }
+
   env = concat([
     "GITHUB_API_BASE=${var.github_api_base}",
     "GITHUB_GIT_BASE=${var.github_git_base}",
     "OPENFLOWS_RUNTIME_CREDENTIAL_FILE=/run/openflows/runtime.json",
+    "OPENFLOWS_LOCAL_MANAGER_URL=${var.connected_local_manager_url}",
+    "OPENFLOWS_CONNECTED_LOCAL_REPOSITORY=${data.coder_parameter.repo_url.value}",
     "OPENFLOWS_GITHUB_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token",
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
@@ -713,8 +804,3 @@ resource "docker_container" "workspace" {
 
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
-data "coder_external_auth" "github" {
-  count = data.coder_parameter.hosted.value == "true" ? 0 : 1
-  id       = "primary-github"
-  optional = true
-}

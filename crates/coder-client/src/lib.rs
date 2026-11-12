@@ -78,6 +78,19 @@ pub fn template_variable_values() -> Vec<(&'static str, String)> {
         ("TF_VAR_workspace_image", "workspace_image"),
         ("TF_VAR_github_api_base", "github_api_base"),
         ("TF_VAR_github_git_base", "github_git_base"),
+        ("TF_VAR_connected_local", "connected_local"),
+        (
+            "TF_VAR_connected_local_broker_secret_host_path",
+            "connected_local_broker_secret_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_helper_host_path",
+            "connected_local_helper_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_manager_url",
+            "connected_local_manager_url",
+        ),
     ]
     .into_iter()
     .filter_map(|(env_name, name)| {
@@ -728,8 +741,19 @@ impl CoderClient {
     pub async fn push_template(&self, name: &str, archive: &[u8]) -> Result<CoderTemplate> {
         use std::process::Stdio;
 
-        // Check if template already exists
-        let templates = self.list_templates().await?;
+        let organizations = self.list_organizations().await?;
+        let organization = organizations
+            .iter()
+            .find(|organization| organization.is_default)
+            .or_else(|| organizations.first())
+            .filter(|organization| !organization.name.trim().is_empty())
+            .context("Coder has no organization available for template push")?;
+
+        let organization_id = CoderOrganizationId(organization.id.clone());
+
+        // Check only the selected organization. Template names may be repeated
+        // across organizations on multi-tenant Coder deployments.
+        let templates = self.list_templates_in_org(&organization_id).await?;
         let template_exists = templates.iter().any(|t| t.name == name);
 
         if template_exists {
@@ -761,6 +785,8 @@ impl CoderClient {
         if !status.success() {
             bail!("Failed to extract template archive");
         }
+        // The extraction archive must not be uploaded inside the template directory.
+        std::fs::remove_file(&archive_path).context("Failed to remove template staging archive")?;
 
         // Push the template via coder CLI
         // The CLI reads the directory and pushes it to the Coder server
@@ -769,6 +795,8 @@ impl CoderClient {
             "templates",
             "push",
             "--yes",
+            "--org",
+            &organization.name,
             name,
             "-d",
             temp_dir.to_str().unwrap(),
@@ -804,8 +832,8 @@ impl CoderClient {
         let _ = std::fs::remove_dir_all(&temp_dir);
         check_template_push_output(name, &output)?;
 
-        // Return the template info by listing again
-        let templates = self.list_templates().await?;
+        // Return the template from the organization we explicitly pushed to.
+        let templates = self.list_templates_in_org(&organization_id).await?;
         templates
             .into_iter()
             .find(|t| t.name == name)
@@ -936,6 +964,14 @@ impl CoderClient {
             }
             .into())
         }
+    }
+
+    /// List templates in Coder's designated default organization. Local
+    /// bootstrap and workspace creation use this scope so duplicate template
+    /// names in tenant organizations cannot select a foreign version.
+    pub async fn list_templates_in_default_org(&self) -> Result<Vec<CoderTemplate>> {
+        let org_id = CoderOrganizationId(self.get_default_organization_id().await?);
+        self.list_templates_in_org(&org_id).await
     }
 
     /// Fetch a template by id within an explicit organization, verifying the
@@ -1552,7 +1588,7 @@ impl CoderClient {
 
     /// Look up a template ID by name.
     async fn find_template_id_by_name(&self, name: &str) -> Result<String> {
-        let templates = self.list_templates().await?;
+        let templates = self.list_templates_in_default_org().await?;
         templates
             .into_iter()
             .find(|t| t.name == name)
@@ -2171,82 +2207,6 @@ impl CoderClient {
             anyhow::bail!("write_file failed: {}", output.stderr);
         }
         Ok(())
-    }
-}
-
-// External-auth (GitHub link) API
-
-impl CoderClient {
-    /// List the external-auth links for the current token's user.
-    /// `GET /api/v2/external-auth`.
-    pub async fn list_external_auth_links(&self) -> Result<Vec<crate::ExternalAuthLink>> {
-        let resp = self
-            .authenticated_request(reqwest::Method::GET, "/api/v2/external-auth")
-            .send()
-            .await
-            .context("Failed to list external-auth links")?;
-
-        if resp.status().is_success() {
-            let links: Vec<crate::ExternalAuthLink> = resp.json().await?;
-            Ok(links)
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to list external-auth links ({}): {}", status, body)
-        }
-    }
-
-    /// Get the link status for a single external-auth provider (e.g.
-    /// `primary-github`). `GET /api/v2/external-auth/{externalauth}`.
-    pub async fn get_external_auth(&self, id: &str) -> Result<crate::ExternalAuth> {
-        let resp = self
-            .authenticated_request(
-                reqwest::Method::GET,
-                &format!("/api/v2/external-auth/{}", id),
-            )
-            .send()
-            .await
-            .context("Failed to get external-auth status")?;
-
-        if resp.status().is_success() {
-            let auth: crate::ExternalAuth = resp.json().await?;
-            Ok(auth)
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Failed to get external-auth status ({}): {}", status, body)
-        }
-    }
-
-    /// Retrieve the pending device-flow link details for a provider. Returns
-    /// the verification URI and codes the user needs to complete linking
-    /// without a dashboard click. `GET /api/v2/external-auth/{externalauth}/device`.
-    ///
-    /// The POST variant of this endpoint performs the *exchange* of a device
-    /// code for a token (a 204 with an empty body); the device-details payload
-    /// is only returned by GET, so the device flow is initiated with GET here.
-    pub async fn get_external_auth_device(&self, id: &str) -> Result<crate::ExternalAuthDevice> {
-        let resp = self
-            .authenticated_request(
-                reqwest::Method::GET,
-                &format!("/api/v2/external-auth/{}/device", id),
-            )
-            .send()
-            .await
-            .context("Failed to retrieve external-auth device flow")?;
-
-        if resp.status().is_success() {
-            let device: crate::ExternalAuthDevice = resp.json().await?;
-            Ok(device)
-        } else {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "Failed to retrieve external-auth device flow ({}): {}",
-                status,
-                body
-            )
-        }
     }
 }
 

@@ -30,6 +30,10 @@ use tracing::{debug, error, info, warn};
 
 pub mod a2a;
 pub mod hooks;
+mod role_traits;
+pub(crate) use role_traits::RoleTraits;
+mod lore;
+pub mod openapi;
 pub mod runtime_control;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
@@ -255,6 +259,15 @@ pub struct NexusNode {
     pub registry_path: PathBuf,
     pub a2a_relay: Option<std::sync::Arc<crate::a2a::A2ARelay>>,
     runtime_control: Option<runtime_control::RuntimeControlClient>,
+    /// Keys that verify operator docs approvals (see
+    /// [`config::docs_lifecycle::DocsGateKeys`]); NEXUS opens a docs PR only
+    /// for a verified seal.
+    docs_gate_keys: Option<config::docs_lifecycle::DocsGateKeys>,
+    /// `(token, api_base)` replacing the resolved GitHub client (tests).
+    github_override: Option<(String, String)>,
+    /// Merged tickets whose docs records are closed, so the LORE driver does
+    /// not read them every poll (see `lore.rs`).
+    docs_closed: std::sync::Mutex<lore::ClosedDocsCache>,
 }
 
 impl NexusNode {
@@ -264,7 +277,26 @@ impl NexusNode {
             registry_path: registry_path.into(),
             a2a_relay: None,
             runtime_control: None,
+            docs_gate_keys: config::docs_lifecycle::gate_keys_from_env_logged(),
+            github_override: None,
+            docs_closed: Default::default(),
         }
+    }
+
+    /// Use `secret` to verify operator docs approvals (normally read from env).
+    pub fn with_docs_gate_secret(mut self, secret: Option<String>) -> Self {
+        self.docs_gate_keys = secret.map(|s| config::docs_lifecycle::DocsGateKeys::new(&s));
+        self
+    }
+
+    /// Talk to GitHub at `api_base` with `token` instead of the resolved client.
+    pub fn with_github_override(
+        mut self,
+        token: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        self.github_override = Some((token.into(), api_base.into()));
+        self
     }
 
     /// Attach an A2A relay reference so NexusNode can check relay health
@@ -291,6 +323,26 @@ impl NexusNode {
         hasher.update(b"\0");
         hasher.update(ticket_id.as_bytes());
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Derive and register the FORGE/SENTINEL A2A pair token for a ticket.
+    /// LORE never takes part in A2A verification, so it gets no token.
+    async fn register_a2a_pair_token(
+        store: &SharedStore,
+        worker_id: &str,
+        ticket_id: &str,
+    ) -> Result<Option<String>> {
+        if !RoleTraits::of(worker_id).uses_a2a {
+            return Ok(None);
+        }
+        let token = Self::a2a_pair_token(ticket_id)?;
+        store
+            .set(
+                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
+                json!(crate::a2a::A2ARelay::hash_pair_token(&token)),
+            )
+            .await;
+        Ok(Some(token))
     }
 
     fn managed_worker_request_key(worker_id: &str, ticket_id: &str) -> String {
@@ -331,8 +383,7 @@ impl NexusNode {
         registry.resolve_github_token("nexus")
     }
 
-    /// Best-effort GitHub token from Coder external auth (the tenant user's
-    /// linked App token). `None` when not configured. PAT flow removed.
+    /// Best-effort GitHub token from the Manager-brokered token file.
     fn resolve_github_token_from_env_or_file(&self) -> Option<String> {
         config::EnvConfig::from_env()
             .ok()
@@ -520,13 +571,31 @@ Before significant work, read the relevant skill file to understand the workflow
             .collect();
 
         let mut new_prs = Vec::new();
+        let mut tracked_prs_updated = false;
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
 
         for pr in &gh_prs {
-            if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref()).await {
+            if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref(), &pr.head_branch)
+                .await
+            {
                 continue;
             }
-            if !known_numbers.contains(&pr.number) {
+            if known_numbers.contains(&pr.number) {
+                if let Some(existing) = pending_prs
+                    .iter_mut()
+                    .find(|p| p["number"].as_u64() == Some(pr.number))
+                {
+                    if existing["head_sha"].as_str() != Some(pr.head_sha.as_str())
+                        || existing["mergeable"].as_bool() != pr.mergeable
+                        || existing["has_conflicts"].as_bool() != Some(pr.has_conflicts())
+                    {
+                        existing["head_sha"] = json!(pr.head_sha);
+                        existing["mergeable"] = json!(pr.mergeable);
+                        existing["has_conflicts"] = json!(pr.has_conflicts());
+                        tracked_prs_updated = true;
+                    }
+                }
+            } else {
                 if let Some(ref tid) = pr.ticket_id {
                     let already_tracked = pending_prs
                         .iter()
@@ -664,12 +733,23 @@ Before significant work, read the relevant skill file to understand the workflow
                             }
                         }
                         if matches!(ticket.status, TicketStatus::InProgress { .. }) {
+                            let lifecycle_in_submit = store
+                                .lifecycle(tid)
+                                .await
+                                .is_ok_and(|state| state.phase == config::lifecycle::Phase::Submit);
+                            if !lifecycle_in_submit {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                );
+                                continue;
+                            }
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                "Skipping re-add of PR for ticket with InProgress status — CI fix already in flight"
+                                "Ticket is InProgress and lifecycle has returned to Submit — re-adding PR to pending_prs"
                             );
-                            continue;
                         }
                     }
                 }
@@ -750,8 +830,9 @@ Before significant work, read the relevant skill file to understand the workflow
             still_open
         });
 
-        let prs_changed =
-            pending_prs.len() != known_numbers.len() || pending_prs.len() != before_count;
+        let prs_changed = pending_prs.len() != known_numbers.len()
+            || pending_prs.len() != before_count
+            || tracked_prs_updated;
 
         if prs_changed {
             store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
@@ -810,11 +891,28 @@ Before significant work, read the relevant skill file to understand the workflow
                                 tickets_changed = true;
                             }
                             TicketStatus::InProgress { .. } => {
-                                info!(
-                                    ticket_id = tid,
-                                    pr_number = pr.number,
-                                    "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
-                                );
+                                let lifecycle_in_submit =
+                                    store.lifecycle(tid).await.is_ok_and(|state| {
+                                        state.phase == config::lifecycle::Phase::Submit
+                                    });
+                                if lifecycle_in_submit {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket returned to Submit after rework — marking Completed(pr_opened)"
+                                    );
+                                    ticket.status = TicketStatus::Completed {
+                                        worker_id: String::from("nexus-reconciliation"),
+                                        outcome: "pr_opened".to_string(),
+                                    };
+                                    tickets_changed = true;
+                                } else {
+                                    info!(
+                                        ticket_id = tid,
+                                        pr_number = pr.number,
+                                        "Ticket has open PR but is InProgress (CI fix in flight) — NOT overriding to Completed"
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -1064,14 +1162,8 @@ Before significant work, read the relevant skill file to understand the workflow
             .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
             .await
             .unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
-        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
-        store
-            .set(
-                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
-                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
-            )
-            .await;
+        let branch = Self::workspace_branch_for(worker_id, &pending_prs, ticket_id);
+        let a2a_pair_token = Self::register_a2a_pair_token(store, worker_id, ticket_id).await?;
 
         // Note: The openflows-forge template expects the dev binaries via the
         // Terraform variable `TF_VAR_dev_binary_host_path` (not workspace parameters). Providing it this
@@ -1089,7 +1181,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 "tenant": config::EnvConfig::from_env()
                     .map(|e| e.tenant.effective_tenant().to_string())
                     .unwrap_or_else(|_| "default".to_string()),
-                "a2a_pair_token": a2a_pair_token,
+                "a2a_pair_token": a2a_pair_token.as_deref().unwrap_or_default(),
                 "coder_url": coder_url.unwrap_or_else(|| {
                     config::EnvConfig::from_env()
                         .map(|e| e.coder.url)
@@ -1277,14 +1369,8 @@ Before significant work, read the relevant skill file to understand the workflow
             .rsplit_once('-')
             .and_then(|(_, value)| value.parse::<i32>().ok());
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
-        let branch = Self::resolve_workspace_branch(&pending_prs, ticket_id);
-        let a2a_pair_token = Self::a2a_pair_token(ticket_id)?;
-        store
-            .set(
-                &crate::a2a::A2ARelay::pair_token_key(ticket_id),
-                json!(crate::a2a::A2ARelay::hash_pair_token(&a2a_pair_token)),
-            )
-            .await;
+        let branch = Self::workspace_branch_for(worker_id, &pending_prs, ticket_id);
+        let a2a_pair_token = Self::register_a2a_pair_token(store, worker_id, ticket_id).await?;
         let idempotency_store_key = Self::managed_worker_request_key(worker_id, ticket_id);
         let idempotency_key: String = store
             .get_typed(&idempotency_store_key)
@@ -1300,7 +1386,7 @@ Before significant work, read the relevant skill file to understand the workflow
                 slot_number,
                 Some(ticket_id),
                 (!branch.is_empty()).then_some(branch.as_str()),
-                Some(&a2a_pair_token),
+                a2a_pair_token.as_deref(),
                 &idempotency_key,
             )
             .await?;
@@ -1495,6 +1581,15 @@ Before significant work, read the relevant skill file to understand the workflow
     ///
     /// Prefers the PR's `head_branch` recorded in `pending_prs` for the ticket (so a
     /// rework workspace resumes its commits). Empty means create a fresh task branch.
+    /// LORE always starts from the default branch (it creates or checks out
+    /// its own `lore/` branch); a merged ticket's FORGE PR branch is never its base.
+    fn workspace_branch_for(worker_id: &str, pending_prs: &[Value], ticket_id: &str) -> String {
+        if RoleTraits::of(worker_id).starts_from_default_branch {
+            return String::new();
+        }
+        Self::resolve_workspace_branch(pending_prs, ticket_id)
+    }
+
     fn resolve_workspace_branch(pending_prs: &[Value], ticket_id: &str) -> String {
         pending_prs
             .iter()
@@ -1525,7 +1620,8 @@ Before significant work, read the relevant skill file to understand the workflow
         // Review chats belong exclusively to the phase/revision/round scheduler.
         // Generic recovery uses a different chat key and would create a second
         // reviewer (and overwrite its dispatch with builder instructions).
-        if Self::worker_role(worker_id) == "sentinel" {
+        // LORE chats are likewise owned by the docs driver (`lore.rs`).
+        if RoleTraits::of(worker_id).scheduler_owns_chats {
             return;
         }
 
@@ -2168,6 +2264,11 @@ Use `openflows-harness` for all coordination:
     /// - A ticket reaches `planning` phase (SENTINEL reviews the plan and approves the gate)
     /// - A ticket reaches `review_ready` phase (SENTINEL reviews the PR)
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
+        let lore_enabled = Self::lore_enabled(store).await;
+        if lore_enabled {
+            self.refresh_closed_docs(store).await;
+            Box::pin(self.docs_cutover(store, tickets)).await;
+        }
         for ticket in tickets {
             let key = format!("ticket:{}:review_poll_lease", ticket.id);
             let token = uuid::Uuid::new_v4().to_string();
@@ -2181,6 +2282,11 @@ Use `openflows-harness` for all coordination:
             }
             self.poll_harness_status_and_spawn_agents_inner(store, std::slice::from_ref(ticket))
                 .await;
+            // Run after the review scheduler's (large) future has returned so
+            // the LORE driver does not nest inside its stack frame.
+            if lore_enabled {
+                Box::pin(self.drive_lore_docs(store, ticket)).await;
+            }
             if let Err(error) = store.release_claim(&key, &token).await {
                 warn!(ticket_id = %ticket.id, %error, "Cannot release review scheduling lease");
             }
@@ -2205,13 +2311,14 @@ Use `openflows-harness` for all coordination:
             }
         };
 
-        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
-            Some(s) => s,
-            None => {
-                info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
-                return;
-            }
-        };
+        if store
+            .get_typed::<HashMap<String, WorkerSlot>>(KEY_WORKER_SLOTS)
+            .await
+            .is_none()
+        {
+            info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
+            return;
+        }
 
         let ticket_count = tickets.len();
         let is_ticket_active = |t: &Ticket| {
@@ -3057,161 +3164,6 @@ Use `openflows-harness` for all coordination:
                 }
             }
         }
-
-        // Check for merged tickets that need Lore documentation
-        self.spawn_lore_for_merged_tickets(store, tickets, &client, &slots)
-            .await;
-    }
-
-    /// Spawn Lore agent for merged tickets to generate documentation.
-    async fn spawn_lore_for_merged_tickets(
-        &self,
-        store: &SharedStore,
-        tickets: &[Ticket],
-        client: &CoderClient,
-        slots: &HashMap<String, WorkerSlot>,
-    ) {
-        for ticket in tickets {
-            // Only process merged tickets
-            let is_merged = matches!(&ticket.status, TicketStatus::Merged { .. });
-            if !is_merged {
-                continue;
-            }
-
-            // Check if Lore chat already exists for this ticket
-            let lore_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "lore");
-            let existing_lore_chat: Option<String> = store.get_typed(&lore_chat_key).await;
-            if existing_lore_chat.is_some() {
-                debug!(ticket_id = %ticket.id, "Lore chat already exists, skipping spawn");
-                continue;
-            }
-
-            // Check if Lore already completed documentation
-            let lore_done_key = full_ticket_key_flat(&ticket.id, "lore_done");
-            let lore_done: Option<bool> = store.get_typed(&lore_done_key).await;
-            if lore_done == Some(true) {
-                debug!(ticket_id = %ticket.id, "Lore already completed documentation");
-                continue;
-            }
-
-            // Find an idle lore worker slot
-            let lore_slot = slots.iter().find(|(id, slot)| {
-                Self::worker_role(id) == "lore" && matches!(slot.status, WorkerStatus::Idle)
-            });
-
-            let (lore_worker_id, lore_slot) = match lore_slot {
-                Some((id, slot)) => (id.clone(), slot.clone()),
-                None => {
-                    debug!(
-                        ticket_id = %ticket.id,
-                        "No idle lore worker available for merged ticket"
-                    );
-                    continue;
-                }
-            };
-
-            let workspace_id = match &lore_slot.workspace_id {
-                Some(ws) => ws.clone(),
-                None => {
-                    // Provision a lore workspace
-                    match self
-                        .provision_coder_workspace(store, &lore_worker_id, &ticket.id)
-                        .await
-                    {
-                        Ok(Some(ws_id)) => ws_id,
-                        Ok(None) | Err(_) => {
-                            warn!(
-                                ticket_id = %ticket.id,
-                                lore_worker_id,
-                                "Failed to provision lore workspace"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            // Build dispatch payload for Lore
-            let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "lore");
-            let dispatch_payload = json!({
-                "ticket_id": ticket.id,
-                "title": ticket.title,
-                "body": ticket.body,
-                "branch": ticket.branch,
-                "action": "generate_documentation",
-            });
-            store.set(&dispatch_key, dispatch_payload).await;
-
-            // Update lore slot to Assigned
-            let mut updated_slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-            if let Some(slot) = updated_slots.get_mut(&lore_worker_id) {
-                slot.status = WorkerStatus::Assigned {
-                    ticket_id: ticket.id.clone(),
-                    issue_url: ticket.issue_url.clone(),
-                };
-                slot.workspace_id = Some(workspace_id.clone());
-            }
-            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
-
-            // Create lore chat
-            let mut labels = serde_json::Map::new();
-            labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
-            labels.insert(CHAT_LABEL_ROLE.to_string(), json!("lore"));
-            labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
-
-            // Resolve organization_id first - fail fast if unavailable
-            let organization_id = match client.get_default_organization_id().await {
-                Ok(id) => id,
-                Err(e) => {
-                    error!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        error = %e,
-                        "CRITICAL: Failed to resolve organization_id for Lore chat - cannot proceed"
-                    );
-                    continue;
-                }
-            };
-
-            let chat_req = coder_client::types::CreateChatRequest {
-                organization_id: Some(organization_id),
-                owner_id: None,
-                workspace_id: workspace_id.clone(),
-                model_config_id: None,
-                content: vec![],
-                labels: Some(labels),
-            };
-
-            if let Err(e) = self
-                .ensure_workspace_instructions(store, client, &workspace_id, &lore_worker_id)
-                .await
-            {
-                warn!(error = %e, "Lore instructions unavailable; deferring chat");
-                continue;
-            }
-            let chat_result = client.create_chat(&chat_req).await;
-
-            match chat_result {
-                Ok(chat) => {
-                    store.set(&lore_chat_key, json!(chat.id)).await;
-                    info!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        chat_id = %chat.id,
-                        "Spawned Lore chat for merged ticket documentation"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        ticket_id = %ticket.id,
-                        lore_worker_id,
-                        error = %e,
-                        "Failed to create Lore chat"
-                    );
-                }
-            }
-        }
     }
 
     /// Hosted review orchestration. All Coder authority remains in Manager;
@@ -3888,8 +3840,8 @@ Use `openflows-harness` for all coordination:
         #[allow(clippy::needless_borrow)]
         let worker_entry = registry.get(&base_id);
 
-        // Resolve the worker's GitHub token. resolve_github_token() falls back
-        // to the Coder external-auth token when no dedicated github_token_env
+        // Resolve the worker's GitHub token. resolve_github_token() reads the
+        // Manager-brokered token file when no dedicated github_token_env
         // is configured on the registry entry. We do NOT hard-fail on a
         // missing github_token_env field — that would block all v2-style
         // registry entries (which omit the deprecated v1 field).
@@ -3903,7 +3855,7 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("CODER_EXTERNAL_AUTH_*_TOKEN");
+                .unwrap_or("OPENFLOWS_GITHUB_API_TOKEN_FILE");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
                  ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \
@@ -4104,7 +4056,9 @@ Use `openflows-harness` for all coordination:
                             .await
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
-                    if ticket_done {
+                    if ticket_done
+                        && !Self::terminal_work_outstanding(store, &slot.id, ticket_id).await
+                    {
                         let ticket_id = ticket_id.clone();
                         if let Some(workspace_id) = slot.workspace_id.as_deref() {
                             if let Err(error) =
@@ -4149,7 +4103,9 @@ Use `openflows-harness` for all coordination:
                             .ok()
                             .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
 
-                    if complete {
+                    if complete
+                        && !Self::terminal_work_outstanding(store, &slot.id, ticket_id).await
+                    {
                         let ticket_id = ticket_id.clone();
                         if let Some(workspace_id) = slot.workspace_id.as_deref() {
                             if let Err(error) =
@@ -4339,7 +4295,11 @@ Use `openflows-harness` for all coordination:
                             reason: "ticket no longer exists".to_string(),
                         });
                     } else if let Some(t) = ticket {
-                        if t.status.is_terminal() {
+                        // LORE documents merged tickets; a terminal ticket is its
+                        // normal binding. The docs driver (`lore.rs`) releases it.
+                        if t.status.is_terminal()
+                            && !RoleTraits::of(&slot.id).serves_terminal_tickets
+                        {
                             recovery.stale_workers.push(StaleWorker {
                                 worker_id: slot.id.clone(),
                                 ticket_id: ticket_id.clone(),
@@ -4353,7 +4313,7 @@ Use `openflows-harness` for all coordination:
                     let ticket_completed = tickets
                         .iter()
                         .any(|t| t.id == *ticket_id && t.status.is_terminal());
-                    if ticket_completed {
+                    if ticket_completed && !RoleTraits::of(&slot.id).serves_terminal_tickets {
                         recovery.stale_workers.push(StaleWorker {
                             worker_id: slot.id.clone(),
                             ticket_id: ticket_id.clone(),
@@ -4463,8 +4423,16 @@ Use `openflows-harness` for all coordination:
             .map(|(id, slot)| (id.clone(), slot.clone()))
     }
 
-    async fn should_discover_pr(store: &SharedStore, number: u64, ticket_id: Option<&str>) -> bool {
-        ticket_id.is_some_and(|id| !id.is_empty())
+    async fn should_discover_pr(
+        store: &SharedStore,
+        number: u64,
+        ticket_id: Option<&str>,
+        head_branch: &str,
+    ) -> bool {
+        // A docs PR names its ticket by branch, but one handed to a human
+        // (no docs record owns it) must not be re-queued every poll.
+        let is_docs = head_branch.starts_with(config::docs_lifecycle::DOCS_BRANCH_PREFIX);
+        (!is_docs && ticket_id.is_some_and(|id| !id.is_empty()))
             || store.get(&format!("pr:{number}:unmanaged")).await.is_none()
     }
 
@@ -4616,6 +4584,31 @@ Use `openflows-harness` for all coordination:
                 continue;
             };
 
+            // A LORE docs PR documents a merged ticket: its docs record, not
+            // that ticket's (terminal) lifecycle, decides whether VESSEL sees it.
+            let head_branch = pr["head_branch"].as_str().unwrap_or_default();
+            if head_branch.starts_with(config::docs_lifecycle::DOCS_BRANCH_PREFIX) {
+                match store.docs_record(ticket_id).await {
+                    Ok(record)
+                        if record.merge_candidate(pr_number)
+                            || !record.owns_pr(head_branch, pr_number) =>
+                    {
+                        ready.push(pr.clone());
+                    }
+                    Ok(record) => debug!(
+                        pr_number,
+                        ticket_id,
+                        phase = record.phase.as_str(),
+                        paused = record.paused,
+                        "Holding docs PR until it is published and unpaused"
+                    ),
+                    Err(error) => {
+                        warn!(pr_number, ticket_id, %error, "Holding docs PR: docs record unreadable")
+                    }
+                }
+                continue;
+            }
+
             let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, "forge");
             if store.get(&rework_key).await.is_some() {
                 debug!(
@@ -4721,6 +4714,18 @@ Use `openflows-harness` for all coordination:
 
         for ticket in tickets.iter_mut() {
             if ticket.id == ticket_id {
+                if ticket.status.is_terminal() {
+                    // Merged/closed tickets are final; a worker problem on one
+                    // (e.g. LORE documenting it) must never rewrite its status.
+                    warn!(
+                        ticket_id,
+                        worker_id,
+                        reason,
+                        "Refusing to escalate a terminal ticket; releasing the worker only"
+                    );
+                    self.release_worker_slot(store, worker_id).await;
+                    return;
+                }
                 if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
                     // Already escalated — do not re-notify or bump attempts on
                     // every controller poll.
@@ -5097,12 +5102,21 @@ Use `openflows-harness` for all coordination:
             if crashed_workspace.ticket_id.is_empty() {
                 continue;
             }
+            // LORE is bound to merged tickets: its crashes must never count
+            // against (or escalate) the ticket. Stopped workspaces are
+            // restarted below; anything needing a new workspace is handed to
+            // the docs driver, which re-provisions and re-delivers.
+            let docs_driven =
+                !RoleTraits::of(&crashed_workspace.worker_id).crashes_count_against_ticket;
 
-            let attempts = self
-                .increment_recovery_attempts(store, &crashed_workspace.ticket_id)
-                .await;
+            let attempts = if docs_driven {
+                0
+            } else {
+                self.increment_recovery_attempts(store, &crashed_workspace.ticket_id)
+                    .await
+            };
 
-            if attempts >= Ticket::MAX_ATTEMPTS {
+            if !docs_driven && attempts >= Ticket::MAX_ATTEMPTS {
                 let reason = format!(
                     "workspace {} crashed {} times and requires human intervention",
                     crashed_workspace.workspace_id, attempts
@@ -5193,6 +5207,15 @@ Use `openflows-harness` for all coordination:
                                 "Recreating Coder workspace after crash (unknown status, agent not ready)"
                             );
 
+                            if docs_driven {
+                                self.recover_lore_workspace(
+                                    store,
+                                    &crashed_workspace.worker_id,
+                                    &crashed_workspace.ticket_id,
+                                )
+                                .await;
+                                continue;
+                            }
                             let mut slots: HashMap<String, WorkerSlot> =
                                 store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                             if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
@@ -5237,6 +5260,15 @@ Use `openflows-harness` for all coordination:
                             "Recreating Coder workspace after crash"
                         );
 
+                        if docs_driven {
+                            self.recover_lore_workspace(
+                                store,
+                                &crashed_workspace.worker_id,
+                                &crashed_workspace.ticket_id,
+                            )
+                            .await;
+                            continue;
+                        }
                         let mut slots: HashMap<String, WorkerSlot> =
                             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                         if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
@@ -5370,13 +5402,16 @@ impl Node for NexusNode {
                 .values()
                 .filter(|slot| {
                     let is_done = matches!(slot.status, WorkerStatus::Done { .. });
-                    let is_terminal = match &slot.status {
-                        WorkerStatus::Assigned { ticket_id, .. }
-                        | WorkerStatus::Working { ticket_id, .. } => tickets
-                            .iter()
-                            .any(|t| t.id == *ticket_id && t.status.is_terminal()),
-                        _ => false,
-                    };
+                    // LORE slots are bound to merged tickets by design and are
+                    // released by the docs driver once the docs PR is recorded.
+                    let is_terminal = !RoleTraits::of(&slot.id).serves_terminal_tickets
+                        && match &slot.status {
+                            WorkerStatus::Assigned { ticket_id, .. }
+                            | WorkerStatus::Working { ticket_id, .. } => tickets
+                                .iter()
+                                .any(|t| t.id == *ticket_id && t.status.is_terminal()),
+                            _ => false,
+                        };
                     is_done || is_terminal
                 })
                 .map(|slot| slot.id.clone())
@@ -7254,8 +7289,11 @@ mod tests {
         notify.assert_async().await;
     }
 
-    #[tokio::test]
-    async fn review_scheduler_and_recovery_share_one_plan_reviewer() {
+    #[test]
+    fn review_scheduler_and_recovery_share_one_plan_reviewer() {
+        support::on_large_stack(review_scheduler_and_recovery_share_one_plan_reviewer_body);
+    }
+    async fn review_scheduler_and_recovery_share_one_plan_reviewer_body() {
         let mut server = mockito::Server::new_async().await;
         let _org = server
             .mock("GET", "/api/v2/organizations")
@@ -7729,9 +7767,9 @@ mod tests {
         store
             .set("pr:345:unmanaged", json!({"reason":"no ticket"}))
             .await;
-        assert!(!NexusNode::should_discover_pr(&store, 345, None).await);
-        assert!(NexusNode::should_discover_pr(&store, 345, Some("T-1")).await);
-        assert!(NexusNode::should_discover_pr(&store, 346, None).await);
+        assert!(!NexusNode::should_discover_pr(&store, 345, None, "feature").await);
+        assert!(NexusNode::should_discover_pr(&store, 345, Some("T-1"), "forge-1/T-1").await);
+        assert!(NexusNode::should_discover_pr(&store, 346, None, "feature").await);
     }
 
     #[tokio::test]
@@ -7946,4 +7984,7 @@ mod tests {
         );
         assert_eq!(forge_slot.workspace_id.as_deref(), Some("ws-forge"));
     }
+
+    mod lore_docs;
+    mod support;
 }

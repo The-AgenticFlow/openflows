@@ -163,8 +163,12 @@ All settings come from the environment, as listed in `.env.openflows.example`;
 the image holds no configuration or secrets. It is built from
 [`Dockerfile.manager`](../../Dockerfile.manager) by the `Docker Publish Manager`
 workflow, which `release.yml` dispatches for each release and which can be
-dispatched by hand for any ref and tag. It is `linux/amd64` only. Deploy it by
-digest, not by tag.
+dispatched by hand for any ref and tag. A dispatch whose `ref` is `refs/tags/openflows-X.Y.Z` and whose `tag` is `X.Y.Z`
+is a release build. After it, a separate job that runs one at a time across all
+builds points `X.Y`, `X` and `latest` at the newest published release of each
+series, so the order in which builds finish does not matter and rebuilding an old
+release changes nothing. Any other dispatch publishes only the tag it is given.
+The image is `linux/amd64` only. Deploy it by digest, not by tag.
 
 # Deployment commands
 

@@ -49,7 +49,7 @@ def wait(description, predicate, seconds=180):
 def ssh(name, command):
     encoded = base64.b64encode(command.encode()).decode()
     return subprocess.run(['coder', 'ssh', name, '--', f'echo {encoded} | base64 -d | bash -l'],
-        capture_output=True, text=True, timeout=40, check=True).stdout
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40, check=True).stdout
 
 
 def save_chat_diagnostics(chat_id):
@@ -85,8 +85,21 @@ def wait_for_chat(chat_id, seconds=180):
         save_chat_diagnostics(chat_id)
 
 
-def setup_tenant(model_name='bootstrap-canary'):
+def enable_lore():
+    """Enable LORE the way an operator does: in the registry `tenant add` reads."""
+    source = Path(__file__).resolve().parents[3] / 'orchestration' / 'agent' / 'registry.json'
+    registry = json.loads(source.read_text())
+    lore = next(agent for agent in registry['team'] if agent['id'] == 'lore')
+    lore.update(enabled=True, max_instances=1)
+    target = Path(os.environ['OPENFLOWS_HOME']) / 'orchestration' / 'agent' / 'registry.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(registry, indent=2))
+
+
+def setup_tenant(model_name='bootstrap-canary', lore=False):
     global TOKEN
+    if lore:
+        enable_lore()
     def server_ready():
         try:
             return coder('/buildinfo')
@@ -112,8 +125,15 @@ def setup_tenant(model_name='bootstrap-canary'):
         'context_limit': 128000, 'is_default': True})
     with (ARTIFACTS / 'tenant-add.log').open('w') as log:
         print('Running the public tenant CLI with production templates.', flush=True)
-        subprocess.run(['openflows', 'tenant', 'add', 'test/repo', '--name', TENANT, '--fleet', '1'],
-            stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
+        for attempt in range(1, 4):
+            res = subprocess.run(['openflows', 'tenant', 'add', 'test/repo', '--name', TENANT, '--fleet', '1'],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=600)
+            if res.returncode == 0:
+                break
+            if attempt == 3:
+                res.check_returncode()
+            print(f'openflows tenant add attempt {attempt} exited with {res.returncode}; retrying after transient error...', flush=True)
+            time.sleep(5)
     templates = coder('/organizations/' + organization['id'] + '/templates')
     assert {t['name'] for t in templates} == {
         'openflows-nexus', 'openflows-forge', 'openflows-sentinel', 'openflows-vessel', 'openflows-lore'}
@@ -121,6 +141,7 @@ def setup_tenant(model_name='bootstrap-canary'):
     parameters = {p['name']: p['value'] for p in coder('/workspacebuilds/' + workspace['latest_build']['id'] + '/parameters')}
     fleet = json.loads(parameters['registry_json'])
     assert {a['id']: a['max_instances'] for a in fleet['team'] if a['id'] in ('forge', 'sentinel')} == {'forge': 1, 'sentinel': 1}
+    assert next(a for a in fleet['team'] if a['id'] == 'lore')['enabled'] is lore
     assert parameters['start_controller'] == 'true'
     name = 'ci/' + workspace['name']
     def ready():
@@ -154,8 +175,8 @@ def run():
     before = {t['name']: t['active_version_id'] for t in templates}
     def bootstrap(log_name):
         with (ARTIFACTS / log_name).open('w') as log:
-            subprocess.run(['openflows', 'bootstrap'], stdout=log, stderr=subprocess.STDOUT,
-                check=True, timeout=300)
+            subprocess.run(['openflows', 'bootstrap'], stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
         return {t['name']: t['active_version_id'] for t in coder('/organizations/' + organization['id'] + '/templates')}
     assert bootstrap('bootstrap-repeat.log') == before, 'Unchanged bootstrap must reuse template versions'
     print('Unchanged bootstrap reused all five template versions; checking changed configuration.', flush=True)

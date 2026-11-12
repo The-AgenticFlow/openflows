@@ -38,6 +38,52 @@ pub struct ConnectionsResponse {
     pub items: Vec<ConnectionDto>,
 }
 
+/// A repository the installation can access. Visibility is not stored, so it
+/// is not reported.
+#[derive(Serialize)]
+pub struct RepositoryDto {
+    pub id: i64,
+    pub full_name: String,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+pub struct RepositoriesResponse {
+    pub items: Vec<RepositoryDto>,
+    /// Opaque cursor for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Paging for the repository list.
+#[derive(Deserialize)]
+pub struct RepositoriesQuery {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+}
+
+/// Repositories are ordered by name, not by time, so their cursor carries
+/// `(lower-cased name, id)`. It reuses the shared opaque cursor encoding; the
+/// timestamp slot is unused and fixed.
+fn repository_cursor(name_lower: &str, id: i64) -> String {
+    crate::pagination::Cursor {
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        tiebreaker: format!("{name_lower}\t{id}"),
+    }
+    .encode()
+}
+
+fn decode_repository_cursor(raw: &str) -> Result<(String, i64), ManagerError> {
+    let cursor = crate::pagination::Cursor::decode(raw)?;
+    let (name, id) = cursor
+        .tiebreaker
+        .rsplit_once('\t')
+        .ok_or_else(|| ManagerError::InvalidInput("malformed cursor".into()))?;
+    let id = id
+        .parse::<i64>()
+        .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?;
+    Ok((name.to_string(), id))
+}
+
 #[derive(Deserialize)]
 pub struct OauthCallbackQuery {
     pub code: Option<String>,
@@ -49,6 +95,20 @@ pub struct SetupCallbackQuery {
     pub state: Option<String>,
     pub installation_id: Option<i64>,
     pub setup_action: Option<String>,
+}
+
+/// Public return marker for the shared App's connected-local installation.
+/// It carries no authorization; the local Manager verifies repository access
+/// using its own GitHub App user token after the browser returns.
+pub(crate) const LOCAL_INSTALL_STATE: &str = "of-local-v1";
+
+fn local_install_return(state: Option<&str>, installation_id: Option<i64>) -> Option<Redirect> {
+    // GitHub may drop the installation URL's state while selecting an account.
+    // An uncorrelated installation cannot complete a hosted connection flow;
+    // return its browser to the local console, where GitHub access is checked
+    // with the user's App token instead of trusting this callback's ID.
+    (state == Some(LOCAL_INSTALL_STATE) || (state.is_none() && installation_id.is_some()))
+        .then(|| Redirect::to("http://localhost:3002/?github-installation=complete"))
 }
 
 /// POST /api/v1/organizations/{org}/github/connect (admin).
@@ -115,6 +175,9 @@ pub async fn setup_callback(
     headers: HeaderMap,
     Query(q): Query<SetupCallbackQuery>,
 ) -> Result<Response, ManagerError> {
+    if let Some(redirect) = local_install_return(q.state.as_deref(), q.installation_id) {
+        return Ok(redirect.into_response());
+    }
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -160,6 +223,50 @@ pub async fn list_connections(
         )
         .await?;
     Ok(Json(ConnectionsResponse { items }))
+}
+
+/// GET /api/v1/organizations/{org}/github/connections/{id}/repositories
+/// (member view): repositories the installation can currently access, one
+/// bounded page at a time (`limit`, `after`; `next_cursor` in the response).
+pub async fn list_repositories(
+    State(state): State<crate::server::AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+    Query(q): Query<RepositoriesQuery>,
+) -> Result<Json<RepositoriesResponse>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    let org_id = parse_org(&org)?;
+    let connection_id = parse_connection_id(&id)?;
+    let limit = crate::pagination::PageLimit::new(q.limit);
+    let after = q
+        .after
+        .as_deref()
+        .map(decode_repository_cursor)
+        .transpose()?;
+    let mut rows = services
+        .connections_service
+        .list_repositories(principal.user_id, org_id, connection_id, after, limit)
+        .await?;
+    let has_more = rows.len() > limit.get() as usize;
+    rows.truncate(limit.get() as usize);
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|r| repository_cursor(&r.full_name.to_lowercase(), r.github_repository_id))
+    } else {
+        None
+    };
+    let items = rows
+        .into_iter()
+        .map(|r| RepositoryDto {
+            id: r.github_repository_id,
+            full_name: r.full_name,
+            last_seen_at: r.last_seen_at,
+        })
+        .collect();
+    Ok(Json(RepositoriesResponse { items, next_cursor }))
 }
 
 /// POST /api/v1/organizations/{org}/github/connections/{id}/reconcile (admin).
@@ -256,4 +363,32 @@ fn callback_redirect(outcome: CallbackOutcome) -> Response {
         CallbackOutcome::PendingAnotherLeg => "/api/v1/me?connection=pending",
     };
     Redirect::temporary(path).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_install_state_returns_to_fixed_loopback_console() {
+        let response = local_install_return(Some(LOCAL_INSTALL_STATE), Some(123))
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "http://localhost:3002/?github-installation=complete"
+        );
+        assert_eq!(
+            local_install_return(None, Some(123))
+                .unwrap()
+                .into_response()
+                .headers()
+                .get("location")
+                .unwrap(),
+            "http://localhost:3002/?github-installation=complete"
+        );
+        assert!(local_install_return(Some("unrelated-setup-state"), Some(123)).is_none());
+        assert!(local_install_return(None, None).is_none());
+    }
 }

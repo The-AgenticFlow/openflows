@@ -1,14 +1,12 @@
 # AWS operator runbook
 
+The hosted contract, including AWS Secrets Manager as the default and an explicit non-AWS path, is in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md).
+
+> **Current blocker:** Hosted Kubernetes deployment is not yet validated. The role templates still create Docker containers, and hosted mode rejects the Docker backend. Follow the architecture contract and its implementation issues for the target design; do not use an arbitrary backend name to bypass the hosted-mode check. Remove this notice only after the hosted release gates pass.
+
 Deploy **staging**, validate it, then deploy **production** with separate
 resources and credentials. The local Compose stack is not a production
 deployment.
-
-> **Current blocker:** This repository does not yet ship a validated isolated
-> provisioner backend or an AWS deployment manifest/Helm chart. Hosted mode
-> rejects the shared Docker backend. The steps below become executable only
-> when an infrastructure release supplies those missing pieces. Do not use an
-> arbitrary backend name to bypass the check.
 
 ## 1. Provision each environment
 
@@ -48,6 +46,22 @@ Redis URLs, GitHub App settings and secret references, the isolated provisioner
 backend, and a pinned GitHub template release. The
 [hosted release contract](06-hosted-template-releases.md) lists its required
 repository, tag, and SHA-256 settings. Never put raw secrets in this file.
+
+Workspaces receive their runtime credential bundle separately from the secret
+store. On the `kubernetes` backend the Manager creates one Secret per workspace
+in the organization's namespace (`OPENFLOWS_K8S_NAMESPACE_PREFIX`, default
+`openflows-`, followed by the organization ID). The Manager identity needs
+`create`, `patch` and `delete` on `secrets` in those namespaces and nothing
+cluster-wide, and the namespaces must already exist. Tenants of one
+organization share that namespace, so tenant separation relies on RBAC and on
+each workspace mounting only the Secret it is given. The shipped templates
+bind-mount a host file, so they cannot use that Secret yet: the Manager refuses
+to start on the `kubernetes` backend unless `OPENFLOWS_K8S_RUNTIME_DELIVERY=1`
+is set, and that should only be set with a template that mounts the Secret's
+`runtime.json` key at `/run/openflows/runtime.json`. On the `docker`
+backend with a non-filesystem store, set an absolute
+`OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
+Manager refuses to start without it.
 
 For a new, empty Coder, set `OPENFLOWS_CODER_BOOTSTRAP_EMAIL`; setup creates
 and retains the administrator credential and Manager key. Configure Coder's

@@ -15,9 +15,11 @@
 //!   records a sanitized error and requires the tenant-capable adapter/backend
 //!   that a licensed deployment supplies.
 
+mod runtime_secret;
+
 use crate::coder::CoderAdapter;
 use crate::error::ManagerError;
-use crate::id::{OrganizationId, ReleaseId, TenantId};
+use crate::id::{OrganizationId, TenantId};
 use crate::operations::{self, LeaseGuard};
 use crate::quotas::TenantQuotaService;
 use crate::repositories::OrganizationsRepository;
@@ -98,6 +100,7 @@ pub struct TenantProvisionWorker {
     pub manager_url: String,
     pub runtime_redis_url: String,
     pub local_workspace_cleanup: Option<super::local_workspace_cleanup::LocalWorkspaceCleanup>,
+    pub compatibility_target: crate::templates::ReleaseCompatibilityTarget,
 }
 
 impl TenantProvisionWorker {
@@ -122,7 +125,16 @@ impl TenantProvisionWorker {
             manager_url: "http://127.0.0.1:3002".into(),
             runtime_redis_url: "redis://127.0.0.1:6379".into(),
             local_workspace_cleanup: None,
+            compatibility_target: crate::templates::ReleaseCompatibilityTarget::docker_default(),
         }
+    }
+
+    pub fn with_compatibility_target(
+        mut self,
+        target: crate::templates::ReleaseCompatibilityTarget,
+    ) -> Self {
+        self.compatibility_target = target;
+        self
     }
 
     pub fn with_runtime_endpoints(
@@ -208,97 +220,6 @@ impl TenantProvisionWorker {
         heartbeat.abort_all();
         self.finish(&guard, kind.as_deref(), result).await?;
         Ok(())
-    }
-
-    async fn mutate_worker_workspace(
-        &self,
-        guard: &LeaseGuard,
-        delete: bool,
-    ) -> Result<TenantProvisionOutcome, ManagerError> {
-        let row: (
-            uuid::Uuid,
-            uuid::Uuid,
-            Option<String>,
-            String,
-            String,
-            String,
-        ) = sqlx::query_as(
-            "SELECT w.id, w.tenant_id, w.coder_workspace_id, o.coder_organization_id,
-                    w.desired_state, w.observed_state
-               FROM workspaces w JOIN organizations o ON o.id = w.organization_id
-              WHERE w.id = (SELECT resource_id FROM operations WHERE id = $1)
-                AND w.organization_id = $2",
-        )
-        .bind(guard.operation_id.0)
-        .bind(guard.organization_id.0)
-        .fetch_one(&self.pool)
-        .await?;
-        if !delete && crate::runtime::workspaces::deletion_started(&row.4, &row.5) {
-            let mut tx = self.pool.begin().await?;
-            if !guard.lock_in_tx(&mut tx).await? {
-                return Ok(TenantProvisionOutcome::StaleLease);
-            }
-            if !guard
-                .complete_in_tx(
-                    &mut tx,
-                    serde_json::json!({"workspace_id": row.0, "status": "superseded_by_delete"}),
-                )
-                .await?
-            {
-                return Ok(TenantProvisionOutcome::StaleLease);
-            }
-            tx.commit().await?;
-            return Ok(TenantProvisionOutcome::Provisioned(TenantId::from_uuid(
-                row.1,
-            )));
-        }
-        if let Some(coder_id) = &row.2 {
-            let org = coder_client::CoderOrganizationId::new(row.3);
-            if delete {
-                self.adapter.delete_workspace(&org, coder_id).await?;
-            } else {
-                self.adapter.stop_workspace(&org, coder_id).await?;
-            }
-        }
-        let mut tx = self.pool.begin().await?;
-        if !guard.lock_in_tx(&mut tx).await? {
-            return Ok(TenantProvisionOutcome::StaleLease);
-        }
-        let state = if delete { "deleted" } else { "stopped" };
-        let expected = if delete { "deleting" } else { "stopped" };
-        let changed = sqlx::query(
-            "UPDATE workspaces
-                SET desired_state = $1, observed_state = $1, updated_at = now()
-              WHERE id = $2 AND desired_state = $3
-                AND observed_state NOT IN ('deleting', 'deleted')",
-        )
-        .bind(state)
-        .bind(row.0)
-        .bind(expected)
-        .execute(&mut *tx)
-        .await?;
-        if delete && changed.rows_affected() == 1 {
-            sqlx::query("UPDATE tenants SET reserved_worker_capacity = GREATEST(reserved_worker_capacity - 1, 0), updated_at = now() WHERE id = $1")
-                .bind(row.1).execute(&mut *tx).await?;
-        }
-        let result_status = if changed.rows_affected() == 1 {
-            state
-        } else {
-            "superseded"
-        };
-        if !guard
-            .complete_in_tx(
-                &mut tx,
-                serde_json::json!({"workspace_id": row.0, "status": result_status}),
-            )
-            .await?
-        {
-            return Ok(TenantProvisionOutcome::StaleLease);
-        }
-        tx.commit().await?;
-        Ok(TenantProvisionOutcome::Provisioned(TenantId::from_uuid(
-            row.1,
-        )))
     }
 
     async fn stop(&self, guard: &LeaseGuard) -> Result<TenantProvisionOutcome, ManagerError> {
@@ -565,6 +486,8 @@ impl TenantProvisionWorker {
         // heartbeat. Do not replace a consumed bootstrap while that same
         // authenticated runtime is completing startup.
         if self.runtime_session_pending_readiness(workspace_id).await? {
+            self.recover_pending_worker(guard.organization_id, tenant_id, workspace_id, &row.2)
+                .await?;
             return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
         }
         let owner: (String,) = sqlx::query_as(
@@ -572,16 +495,6 @@ impl TenantProvisionWorker {
         ).bind(row.0).bind(guard.organization_id.0).fetch_one(&self.pool).await?;
         let org = coder_client::CoderOrganizationId::new(row.2);
         let owner = crate::coder::types::CoderOwnerId::new(owner.0);
-        let release_id = self
-            .release_repo
-            .get_org_binding(guard.organization_id)
-            .await?
-            .ok_or_else(|| {
-                ManagerError::api(
-                    err::RELEASE_NOT_RESOLVED,
-                    "template release is not published",
-                )
-            })?;
         let role = match row.1.as_str() {
             "nexus" => Role::Nexus,
             "forge" => Role::Forge,
@@ -595,22 +508,24 @@ impl TenantProvisionWorker {
                 .bind(row.0)
                 .fetch_one(&self.pool)
                 .await?;
-        let version = self
-            .release_repo
-            .get_org_template_version(guard.organization_id, release_id, role)
-            .await?
-            .ok_or_else(|| {
-                ManagerError::api(err::RELEASE_NOT_RESOLVED, "template version is not ready")
-            })?;
-        let template =
-            coder_client::CoderTemplateId::new(version.coder_template_id.ok_or_else(|| {
-                ManagerError::api(err::RELEASE_NOT_RESOLVED, "template id missing")
-            })?);
-        let version_id =
-            coder_client::CoderTemplateVersionId::new(version.coder_version_id.ok_or_else(
-                || ManagerError::api(err::RELEASE_NOT_RESOLVED, "template version id missing"),
-            )?);
-        let workspace_image_digest = self.role_image_digest(release_id, role).await?;
+        let spec = super::selection::resolve_worker_release_for_tenant(
+            &self.pool,
+            &self.release_repo,
+            guard.organization_id,
+            tenant_id,
+            role,
+            &self.compatibility_target,
+        )
+        .await?;
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            guard.organization_id,
+            tenant_id,
+            workspace_id,
+            &spec,
+        )
+        .await?;
         let runtime_secret_ref = self
             .ensure_workspace_runtime_secret(
                 guard.organization_id,
@@ -621,7 +536,7 @@ impl TenantProvisionWorker {
         let mut parameters = vec![
             coder_client::types::WorkspaceParameterValue {
                 name: "hosted".into(),
-                value: "true".into(),
+                value: self.hosted_workspace().to_string(),
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "runtime_secret_ref".into(),
@@ -629,7 +544,7 @@ impl TenantProvisionWorker {
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "workspace_image_digest".into(),
-                value: workspace_image_digest,
+                value: spec.image_digest.clone(),
             },
             coder_client::types::WorkspaceParameterValue {
                 name: "role".into(),
@@ -677,8 +592,8 @@ impl TenantProvisionWorker {
             .create_tenant_workspace_with_parameters(
                 &org,
                 &owner,
-                &template,
-                &version_id,
+                &spec.template_id,
+                &spec.version_id,
                 &worker_workspace_name(&row.1, row.0),
                 &parameters,
             )
@@ -735,6 +650,9 @@ impl TenantProvisionWorker {
             if let Some(cleanup) = &self.local_workspace_cleanup {
                 cleanup.remove_workspace(&row.1, &created.id).await?;
             }
+            self.tenant_runtime
+                .retire_workspace_secret(guard.organization_id, tenant_id, workspace_id)
+                .await?;
             return self
                 .complete_worker_creation_superseded(guard, tenant_id, workspace_id)
                 .await;
@@ -913,11 +831,8 @@ impl TenantProvisionWorker {
                 "OWNER_MIGRATION_REQUIRED",
             ));
         };
-        if deployment
-            != std::env::var("CODER_URL")
-                .unwrap_or_default()
-                .trim_end_matches('/')
-        {
+        let configured_deployment = crate::routes::coder_identity::deployment_identity()?;
+        if !crate::routes::coder_identity::same_deployment(&deployment, &configured_deployment) {
             self.record_error(guard, tenant_id, "CODER_DEPLOYMENT_MISMATCH")
                 .await?;
             return Ok(TenantProvisionOutcome::NotReady(
@@ -977,6 +892,12 @@ impl TenantProvisionWorker {
             return self.mark_tenant_running(guard, tenant_id, nexus_ws).await;
         }
         if self.runtime_session_pending_readiness(nexus_ws).await? {
+            if self
+                .recover_stalled_nexus(org_id, tenant_id, nexus_ws, &coder_org)
+                .await?
+            {
+                return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
+            }
             return Ok(TenantProvisionOutcome::NotReady(
                 tenant_id,
                 err::NEXUS_NOT_READY,
@@ -1007,10 +928,13 @@ impl TenantProvisionWorker {
                     .workspace_startup_failed(&coder_org, existing)
                     .await?
                 {
-                    return Ok(TenantProvisionOutcome::NotReady(
-                        tenant_id,
-                        err::NEXUS_START_FAILED,
-                    ));
+                    // A failed startup may have consumed or expired its
+                    // single-use bootstrap. Issue a fresh bundle before
+                    // asking Coder to restart the same workspace.
+                    self.ensure_workspace_runtime_secret(org_id, tenant_id, nexus_ws)
+                        .await?;
+                    self.adapter.restart_workspace(&coder_org, existing).await?;
+                    return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
                 }
                 return Ok(TenantProvisionOutcome::WaitingForController(tenant_id));
             }
@@ -1027,18 +951,34 @@ impl TenantProvisionWorker {
         if !guard.set_step(step::CREATE_NEXUS).await? {
             return Ok(TenantProvisionOutcome::StaleLease);
         }
-        let (template_id, version_id, workspace_image_digest) =
-            match self.resolve_nexus_template(org_id).await? {
-                Some(x) => x,
-                None => {
-                    self.record_error(guard, tenant_id, err::RELEASE_NOT_RESOLVED)
-                        .await?;
-                    return Ok(TenantProvisionOutcome::NotReady(
-                        tenant_id,
-                        err::RELEASE_NOT_RESOLVED,
-                    ));
-                }
-            };
+        let spec = match super::selection::resolve_nexus_release_for_tenant(
+            &self.pool,
+            &self.release_repo,
+            org_id,
+            tenant_id,
+            &self.compatibility_target,
+        )
+        .await?
+        {
+            Some(x) => x,
+            None => {
+                self.record_error(guard, tenant_id, err::RELEASE_NOT_RESOLVED)
+                    .await?;
+                return Ok(TenantProvisionOutcome::NotReady(
+                    tenant_id,
+                    err::RELEASE_NOT_RESOLVED,
+                ));
+            }
+        };
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            org_id,
+            tenant_id,
+            nexus_ws,
+            &spec,
+        )
+        .await?;
         // Coder workspace names are limited and must be lowercase. Keep the
         // name deterministic for retry adoption while staying within Coder's
         // 32-character limit.
@@ -1054,13 +994,13 @@ impl TenantProvisionWorker {
             .create_tenant_workspace_with_parameters(
                 &coder_org,
                 &owner,
-                &template_id,
-                &version_id,
+                &spec.template_id,
+                &spec.version_id,
                 &workspace_name,
                 &[
                     coder_client::types::WorkspaceParameterValue {
                         name: "hosted".into(),
-                        value: "true".into(),
+                        value: self.hosted_workspace().to_string(),
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "runtime_secret_ref".into(),
@@ -1068,7 +1008,7 @@ impl TenantProvisionWorker {
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "workspace_image_digest".into(),
-                        value: workspace_image_digest,
+                        value: spec.image_digest.clone(),
                     },
                     coder_client::types::WorkspaceParameterValue {
                         name: "tenant".into(),
@@ -1585,101 +1525,8 @@ impl TenantProvisionWorker {
         Ok(())
     }
 
-    async fn resolve_nexus_template(
-        &self,
-        org_id: OrganizationId,
-    ) -> Result<
-        Option<(
-            coder_client::CoderTemplateId,
-            coder_client::CoderTemplateVersionId,
-            String,
-        )>,
-        ManagerError,
-    > {
-        let release_id: Option<ReleaseId> = self.release_repo.get_org_binding(org_id).await?;
-        let Some(release_id) = release_id else {
-            return Ok(None);
-        };
-        let row = self
-            .release_repo
-            .get_org_template_version(org_id, release_id, Role::Nexus)
-            .await?;
-        match row {
-            Some(r) if r.status == "ready" => match (r.coder_template_id, r.coder_version_id) {
-                (Some(t), Some(v)) => Ok(Some((
-                    coder_client::CoderTemplateId::new(t),
-                    coder_client::CoderTemplateVersionId::new(v),
-                    self.role_image_digest(release_id, Role::Nexus).await?,
-                ))),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
-        }
-    }
-
-    async fn role_image_digest(
-        &self,
-        release_id: ReleaseId,
-        role: Role,
-    ) -> Result<String, ManagerError> {
-        let (_, roles) = self
-            .release_repo
-            .get_release(release_id)
-            .await?
-            .ok_or_else(|| ManagerError::api(err::RELEASE_NOT_RESOLVED, "release missing"))?;
-        // Older local releases may have been imported before the operator
-        // configured the image digest. Allow the explicit deployment setting
-        // to repair that metadata during provisioning; hosted releases still
-        // require a digest either in the release or in this setting.
-        let configured_digest = std::env::var("OPENFLOWS_WORKSPACE_IMAGE_DIGEST").ok();
-        let digest = roles
-            .get(&role)
-            .and_then(|entry| entry.image_digest.as_deref())
-            .map(str::to_owned)
-            .or(configured_digest)
-            .ok_or_else(|| {
-                ManagerError::api(
-                    err::RELEASE_NOT_RESOLVED,
-                    "hosted template release is missing its workspace image digest; set OPENFLOWS_WORKSPACE_IMAGE_DIGEST",
-                )
-            })?;
-        let valid = digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        if !valid {
-            return Err(ManagerError::api(
-                err::RELEASE_NOT_RESOLVED,
-                "hosted template release has an invalid workspace image digest",
-            ));
-        }
-        Ok(digest)
-    }
-
-    async fn ensure_workspace_runtime_secret(
-        &self,
-        org_id: OrganizationId,
-        tenant_id: TenantId,
-        workspace_id: crate::id::WorkspaceId,
-    ) -> Result<String, ManagerError> {
-        // A workspace can be rebuilt after its single-use bootstrap has been
-        // consumed. The mounted bundle is then deliberately scrubbed, so
-        // reusing it would make the next startup fail with AUTH_FAILED. This
-        // is called when preparing a new startup, never while adopting an
-        // existing Nexus startup during a provisioning retry.
-        let bootstrap_ref = self
-            .runtime_credentials
-            .ensure_bootstrap_ref(workspace_id)
-            .await?;
-        self.tenant_runtime
-            .prepare_workspace_secret(
-                org_id,
-                tenant_id,
-                workspace_id,
-                &bootstrap_ref,
-                &self.manager_url,
-                &self.runtime_redis_url,
-            )
-            .await
+    fn hosted_workspace(&self) -> bool {
+        std::env::var("OPENFLOWS_MODE").as_deref() == Ok("hosted")
     }
 
     async fn record_error(

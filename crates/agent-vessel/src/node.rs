@@ -27,12 +27,19 @@ use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
+use crate::merger::{is_merge_conflict_message, is_merge_refused_pending_review};
 use crate::pr_monitor::{
-    build_directive, classify, collect_rework, PrMonitorState, ReworkEvidence,
+    applicable_reviews, build_directive, candidate_review_state, classify, collect_rework,
+    is_authorized_head_approval, PrMonitorState, ReworkEvidence,
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
+
+mod docs_pr;
 use crate::{CiPoller, PrMerger, VesselNotifier};
+use config::docs_lifecycle::{
+    non_docs_paths, ticket_from_docs_branch, DocsEvent, DOCS_BRANCH_PREFIX, DOCS_TICKET,
+};
 
 /// VESSEL Node — DevOps Specialist and Merge Gatekeeper.
 ///
@@ -891,6 +898,12 @@ impl Node for VesselNode {
                 }
             };
 
+            // A docs PR documents a merged ticket; its authority is the docs
+            // record, never that ticket's (terminal) lifecycle.
+            if Self::is_docs_pr(&pr_info) {
+                outcomes.push(Box::pin(self.process_docs_pr(owner, repo, pr_info)).await);
+                continue;
+            }
             let store = self
                 .lifecycle_store
                 .lock()
@@ -974,6 +987,7 @@ impl Node for VesselNode {
                 }
                 continue;
             }
+            let evidence = Self::get_rework_evidence(&store, pr_number).await;
             if !state.merge_ready(&pr_info.head_sha) {
                 // Reconcile a human's GitHub approval into the lifecycle before
                 // deferring. SENTINEL shares the PR author's GitHub identity, so
@@ -989,6 +1003,7 @@ impl Node for VesselNode {
                         repo,
                         pr_number,
                         &pr_info.head_sha,
+                        evidence.as_ref(),
                     )
                     .await?;
                 let ready = if reconciled {
@@ -1000,7 +1015,9 @@ impl Node for VesselNode {
                     false
                 };
                 if !ready {
-                    let needs_rework = self.check_pr_needs_rework(owner, repo, &pr_info).await;
+                    let needs_rework = self
+                        .check_pr_needs_rework(owner, repo, &pr_info, evidence.as_ref())
+                        .await;
                     if !needs_rework {
                         info!(
                             pr_number,
@@ -1021,7 +1038,6 @@ impl Node for VesselNode {
                 }
             }
 
-            let evidence = Self::get_rework_evidence(&store, pr_number).await;
             let outcome = self
                 .process_single_pr(owner, repo, pr_info, evidence.as_ref())
                 .await?;
@@ -1908,12 +1924,51 @@ impl Node for VesselNode {
                     self.remove_from_pending_prs(store, *pr_number).await;
                     any_awaiting_human = true;
                 }
-                VesselOutcome::DocsPrClosed { pr_number, reason } => {
+                VesselOutcome::DocsPrRework {
+                    pr_number,
+                    reason,
+                    docs_ticket,
+                } => {
+                    info!(pr_number, ticket_id = %docs_ticket, reason, "Docs PR needs rework — returning it to LORE");
+                    Box::pin(Self::record_docs_outcome(
+                        store,
+                        docs_ticket,
+                        *pr_number,
+                        DocsEvent::Rework {
+                            reason: reason.clone(),
+                        },
+                    ))
+                    .await;
+                    // The PR stays open: LORE updates the same branch.
+                    any_success = true;
+                }
+                VesselOutcome::DocsPrHeld { pr_number, reason } => {
+                    // Not SENTINEL's to review: the docs gate decides. Keep it
+                    // pending and let the controller poll again.
+                    info!(pr_number, reason, "Holding docs PR");
+                    any_needs_review = true;
+                }
+                VesselOutcome::DocsPrMerged {
+                    pr_number,
+                    sha,
+                    docs_ticket,
+                } => {
                     info!(
                         pr_number,
-                        reason,
-                        "Docs PR closed due to conflicts — lore will regenerate on next deployment"
+                        sha,
+                        ticket_id = %docs_ticket,
+                        "Merged operator-approved docs PR"
                     );
+                    Box::pin(Self::record_docs_outcome(
+                        store,
+                        docs_ticket,
+                        *pr_number,
+                        DocsEvent::Merged {
+                            number: *pr_number,
+                            sha: sha.clone(),
+                        },
+                    ))
+                    .await;
                     self.remove_from_pending_prs(store, *pr_number).await;
                     any_success = true;
                 }
@@ -1959,39 +2014,12 @@ impl VesselNode {
     ) -> Result<VesselOutcome> {
         let pr_number = pr_info.number;
 
-        let ticket_id = if Self::is_docs_pr(&pr_info) {
-            Some("T-DOCS".to_string())
-        } else {
-            pr_info.ticket_id.clone()
-        };
+        if Self::is_docs_pr(&pr_info) {
+            return Ok(self.process_docs_pr(owner, repo, pr_info).await);
+        }
+        let ticket_id = pr_info.ticket_id.clone();
 
         info!(pr_number, ticket_id = ?ticket_id, "Processing PR");
-
-        // Short-circuit for Docs PRs: check mergeability first to skip CI polling if conflicts exist
-        if Self::is_docs_pr(&pr_info) {
-            if pr_info.has_conflicts() {
-                warn!(
-                    pr_number,
-                    "Docs PR has conflicts — short-circuiting CI poll and closing"
-                );
-                return self
-                    .close_docs_pr_with_conflicts(owner, repo, &pr_info)
-                    .await;
-            }
-            // Re-fetch PR to get fresh mergeability status if not yet computed
-            if pr_info.mergeable.is_none() {
-                let fresh_pr = self.client.get_pull_request(owner, repo, pr_number).await?;
-                if fresh_pr.has_conflicts() {
-                    warn!(
-                        pr_number,
-                        "Docs PR has conflicts (after re-fetch) — short-circuiting CI poll and closing"
-                    );
-                    return self
-                        .close_docs_pr_with_conflicts(owner, repo, &fresh_pr)
-                        .await;
-                }
-            }
-        }
 
         let poll_result = self
             .poller
@@ -2104,6 +2132,16 @@ impl VesselNode {
                         );
                         self.handle_conflicts(owner, repo, pr_info).await
                     }
+                    Ok(result) if is_merge_refused_pending_review(&result.message) => {
+                        let message = &result.message;
+                        warn!(pr_number, %message, "GitHub refused the merge; waiting for a reviewer to re-review or dismiss the change request");
+                        Ok(VesselOutcome::Reviews {
+                            ticket_id,
+                            pr_number,
+                            state: PrMonitorState::NeedsReview.as_str().to_string(),
+                            head_sha: Some(pr_info.head_sha.clone()),
+                        })
+                    }
                     Ok(result) => Ok(VesselOutcome::MergeBlocked {
                         ticket_id,
                         pr_number,
@@ -2182,17 +2220,6 @@ impl VesselNode {
         pr_info: PrInfo,
     ) -> Result<VesselOutcome> {
         let pr_number = pr_info.number;
-
-        if Self::is_docs_pr(&pr_info) {
-            info!(
-                pr_number,
-                branch = %pr_info.head_branch,
-                "Docs PR has merge conflicts — closing to allow lore to regenerate"
-            );
-            return self
-                .close_docs_pr_with_conflicts(owner, repo, &pr_info)
-                .await;
-        }
 
         let ticket_id = pr_info.ticket_id.clone();
         // Release the frozen candidate before touching its worktree. A merge with
@@ -2556,7 +2583,13 @@ impl VesselNode {
 
     /// Checks whether an unapproved PR requires rework (merge conflicts, failing CI,
     /// changes requested, or unaddressed review comments) before gating on `merge_ready`.
-    async fn check_pr_needs_rework(&self, owner: &str, repo: &str, pr_info: &PrInfo) -> bool {
+    async fn check_pr_needs_rework(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_info: &PrInfo,
+        evidence: Option<&ReworkEvidence>,
+    ) -> bool {
         // 1. Merge conflicts
         if pr_info.has_conflicts() || pr_info.mergeable == Some(false) {
             return true;
@@ -2573,28 +2606,21 @@ impl VesselNode {
             }
         }
 
-        // 3. Reviews: changes requested
+        // 3. Reviews: changes requested (only when not already addressed by a rework commit)
         let reviews = self
             .client
             .list_pr_reviews(owner, repo, pr_info.number)
             .await
             .unwrap_or_default();
-        let review_state = github::effective_review_state(&reviews);
+        let applicable = applicable_reviews(&reviews, &pr_info.head_sha, evidence);
+        let review_state = candidate_review_state(&applicable, &pr_info.head_sha);
         if review_state == github::PrReviewState::ChangesRequested {
             return true;
         }
 
-        // 4. Inline review comments (only considered rework if PR is not approved on current head
-        // by an authorized reviewer — stale approvals or outside drive-by approvals do not hide feedback)
-        let is_authorized_head_approved = review_state == github::PrReviewState::Approved
-            && github::latest_review_per_user(&reviews)
-                .into_iter()
-                .any(|r| {
-                    r.state_enum() == github::PrReviewState::Approved
-                        && r.is_authorized_reviewer()
-                        && (r.commit_id.as_deref() == Some(&pr_info.head_sha)
-                            || r.commit_id.is_none())
-                });
+        // 4. Inline review comments are rework only while the current head lacks an
+        // authorized approval. Stale approvals and outside drive-by approvals do not hide feedback.
+        let is_authorized_head_approved = review_state == github::PrReviewState::Approved;
 
         if !is_authorized_head_approved {
             let comments = self
@@ -2602,7 +2628,14 @@ impl VesselNode {
                 .list_review_comments(owner, repo, pr_info.number)
                 .await
                 .unwrap_or_default();
-            if !comments.is_empty() {
+            if comments.iter().any(|c| {
+                !crate::pr_monitor::is_feedback_addressed(
+                    c.commit_id.as_deref(),
+                    c.created_at.as_deref(),
+                    &pr_info.head_sha,
+                    evidence,
+                )
+            }) {
                 return true;
             }
         }
@@ -2616,7 +2649,9 @@ impl VesselNode {
     /// self-review, so an `APPROVED` review can only originate from a distinct
     /// account. That approval satisfies the `pr_human` merge gate without a
     /// manual operator CLI entry, provided that:
-    /// - no reviewer currently requests changes (fail closed),
+    /// - no reviewer has an unaddressed change request (fail closed); change
+    ///   requests that rework has addressed are dropped first, see
+    ///   [`applicable_reviews`],
     /// - the approving reviewer is an `OWNER`, `MEMBER`, or `COLLABORATOR`, and
     /// - their latest review is `APPROVED` on exactly `head_sha`.
     ///
@@ -2634,6 +2669,7 @@ impl VesselNode {
         repo: &str,
         pr_number: u64,
         head_sha: &str,
+        evidence: Option<&ReworkEvidence>,
     ) -> Result<bool> {
         if state.phase != config::lifecycle::Phase::Submit
             || (state.pr_human.is_some() && state.pr_decision.is_some())
@@ -2648,20 +2684,26 @@ impl VesselNode {
                 return Ok(false);
             }
         };
-        // Any reviewer currently requesting changes vetoes reconciliation.
-        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+        // Any reviewer with an unaddressed change request vetoes reconciliation.
+        // Change requests already addressed by rework are dropped first, so they
+        // cannot hide another reviewer's valid approval of the current head.
+        let applicable = applicable_reviews(&reviews, head_sha, evidence);
+        if applicable
+            .iter()
+            .any(|r| r.state_enum() == github::PrReviewState::ChangesRequested)
+        {
             return Ok(false);
         }
+        // The rework evidence is what marks those change requests as addressed.
+        // While one is still on GitHub, later passes need the evidence too.
+        let relies_on_rework_evidence =
+            applicable.len() != github::latest_review_per_user(&reviews).len();
         // The effective approver: an authorized reviewer whose *latest* review
         // approves the current head. Stale approvals of older commits and
         // drive-by approvals from outside accounts do not count.
-        let Some(approver) = github::latest_review_per_user(&reviews)
+        let Some(approver) = applicable
             .into_iter()
-            .filter(|r| {
-                r.state_enum() == github::PrReviewState::Approved
-                    && r.is_authorized_reviewer()
-                    && r.commit_id.as_deref() == Some(head_sha)
-            })
+            .filter(|r| is_authorized_head_approval(r, head_sha))
             .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
             .and_then(|r| r.user.clone())
         else {
@@ -2747,7 +2789,9 @@ impl VesselNode {
                 .await?;
         }
         self.reset_address_review_attempts(store, pr_number).await;
-        self.clear_address_review_dispatched(store, pr_number).await;
+        if !relies_on_rework_evidence {
+            self.clear_address_review_dispatched(store, pr_number).await;
+        }
 
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut modified = false;
@@ -3052,45 +3096,6 @@ impl VesselNode {
             "Incremented merge blocked attempt counter"
         );
         store.set(&key, json!(next)).await;
-    }
-
-    fn is_docs_pr(pr_info: &PrInfo) -> bool {
-        pr_info.head_branch.starts_with("lore/") || pr_info.ticket_id.as_deref() == Some("T-DOCS")
-    }
-
-    /// Close a docs PR that has conflicts, allowing lore to regenerate.
-    async fn close_docs_pr_with_conflicts(
-        &self,
-        owner: &str,
-        repo: &str,
-        pr_info: &PrInfo,
-    ) -> Result<VesselOutcome> {
-        let pr_number = pr_info.number;
-        let comment = "This documentation PR has merge conflicts with the main branch. \
-                       Closing to allow the lore agent to regenerate the documentation. \
-                       Lore will create a fresh docs PR on the next deployment cycle.";
-
-        match self
-            .client
-            .close_pull_request(owner, repo, pr_number, Some(comment))
-            .await
-        {
-            Ok(()) => {
-                info!(pr_number, "Closed conflicting docs PR");
-                Ok(VesselOutcome::DocsPrClosed {
-                    pr_number,
-                    reason: "Merge conflicts on docs PR — closed for regeneration".to_string(),
-                })
-            }
-            Err(e) => {
-                warn!(pr_number, error = %e, "Failed to close docs PR with conflicts");
-                Ok(VesselOutcome::Conflicts {
-                    ticket_id: None,
-                    pr_number,
-                    conflicted_files: vec!["Docs PR could not be closed".to_string()],
-                })
-            }
-        }
     }
 
     /// Recycle workers (both FORGE and paired SENTINEL) back to Idle after a PR is merged.
@@ -3849,13 +3854,6 @@ impl VesselNode {
     }
 }
 
-fn is_merge_conflict_message(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("merge conflict")
-        || lower.contains("merge_conflict")
-        || (lower.contains("405") && lower.contains("method not allowed"))
-}
-
 /// Build the lightweight `/ci_fix` chat directive for FORGE.
 ///
 /// This is a **pointer**, not a dump of the whole CI output: it names the PR, the
@@ -3925,6 +3923,26 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod reconcile_rework;
+    use reconcile_rework::run_reconcile_with_evidence;
+
+    /// `VesselNode::post`'s unoptimized frame (~1.7 MB) overflows the 2 MiB
+    /// test stack in CI's workspace build; run such tests on 8 MiB.
+    fn on_large_stack<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn merge_reservation_clears_only_for_definitive_rejection() {
@@ -4035,10 +4053,7 @@ mod tests {
     }
 
     async fn run_reconcile(node: &VesselNode, store: &SharedStore) -> bool {
-        let state = store.lifecycle("T-42").await.unwrap();
-        node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head")
-            .await
-            .unwrap()
+        run_reconcile_with_evidence(node, store, None).await
     }
 
     #[tokio::test]
@@ -4597,7 +4612,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
@@ -4683,7 +4701,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body(
                 r#"[{"id":10,"body":"Please fix error handling","path":"src/main.rs","line":50}]"#,
@@ -4771,7 +4792,10 @@ mod tests {
             .create_async()
             .await;
         let comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
             .with_status(200)
             .with_body("[]")
             .expect_at_least(1)
@@ -4905,8 +4929,12 @@ mod tests {
         assert!(pending.iter().all(|pr| pr["number"] != 42));
     }
 
-    #[tokio::test]
-    async fn test_post_handles_address_review_outcome() {
+    #[test]
+    fn test_post_handles_address_review_outcome() {
+        on_large_stack(test_post_handles_address_review_outcome_body);
+    }
+
+    async fn test_post_handles_address_review_outcome_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(
@@ -5009,8 +5037,14 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+    #[test]
+    fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+        on_large_stack(
+            test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body,
+        );
+    }
+
+    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(
@@ -5646,7 +5680,7 @@ mod tests {
             .await;
         // Inline review comments present
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100&page=1")
             .with_status(200)
             .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
             .expect_at_least(1)
@@ -5679,7 +5713,9 @@ mod tests {
             ticket_id: Some("T-42".to_string()),
         };
 
-        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        let needs_rework = node
+            .check_pr_needs_rework("org", "repo", &pr_info, None)
+            .await;
         assert!(
             needs_rework,
             "Stale approval on older commit must not hide review comments"
@@ -5712,7 +5748,7 @@ mod tests {
             .await;
         // Inline review comments present
         let _comments = server
-            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100&page=1")
             .with_status(200)
             .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
             .expect_at_least(1)
@@ -5745,10 +5781,81 @@ mod tests {
             ticket_id: Some("T-42".to_string()),
         };
 
-        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        let needs_rework = node
+            .check_pr_needs_rework("org", "repo", &pr_info, None)
+            .await;
         assert!(
             needs_rework,
             "Unauthorized drive-by approval must not hide review comments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_needs_rework_ignores_addressed_changes_requested_until_new_review() {
+        let mut server = mockito::Server::new_async().await;
+        let _ci = server
+            .mock("GET", "/repos/org/repo/commits/head_2/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success"}"#)
+            .create_async()
+            .await;
+        let _runs = server
+            .mock("GET", "/repos/org/repo/commits/head_2/check-runs")
+            .with_status(200)
+            .with_body(r#"{"total_count":0,"check_runs":[]}"#)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/comments?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(r#"[]"#)
+            .create_async()
+            .await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"owner","id":1},"body":"Round 1 changes","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"head_1","author_association":"OWNER"}]"#)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let config = VesselConfig {
+            github_token: "test".to_string(),
+            ..Default::default()
+        };
+        let node = VesselNode {
+            lifecycle_store: std::sync::Mutex::new(None),
+            poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
+            merger: PrMerger::new(client.clone(), config.merge_method),
+            client,
+            config,
+            slots_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "head_2".to_string(),
+            head_branch: "feat".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feat".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+        let evidence = ReworkEvidence {
+            dispatched_sha: Some("head_1".to_string()),
+            dispatched_at: Some("2026-10-08T12:05:00Z".to_string()),
+        };
+
+        assert!(
+            !node
+                .check_pr_needs_rework("org", "repo", &pr_info, Some(&evidence))
+                .await,
+            "Addressed CHANGES_REQUESTED on head_1 must not trigger rework on head_2"
         );
     }
 }

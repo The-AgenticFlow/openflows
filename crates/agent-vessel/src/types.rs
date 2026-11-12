@@ -22,6 +22,10 @@ pub struct VesselConfig {
     /// when a PR is in a non-merge-ready review state. When disabled, VESSEL
     /// falls back to the existing file-based rework markers.
     pub address_review_enabled: bool,
+    /// Keys that verify operator docs approvals (see
+    /// [`config::docs_lifecycle::DocsGateKeys`]). Without them VESSEL never
+    /// merges docs PRs.
+    pub docs_gate_keys: Option<config::docs_lifecycle::DocsGateKeys>,
 }
 
 impl Default for VesselConfig {
@@ -31,6 +35,7 @@ impl Default for VesselConfig {
             merge_method: MergeMethod::default(),
             github_token: String::new(),
             address_review_enabled: true,
+            docs_gate_keys: None,
         }
     }
 }
@@ -45,6 +50,7 @@ impl VesselConfig {
             merge_method: MergeMethod::default(),
             github_token,
             address_review_enabled: true,
+            docs_gate_keys: config::docs_lifecycle::gate_keys_from_env_logged(),
         })
     }
 
@@ -59,6 +65,7 @@ impl VesselConfig {
             merge_method: MergeMethod::default(),
             github_token,
             address_review_enabled: true,
+            docs_gate_keys: config::docs_lifecycle::gate_keys_from_env_logged(),
         }
     }
 }
@@ -109,13 +116,24 @@ pub enum VesselOutcome {
         head_sha: Option<String>,
     },
     /// No lifecycle ticket owns this PR; a human must handle it.
-    Unmanaged {
+    Unmanaged { pr_number: u64, reason: String },
+    /// A published LORE docs PR cannot merge as it is (conflicts, failed CI,
+    /// head moved, or non-documentation files); its docs record goes back to
+    /// LORE on the same branch.
+    DocsPrRework {
         pr_number: u64,
         reason: String,
+        docs_ticket: String,
     },
-    DocsPrClosed {
+    /// A LORE docs PR that is not mergeable yet (awaiting the operator,
+    /// paused, unverifiable approval, CI still running, or an error reading
+    /// its state). It stays pending; nothing else happens.
+    DocsPrHeld { pr_number: u64, reason: String },
+    /// An operator-approved LORE docs PR merged at its approved head.
+    DocsPrMerged {
         pr_number: u64,
-        reason: String,
+        sha: String,
+        docs_ticket: String,
     },
 }
 
@@ -129,7 +147,10 @@ impl VesselOutcome {
             VesselOutcome::CiMissing { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::Conflicts { ticket_id, .. } => ticket_id.as_deref(),
             VesselOutcome::Reviews { ticket_id, .. } => ticket_id.as_deref(),
-            VesselOutcome::Unmanaged { .. } | VesselOutcome::DocsPrClosed { .. } => None,
+            VesselOutcome::Unmanaged { .. }
+            | VesselOutcome::DocsPrRework { .. }
+            | VesselOutcome::DocsPrHeld { .. }
+            | VesselOutcome::DocsPrMerged { .. } => None,
         }
     }
 
@@ -143,7 +164,9 @@ impl VesselOutcome {
             VesselOutcome::Conflicts { pr_number, .. } => *pr_number,
             VesselOutcome::Reviews { pr_number, .. } => *pr_number,
             VesselOutcome::Unmanaged { pr_number, .. }
-            | VesselOutcome::DocsPrClosed { pr_number, .. } => *pr_number,
+            | VesselOutcome::DocsPrRework { pr_number, .. }
+            | VesselOutcome::DocsPrHeld { pr_number, .. }
+            | VesselOutcome::DocsPrMerged { pr_number, .. } => *pr_number,
         }
     }
 }

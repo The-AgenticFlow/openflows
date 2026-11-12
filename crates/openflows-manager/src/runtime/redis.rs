@@ -22,6 +22,15 @@ pub trait RedisIsolationBackend: Send + Sync {
         password: &str,
         namespace: &str,
     ) -> Result<(), ManagerError>;
+    /// The tenant's controller user: everything the tenant user may do, plus
+    /// the controller-only `ctl:{namespace}:*` keys that workspaces (which get
+    /// the tenant user) cannot write, such as the operator's docs decisions.
+    async fn ensure_controller(
+        &self,
+        username: &str,
+        password: &str,
+        namespace: &str,
+    ) -> Result<(), ManagerError>;
     async fn revoke_tenant(&self, username: &str) -> Result<(), ManagerError>;
     async fn clean_namespace(
         &self,
@@ -51,6 +60,15 @@ impl RedisIsolationBackend for InMemoryRedisIsolation {
             .unwrap()
             .insert(username.to_string(), namespace.to_string());
         Ok(())
+    }
+
+    async fn ensure_controller(
+        &self,
+        username: &str,
+        password: &str,
+        namespace: &str,
+    ) -> Result<(), ManagerError> {
+        self.ensure_tenant(username, password, namespace).await
     }
 
     async fn revoke_tenant(&self, username: &str) -> Result<(), ManagerError> {
@@ -100,6 +118,17 @@ impl FredRedisIsolation {
             })?;
         Ok(())
     }
+}
+
+/// The controller user's ACL: the tenant ACL plus the controller-only prefix.
+fn controller_acl_args(username: &str, password: &str, namespace: &str) -> Vec<String> {
+    let mut args = tenant_acl_args(username, password, namespace);
+    let at = args
+        .iter()
+        .position(|arg| arg.starts_with('~'))
+        .expect("tenant ACL grants a key pattern");
+    args.insert(at + 1, format!("~ctl:{namespace}:*"));
+    args
 }
 
 fn tenant_acl_args(username: &str, password: &str, namespace: &str) -> Vec<String> {
@@ -172,6 +201,16 @@ impl RedisIsolationBackend for FredRedisIsolation {
         namespace: &str,
     ) -> Result<(), ManagerError> {
         self.acl(tenant_acl_args(username, password, namespace))
+            .await
+    }
+
+    async fn ensure_controller(
+        &self,
+        username: &str,
+        password: &str,
+        namespace: &str,
+    ) -> Result<(), ManagerError> {
+        self.acl(controller_acl_args(username, password, namespace))
             .await
     }
 
@@ -297,18 +336,20 @@ impl RedisIsolationBackend for FredRedisIsolation {
     async fn clear_namespace(&self, namespace: &str) -> Result<u64, ManagerError> {
         use fred::types::scan::Scanner;
         use futures_util::StreamExt;
-        let pattern = format!("ns:{namespace}:*");
-        let mut stream = self.client.scan(pattern, Some(500), None);
         let mut keys = Vec::new();
-        while let Some(page) = stream.next().await {
-            let mut page = page.map_err(|e| {
-                ManagerError::Service(anyhow::anyhow!("Redis namespace scan failed: {e}"))
-            })?;
-            if let Some(values) = page.take_results() {
-                keys.extend(values.into_iter().filter_map(|value| value.into_string()));
-            }
-            if page.has_more() {
-                page.next();
+        // Workspace keys and the controller-only keys of the same tenant.
+        for pattern in [format!("ns:{namespace}:*"), format!("ctl:{namespace}:*")] {
+            let mut stream = self.client.scan(pattern, Some(500), None);
+            while let Some(page) = stream.next().await {
+                let mut page = page.map_err(|e| {
+                    ManagerError::Service(anyhow::anyhow!("Redis namespace scan failed: {e}"))
+                })?;
+                if let Some(values) = page.take_results() {
+                    keys.extend(values.into_iter().filter_map(|value| value.into_string()));
+                }
+                if page.has_more() {
+                    page.next();
+                }
             }
         }
         if keys.is_empty() {
@@ -324,6 +365,23 @@ impl RedisIsolationBackend for FredRedisIsolation {
 mod tests {
     use super::*;
     use config::WorkerStatus;
+
+    #[test]
+    fn only_the_controller_acl_reaches_controller_keys() {
+        let tenant = tenant_acl_args("tenant", "secret", "namespace");
+        let controller = controller_acl_args("tenant-ctl", "secret", "namespace");
+        assert!(!tenant.iter().any(|arg| arg.starts_with("~ctl:")));
+        assert!(controller.contains(&"~ns:namespace:*".to_string()));
+        assert!(controller.contains(&"~ctl:namespace:*".to_string()));
+        // Same command rules otherwise, including the keyless-write revocations.
+        let rules = |args: &[String]| {
+            args.iter()
+                .filter(|arg| arg.starts_with('+') || arg.starts_with('-'))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rules(&tenant), rules(&controller));
+    }
 
     #[test]
     fn tenant_acl_revokes_keyless_global_writes() {

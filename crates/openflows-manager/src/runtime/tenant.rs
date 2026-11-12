@@ -21,8 +21,17 @@ use sqlx::PgPool;
 use tracing::warn;
 use zeroize::Zeroizing;
 
+mod tenant_delivery;
+
 /// The Redis username prefix for tenant-scoped clients.
 pub const TENANT_REDIS_USER_PREFIX: &str = "tenant";
+
+/// The tenant controller's Redis user (see
+/// `RedisIsolationBackend::ensure_controller`): only the Nexus workspace
+/// receives it; worker workspaces get the tenant user.
+pub fn controller_redis_username(tenant_username: &str) -> String {
+    format!("{tenant_username}-ctl")
+}
 
 /// A tenant's isolated Redis credential (namespace is the immutable tenant
 /// UUID, never a customer-chosen name).
@@ -61,6 +70,7 @@ pub struct TenantRuntimeRepository {
     pool: PgPool,
     secret_provider: std::sync::Arc<dyn SecretProvider>,
     redis_isolation: std::sync::Arc<dyn crate::runtime::redis::RedisIsolationBackend>,
+    delivery: std::sync::Arc<dyn crate::runtime::delivery::SecretDelivery>,
 }
 
 impl TenantRuntimeRepository {
@@ -71,6 +81,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -84,6 +95,7 @@ impl TenantRuntimeRepository {
             redis_isolation: std::sync::Arc::new(
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -96,6 +108,7 @@ impl TenantRuntimeRepository {
             pool,
             secret_provider,
             redis_isolation,
+            delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -139,6 +152,36 @@ impl TenantRuntimeRepository {
                 .map_err(|_| ManagerError::Config("tenant Redis secret is not UTF-8".into()))?;
             self.redis_isolation
                 .ensure_tenant(&username, password, &namespace)
+                .await?;
+        }
+        let controllers: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT username, namespace, controller_secret_ref
+               FROM tenant_redis_credentials
+              WHERE revoked_at IS NULL AND controller_secret_ref IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (username, namespace, secret_ref) in controllers {
+            let password = match self.secret_provider.get(&secret_ref).await {
+                Ok(password) => password,
+                Err(crate::secrets::SecretError::NotFound(_)) => {
+                    warn!(
+                        username,
+                        secret_ref,
+                        "skipping controller Redis credential restore: stored secret is missing"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ManagerError::Config(format!(
+                        "cannot restore controller Redis secret: {error}"
+                    )))
+                }
+            };
+            let password = std::str::from_utf8(&password)
+                .map_err(|_| ManagerError::Config("controller Redis secret is not UTF-8".into()))?;
+            self.redis_isolation
+                .ensure_controller(&controller_redis_username(&username), password, &namespace)
                 .await?;
         }
         Ok(())
@@ -217,7 +260,97 @@ impl TenantRuntimeRepository {
         })
     }
 
+    /// Ensure the tenant's Redis credential and its controller credential
+    /// ([`controller_redis_username`]) both exist and are live in Redis.
     pub async fn ensure_redis_credential(
+        &self,
+        org_id: OrganizationId,
+        tenant_id: TenantId,
+        secret_ref: &str,
+    ) -> Result<TenantRedisCredential, ManagerError> {
+        let credential = self
+            .ensure_tenant_redis_credential(org_id, tenant_id, secret_ref)
+            .await?;
+        self.ensure_controller_redis_credential(org_id, tenant_id, &credential)
+            .await?;
+        Ok(credential)
+    }
+
+    /// The controller's Redis password secret reference, allocating it (and
+    /// the Redis ACL user) when missing or lost.
+    pub async fn ensure_controller_redis_credential(
+        &self,
+        org_id: OrganizationId,
+        tenant_id: TenantId,
+        credential: &TenantRedisCredential,
+    ) -> Result<String, ManagerError> {
+        let username = controller_redis_username(&credential.username);
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT controller_secret_ref FROM tenant_redis_credentials
+              WHERE tenant_id = $1 AND organization_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        if let Some(reference) = existing {
+            match self.secret_provider.get(&reference).await {
+                Ok(password) => {
+                    let password = std::str::from_utf8(&password).map_err(|_| {
+                        ManagerError::Config("controller Redis secret is not UTF-8".into())
+                    })?;
+                    self.redis_isolation
+                        .ensure_controller(&username, password, &credential.namespace)
+                        .await?;
+                    return Ok(reference);
+                }
+                // Lost (in-memory provider restart): issue a new password below.
+                Err(crate::secrets::SecretError::NotFound(_)) => {}
+                Err(error) => {
+                    return Err(ManagerError::Config(format!(
+                        "cannot verify controller Redis secret: {error}"
+                    )))
+                }
+            }
+        }
+        let secret = Secret::generate();
+        let encoded = secret.encode();
+        self.redis_isolation
+            .ensure_controller(&username, &encoded, &credential.namespace)
+            .await?;
+        let name = format!("tenant-redis-controller-{}", tenant_id.0);
+        let reference = match self.secret_provider.put(&name, encoded.as_bytes()).await {
+            Ok(reference) => reference,
+            Err(crate::secrets::SecretError::AlreadyExists(_)) => {
+                self.secret_provider
+                    .replace(&name, encoded.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        ManagerError::Config(format!("cannot store controller Redis secret: {e}"))
+                    })?;
+                name
+            }
+            Err(error) => {
+                return Err(ManagerError::Config(format!(
+                    "cannot store controller Redis secret: {error}"
+                )))
+            }
+        };
+        sqlx::query(
+            "UPDATE tenant_redis_credentials
+                SET controller_secret_ref = $3, updated_at = now()
+              WHERE tenant_id = $1 AND organization_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id.0)
+        .bind(org_id.0)
+        .bind(&reference)
+        .execute(&self.pool)
+        .await?;
+        Ok(reference)
+    }
+
+    async fn ensure_tenant_redis_credential(
         &self,
         org_id: OrganizationId,
         tenant_id: TenantId,
@@ -296,6 +429,28 @@ impl TenantRuntimeRepository {
     ) -> Result<(), ManagerError> {
         if let Some(credential) = self.redis_credential_any(org_id, tenant_id).await? {
             self.redis_isolation
+                .revoke_tenant(&controller_redis_username(&credential.username))
+                .await?;
+            let controller_ref: Option<String> = sqlx::query_scalar(
+                "SELECT controller_secret_ref FROM tenant_redis_credentials
+                  WHERE organization_id = $1 AND tenant_id = $2",
+            )
+            .bind(org_id.0)
+            .bind(tenant_id.0)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten();
+            if let Some(reference) = controller_ref {
+                match self.secret_provider.delete(&reference).await {
+                    Ok(()) | Err(crate::secrets::SecretError::NotFound(_)) => {}
+                    Err(error) => {
+                        return Err(ManagerError::Config(format!(
+                            "cannot delete controller Redis secret: {error}"
+                        )))
+                    }
+                }
+            }
+            self.redis_isolation
                 .revoke_tenant(&credential.username)
                 .await?;
             match self.secret_provider.delete(&credential.secret_ref).await {
@@ -318,50 +473,7 @@ impl TenantRuntimeRepository {
         Ok(())
     }
 
-    /// Remove every secret-provider object owned by a tenant. Database rows
-    /// remain as a sanitized audit trail, with their credentials revoked.
-    pub async fn delete_tenant_secrets(
-        &self,
-        org_id: OrganizationId,
-        tenant_id: TenantId,
-    ) -> Result<(), ManagerError> {
-        let refs: Vec<String> = sqlx::query_scalar(
-            "SELECT secret_ref FROM tenant_hook_keys
-              WHERE organization_id = $1 AND tenant_id = $2 AND secret_ref IS NOT NULL
-             UNION
-             SELECT runtime_secret_ref FROM workspaces
-              WHERE organization_id = $1 AND tenant_id = $2 AND runtime_secret_ref IS NOT NULL
-             UNION
-             SELECT b.secret_ref FROM workspace_bootstrap_credentials b
-               JOIN workspaces w ON w.id = b.workspace_id
-              WHERE w.organization_id = $1 AND w.tenant_id = $2",
-        )
-        .bind(org_id.0)
-        .bind(tenant_id.0)
-        .fetch_all(&self.pool)
-        .await?;
-        for reference in refs {
-            match self.secret_provider.delete(&reference).await {
-                Ok(()) | Err(crate::secrets::SecretError::NotFound(_)) => {}
-                Err(error) => {
-                    return Err(ManagerError::Config(format!(
-                        "cannot delete tenant secret: {error}"
-                    )))
-                }
-            }
-        }
-        sqlx::query(
-            "UPDATE tenant_hook_keys SET revoked_at = COALESCE(revoked_at, now()), updated_at = now()
-              WHERE organization_id = $1 AND tenant_id = $2",
-        )
-        .bind(org_id.0)
-        .bind(tenant_id.0)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Assemble the per-workspace mounted secret file. Only this method reads
+    /// Assemble the per-workspace credential bundle and deliver it. Only this method reads
     /// the component secrets; templates receive the opaque returned reference.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_workspace_secret(
@@ -389,9 +501,26 @@ impl TenantRuntimeRepository {
             .redis_credential(org_id, tenant_id)
             .await?
             .ok_or_else(|| ManagerError::not_found("tenant Redis credential"))?;
+        // The controller (Nexus) gets the controller Redis user and the hook
+        // key; worker workspaces get neither, so nothing they can read lets
+        // them rewrite operator decisions or derive the docs approval key.
+        let role: String = sqlx::query_scalar("SELECT role FROM workspaces WHERE id = $1")
+            .bind(workspace_id.0)
+            .fetch_one(&self.pool)
+            .await?;
+        let controller = role == "nexus";
+        let (redis_username, redis_secret_ref) = if controller {
+            (
+                controller_redis_username(&redis.username),
+                self.ensure_controller_redis_credential(org_id, tenant_id, &redis)
+                    .await?,
+            )
+        } else {
+            (redis.username.clone(), redis.secret_ref.clone())
+        };
         let redis_password =
             Zeroizing::new(
-                String::from_utf8(self.secret_provider.get(&redis.secret_ref).await.map_err(
+                String::from_utf8(self.secret_provider.get(&redis_secret_ref).await.map_err(
                     |e| ManagerError::Config(format!("cannot resolve Redis secret: {e}")),
                 )?)
                 .map_err(|_| ManagerError::Config("tenant Redis secret is not UTF-8".into()))?,
@@ -426,27 +555,29 @@ impl TenantRuntimeRepository {
         let mut redis_url = url::Url::parse(runtime_redis_url)
             .map_err(|_| ManagerError::Config("invalid runtime Redis URL".into()))?;
         redis_url
-            .set_username(&redis.username)
+            .set_username(&redis_username)
             .map_err(|_| ManagerError::Config("invalid Redis username".into()))?;
         redis_url
             .set_password(Some(redis_password.as_str()))
             .map_err(|_| ManagerError::Config("invalid Redis password".into()))?;
         let hook_url =
             crate::config::runtime_hook_url(tenant_id.into()).map_err(ManagerError::Config)?;
+        let mut bundle = serde_json::json!({
+            "schema_version": 1,
+            "workspace_id": workspace_id,
+            "tenant_id": tenant_id,
+            "manager_url": manager_url.trim_end_matches('/'),
+            "bootstrap_token": bootstrap.as_str(),
+            "redis_url": redis_url.as_str(),
+            "redis_username": redis_username,
+            "redis_namespace": redis.namespace,
+        });
+        if controller {
+            bundle["hook_key"] = serde_json::json!(hook_key.as_str());
+            bundle["hook_url"] = serde_json::json!(hook_url);
+        }
         let payload = Zeroizing::new(
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
-                "workspace_id": workspace_id,
-                "tenant_id": tenant_id,
-                "manager_url": manager_url.trim_end_matches('/'),
-                "bootstrap_token": bootstrap.as_str(),
-                "redis_url": redis_url.as_str(),
-                "redis_username": redis.username,
-                "redis_namespace": redis.namespace,
-                "hook_key": hook_key.as_str(),
-                "hook_url": hook_url,
-            }))
-            .map_err(|e| ManagerError::Service(e.into()))?,
+            serde_json::to_vec(&bundle).map_err(|e| ManagerError::Service(e.into()))?,
         );
         let stored_secret_ref = if let Some(existing) = existing_bundle {
             match self.secret_provider.replace(&existing, &payload).await {
@@ -514,7 +645,14 @@ impl TenantRuntimeRepository {
         .bind(workspace_id.0)
         .execute(&self.pool)
         .await?;
-        Ok(stored_secret_ref)
+        self.deliver_workspace_bundle(
+            org_id,
+            tenant_id,
+            workspace_id,
+            &stored_secret_ref,
+            &payload,
+        )
+        .await
     }
 
     /// Look up a tenant's Redis credential (namespace + username + generation),

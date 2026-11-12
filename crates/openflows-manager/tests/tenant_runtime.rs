@@ -55,22 +55,21 @@ fn build_release_artifacts() -> (ReleaseArtifacts, tempfile::TempDir) {
         archives.insert(role, archive);
         roles.insert(
             role,
-            RoleManifestEntry {
+            RoleManifestEntry::docker(
                 role,
-                archive: role.archive_name(),
+                role.archive_name(),
                 sha256,
-                parameter_schema_version: 1,
-                image_digest: Some(format!("sha256:{}", "a".repeat(64))),
-            },
+                1,
+                Some(format!("sha256:{}", "a".repeat(64))),
+            ),
         );
     }
-    let manifest = TemplateManifest {
-        schema_version: 1,
-        release: "2026.10.0".into(),
-        required_roles: vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
+    let manifest = TemplateManifest::from_v1_roles(
+        "2026.10.0",
+        vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
         roles,
-    };
-    (ReleaseArtifacts { manifest, archives }, dir)
+    );
+    (ReleaseArtifacts::new(manifest, archives), dir)
 }
 
 /// A ready-to-run harness: an isolated database, a ready organization with a
@@ -401,65 +400,8 @@ async fn registered_resuming_nexus_can_commit_a_repository_lease() {
         .expect("registered workspace must receive a scoped lease before readiness");
 }
 
-#[tokio::test]
-#[ignore = "requires isolated PostgreSQL"]
-async fn missing_tenant_secrets_recover_existing_unique_rows() {
-    let h = harness().await;
-    let tenant = create_tenant(&h, "secret-recovery", 1, "secret-recovery").await;
-    let redis = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    let hook = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    h.secret_provider.delete(&redis.secret_ref).await.unwrap();
-    h.secret_provider.delete(&hook.secret_ref).await.unwrap();
-    // Reproduce both a lost provider and a previous attempt that already
-    // revoked the row before failing to allocate its replacement.
-    sqlx::query("UPDATE tenant_redis_credentials SET revoked_at = now() WHERE tenant_id = $1")
-        .bind(tenant.0)
-        .execute(&h.pool)
-        .await
-        .unwrap();
-    let recovered = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    let recovered_hook = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    assert_eq!(recovered.generation, redis.generation + 1);
-    assert_eq!(recovered_hook.generation, hook.generation + 1);
-    assert_ne!(recovered.credential_hash, redis.credential_hash);
-    assert_ne!(recovered_hook.key_hash, hook.key_hash);
-    assert_eq!(recovered.namespace, redis.namespace);
-    assert_eq!(recovered.username, redis.username);
-    assert!(h.secret_provider.get(&recovered.secret_ref).await.is_ok());
-    assert!(h
-        .secret_provider
-        .get(&recovered_hook.secret_ref)
-        .await
-        .is_ok());
-    let again = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    assert_eq!(again.credential_hash, recovered.credential_hash);
-    let again = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    assert_eq!(again.key_hash, recovered_hook.key_hash);
-}
+#[path = "tenant_runtime/redis_credentials.rs"]
+mod redis_credentials;
 
 // ---------------------------------------------------------------------------
 // Cross-organization and cross-tenant access denial.
@@ -1176,4 +1118,153 @@ fn tenant_slug_validation_rejects_unsafe_names() {
     assert!(validate_tenant_slug("UPPER").is_err());
     assert!(validate_tenant_slug("has space").is_err());
     assert!(validate_tenant_slug(&"x".repeat(64)).is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn tenant_status_reports_runtime_health() {
+    let h = harness().await;
+    let tenant = create_tenant(&h, "runtime-health", 1, "runtime-health").await;
+    let health = |h: &Harness| {
+        let svc = h.tenant_service.clone();
+        let (owner, org) = (h.owner, h.org);
+        async move {
+            let status = svc.tenant_status(owner, org, tenant).await.unwrap();
+            status["runtime"]["health"].as_str().unwrap().to_owned()
+        }
+    };
+    sqlx::query("DELETE FROM workspaces WHERE tenant_id = $1")
+        .bind(tenant.0)
+        .execute(&h.pool)
+        .await
+        .ok();
+
+    // Not meant to be running yet.
+    assert_eq!(health(&h).await, "inactive");
+
+    // A normal start: desired `running` while observed is still `paused` until
+    // the first heartbeat. That is "starting", not "inactive".
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'running', observed_state = 'paused' WHERE id = $1",
+    )
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "starting");
+
+    let nexus = uuid::Uuid::new_v4();
+    sqlx::query(
+        "UPDATE tenants SET observed_state = 'running', desired_state = 'running' WHERE id = $1",
+    )
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workspaces (id, organization_id, tenant_id, role, desired_state, observed_state)
+         VALUES ($1, $2, $3, 'nexus', 'running', 'running')",
+    )
+    .bind(nexus)
+    .bind(h.org.0)
+    .bind(tenant.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "starting");
+
+    sqlx::query(
+        "UPDATE workspaces SET registered_at = now(), last_heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(nexus)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "healthy");
+
+    // Silent runtime whose refresh session has expired: only a restart helps.
+    sqlx::query(
+        "UPDATE workspaces SET last_heartbeat_at = now() - interval '30 minutes' WHERE id = $1",
+    )
+    .bind(nexus)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "restart_required");
+
+    // Silent runtime that can still refresh: it may come back on its own.
+    sqlx::query(
+        "INSERT INTO runtime_credentials
+            (id, workspace_id, credential_hash, audience, expires_at, generation, family_id, family_expires_at)
+         VALUES ($1, $2, $3, 'openflows-workspace-refresh', now() + interval '1 hour', 0, $4, now() + interval '1 day')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(nexus)
+    .bind(format!("test-hash-{nexus}"))
+    .bind(uuid::Uuid::new_v4())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(health(&h).await, "unresponsive");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn agent_activity_rows_are_scoped_to_the_tenant() {
+    let h = harness().await;
+    let mine = create_tenant(&h, "activity-a", 1, "activity-a").await;
+    // A second tenant in the same organization (the harness has one repository,
+    // so copy the first tenant's row under another repository id).
+    let other = TenantId::from_uuid(uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO github_repositories
+            (organization_id, connection_id, github_repository_id, full_name, accessible, last_seen_at)
+         SELECT r.organization_id, r.connection_id, r.github_repository_id + 1, 'acme/second', true, now()
+           FROM tenants t
+           JOIN github_repositories r ON r.connection_id = t.connection_id
+            AND r.github_repository_id = t.github_repository_id
+          WHERE t.id = $1",
+    )
+    .bind(mine.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, organization_id, slug, connection_id, github_repository_id, fleet_size)
+         SELECT $1, organization_id, 'activity-b', connection_id, github_repository_id + 1, 1
+           FROM tenants WHERE id = $2",
+    )
+    .bind(other.0)
+    .bind(mine.0)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    for (tenant, ticket, chat) in [(mine, "T-1", "chat-a"), (other, "T-9", "chat-b")] {
+        let ws = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workspaces (id, organization_id, tenant_id, role, desired_state, observed_state)
+             VALUES ($1, $2, $3, 'forge', 'running', 'running')",
+        )
+        .bind(ws)
+        .bind(h.org.0)
+        .bind(tenant.0)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runtime_chats (workspace_id, ticket_id, coder_workspace_id, coder_chat_id)
+             VALUES ($1, $2, 'cw', $3)",
+        )
+        .bind(ws)
+        .bind(ticket)
+        .bind(chat)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    let rows = openflows_manager::routes::agent_activity::load_chat_rows(&h.pool, h.org, mine)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("T-1", "forge"));
 }

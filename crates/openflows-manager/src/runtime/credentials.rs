@@ -29,6 +29,7 @@ pub const REFRESH_FAMILY_TTL_HOURS: i64 = 24;
 pub struct RuntimeCredentialService {
     pub repo: RuntimeRepository,
     secret_provider: Arc<dyn crate::secrets::SecretProvider>,
+    delivery: Arc<dyn crate::runtime::delivery::SecretDelivery>,
 }
 
 impl RuntimeCredentialService {
@@ -36,6 +37,7 @@ impl RuntimeCredentialService {
         RuntimeCredentialService {
             repo,
             secret_provider: Arc::new(crate::secrets::InMemorySecretProvider::new()),
+            delivery: Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
     }
 
@@ -46,7 +48,17 @@ impl RuntimeCredentialService {
         RuntimeCredentialService {
             repo,
             secret_provider,
+            delivery: Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
         }
+    }
+
+    /// Select how scrubbed bundles are redelivered to the workspace.
+    pub fn with_delivery(
+        mut self,
+        delivery: Arc<dyn crate::runtime::delivery::SecretDelivery>,
+    ) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     /// Issue a fresh runtime credential for a workspace. This is an internal
@@ -203,16 +215,36 @@ impl RuntimeCredentialService {
                             match serde_json::to_vec(&payload) {
                                 Ok(updated) => {
                                     bytes = zeroize::Zeroizing::new(updated);
-                                    if let Err(error) = self
+                                    match self
                                         .secret_provider
                                         .replace(runtime_secret_ref, &bytes)
                                         .await
                                     {
-                                        tracing::warn!(
+                                        // Redis and hook credentials stay; only the dead
+                                        // token is dropped from the delivered copy too.
+                                        Ok(()) => {
+                                            let target = crate::runtime::delivery::DeliveryTarget {
+                                                organization_id: consumed.organization_id,
+                                                tenant_id: consumed.tenant_id,
+                                                workspace_id: consumed.workspace_id,
+                                            };
+                                            if let Err(error) = self
+                                                .delivery
+                                                .deliver(&target, runtime_secret_ref, &bytes)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    workspace_id = %consumed.workspace_id,
+                                                    %error,
+                                                    "Could not redeliver scrubbed workspace secret bundle"
+                                                );
+                                            }
+                                        }
+                                        Err(error) => tracing::warn!(
                                             workspace_id = %consumed.workspace_id,
                                             %error,
                                             "Could not remove consumed bootstrap from workspace secret bundle"
-                                        );
+                                        ),
                                     }
                                 }
                                 Err(error) => tracing::warn!(

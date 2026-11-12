@@ -23,6 +23,39 @@ pub struct CoderBootstrapper {
     env: Option<config::EnvConfig>,
 }
 
+/// Prefix of the per-tenant Nexus workspace name. `scripts/setup.sh` looks the
+/// workspace up by the same `openflows-nexus-<tenant>` name.
+const NEXUS_WORKSPACE_PREFIX: &str = "openflows-nexus-";
+
+/// Coder rejects workspace names longer than this.
+const CODER_WORKSPACE_NAME_MAX: usize = 32;
+
+/// Longest tenant name whose Nexus workspace name still fits in Coder's limit.
+pub const MAX_TENANT_NAME_LEN: usize = CODER_WORKSPACE_NAME_MAX - NEXUS_WORKSPACE_PREFIX.len();
+
+/// Build the Nexus workspace name for a tenant, checking it against Coder's
+/// workspace name rule (letters, digits and single hyphens, at most 32
+/// characters) so a bad name fails before any Coder call instead of as a
+/// 400 from workspace creation.
+pub fn nexus_workspace_name(tenant_name: &str) -> Result<String> {
+    anyhow::ensure!(
+        tenant_name.len() <= MAX_TENANT_NAME_LEN,
+        "tenant name '{tenant_name}' is {} characters; Coder limits workspace names to {CODER_WORKSPACE_NAME_MAX}, \
+         so with the '{NEXUS_WORKSPACE_PREFIX}' prefix the tenant name can be at most {MAX_TENANT_NAME_LEN}. \
+         Pass a shorter --name",
+        tenant_name.len()
+    );
+    anyhow::ensure!(
+        !tenant_name.is_empty()
+            && tenant_name
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "tenant name '{tenant_name}' is not a valid Coder workspace name: use only ASCII letters, digits and \
+         single hyphens, not starting or ending with a hyphen. Pass a different --name"
+    );
+    Ok(format!("{NEXUS_WORKSPACE_PREFIX}{tenant_name}"))
+}
+
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
 
@@ -331,13 +364,6 @@ impl CoderBootstrapper {
         }
     }
 
-    /// Verify that GitHub external auth is configured on the Coder server.
-    ///  needed for agents authentication
-    pub fn verify_external_auth_configured() -> Result<()> {
-        info!("  ✓ GitHub external auth configure in the Coder dashboard if agents authentication");
-        Ok(())
-    }
-
     /// Provision a tenant's nexus workspace using the current session user
     /// (admin) identity. Returns the workspace ID.
     pub async fn ensure_tenant(
@@ -348,6 +374,7 @@ impl CoderBootstrapper {
         registry_json: &str,
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
+        let nexus_workspace_name = nexus_workspace_name(tenant_name)?;
 
         // Use the current session user (admin) as the tenant owner.
         let admin = client.get_me().await?;
@@ -355,95 +382,10 @@ impl CoderBootstrapper {
             "  ✓ Using session user '{}' as tenant owner",
             admin.username
         );
-
-        // 1. Check the session user's GitHub external-auth grant until linked.
         let coder_url = client.base_url();
-        let external_auth_id = self
-            .env
-            .as_ref()
-            .and_then(|e| e.coder.external_auth_id.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "primary-github".to_string());
-        eprintln!();
-        eprintln!("  ─── GitHub Link Required ───");
-        eprintln!();
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(300);
-        let mut link_shown = false;
-        loop {
-            match client.get_external_auth(&external_auth_id).await {
-                Ok(auth) if auth.authenticated => {
-                    let linked_user = auth
-                        .user
-                        .as_ref()
-                        .map(|u| u.login.as_str())
-                        .unwrap_or("(unknown account)");
-                    info!(
-                        "  ✓ GitHub link confirmed for account '{}' (provider: {})",
-                        linked_user, external_auth_id
-                    );
-                    break;
-                }
-                Ok(auth) => {
-                    if !link_shown {
-                        eprintln!("  Your GitHub account is not linked yet. To connect it:");
-                        if !auth.app_install_url.is_empty() {
-                            eprintln!(
-                                "    1. Install/grant the OpenFlows GitHub App: {}",
-                                auth.app_install_url
-                            );
-                        }
-                        // Kick off a device flow for self-serve linking.
-                        match client.get_external_auth_device(&external_auth_id).await {
-                            Ok(device) => {
-                                let target = if !device.verification_uri_complete.is_empty() {
-                                    device.verification_uri_complete.clone()
-                                } else {
-                                    device.verification_uri.clone()
-                                };
-                                if !target.is_empty() {
-                                    eprintln!("    2. Authorize at: {}", target);
-                                }
-                                if !device.user_code.is_empty() {
-                                    eprintln!("       and enter code: {}", device.user_code);
-                                }
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "    2. Complete the link in the dashboard: {}/external-auth/{}",
-                                    coder_url.trim_end_matches('/'),
-                                    external_auth_id
-                                );
-                            }
-                        }
-                        eprintln!();
-                        eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
-                        link_shown = true;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Could not query external-auth status for '{}'; retrying",
-                        external_auth_id
-                    );
-                }
-            }
-            if start.elapsed() >= timeout {
-                anyhow::bail!(
-                    "Timed out waiting for the GitHub link (provider '{}'). \
-                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
-                    external_auth_id,
-                    coder_url.trim_end_matches('/'),
-                    external_auth_id
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
 
         // 2. Create the nexus workspace under the session user (admin).
         let redis_url = "redis://redis:6379".to_string();
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
         let repo_url = config::GithubConfig::init_from_env()?.repository_clone_url(github_repo);
 
         // Re-running `tenant add` for an existing tenant returns the existing
@@ -487,6 +429,15 @@ impl CoderBootstrapper {
                     .and_then(|c| c.hooks.chat_hook_url_effective())
             })
             .unwrap_or_default();
+        // The docs gate secrets go to the controller only (never to workers).
+        let docs_gate = self
+            .env
+            .as_ref()
+            .map(|e| e.docs_gate.clone())
+            .or_else(|| config::EnvConfig::from_env().ok().map(|c| c.docs_gate));
+        let (docs_gate_secret, docs_gate_previous) = docs_gate
+            .map(|g| (g.secret, g.previous_secret))
+            .unwrap_or_default();
         let workspace = client
             .create_workspace_for_user(
                 &admin.id,
@@ -502,6 +453,8 @@ impl CoderBootstrapper {
                         "github_repository": github_repo,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
+                        "docs_gate_secret": docs_gate_secret.unwrap_or_default(),
+                        "docs_gate_secret_previous": docs_gate_previous.unwrap_or_default(),
                         "registry_json": registry_json,
                         "start_controller": true,
                     }),
@@ -583,12 +536,11 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
     let current_hash = template_hash(data);
 
-    let before_templates = client.list_templates().await.ok();
+    let before_templates = client.list_templates_in_default_org().await.ok();
     let before_template = before_templates
         .as_ref()
         .and_then(|t| t.iter().find(|t| t.name == name));
     let before_template_id = before_template.map(|t| t.id.clone());
-    let before_updated_at = before_template.map(|t| t.updated_at.clone());
 
     let mut hashes = load_template_hashes();
     let last_hash = hashes.get(name).map(String::as_str);
@@ -608,36 +560,28 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     };
     info!("  → Pushing template '{}' ({})", name, reason);
 
-    match client.push_template(name, data).await {
-        Ok(t) => {
-            let after_templates = match client.list_templates().await {
-                Ok(templates) => templates,
-                Err(e) => {
-                    warn!("  ⚠ Could not verify template '{}' after push: {}", name, e);
-                    return None;
-                }
-            };
-            let after_updated_at = after_templates
-                .iter()
-                .find(|tp| tp.name == name)
-                .map(|tp| tp.updated_at.clone());
-
-            // A successful version push keeps the stable template ID but bumps
-            // `updated_at`. Only treat the push as rejected when we have a
-            // known previous `updated_at` and it did not change. (An empty
-            // `updated_at` means the API did not report one, so we cannot
-            // verify and assume the push succeeded.)
-            if before_template_id.is_some()
-                && !before_updated_at.as_deref().unwrap_or("").is_empty()
-                && after_updated_at.as_ref() == before_updated_at.as_ref()
-            {
-                warn!(
-                    "  ⚠ Template '{}' push returned success but updated_at did not change — push may have been rejected",
-                    name
-                );
-                return None;
+    let mut push_result = Err(anyhow::anyhow!("template push not attempted"));
+    for attempt in 1..=5u32 {
+        match client.push_template(name, data).await {
+            Ok(t) => {
+                push_result = Ok(t);
+                break;
             }
+            Err(e) => {
+                if attempt < 5 {
+                    warn!(
+                        attempt,
+                        "  ⚠ Template '{}' push attempt failed ({}); retrying...", name, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(u64::from(attempt) * 3)).await;
+                }
+                push_result = Err(e);
+            }
+        }
+    }
 
+    match push_result {
+        Ok(t) => {
             hashes.insert(name.to_string(), current_hash);
             save_template_hashes(&hashes);
             info!("  ✓ Template '{}' pushed (version updated)", t.name);
@@ -646,6 +590,44 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
         Err(e) => {
             warn!("  ⚠ Template '{}' push failed: {}", name, e);
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nexus_workspace_name, MAX_TENANT_NAME_LEN};
+
+    #[test]
+    fn nexus_workspace_name_fits_coder_limit() {
+        assert_eq!(MAX_TENANT_NAME_LEN, 16);
+        let longest = "a".repeat(MAX_TENANT_NAME_LEN);
+        assert_eq!(nexus_workspace_name(&longest).unwrap().len(), 32);
+        assert_eq!(
+            nexus_workspace_name("rustlib").unwrap(),
+            "openflows-nexus-rustlib"
+        );
+        assert_eq!(
+            nexus_workspace_name("Jagoum-rust").unwrap(),
+            "openflows-nexus-Jagoum-rust"
+        );
+    }
+
+    #[test]
+    fn nexus_workspace_name_rejects_names_coder_would_reject() {
+        for bad in [
+            "Jagoum-rust-library", // 35-character workspace name
+            "",
+            "my_team",
+            "my.team",
+            "-team",
+            "team-",
+            "my--team",
+        ] {
+            assert!(
+                nexus_workspace_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 }

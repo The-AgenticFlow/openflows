@@ -370,6 +370,31 @@ class GitHubFixtureTest(FixtureCase):
         _, pr = self.request('GET', f'/repos/test/repo/pulls/{self.pr}')
         self.assertFalse(pr['merged'])
 
+    def test_docs_branch_head_compare_files_and_head_filter_follow_real_git(self):
+        self.git('switch', '-c', 'lore/T-1', 'origin/main')
+        (self.checkout / 'CHANGELOG.md').write_text('# Changelog\n\n- T-1: answer is 42\n')
+        self.git('add', 'CHANGELOG.md')
+        self.git('commit', '-m', 'docs(T-1): changelog')
+        self.git('push', 'origin', 'HEAD')
+        docs = self.git('rev-parse', 'HEAD').strip()
+        code, ref = self.request('GET', '/repos/test/repo/git/ref/heads/lore/T-1')
+        self.assertEqual((code, ref['object']['sha']), (200, docs))
+        self.assertEqual(self.request('GET', '/repos/test/repo/git/ref/heads/lore/T-9')[0], 404)
+        code, comparison = self.request('GET', f'/repos/test/repo/compare/main...{docs}?per_page=1')
+        self.assertEqual(code, 200)
+        self.assertEqual(comparison['files'], [{'filename': 'CHANGELOG.md', 'status': 'added'}])
+        code, comparison = self.request('GET', f'/repos/test/repo/compare/main...{self.broken}')
+        self.assertEqual((code, comparison['files']), (200, []))
+        code, pr = self.request('POST', '/repos/test/repo/pulls',
+            {'title': 'docs(T-1)', 'head': 'lore/T-1', 'base': 'main'}, token='ci-vessel-token')
+        self.assertEqual(code, 201, pr)
+        code, files = self.request('GET', f'/repos/test/repo/pulls/{pr["number"]}/files?per_page=100&page=1')
+        self.assertEqual((code, [f['filename'] for f in files]), (200, ['CHANGELOG.md']))
+        _, found = self.request('GET', '/repos/test/repo/pulls?state=open&head=test:lore/T-1&base=main')
+        self.assertEqual([p['number'] for p in found], [pr['number']])
+        _, other = self.request('GET', '/repos/test/repo/pulls?state=open&head=test:lore/T-1&base=dev')
+        self.assertEqual(other, [])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -47,7 +47,24 @@ echo "==> Running manager PostgreSQL integration tests (connection URL omitted)"
 # opts in with `--ignored` now that a database is available.
 (
   cd "$MANAGER_CRATE"
-  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --locked --test postgres --test http_auth --test http_org --test org_policy --test review_regressions -- --ignored --test-threads=4
+  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" cargo test --locked --test postgres --test http_auth --test http_org --test org_policy --test review_regressions --test http_console_reads --test http_invitation_preview --test http_operations --test http_org_provisioning -- --ignored --test-threads=4
+  # tenant_runtime and backend_release_selection build hook URLs for the
+  # runtime relay and deliver runtime secret bundles, which must both be
+  # configured with writable locations. The default relay URL lives in a
+  # variable: inside "${VAR:-...}" bash would end the expansion at the first
+  # closing brace of "{tenant}" and append a stray one whenever VAR is already
+  # set.
+  DEFAULT_RELAY_URL='http://127.0.0.1:7081/tenants/{tenant}'
+  CREATED_DELIVERY_DIR=""
+  if [ -z "${OPENFLOWS_RUNTIME_DELIVERY_DIR:-}" ]; then
+    CREATED_DELIVERY_DIR="$(mktemp -d)"
+    trap 'rm -rf "$CREATED_DELIVERY_DIR"' EXIT
+  fi
+  RUNTIME_DELIVERY_DIR="${OPENFLOWS_RUNTIME_DELIVERY_DIR:-$CREATED_DELIVERY_DIR}"
+  OPENFLOWS_TEST_DATABASE_URL="$TEST_DB_URL" \
+    OPENFLOWS_RUNTIME_RELAY_BASE_URL="${OPENFLOWS_RUNTIME_RELAY_BASE_URL:-$DEFAULT_RELAY_URL}" \
+    OPENFLOWS_RUNTIME_DELIVERY_DIR="$RUNTIME_DELIVERY_DIR" \
+    cargo test --locked --test tenant_runtime --test runtime_delivery --test backend_collision_and_pinning --test backend_release_selection -- --ignored --test-threads=4
   cargo test --locked --test ready --test health
 )
 

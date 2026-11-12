@@ -6,7 +6,8 @@ from urllib.parse import parse_qs, urlsplit
 from git_repository import Repository, git
 
 TOKENS = {'ci-forge-token': 'forge', 'ci-sentinel-token': 'sentinel',
-    'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator'}
+    'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator',
+    'ci-reviewer-token': 'reviewer'}
 
 
 class GitHub:
@@ -108,7 +109,7 @@ class GitHub:
                     return 200, self.page(comments, query)
         if route == ['pulls']:
             if method == 'POST':
-                self.require_role(role, ['forge', 'vessel'])
+                self.require_role(role, ['forge', 'vessel', 'operator'])
                 head, base = body['head'], body['base']
                 if head == base:
                     self.fail(422, 'Head and base must differ')
@@ -124,8 +125,12 @@ class GitHub:
                 return 201, pr
             if method == 'GET':
                 state = query.get('state', ['open'])[0]
+                head = query.get('head', [None])[0]
+                base = query.get('base', [None])[0]
                 return 200, self.page([self.pull(n) for n, pr in self.pulls.items()
-                    if state == 'all' or pr['state'] == state], query)
+                    if (state == 'all' or pr['state'] == state) and
+                    (head is None or head == 'test:' + pr['head']['ref']) and
+                    (base is None or base == pr['base']['ref'])], query)
         if len(route) >= 2 and route[0] == 'pulls':
             number = int(route[1])
             pr = self.pull(number)
@@ -136,7 +141,7 @@ class GitHub:
                 if method == 'GET':
                     return 200, self.page(reviews, query)
                 if method == 'POST':
-                    self.require_role(role, ['sentinel', 'operator', 'vessel'])
+                    self.require_role(role, ['sentinel', 'operator', 'vessel', 'reviewer'])
                     states = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED'}
                     if body.get('event') not in states or body.get('comments'):
                         self.fail(422, 'Unsupported review event or inline comments')
@@ -150,11 +155,13 @@ class GitHub:
                         'submitted_at': datetime.now(timezone.utc).isoformat()}
                     reviews.append(review)
                     return 201, review
+            if route[2:] == ['files'] and method == 'GET':
+                return 200, self.page(self.repo.changed_files(pr['base']['sha'], pr['head']['sha']), query)
             if route[2:] == ['comments'] and method == 'GET':
                 # Inline review creation is unsupported, so this collection is empty.
                 return 200, []
             if route[2:] == ['merge'] and method == 'PUT':
-                self.require_role(role, ['vessel'])
+                self.require_role(role, ['vessel', 'operator'])
                 if pr['merged'] or pr['state'] != 'open':
                     self.fail(405, 'PR is not open')
                 sha = pr['head']['sha']
@@ -177,6 +184,20 @@ class GitHub:
                     body.get('commit_title') or f'Merge PR #{number}', body['merge_method'])
                 pr.update(state='closed', merged=True, merge_commit_sha=merged)
                 return 200, {'merged': True, 'sha': merged, 'message': 'Real Git merge completed'}
+        if method == 'GET' and route[:3] == ['git', 'ref', 'heads'] and len(route) > 3:
+            branch = '/'.join(route[3:])
+            try:
+                sha = self.repo.head(branch)
+            except subprocess.CalledProcessError:
+                self.fail(404, 'Not Found')
+            return 200, {'ref': f'refs/heads/{branch}', 'object': {'sha': sha, 'type': 'commit'}}
+        if method == 'GET' and route[:1] == ['compare'] and len(route) > 1:
+            base, _, head = '/'.join(route[1:]).partition('...')
+            try:
+                files = self.repo.changed_files(base, head)
+            except (subprocess.CalledProcessError, ValueError):
+                self.fail(404, 'Not Found')
+            return 200, {'status': 'ahead' if files else 'identical', 'files': files}
         if route == ['check-runs'] and method == 'POST':
             self.require_role(role, ['ci'])
             sha = body['head_sha']

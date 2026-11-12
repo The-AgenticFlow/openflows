@@ -14,6 +14,8 @@ RUN cargo fetch
 
 RUN cargo build --release --bin openflows-manager
 
+FROM docker:27-cli AS docker-cli
+
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,6 +26,7 @@ RUN groupadd -r openflows && useradd -r -g openflows -m -d /home/openflows openf
 
 COPY --from=builder /app/target/release/openflows-manager /usr/local/bin/openflows-manager
 COPY --from=builder /app/crates/coder-client/templates /opt/openflows/templates
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
 USER openflows
 WORKDIR /home/openflows

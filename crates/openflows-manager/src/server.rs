@@ -146,17 +146,10 @@ pub async fn resolve_secret_provider(
 ) -> Result<Box<dyn crate::secrets::SecretProvider>, ManagerError> {
     match name {
         IN_MEMORY_SECRET_PROVIDER => Ok(Box::new(crate::secrets::InMemorySecretProvider::new())),
-        FILESYSTEM_SECRET_PROVIDER => {
-            let root = std::env::var("OPENFLOWS_SECRET_DIR").map_err(|_| {
-                ManagerError::Config(
-                    "filesystem secret provider requires OPENFLOWS_SECRET_DIR".into(),
-                )
-            })?;
-            Ok(Box::new(
-                crate::secrets::FilesystemSecretProvider::new(root)
-                    .map_err(|e| ManagerError::Config(e.to_string()))?,
-            ))
-        }
+        FILESYSTEM_SECRET_PROVIDER => Ok(Box::new(
+            crate::secrets::FilesystemSecretProvider::from_env()
+                .map_err(|e| ManagerError::Config(e.to_string()))?,
+        )),
         AWS_SECRETS_MANAGER_SECRET_PROVIDER => {
             let prefix = std::env::var("OPENFLOWS_AWS_SECRETS_PREFIX").map_err(|_| {
                 ManagerError::Config(
@@ -592,17 +585,24 @@ impl ManagerServices {
                     std::sync::Arc::new(crate::runtime::redis::InMemoryRedisIsolation::default())
                 }
             };
+        let delivery = crate::runtime::delivery::resolve_delivery(
+            &config.provisioner_backend,
+            &config.secret_provider,
+        )
+        .await?;
         services.tenant_runtime = crate::runtime::tenant::TenantRuntimeRepository::with_backends(
             services.db.pool().clone(),
             provider.clone(),
             redis_isolation,
-        );
+        )
+        .with_delivery(delivery.clone());
         services.tenant_runtime.restore_redis_credentials().await?;
         services.runtime_credentials =
             crate::runtime::RuntimeCredentialService::with_secret_provider(
                 services.runtime_repo.clone(),
                 provider.clone(),
-            );
+            )
+            .with_delivery(delivery);
         // Bind the operator-configured tenant limits (platform-operator
         // configuration) into the central quota service.
         services.quotas = crate::quotas::TenantQuotaService::new(
@@ -743,6 +743,7 @@ impl ManagerServices {
             .approve_configured_release(release_id)
             .await?;
 
+        let target = crate::provisioning::release_target(&config.provisioner_backend, config.mode)?;
         let worker = crate::provisioning::OrgProvisionWorker::new(
             self.db.pool().clone(),
             self.organizations.clone(),
@@ -754,10 +755,8 @@ impl ManagerServices {
             config.provisioner_backend.clone(),
             config.coder_version_baseline.clone(),
         );
-        self.org_provision = Some(worker);
+        self.org_provision = Some(worker.with_compatibility_target(target.clone()));
 
-        // Durable tenant-provisioning worker sharing the same platform Coder
-        // adapter, quota service, and tenant runtime repository.
         let tenant_worker = crate::provisioning::TenantProvisionWorker::new(
             self.db.pool().clone(),
             self.organizations.clone(),
@@ -767,6 +766,7 @@ impl ManagerServices {
             self.release_repo.clone(),
             adapter,
         )
+        .with_compatibility_target(target)
         .with_runtime_endpoints(
             crate::config::runtime_manager_url(&config.auth.public_url)
                 .map_err(crate::error::ManagerError::Config)?,
@@ -897,6 +897,7 @@ pub struct AppState {
     /// Database-backed services, present only when a control-plane database is
     /// configured. `None` in pure-local test mode.
     services: Option<Arc<ManagerServices>>,
+    local_github: Option<Arc<crate::auth::local_credentials::LocalCredentials>>,
 }
 
 impl AppState {
@@ -944,11 +945,29 @@ impl AppState {
             store: store.clone(),
         });
 
+        let local_github = if config.mode == crate::config::Mode::Local
+            && config.connected_local_enabled
+            && !config.auth.client_id.trim().is_empty()
+        {
+            let github = Arc::new(
+                crate::auth::local_github::LocalGithubAuth::new(config.auth.client_id.clone())?
+                    .with_api_base(config.auth.github_api_base.clone()),
+            );
+            let credentials = crate::auth::local_credentials::LocalCredentials::new(
+                crate::auth::local_credentials::credential_path_from_env()?,
+                github,
+            )?;
+            Some(Arc::new(credentials))
+        } else {
+            None
+        };
+
         Ok(Self {
             store,
             readiness,
             config,
             services,
+            local_github,
         })
     }
 
@@ -966,7 +985,33 @@ impl AppState {
             readiness,
             config,
             services: None,
+            local_github: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_local_github_for_tests(
+        store: SharedStore,
+        credential_path: std::path::PathBuf,
+        github: Arc<crate::auth::local_github::LocalGithubAuth>,
+        app_slug: &str,
+    ) -> Result<Self, ManagerError> {
+        let readiness = Arc::new(StoreReadiness {
+            store: store.clone(),
+        });
+        let mut config = crate::config::local_test_config();
+        config.connected_local_enabled = true;
+        config.auth.client_id = "test-public-client-id".into();
+        config.github_app.app_slug = Some(app_slug.into());
+        Ok(Self {
+            store,
+            readiness,
+            config,
+            services: None,
+            local_github: Some(Arc::new(
+                crate::auth::local_credentials::LocalCredentials::new(credential_path, github)?,
+            )),
+        })
     }
 
     pub fn with_readiness_check(store: SharedStore, readiness: Arc<dyn ReadinessCheck>) -> Self {
@@ -975,6 +1020,7 @@ impl AppState {
             readiness,
             config: crate::config::local_test_config(),
             services: None,
+            local_github: None,
         }
     }
 
@@ -991,6 +1037,7 @@ impl AppState {
             readiness,
             config,
             services: Some(Arc::new(services)),
+            local_github: None,
         }
     }
 
@@ -1000,6 +1047,28 @@ impl AppState {
 
     pub fn services(&self) -> Option<&Arc<ManagerServices>> {
         self.services.as_ref()
+    }
+
+    pub fn local_github(&self) -> Option<&Arc<crate::auth::local_credentials::LocalCredentials>> {
+        self.local_github.as_ref()
+    }
+
+    pub fn local_github_client_id(&self) -> Option<&str> {
+        self.local_github
+            .as_ref()
+            .map(|_| self.config.auth.client_id.as_str())
+    }
+
+    pub fn connected_local_enabled(&self) -> bool {
+        self.config.mode == crate::config::Mode::Local && self.config.connected_local_enabled
+    }
+
+    pub fn local_github_app_slug(&self) -> Option<&str> {
+        self.config.github_app.app_slug.as_deref()
+    }
+
+    pub fn github_api_base(&self) -> &str {
+        &self.config.auth.github_api_base
     }
 
     pub fn mode(&self) -> crate::config::Mode {
@@ -1227,6 +1296,11 @@ async fn request_context(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let is_test_console = request.uri().path() == "/";
+    // The browsable OpenAPI reference (Swagger UI) loads same-origin JS/CSS and
+    // fetches the spec from `/openapi.json`, so it needs a permissive-enough
+    // CSP scoped to this documentation route only. Every other route keeps the
+    // strict, network-restricted CSP below; no external origin is ever allowed.
+    let is_swagger_ui = request.uri().path().starts_with("/swagger-ui");
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
@@ -1273,7 +1347,12 @@ async fn request_context(
     response
         .headers_mut()
         .insert("x-content-type-options", "nosniff".parse().unwrap());
-    let csp = if is_test_console {
+    let csp = if is_swagger_ui {
+        // Scoped, same-origin-only policy for the Swagger UI documentation page.
+        // Allows the bundled UI to load its own JS/CSS and fetch `/openapi.json`
+        // from `self`; blocks all external origins.
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+    } else if is_test_console {
         "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     } else {
         "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"

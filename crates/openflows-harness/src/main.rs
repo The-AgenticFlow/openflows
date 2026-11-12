@@ -26,6 +26,25 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ArtifactAction {
+    /// Fetch, verify and install the workspace artifact bundle
+    Fetch {
+        /// Directory to install the artifacts tree into
+        #[arg(long)]
+        dir: PathBuf,
+        /// Manager base URL (defaults to OF_MANAGER_URL)
+        #[arg(long)]
+        manager_url: Option<String>,
+        /// Runtime access token (defaults to OF_RUNTIME_ACCESS_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// Pin a bundle digest; the Manager must serve exactly that release
+        #[arg(long)]
+        digest: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Read the task dispatch for this ticket+role
     #[command(name = "dispatch")]
@@ -63,6 +82,12 @@ enum Commands {
         #[command(subcommand)]
         action: MergeAction,
     },
+    /// Install the workspace artifact bundle served by the Manager
+    #[command(name = "artifacts")]
+    Artifacts {
+        #[command(subcommand)]
+        action: ArtifactAction,
+    },
     /// Manage heartbeat writing (daemonized)
     #[command(name = "heartbeat")]
     Heartbeat {
@@ -86,6 +111,24 @@ enum Commands {
     Verify {
         #[command(subcommand)]
         action: VerifyAction,
+    },
+    /// Post-merge documentation gate (LORE)
+    Docs {
+        #[command(subcommand)]
+        action: DocsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Print the documentation gate record for this ticket
+    Status,
+    /// Submit the pushed, clean docs branch for operator review. After the
+    /// operator approves, the controller opens and merges the docs PR.
+    Submit {
+        /// Summary of the documentation changes for the operator
+        #[arg(long)]
+        report: PathBuf,
     },
 }
 
@@ -479,6 +522,34 @@ async fn main() -> Result<()> {
         } => {
             store.gate_status(&ticket, &phase).await?;
         }
+        Commands::Artifacts { action } => match action {
+            ArtifactAction::Fetch {
+                dir,
+                manager_url,
+                token,
+                digest,
+            } => {
+                let manager_url = manager_url
+                    .or_else(|| std::env::var("OF_MANAGER_URL").ok())
+                    .context("--manager-url or OF_MANAGER_URL is required")?;
+                let token = token
+                    .or_else(|| std::env::var("OF_RUNTIME_ACCESS_TOKEN").ok())
+                    .context("--token or OF_RUNTIME_ACCESS_TOKEN is required")?;
+                let installed = openflows_harness::artifacts::fetch(
+                    &manager_url,
+                    &token,
+                    digest.as_deref(),
+                    &dir,
+                )
+                .await?;
+                println!(
+                    "installed {} artifacts ({}) into {}",
+                    installed.files,
+                    installed.digest,
+                    dir.display()
+                );
+            }
+        },
         Commands::Verify {
             action:
                 VerifyAction::Request {
@@ -512,6 +583,16 @@ async fn main() -> Result<()> {
             action: VerifyAction::List { pair_id },
         } => {
             store.verify_list(pair_id.as_deref()).await?;
+        }
+        Commands::Docs {
+            action: DocsAction::Status,
+        } => {
+            store.docs_status(&ticket).await?;
+        }
+        Commands::Docs {
+            action: DocsAction::Submit { report },
+        } => {
+            store.docs_submit(&ticket, &role, &report).await?;
         }
     }
 

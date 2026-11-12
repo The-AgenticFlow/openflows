@@ -17,7 +17,7 @@ All production operations use `./scripts/prod.sh`:
 
 - Creates admin user in Coder (if not exists)
 - Pushes Coder templates (nexus, forge, etc.)
-- Verifies LLM and GitHub external auth are configured
+- Verifies LLM configuration; local GitHub access comes from the Manager
 
 ### `tenant` — Add a Team
 

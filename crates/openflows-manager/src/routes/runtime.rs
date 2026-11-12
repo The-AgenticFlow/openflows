@@ -116,10 +116,54 @@ pub async fn github_credentials(
     let purpose = RuntimePurpose::parse(&body.purpose)?;
     let request_id = crate::routes::organizations::request_id(&headers);
 
-    let credential = services
-        .broker
-        .exchange(&scope, purpose, &request_id)
-        .await?;
+    let credential = if state.connected_local_enabled() {
+        let local = state.local_github().ok_or_else(|| {
+            ManagerError::api(
+                "SERVICE_UNAVAILABLE",
+                "connected-local GitHub credentials are unavailable",
+            )
+        })?;
+        let token = local.access_token().await?;
+        let repository: String = sqlx::query_scalar(
+            "SELECT full_name FROM github_repositories
+             WHERE organization_id = $1 AND github_repository_id = $2 AND accessible = true",
+        )
+        .bind(scope.organization_id.0)
+        .bind(scope.repository_id)
+        .fetch_optional(services.db.pool())
+        .await?
+        .ok_or_else(|| ManagerError::not_found("GitHub repository"))?;
+        let github = crate::auth::local_github::LocalGithubAuth::new(
+            state
+                .local_github_client_id()
+                .ok_or_else(|| {
+                    ManagerError::api("SERVICE_UNAVAILABLE", "local GitHub broker is unavailable")
+                })?
+                .to_owned(),
+        )?
+        .with_api_base(state.github_api_base().to_owned());
+        if !github
+            .accessible_repository(&token, &repository)
+            .await?
+            .is_some_and(|repo| {
+                repo.id == scope.repository_id && repo.full_name.eq_ignore_ascii_case(&repository)
+            })
+        {
+            return Err(ManagerError::not_found("GitHub repository"));
+        }
+        crate::runtime::broker::BrokerCredential {
+            token,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            repository_id: scope.repository_id,
+            username: "x-access-token".into(),
+            permissions: std::collections::BTreeMap::new(),
+        }
+    } else {
+        services
+            .broker
+            .exchange(&scope, purpose, &request_id)
+            .await?
+    };
 
     let body = BrokerResponse {
         token: credential.token,

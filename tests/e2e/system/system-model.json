@@ -19,12 +19,16 @@
     ],
     "turn_contains": [
       "You are the **forge** agent.",
+      "Review rejected:",
       "Review gates passed.",
       "SENTINEL approved plan revision",
       "Testing review gates passed",
+      "/ci_fix\nstate: ci_failed",
+      "/address_review\nstate: changes_requested",
       "Review plan revision",
       "Testing review for",
-      "## PR Review \u2014 Ticket"
+      "## PR Review \u2014 Ticket",
+      "Document merged ticket"
     ],
     "routes": [
       {
@@ -41,17 +45,138 @@
           {
             "tool": "write_file",
             "arguments": {
-              "path": "{chat_plan}",
-              "content": "# Plan\nChange answer.txt from 41 to 42.\nAcceptance: run the fixed requirement 42 at the exact committed head through A2A.\nPreserve the CI workflow and acceptance oracle.\n"
+              "path": "/home/coder/workspace/answer.txt",
+              "content": "42\n"
             },
             "requires": {
               "contains": "41"
             }
           },
           {
+            "tool": "write_file",
+            "arguments": {
+              "path": "{chat_plan}",
+              "content": "# Plan (Draft Revision 1)\nInspect answer.txt before choosing the final value.\n"
+            },
+            "requires": {
+              "contains": "source modifications require an approved plan"
+            }
+          },
+          {
             "tool": "execute",
             "arguments": {
               "command": "openflows-harness plan write --file {chat_plan} && openflows-harness status set plan_ready",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Submitted draft plan revision 1; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "Review plan revision 1 for",
+          "T-001"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness plan read; openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/review.md",
+              "content": "# Plan Review\nPLAN_REJECTED_REV_1: specify changing answer.txt from 41 to 42 and exact-head A2A verification.\n"
+            },
+            "requires": {
+              "contains": "Draft Revision 1"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness gate decide --phase plan_ready --revision {revision} --round {round} --verdict reject --report /home/coder/workspace/review.md",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Rejected incomplete plan revision 1; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "Review rejected:",
+          "PLAN_REJECTED_REV_1"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}' && openflows-harness status set planning",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "{chat_plan}",
+              "content": "# Plan\nChange answer.txt from 41 to 42.\nAcceptance: run the fixed requirement 42 at the exact committed head through A2A.\nPreserve the CI workflow and acceptance oracle.\n"
+            },
+            "requires": {
+              "contains": "plan_rejected"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness plan write --file {chat_plan} && openflows-harness status set plan_ready",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Submitted revised plan revision 2; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "Review plan revision 2 for",
+          "T-001"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness plan read; openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/review.md",
+              "content": "# Review\nThe approved plan requires 42. Exact-head A2A verification is required before submit.\n"
+            },
+            "requires": {
+              "contains": "42"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "(! openflows-harness gate decide --phase plan_ready --revision 1 --round {round} --verdict approve --report /home/coder/workspace/review.md) && (! openflows-harness gate decide --phase plan_ready --revision {revision} --round 1 --verdict approve --report /home/coder/workspace/review.md) && openflows-harness gate decide --phase plan_ready --revision {revision} --round {round} --verdict approve --report /home/coder/workspace/review.md",
               "workdir": "/home/coder/workspace",
               "timeout": "2m"
             }
@@ -79,10 +204,95 @@
             "tool": "write_file",
             "arguments": {
               "path": "/home/coder/workspace/answer.txt",
-              "content": "42\n"
+              "content": "40\n"
             },
             "requires": {
               "contains": "42"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "python3 /opt/openflows-e2e/prepare_http.py && git add answer.txt && git commit -m 'wip: initial candidate 40' && openflows-harness status set testing",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Committed initial candidate 40; waiting for the controller.",
+            "requires": {
+              "contains": "wip: initial candidate 40"
+            }
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "Testing review for T-001",
+          "--round 3"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness plan read; openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness verify request --timeout-secs 60 --expect-exit 0 -- sh /opt/openflows-e2e/acceptance.sh || true",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/review.md",
+              "content": "# Testing Review\nTESTING_REJECTED_ROUND_3: A2A verification failed because answer.txt is 40 instead of 42.\n"
+            },
+            "requires": {
+              "contains": "\"exit_code\": 1"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "(! openflows-harness gate decide --phase testing --revision {revision} --round {round} --head {head} --verdict approve --report /home/coder/workspace/review.md) && openflows-harness gate decide --phase testing --revision {revision} --round {round} --head {head} --verdict reject --report /home/coder/workspace/review.md",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Rejected failing candidate in testing; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "Review rejected:",
+          "TESTING_REJECTED_ROUND_3"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'; openflows-harness plan read",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/answer.txt",
+              "content": "42\n"
+            },
+            "requires": {
+              "contains": "building"
             }
           },
           {
@@ -142,41 +352,107 @@
         ]
       },
       {
-        "contains": "Review plan revision",
+        "contains_all": [
+          "/ci_fix",
+          "state: ci_failed"
+        ],
         "steps": [
           {
             "tool": "execute",
             "arguments": {
-              "command": "openflows-harness plan read; openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'",
+              "command": "openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'; git branch --show-current",
               "workdir": "/home/coder/workspace",
               "timeout": "2m"
-            }
-          },
-          {
-            "tool": "write_file",
-            "arguments": {
-              "path": "/home/coder/workspace/review.md",
-              "content": "# Review\nThe approved plan requires 42. Exact-head A2A verification is required before submit.\n"
-            },
-            "requires": {
-              "contains": "42"
             }
           },
           {
             "tool": "execute",
             "arguments": {
-              "command": "openflows-harness gate decide --phase plan_ready --revision {revision} --round {round} --verdict approve --report /home/coder/workspace/review.md",
+              "command": "python3 /opt/openflows-e2e/prepare_http.py && git commit --allow-empty -m 'fix: resolve ci failure on PR' && git push origin HEAD && openflows-harness status set testing",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            },
+            "requires": {
+              "contains": "building"
+            }
+          },
+          {
+            "text": "Pushed CI fix commit and returned to testing.",
+            "requires": {
+              "contains": "fix: resolve ci failure on PR"
+            }
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "/address_review",
+          "REQUEST_CHANGES_ROUND_1"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'; git branch --show-current",
               "workdir": "/home/coder/workspace",
               "timeout": "2m"
             }
           },
           {
-            "text": "Completed this step; waiting for the controller."
+            "tool": "execute",
+            "arguments": {
+              "command": "python3 /opt/openflows-e2e/prepare_http.py && git commit --allow-empty -m 'fix: address human review round 1' && git push origin HEAD && openflows-harness status set testing",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            },
+            "requires": {
+              "contains": "building"
+            }
+          },
+          {
+            "text": "Pushed rework commit for human review round 1 and returned to testing.",
+            "requires": {
+              "contains": "fix: address human review round 1"
+            }
+          }
+        ]
+      },
+      {
+        "contains_all": [
+          "/address_review",
+          "REQUEST_CHANGES_ROUND_2"
+        ],
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness status get | jq -c '{phase, revision, review_round, head, pr_number}'; git branch --show-current",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "python3 /opt/openflows-e2e/prepare_http.py && git commit --allow-empty -m 'fix: address human review round 2' && git push origin HEAD && openflows-harness status set testing",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            },
+            "requires": {
+              "contains": "building"
+            }
+          },
+          {
+            "text": "Pushed rework commit for human review round 2 and returned to testing.",
+            "requires": {
+              "contains": "fix: address human review round 2"
+            }
           }
         ]
       },
       {
         "contains": "Testing review for",
+        "not_contains": "--round 3",
         "steps": [
           {
             "tool": "execute",
@@ -207,7 +483,7 @@
           {
             "tool": "execute",
             "arguments": {
-              "command": "openflows-harness gate decide --phase testing --revision {revision} --round {round} --head {head} --verdict approve --report /home/coder/workspace/review.md",
+              "command": "(! openflows-harness gate decide --phase testing --revision {revision} --round {round} --head 0000000000000000000000000000000000000000 --verdict approve --report /home/coder/workspace/review.md) && (! openflows-harness gate decide --phase testing --revision {revision} --round 1 --head {head} --verdict approve --report /home/coder/workspace/review.md) && openflows-harness gate decide --phase testing --revision {revision} --round {round} --head {head} --verdict approve --report /home/coder/workspace/review.md",
               "workdir": "/home/coder/workspace",
               "timeout": "2m"
             }
@@ -241,13 +517,50 @@
           {
             "tool": "execute",
             "arguments": {
-              "command": "openflows-harness review submit --revision {revision} --round {round} --head {head} --verdict approve --report /home/coder/workspace/review.md",
+              "command": "(! openflows-harness review submit --revision {revision} --round {round} --head 0000000000000000000000000000000000000000 --verdict approve --report /home/coder/workspace/review.md) && openflows-harness review submit --revision {revision} --round {round} --head {head} --verdict approve --report /home/coder/workspace/review.md",
               "workdir": "/home/coder/workspace",
               "timeout": "2m"
             }
           },
           {
             "text": "Completed this step; waiting for the controller."
+          }
+        ]
+      },
+      {
+        "contains": "Document merged ticket T-001",
+        "steps": [
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "openflows-harness dispatch read; openflows-harness docs status; git fetch origin && git checkout -B lore/T-001 origin/main && git branch --show-current && cat answer.txt",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "tool": "write_file",
+            "arguments": {
+              "path": "/home/coder/workspace/CHANGELOG.md",
+              "content": "# Changelog\n\n## Unreleased\n\n- T-001: answer.txt now returns 42 (LORE_DOCS_T001).\n"
+            },
+            "requires": {
+              "contains": "lore/T-001"
+            }
+          },
+          {
+            "tool": "execute",
+            "arguments": {
+              "command": "git add CHANGELOG.md && git commit -m 'docs(T-001): record the answer fix in the changelog' && git push origin lore/T-001 && printf 'Changelog entry for T-001.\\n' > /tmp/docs-report.md && openflows-harness docs submit --report /tmp/docs-report.md",
+              "workdir": "/home/coder/workspace",
+              "timeout": "2m"
+            }
+          },
+          {
+            "text": "Submitted docs revision 1 for T-001; waiting for the operator decision.",
+            "requires": {
+              "contains": "submitted"
+            }
           }
         ]
       }

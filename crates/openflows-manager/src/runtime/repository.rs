@@ -21,6 +21,8 @@ pub const WORKSPACE_REFRESH_AUDIENCE: &str = "openflows-workspace-refresh";
 #[derive(Debug, Clone)]
 pub struct ConsumedBootstrap {
     pub workspace_id: WorkspaceId,
+    pub organization_id: crate::id::OrganizationId,
+    pub tenant_id: crate::id::TenantId,
     pub generation: i64,
     pub bootstrap_secret_ref: String,
     pub runtime_secret_ref: Option<String>,
@@ -204,8 +206,16 @@ impl RuntimeRepository {
         family_expires_at: DateTime<Utc>,
     ) -> Result<Option<ConsumedBootstrap>, ManagerError> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<(uuid::Uuid, i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT b.workspace_id, w.credential_generation, b.secret_ref, w.runtime_secret_ref
+        let row: Option<(
+            uuid::Uuid,
+            i64,
+            String,
+            Option<String>,
+            uuid::Uuid,
+            uuid::Uuid,
+        )> = sqlx::query_as(
+            "SELECT b.workspace_id, w.credential_generation, b.secret_ref, w.runtime_secret_ref,
+                    w.organization_id, w.tenant_id
                FROM workspace_bootstrap_credentials b
                JOIN workspaces w ON w.id = b.workspace_id
                JOIN tenants t ON t.id = w.tenant_id AND t.organization_id = w.organization_id
@@ -218,7 +228,15 @@ impl RuntimeRepository {
         .bind(bootstrap_hash)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((workspace_id, generation, bootstrap_secret_ref, runtime_secret_ref)) = row else {
+        let Some((
+            workspace_id,
+            generation,
+            bootstrap_secret_ref,
+            runtime_secret_ref,
+            organization_id,
+            tenant_id,
+        )) = row
+        else {
             tx.rollback().await?;
             return Ok(None);
         };
@@ -270,6 +288,8 @@ impl RuntimeRepository {
         tx.commit().await?;
         Ok(Some(ConsumedBootstrap {
             workspace_id: WorkspaceId::from_uuid(workspace_id),
+            organization_id: crate::id::OrganizationId::from_uuid(organization_id),
+            tenant_id: crate::id::TenantId::from_uuid(tenant_id),
             generation,
             bootstrap_secret_ref,
             runtime_secret_ref,

@@ -306,6 +306,28 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn nullable_agent_status<'de, D>(deserializer: D) -> Result<AgentStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<AgentStatus>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn nullable_agent_lifecycle_state<'de, D>(deserializer: D) -> Result<AgentLifecycleState, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<AgentLifecycleState>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// A Coder workspace used to parse explicit-org/owner/version responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "CoderWorkspaceDetailWire")]
@@ -498,7 +520,7 @@ pub struct CoderWorkspace {
     pub name: String,
     #[serde(default)]
     pub owner_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub status: String,
     #[serde(default)]
     pub latest_build: Option<WorkspaceBuild>,
@@ -627,18 +649,18 @@ impl WorkspaceStatus {
 /// A workspace build (status info).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceBuild {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub status: String,
     #[serde(default)]
     pub transition: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub resources: Vec<WorkspaceResource>,
 }
 
 /// A workspace resource (e.g., docker_container) containing agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceResource {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_vec")]
     pub agents: Vec<WorkspaceAgent>,
 }
 
@@ -647,9 +669,9 @@ pub struct WorkspaceResource {
 pub struct WorkspaceAgent {
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_agent_status")]
     pub status: AgentStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_agent_lifecycle_state")]
     pub lifecycle_state: AgentLifecycleState,
 }
 
@@ -824,9 +846,26 @@ pub struct Chat {
     /// Labels applied at creation time (e.g. ticket, role, flow).
     #[serde(default)]
     pub labels: serde_json::Map<String, serde_json::Value>,
+    /// Coder's structured failure for a chat in `error` status
+    /// (`{message, detail, kind, provider, retryable, status_code}`). The
+    /// `detail` text comes from the upstream provider and may contain account
+    /// identifiers, so consumers must map `kind` to their own safe wording and
+    /// never forward it.
+    #[serde(default)]
+    pub last_error: Option<serde_json::Value>,
 }
 
 impl Chat {
+    /// The provider-independent failure kind (for example `usage_limit`), if any.
+    pub fn error_kind(&self) -> Option<&str> {
+        self.last_error.as_ref()?.get("kind")?.as_str()
+    }
+
+    /// Whether Coder considers the failure worth retrying.
+    pub fn error_retryable(&self) -> Option<bool> {
+        self.last_error.as_ref()?.get("retryable")?.as_bool()
+    }
+
     /// Get the parsed status enum.
     pub fn status(&self) -> ChatStatus {
         ChatStatus::parse_from_str(&self.status_raw)
@@ -938,130 +977,29 @@ pub fn build_chat_labels(
     map
 }
 
-// ── External-auth (GitHub link) types ────────────────────────────────────
-
-/// One entry of `GET /api/v2/external-auth`: whether the current token's user
-/// has linked the given provider.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExternalAuthLink {
-    #[serde(default)]
-    pub authenticated: bool,
-    #[serde(default, rename = "provider_id")]
-    pub provider_id: String,
-}
-
-/// Link status for one provider from `GET /api/v2/external-auth/{externalauth}`.
-/// `authenticated` is the grant check; `app_install_url`/`user` guide linking.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExternalAuth {
-    #[serde(default)]
-    pub authenticated: bool,
-    #[serde(default, rename = "has_refresh_token")]
-    pub has_refresh_token: bool,
-    #[serde(default, rename = "app_install_url")]
-    pub app_install_url: String,
-    #[serde(default)]
-    pub user: Option<ExternalAuthUser>,
-}
-
-/// The GitHub user linked to a provider (nested in [`ExternalAuth`]).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExternalAuthUser {
-    #[serde(default)]
-    pub login: String,
-}
-
-/// Device-flow initiation result from `POST /api/v2/external-auth/{externalauth}/device`.
-///
-/// The user completes the link by visiting `verification_uri` and entering
-/// `user_code` (or opening `verification_uri_complete` directly); the caller
-/// polls `GET /api/v2/external-auth/{externalauth}` until `authenticated`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExternalAuthDevice {
-    #[serde(default, rename = "verification_uri")]
-    pub verification_uri: String,
-    #[serde(default, rename = "verification_uri_complete")]
-    pub verification_uri_complete: String,
-    #[serde(default, rename = "user_code")]
-    pub user_code: String,
-    #[serde(default, rename = "device_code")]
-    pub device_code: String,
-    #[serde(default, rename = "expires_in")]
-    pub expires_in: i64,
-    #[serde(default)]
-    pub interval: i64,
-}
-
 #[cfg(test)]
 mod external_auth_tests {
     use super::*;
 
     #[test]
-    fn deserialize_external_auth_link_list() {
-        let json = r#"[
-            {"authenticated": true, "provider_id": "primary-github"},
-            {"authenticated": false, "provider_id": "gitlab"}
-        ]"#;
-        let links: Vec<ExternalAuthLink> = serde_json::from_str(json).unwrap();
-        assert_eq!(links.len(), 2);
-        assert!(links[0].authenticated);
-        assert_eq!(links[0].provider_id, "primary-github");
-        assert!(!links[1].authenticated);
-        assert_eq!(links[1].provider_id, "gitlab");
+    fn workspace_with_null_top_level_status_uses_build_and_agent_state() {
+        let workspace: CoderWorkspace = serde_json::from_str(
+            r#"{"id":"workspace-1","status":null,"latest_build":{"status":"running","resources":[{"agents":[{"status":"connected","lifecycle_state":"start_error"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(workspace.is_running());
+        assert_eq!(
+            workspace.agent_lifecycle_state(),
+            AgentLifecycleState::Unknown("start_error".into())
+        );
     }
 
     #[test]
-    fn deserialize_external_auth_link_list_missing_fields() {
-        // Coder may omit provider_id/authenticated for unlinked providers.
-        let json = r#"[{"provider_id": "primary-github"}]"#;
-        let links: Vec<ExternalAuthLink> = serde_json::from_str(json).unwrap();
-        assert_eq!(links.len(), 1);
-        assert!(!links[0].authenticated);
-        assert_eq!(links[0].provider_id, "primary-github");
-    }
-
-    #[test]
-    fn deserialize_external_auth_authenticated() {
-        let json = r#"{
-            "authenticated": true,
-            "has_refresh_token": true,
-            "app_install_url": "https://github.com/apps/openflows/installations/new/abc123",
-            "user": {"login": "octocat"}
-        }"#;
-        let auth: ExternalAuth = serde_json::from_str(json).unwrap();
-        assert!(auth.authenticated);
-        assert!(auth.has_refresh_token);
-        assert!(auth.app_install_url.contains("installations/new"));
-        assert_eq!(auth.user.as_ref().unwrap().login, "octocat");
-    }
-
-    #[test]
-    fn deserialize_external_auth_unauthenticated_defaults() {
-        // Unlinked provider: no user, not authenticated.
-        let json = r#"{"authenticated": false}"#;
-        let auth: ExternalAuth = serde_json::from_str(json).unwrap();
-        assert!(!auth.authenticated);
-        assert!(!auth.has_refresh_token);
-        assert!(auth.app_install_url.is_empty());
-        assert!(auth.user.is_none());
-    }
-
-    #[test]
-    fn deserialize_external_auth_device_flow() {
-        let json = r#"{
-            "verification_uri": "https://github.com/login/device",
-            "verification_uri_complete": "https://github.com/login/device?user_code=ABCD-EFGH",
-            "user_code": "ABCD-EFGH",
-            "device_code": "device-code-123",
-            "expires_in": 900,
-            "interval": 5
-        }"#;
-        let device: ExternalAuthDevice = serde_json::from_str(json).unwrap();
-        assert_eq!(device.verification_uri, "https://github.com/login/device");
-        assert!(device.verification_uri_complete.contains("ABCD-EFGH"));
-        assert_eq!(device.user_code, "ABCD-EFGH");
-        assert_eq!(device.device_code, "device-code-123");
-        assert_eq!(device.expires_in, 900);
-        assert_eq!(device.interval, 5);
+    fn workspace_with_nullable_build_agent_fields_deserializes() {
+        let workspace: CoderWorkspace = serde_json::from_str(
+            r#"{"id":"workspace-2","status":null,"latest_build":{"status":null,"resources":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(workspace.latest_build.unwrap().status, "");
     }
 }

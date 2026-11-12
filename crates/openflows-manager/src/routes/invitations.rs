@@ -177,6 +177,66 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_default()
 }
 
+/// `GET /api/v1/invitations/preview?token=...` — what an invitation offers, for
+/// a client-rendered acceptance page. Returns the organization, the role and
+/// who invited the caller, but only to the exact GitHub identity the
+/// invitation was issued to and only while it is still usable. Every other
+/// case (wrong account, used, revoked, expired, unknown token) is the same 404,
+/// so the endpoint cannot be used to probe tokens or learn organization names.
+/// It accepts nothing.
+pub async fn preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AcceptQuery>,
+) -> Result<axum::Json<serde_json::Value>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    let Some(raw_token) = q.token else {
+        return Err(ManagerError::not_found("invitation"));
+    };
+    if !services
+        .rate_limiter
+        .allow(&principal.user_id.to_string(), LimitScope::Invitation, 30)
+        .await?
+    {
+        return Err(ManagerError::api("RATE_LIMITED", "too many attempts").retryable(true));
+    }
+    let token_hash = crate::auth::crypto::hash_token(&raw_token);
+    let inv = services
+        .org_repo
+        .invitation_by_token(&token_hash)
+        .await?
+        .ok_or_else(|| ManagerError::not_found("invitation"))?;
+    let subject = services.users.github_subject(principal.user_id).await?;
+    if subject != Some(inv.invitee_github_user_id)
+        || inv.accepted_at.is_some()
+        || inv.revoked_at.is_some()
+        || inv.expires_at <= chrono::Utc::now()
+    {
+        return Err(ManagerError::not_found("invitation"));
+    }
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT o.slug, o.display_name,
+                (SELECT u.display_name FROM invitations i JOIN users u ON u.id = i.invited_by
+                  WHERE i.id = $2)
+           FROM organizations o WHERE o.id = $1 AND o.status IN ('ready', 'provisioning')",
+    )
+    .bind(inv.organization_id.0)
+    .bind(inv.id.0)
+    .fetch_optional(&services.orgs_service.pool)
+    .await?;
+    let (slug, display_name, invited_by) =
+        row.ok_or_else(|| ManagerError::not_found("invitation"))?;
+    Ok(axum::Json(serde_json::json!({
+        "organization": {"slug": slug, "display_name": display_name},
+        "role": inv.role.to_string(),
+        "invited_by": invited_by,
+        "expires_at": inv.expires_at,
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct AcceptJson {
     pub token: String,
