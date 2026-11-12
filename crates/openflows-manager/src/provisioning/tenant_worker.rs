@@ -513,6 +513,15 @@ impl TenantProvisionWorker {
             &self.compatibility_target,
         )
         .await?;
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            guard.organization_id,
+            tenant_id,
+            workspace_id,
+            &spec,
+        )
+        .await?;
         let runtime_secret_ref = self
             .ensure_workspace_runtime_secret(
                 guard.organization_id,
@@ -661,15 +670,6 @@ impl TenantProvisionWorker {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        super::selection::record_workspace_and_tenant_pin(
-            &self.pool,
-            &self.release_repo,
-            guard.organization_id,
-            tenant_id,
-            workspace_id,
-            &spec,
-        )
-        .await?;
         if self
             .adapter
             .wait_workspace_ready(&org, &created.id)
@@ -960,6 +960,15 @@ impl TenantProvisionWorker {
                 ));
             }
         };
+        super::selection::record_workspace_and_tenant_pin(
+            &self.pool,
+            &self.release_repo,
+            org_id,
+            tenant_id,
+            nexus_ws,
+            &spec,
+        )
+        .await?;
         // Coder workspace names are limited and must be lowercase. Keep the
         // name deterministic for retry adoption while staying within Coder's
         // 32-character limit.
@@ -1035,15 +1044,6 @@ impl TenantProvisionWorker {
         self.tenant_runtime
             .set_coder_workspace_id(nexus_ws, &created.id)
             .await?;
-        super::selection::record_workspace_and_tenant_pin(
-            &self.pool,
-            &self.release_repo,
-            org_id,
-            tenant_id,
-            nexus_ws,
-            &spec,
-        )
-        .await?;
 
         // Wait for build success + agent connection (bounded).
         if !guard.set_step(step::WAIT_NEXUS).await? {

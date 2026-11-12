@@ -686,31 +686,85 @@ impl ReleaseRepository {
             .map_err(ManagerError::from)?;
         }
 
-        let affected = sqlx::query(
-            "UPDATE workspaces
-                SET pinned_release_id = $3,
-                    pinned_backend = $4,
-                    pinned_version_id = COALESCE($5, pinned_version_id),
-                    updated_at = now()
-              WHERE organization_id = $1
-                AND id = $2
-                AND (pinned_backend IS NULL OR pinned_backend = $4::text)
-                AND (pinned_version_id IS NULL OR pinned_backend IS NOT NULL OR $4::text = 'docker')",
+        let ws_row: Option<(Option<uuid::Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT pinned_release_id, pinned_backend, pinned_version_id
+               FROM workspaces
+              WHERE organization_id = $1 AND tenant_id = $2 AND id = $3
+              FOR UPDATE",
         )
         .bind(organization_id.0)
+        .bind(tenant_id.0)
         .bind(workspace_id.0)
-        .bind(release_id.0)
-        .bind(backend.as_str())
-        .bind(version_id)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(ManagerError::from)?
-        .rows_affected();
-        if affected != 1 {
+        .map_err(ManagerError::from)?;
+
+        let Some((ws_release_uuid, ws_backend_str, ws_version)) = ws_row else {
             return Err(ManagerError::api(
                 crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
-                "workspace is pinned to a different backend",
+                "workspace does not belong to tenant or organization",
             ));
+        };
+        let ws_release = ws_release_uuid.map(ReleaseId::from_uuid);
+        let ws_backend = ws_backend_str
+            .map(|b| {
+                b.parse::<ProvisionerBackend>().map_err(|_| {
+                    ManagerError::Service(anyhow::anyhow!(
+                        "unknown workspace pinned_backend in database: {b}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // Any legacy workspace with an existing release or version pin and NULL
+        // backend belongs to Docker.
+        let ws_effective_backend = ws_backend.or_else(|| {
+            (ws_release.is_some() || ws_version.is_some()).then_some(ProvisionerBackend::Docker)
+        });
+        if let Some(pinned_ws_backend) = ws_effective_backend {
+            if pinned_ws_backend != backend {
+                return Err(ManagerError::api(
+                    crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                    format!(
+                        "workspace is pinned to backend '{}' and cannot use '{}'",
+                        pinned_ws_backend, backend
+                    ),
+                ));
+            }
+        }
+        if let Some(pinned_ws_release) = ws_release {
+            if pinned_ws_release != release_id {
+                return Err(ManagerError::api(
+                    crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                    "workspace is pinned to a different release",
+                ));
+            }
+        }
+        if ws_version.as_deref().is_some_and(|v| v != version_id) {
+            return Err(ManagerError::api(
+                crate::provisioning::tenant_worker::err::RELEASE_NOT_RESOLVED,
+                "workspace is pinned to a different Coder template version",
+            ));
+        }
+
+        if ws_release.is_none() || ws_backend.is_none() || ws_version.is_none() {
+            sqlx::query(
+                "UPDATE workspaces
+                    SET pinned_release_id = COALESCE(pinned_release_id, $4),
+                        pinned_backend = COALESCE(pinned_backend, $5),
+                        pinned_version_id = COALESCE(pinned_version_id, $6),
+                        updated_at = now()
+                  WHERE organization_id = $1 AND tenant_id = $2 AND id = $3",
+            )
+            .bind(organization_id.0)
+            .bind(tenant_id.0)
+            .bind(workspace_id.0)
+            .bind(release_id.0)
+            .bind(backend.as_str())
+            .bind(version_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
         }
 
         tx.commit().await.map_err(ManagerError::from)?;

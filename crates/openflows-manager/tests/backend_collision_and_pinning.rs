@@ -220,11 +220,12 @@ async fn seed_org_with_coder(
         .execute(pool)
         .await
         .unwrap();
-    let conn = common::insert_connection(pool, org_uuid, 100)
+    let id_seq = NEXT_REPO_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let conn = common::insert_connection(pool, org_uuid, id_seq)
         .await
         .unwrap();
-    let repo_id = 200;
-    common::insert_repository(pool, org_uuid, conn, repo_id, "test/repo")
+    let repo_id = id_seq;
+    common::insert_repository(pool, org_uuid, conn, repo_id, &format!("{slug}/repo"))
         .await
         .unwrap();
     (OrganizationId::from_uuid(org_uuid), conn, repo_id)
@@ -641,6 +642,39 @@ async fn migration_0024_backfills_legacy_docker_pins_on_existing_db() {
     assert_eq!(ws_backend.as_deref(), Some("docker"));
 }
 
+async fn seed_docker_nexus_release(
+    repo: &ReleaseRepository,
+    releases: &ReleaseService,
+    org_id: OrganizationId,
+    version: &str,
+    ver_id: &str,
+    bind: bool,
+) -> ReleaseId {
+    let (artifacts, _dir) = build_dual_backend_artifacts(version);
+    let (release_id, _) = releases
+        .import_release(artifacts, &format!("local://{version}"))
+        .await
+        .unwrap();
+    repo.approve_configured_release(release_id).await.unwrap();
+    repo.upsert_org_template_version_for_backend(
+        org_id,
+        release_id,
+        ProvisionerBackend::Docker,
+        Role::Nexus,
+        "tpl-nexus",
+        ver_id,
+        &format!("job-{version}"),
+        "ready",
+        None,
+    )
+    .await
+    .unwrap();
+    if bind {
+        repo.bind_org_release(org_id, release_id).await.unwrap();
+    }
+    release_id
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn record_workspace_and_tenant_pin_rejects_stale_release_after_concurrent_pin() {
@@ -652,27 +686,8 @@ async fn record_workspace_and_tenant_pin_rejects_stale_release_after_concurrent_
 
     let (org_id, conn, repo_id) = seed_org_with_coder(pool, "race-pin-org", "race-org").await;
     let docker_target = ReleaseCompatibilityTarget::docker_default();
-
-    let (r1_artifacts, _d1) = build_dual_backend_artifacts("2026.11.4-r1");
-    let (r1_id, _) = releases
-        .import_release(r1_artifacts, "local://race-r1")
-        .await
-        .unwrap();
-    repo.approve_configured_release(r1_id).await.unwrap();
-    repo.upsert_org_template_version_for_backend(
-        org_id,
-        r1_id,
-        ProvisionerBackend::Docker,
-        Role::Nexus,
-        "tpl-nexus",
-        "ver-r1-nexus",
-        "job-r1",
-        "ready",
-        None,
-    )
-    .await
-    .unwrap();
-    repo.bind_org_release(org_id, r1_id).await.unwrap();
+    let r1_id =
+        seed_docker_nexus_release(&repo, &releases, org_id, "2026.11.4-r1", "ver-r1", true).await;
 
     let tenant_id = seed_tenant(pool, org_id, conn, repo_id, "race-tenant").await;
     let stale_ws = WorkspaceId::from_uuid(
@@ -690,26 +705,8 @@ async fn record_workspace_and_tenant_pin_rejects_stale_release_after_concurrent_
     assert_eq!(r1_spec.release_id, r1_id);
 
     // Org is promoted to R2 and Request 2 wins the tenant pin for R2.
-    let (r2_artifacts, _d2) = build_dual_backend_artifacts("2026.11.4-r2");
-    let (r2_id, _) = releases
-        .import_release(r2_artifacts, "local://race-r2")
-        .await
-        .unwrap();
-    repo.approve_configured_release(r2_id).await.unwrap();
-    repo.upsert_org_template_version_for_backend(
-        org_id,
-        r2_id,
-        ProvisionerBackend::Docker,
-        Role::Nexus,
-        "tpl-nexus",
-        "ver-r2-nexus",
-        "job-r2",
-        "ready",
-        None,
-    )
-    .await
-    .unwrap();
-    repo.bind_org_release(org_id, r2_id).await.unwrap();
+    let r2_id =
+        seed_docker_nexus_release(&repo, &releases, org_id, "2026.11.4-r2", "ver-r2", true).await;
 
     let r2_spec = resolve_nexus_release_for_tenant(pool, &repo, org_id, tenant_id, &docker_target)
         .await
@@ -749,4 +746,241 @@ async fn record_workspace_and_tenant_pin_rejects_stale_release_after_concurrent_
     record_workspace_and_tenant_pin(pool, &repo, org_id, tenant_id, worker_ws, &r2_spec)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn record_workspace_and_tenant_pin_validates_ownership_release_and_version_pins() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let repo = ReleaseRepository::new(pool.clone());
+    let releases = ReleaseService::new(pool.clone(), repo.clone());
+
+    let (org_a, conn_a, repo_a) = seed_org_with_coder(pool, "own-org-a", "own-a").await;
+    let (org_b, conn_b, repo_b) = seed_org_with_coder(pool, "own-org-b", "own-b").await;
+    let tenant_a1 = seed_tenant(pool, org_a, conn_a, repo_a, "tenant-a1").await;
+    let tenant_a2 = seed_tenant(pool, org_a, conn_a, repo_a, "tenant-a2").await;
+    let tenant_b1 = seed_tenant(pool, org_b, conn_b, repo_b, "tenant-b1").await;
+
+    let (r1_artifacts, _d1) = build_dual_backend_artifacts("2026.11.5-r1");
+    let (r1_id, _) = releases
+        .import_release(r1_artifacts, "local://own-r1")
+        .await
+        .unwrap();
+    repo.approve_configured_release(r1_id).await.unwrap();
+    let (r2_artifacts, _d2) = build_dual_backend_artifacts("2026.11.5-r2");
+    let (r2_id, _) = releases
+        .import_release(r2_artifacts, "local://own-r2")
+        .await
+        .unwrap();
+    repo.approve_configured_release(r2_id).await.unwrap();
+
+    // Workspace belonging to a different tenant in the same org must be rejected.
+    let ws_other_tenant = seed_workspace(pool, org_a, tenant_a2, None, None, None).await;
+    let err = repo
+        .record_workspace_and_tenant_pin(
+            org_a,
+            tenant_a1,
+            ws_other_tenant,
+            r1_id,
+            ProvisionerBackend::Docker,
+            "ver-r1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+
+    // Workspace belonging to a different org must be rejected.
+    let ws_other_org = seed_workspace(pool, org_b, tenant_b1, None, None, None).await;
+    let err = repo
+        .record_workspace_and_tenant_pin(
+            org_a,
+            tenant_a1,
+            ws_other_org,
+            r1_id,
+            ProvisionerBackend::Docker,
+            "ver-r1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+
+    // Legacy Docker workspace with NULL backend pin: compatible Docker claim backfills
+    // backend and is idempotent, while different release or version or Kubernetes rejects.
+    let legacy_ws = seed_workspace(
+        pool,
+        org_a,
+        tenant_a1,
+        Some("ver-legacy"),
+        None,
+        Some(r1_id),
+    )
+    .await;
+    let err = repo
+        .record_workspace_and_tenant_pin(
+            org_a,
+            tenant_a1,
+            legacy_ws,
+            r1_id,
+            ProvisionerBackend::Kubernetes,
+            "ver-legacy",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+
+    repo.record_workspace_and_tenant_pin(
+        org_a,
+        tenant_a1,
+        legacy_ws,
+        r1_id,
+        ProvisionerBackend::Docker,
+        "ver-legacy",
+    )
+    .await
+    .unwrap();
+    // Idempotent repeat succeeds.
+    repo.record_workspace_and_tenant_pin(
+        org_a,
+        tenant_a1,
+        legacy_ws,
+        r1_id,
+        ProvisionerBackend::Docker,
+        "ver-legacy",
+    )
+    .await
+    .unwrap();
+
+    // Overwriting an existing workspace version pin with a different version rejects.
+    let err = repo
+        .record_workspace_and_tenant_pin(
+            org_a,
+            tenant_a1,
+            legacy_ws,
+            r1_id,
+            ProvisionerBackend::Docker,
+            "ver-other",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+
+    // Overwriting an existing workspace release pin with a different release rejects even
+    // if the tenant itself is not yet pinned.
+    let tenant_a3 = seed_tenant(pool, org_a, conn_a, repo_a, "tenant-a3").await;
+    let ws_pinned_r1 = seed_workspace(
+        pool,
+        org_a,
+        tenant_a3,
+        Some("ver-r1"),
+        Some("docker"),
+        Some(r1_id),
+    )
+    .await;
+    let err = repo
+        .record_workspace_and_tenant_pin(
+            org_a,
+            tenant_a3,
+            ws_pinned_r1,
+            r2_id,
+            ProvisionerBackend::Docker,
+            "ver-r1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_release_claims_on_same_tenant_cannot_both_succeed() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let repo = ReleaseRepository::new(pool.clone());
+    let releases = ReleaseService::new(pool.clone(), repo.clone());
+
+    let (org_id, conn, repo_id) = seed_org_with_coder(pool, "conc-org", "conc-coder").await;
+    let docker_target = ReleaseCompatibilityTarget::docker_default();
+    let r1_id =
+        seed_docker_nexus_release(&repo, &releases, org_id, "2026.11.6-r1", "ver-c1", true).await;
+
+    let tenant_id = seed_tenant(pool, org_id, conn, repo_id, "conc-tenant").await;
+    let ws_r1 = seed_workspace(pool, org_id, tenant_id, None, None, None).await;
+    let ws_r2 = WorkspaceId::from_uuid(
+        common::insert_running_workspace(pool, org_id.0, tenant_id.0, "forge", 1)
+            .await
+            .unwrap(),
+    );
+
+    let r1_spec = resolve_nexus_release_for_tenant(pool, &repo, org_id, tenant_id, &docker_target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r1_spec.release_id, r1_id);
+
+    let r2_id =
+        seed_docker_nexus_release(&repo, &releases, org_id, "2026.11.6-r2", "ver-c2", true).await;
+
+    let r2_spec = resolve_nexus_release_for_tenant(pool, &repo, org_id, tenant_id, &docker_target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(r1_spec.release_id, r2_spec.release_id);
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let pool1 = pool.clone();
+    let repo1 = repo.clone();
+    let b1 = barrier.clone();
+    let t1 = tokio::spawn(async move {
+        b1.wait().await;
+        record_workspace_and_tenant_pin(&pool1, &repo1, org_id, tenant_id, ws_r1, &r1_spec).await
+    });
+
+    let pool2 = pool.clone();
+    let repo2 = repo.clone();
+    let b2 = barrier.clone();
+    let t2 = tokio::spawn(async move {
+        b2.wait().await;
+        record_workspace_and_tenant_pin(&pool2, &repo2, org_id, tenant_id, ws_r2, &r2_spec).await
+    });
+
+    let (res1, res2) = tokio::join!(t1, t2);
+    let res1 = res1.unwrap();
+    let res2 = res2.unwrap();
+    let (winning_release, winning_ws, losing_ws) = match (res1, res2) {
+        (Ok(()), Err(err)) => {
+            assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+            (r1_id, ws_r1, ws_r2)
+        }
+        (Err(err), Ok(())) => {
+            assert!(matches!(err, ManagerError::Api(ref e) if e.code == "RELEASE_NOT_RESOLVED"));
+            (r2_id, ws_r2, ws_r1)
+        }
+        other => panic!("expected one Ok and one Err, got {other:?}"),
+    };
+
+    assert_eq!(
+        repo.get_tenant_pin(org_id, tenant_id).await.unwrap(),
+        Some((Some(winning_release), Some(ProvisionerBackend::Docker)))
+    );
+    let winning_pin: (Option<uuid::Uuid>, Option<String>) =
+        sqlx::query_as("SELECT pinned_release_id, pinned_backend FROM workspaces WHERE id = $1")
+            .bind(winning_ws.0)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (winning_pin.0, winning_pin.1.as_deref()),
+        (Some(winning_release.0), Some("docker"))
+    );
+    let losing_pin: (Option<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT pinned_release_id, pinned_backend, pinned_version_id FROM workspaces WHERE id = $1",
+    )
+    .bind(losing_ws.0)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(losing_pin, (None, None, None));
 }
