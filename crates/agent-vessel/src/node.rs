@@ -3927,6 +3927,23 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 mod tests {
     use super::*;
 
+    /// `VesselNode::post`'s unoptimized frame (~1.7 MB) overflows the 2 MiB
+    /// test stack in CI's workspace build; run such tests on 8 MiB.
+    fn on_large_stack<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn merge_reservation_clears_only_for_definitive_rejection() {
         for (status, pending) in [
@@ -4915,8 +4932,12 @@ mod tests {
         assert!(pending.iter().all(|pr| pr["number"] != 42));
     }
 
-    #[tokio::test]
-    async fn test_post_handles_address_review_outcome() {
+    #[test]
+    fn test_post_handles_address_review_outcome() {
+        on_large_stack(test_post_handles_address_review_outcome_body);
+    }
+
+    async fn test_post_handles_address_review_outcome_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(
@@ -5019,8 +5040,14 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+    #[test]
+    fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+        on_large_stack(
+            test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body,
+        );
+    }
+
+    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(
