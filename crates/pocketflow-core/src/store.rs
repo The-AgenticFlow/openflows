@@ -10,6 +10,11 @@ use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
+/// A second key for [`SharedStore::compare_and_set`] to write with the record,
+/// and how to derive its new value from the new record and its current value.
+type Companion<'a, T> = Option<(String, DeriveCompanion<'a, T>)>;
+type DeriveCompanion<'a, T> = Box<dyn FnOnce(&T, Option<Value>) -> Result<Value> + Send + 'a>;
+
 // ── Event ring buffer ─────────────────────────────────────────────────────
 
 const RING_BUFFER_SIZE: usize = 1000;
@@ -303,6 +308,8 @@ fn tenant_index_key(key: &str) -> Option<String> {
     Some(format!("ns:{tenant}:_keys"))
 }
 
+mod docs;
+
 // ── SharedStore (public API) ──────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -350,6 +357,11 @@ impl SharedStore {
             ring_buffer: Arc::new(RwLock::new(Vec::with_capacity(RING_BUFFER_SIZE))),
             tenant: resolved_tenant,
         })
+    }
+
+    /// The tenant this store is namespaced to.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
     }
 
     /// Build a tenant-namespaced key: `ns:{tenant}:{key}`.
@@ -499,16 +511,7 @@ impl SharedStore {
     /// Strict lifecycle reads distinguish an absent ticket from a store outage.
     pub async fn lifecycle(&self, ticket: &str) -> Result<config::lifecycle::Lifecycle> {
         let key = self.ns_key(&format!("ticket:{ticket}:status"));
-        let value = match &self.backend {
-            Backend::InMemory(b) => b.map.read().await.get(&key).cloned(),
-            Backend::Redis(b) => {
-                use fred::prelude::*;
-                let raw: Option<String> =
-                    bounded_redis("lifecycle GET", b.client.get(&key)).await?;
-                raw.map(|s| serde_json::from_str(&s)).transpose()?
-            }
-        };
-        config::lifecycle::Lifecycle::decode(value)
+        config::lifecycle::Lifecycle::decode(self.read_record(&key, "lifecycle GET").await?)
     }
 
     /// Compare-and-set the entire lifecycle, including approvals and evidence.
@@ -522,48 +525,96 @@ impl SharedStore {
     ) -> Result<config::lifecycle::Lifecycle> {
         use config::lifecycle::Lifecycle;
         let key = self.ns_key(&format!("ticket:{ticket}:status"));
+        self.compare_and_set(
+            &key,
+            "transition",
+            "Lifecycle changed; refresh before retrying",
+            |raw| {
+                let current = Lifecycle::decode(raw)?;
+                anyhow::ensure!(
+                    current.version == version,
+                    "Lifecycle changed; refresh before retrying"
+                );
+                Ok(current)
+            },
+            |current, ts| current.apply(actor, event, ts),
+            None,
+        )
+        .await
+    }
+
+    async fn read_record(&self, key: &str, op: &'static str) -> Result<Option<Value>> {
+        Ok(match &self.backend {
+            Backend::InMemory(b) => b.map.read().await.get(key).cloned(),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = bounded_redis(op, b.client.get(key)).await?;
+                raw.map(|s| serde_json::from_str(&s)).transpose()?
+            }
+        })
+    }
+
+    /// Shared atomic write for versioned records: decode and check the current
+    /// value, apply the reducer, and commit only if the stored bytes are
+    /// unchanged. Any conflict or reducer error is returned, never retried.
+    /// `companion` may name a second key whose new value is derived from the
+    /// new record and the companion's current value. It is written in the
+    /// same atomic step, or not at all, and the commit also fails if the
+    /// companion changed after it was read.
+    async fn compare_and_set<T: Serialize>(
+        &self,
+        key: &str,
+        op: &'static str,
+        conflict: &'static str,
+        load: impl FnOnce(Option<Value>) -> Result<T>,
+        apply: impl FnOnce(&T, u64) -> Result<T>,
+        companion: Companion<'_, T>,
+    ) -> Result<T> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         match &self.backend {
             Backend::InMemory(b) => {
                 let mut map = b.map.write().await;
-                let current = Lifecycle::decode(map.get(&key).cloned())?;
-                anyhow::ensure!(
-                    current.version == version,
-                    "Lifecycle changed; refresh before retrying"
-                );
-                let next = current.apply(actor, event, ts)?;
-                map.insert(key, serde_json::to_value(&next)?);
+                let current = load(map.get(key).cloned())?;
+                let next = apply(&current, ts)?;
+                let extra = companion
+                    .map(|(extra_key, derive)| {
+                        let value = derive(&next, map.get(&extra_key).cloned())?;
+                        anyhow::Ok((extra_key, value))
+                    })
+                    .transpose()?;
+                map.insert(key.to_owned(), serde_json::to_value(&next)?);
+                if let Some((extra_key, value)) = extra {
+                    map.insert(extra_key, value);
+                }
                 Ok(next)
             }
             Backend::Redis(b) => {
                 use fred::prelude::*;
-                let raw: Option<String> =
-                    bounded_redis("transition GET", b.client.get(&key)).await?;
-                let current =
-                    Lifecycle::decode(raw.as_deref().map(serde_json::from_str).transpose()?)?;
-                anyhow::ensure!(
-                    current.version == version,
-                    "Lifecycle changed; refresh before retrying"
-                );
-                let next = current.apply(actor, event, ts)?;
-                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); return 1";
-                let changed: i64 = bounded_redis(
-                    "transition CAS",
-                    b.client.eval(
-                        script,
-                        vec![key.clone()],
-                        vec![raw.unwrap_or_default(), serde_json::to_string(&next)?],
-                    ),
-                )
-                .await?;
-                anyhow::ensure!(changed == 1, "Lifecycle changed; refresh before retrying");
+                let raw: Option<String> = bounded_redis(op, b.client.get(key)).await?;
+                let current = load(raw.as_deref().map(serde_json::from_str).transpose()?)?;
+                let next = apply(&current, ts)?;
+                let mut keys = vec![key.to_owned()];
+                let mut args = vec![raw.unwrap_or_default(), serde_json::to_string(&next)?];
+                if let Some((extra_key, derive)) = companion {
+                    let extra_raw: Option<String> =
+                        bounded_redis(op, b.client.get(&extra_key)).await?;
+                    let extra_current =
+                        extra_raw.as_deref().map(serde_json::from_str).transpose()?;
+                    args.push(derive(&next, extra_current)?.to_string());
+                    args.push(extra_raw.unwrap_or_default());
+                    keys.push(extra_key);
+                }
+                // Both keys are checked against what was read, then both set.
+                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; if KEYS[2] and (redis.call('GET',KEYS[2]) or '') ~= ARGV[4] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); if KEYS[2] then redis.call('SET',KEYS[2],ARGV[3]) end; return 1";
+                let changed: i64 = bounded_redis(op, b.client.eval(script, keys, args)).await?;
+                anyhow::ensure!(changed == 1, "{conflict}");
                 // Keep the per-tenant key index in sync so `keys()` scans can
-                // find lifecycle status keys written here rather than via `set`.
-                if let Some(index) = tenant_index_key(&key) {
+                // find records written here rather than via `set`.
+                if let Some(index) = tenant_index_key(key) {
                     use fred::interfaces::SetsInterface;
-                    let _ = b.client.sadd::<i64, _, _>(index, &key).await;
+                    let _ = b.client.sadd::<i64, _, _>(index, key).await;
                 }
                 Ok(next)
             }
@@ -647,6 +698,75 @@ mod lifecycle_tests {
             )
             .await
             .is_err());
+    }
+    #[tokio::test]
+    async fn competing_docs_decisions_cannot_both_commit() {
+        use config::docs_lifecycle::{DocsEvent, DocsPhase};
+        let store = SharedStore::new_in_memory();
+        let ready = store
+            .docs_transition(
+                "T-1",
+                0,
+                "lore",
+                DocsEvent::Submit {
+                    branch: "lore/T-1".into(),
+                    head: "abc".into(),
+                    base: "main".into(),
+                    report: "changelog".into(),
+                    files: vec!["CHANGELOG.md".into()],
+                },
+            )
+            .await
+            .unwrap();
+        let decide = |approved: bool| DocsEvent::Decide {
+            revision: ready.revision,
+            head: "abc".into(),
+            approved,
+            report: "operator notes".into(),
+            seal: "seal".into(),
+        };
+        let (a, b) = tokio::join!(
+            store.docs_transition("T-1", ready.version, "human", decide(true)),
+            store.docs_transition("T-1", ready.version, "human", decide(false))
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        let record = store.docs_record("T-1").await.unwrap();
+        assert_eq!(record.version, 2);
+        assert_ne!(record.phase, DocsPhase::DocsReady);
+        // The ticket lifecycle is a separate record and is untouched.
+        assert_eq!(store.lifecycle("T-1").await.unwrap().version, 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_closed_docs_writes_the_reopen_marker() {
+        use config::docs_lifecycle::DocsEvent;
+        let store = SharedStore::new_in_memory();
+        let skipped = store
+            .docs_transition(
+                "T-1",
+                0,
+                "nexus",
+                DocsEvent::Skip {
+                    reason: "predates the gate".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.get(config::state::KEY_DOCS_REOPENED).await.is_none());
+        store
+            .docs_transition(
+                "T-1",
+                skipped.version,
+                "human",
+                DocsEvent::Reopen {
+                    reason: "document it".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let marker = store.get(config::state::KEY_DOCS_REOPENED).await.unwrap();
+        assert_eq!(marker["ticket"], "T-1");
+        assert_eq!(marker["version"], 2);
     }
 }
 

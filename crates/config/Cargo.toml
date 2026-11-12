@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 anyhow      = { workspace = true }
+hmac        = "0.12"
+sha2        = { workspace = true }
 envconfig   = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

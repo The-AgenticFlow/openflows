@@ -85,8 +85,21 @@ def wait_for_chat(chat_id, seconds=180):
         save_chat_diagnostics(chat_id)
 
 
-def setup_tenant(model_name='bootstrap-canary'):
+def enable_lore():
+    """Enable LORE the way an operator does: in the registry `tenant add` reads."""
+    source = Path(__file__).resolve().parents[3] / 'orchestration' / 'agent' / 'registry.json'
+    registry = json.loads(source.read_text())
+    lore = next(agent for agent in registry['team'] if agent['id'] == 'lore')
+    lore.update(enabled=True, max_instances=1)
+    target = Path(os.environ['OPENFLOWS_HOME']) / 'orchestration' / 'agent' / 'registry.json'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(registry, indent=2))
+
+
+def setup_tenant(model_name='bootstrap-canary', lore=False):
     global TOKEN
+    if lore:
+        enable_lore()
     def server_ready():
         try:
             return coder('/buildinfo')
@@ -128,6 +141,7 @@ def setup_tenant(model_name='bootstrap-canary'):
     parameters = {p['name']: p['value'] for p in coder('/workspacebuilds/' + workspace['latest_build']['id'] + '/parameters')}
     fleet = json.loads(parameters['registry_json'])
     assert {a['id']: a['max_instances'] for a in fleet['team'] if a['id'] in ('forge', 'sentinel')} == {'forge': 1, 'sentinel': 1}
+    assert next(a for a in fleet['team'] if a['id'] == 'lore')['enabled'] is lore
     assert parameters['start_controller'] == 'true'
     name = 'ci/' + workspace['name']
     def ready():

@@ -68,22 +68,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-lore"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "config",
- "github",
- "pocketflow-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "agent-nexus"
 version = "0.1.0"
 dependencies = [
@@ -942,9 +926,11 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "envconfig",
+ "hmac 0.12.1",
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "toml",
  "tracing",
@@ -2324,7 +2310,6 @@ name = "openflows"
 version = "1.8.1"
 dependencies = [
  "agent-forge",
- "agent-lore",
  "agent-nexus",
  "agent-sentinel",
  "agent-vessel",

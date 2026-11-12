@@ -34,7 +34,12 @@ use crate::pr_monitor::{
 };
 
 use crate::types::{VesselConfig, VesselOutcome};
+
+mod docs_pr;
 use crate::{CiPoller, PrMerger, VesselNotifier};
+use config::docs_lifecycle::{
+    non_docs_paths, ticket_from_docs_branch, DocsEvent, DOCS_BRANCH_PREFIX, DOCS_TICKET,
+};
 
 /// VESSEL Node — DevOps Specialist and Merge Gatekeeper.
 ///
@@ -893,6 +898,12 @@ impl Node for VesselNode {
                 }
             };
 
+            // A docs PR documents a merged ticket; its authority is the docs
+            // record, never that ticket's (terminal) lifecycle.
+            if Self::is_docs_pr(&pr_info) {
+                outcomes.push(Box::pin(self.process_docs_pr(owner, repo, pr_info)).await);
+                continue;
+            }
             let store = self
                 .lifecycle_store
                 .lock()
@@ -1913,12 +1924,51 @@ impl Node for VesselNode {
                     self.remove_from_pending_prs(store, *pr_number).await;
                     any_awaiting_human = true;
                 }
-                VesselOutcome::DocsPrClosed { pr_number, reason } => {
+                VesselOutcome::DocsPrRework {
+                    pr_number,
+                    reason,
+                    docs_ticket,
+                } => {
+                    info!(pr_number, ticket_id = %docs_ticket, reason, "Docs PR needs rework — returning it to LORE");
+                    Box::pin(Self::record_docs_outcome(
+                        store,
+                        docs_ticket,
+                        *pr_number,
+                        DocsEvent::Rework {
+                            reason: reason.clone(),
+                        },
+                    ))
+                    .await;
+                    // The PR stays open: LORE updates the same branch.
+                    any_success = true;
+                }
+                VesselOutcome::DocsPrHeld { pr_number, reason } => {
+                    // Not SENTINEL's to review: the docs gate decides. Keep it
+                    // pending and let the controller poll again.
+                    info!(pr_number, reason, "Holding docs PR");
+                    any_needs_review = true;
+                }
+                VesselOutcome::DocsPrMerged {
+                    pr_number,
+                    sha,
+                    docs_ticket,
+                } => {
                     info!(
                         pr_number,
-                        reason,
-                        "Docs PR closed due to conflicts — lore will regenerate on next deployment"
+                        sha,
+                        ticket_id = %docs_ticket,
+                        "Merged operator-approved docs PR"
                     );
+                    Box::pin(Self::record_docs_outcome(
+                        store,
+                        docs_ticket,
+                        *pr_number,
+                        DocsEvent::Merged {
+                            number: *pr_number,
+                            sha: sha.clone(),
+                        },
+                    ))
+                    .await;
                     self.remove_from_pending_prs(store, *pr_number).await;
                     any_success = true;
                 }
@@ -1964,39 +2014,12 @@ impl VesselNode {
     ) -> Result<VesselOutcome> {
         let pr_number = pr_info.number;
 
-        let ticket_id = if Self::is_docs_pr(&pr_info) {
-            Some("T-DOCS".to_string())
-        } else {
-            pr_info.ticket_id.clone()
-        };
+        if Self::is_docs_pr(&pr_info) {
+            return Ok(self.process_docs_pr(owner, repo, pr_info).await);
+        }
+        let ticket_id = pr_info.ticket_id.clone();
 
         info!(pr_number, ticket_id = ?ticket_id, "Processing PR");
-
-        // Short-circuit for Docs PRs: check mergeability first to skip CI polling if conflicts exist
-        if Self::is_docs_pr(&pr_info) {
-            if pr_info.has_conflicts() {
-                warn!(
-                    pr_number,
-                    "Docs PR has conflicts — short-circuiting CI poll and closing"
-                );
-                return self
-                    .close_docs_pr_with_conflicts(owner, repo, &pr_info)
-                    .await;
-            }
-            // Re-fetch PR to get fresh mergeability status if not yet computed
-            if pr_info.mergeable.is_none() {
-                let fresh_pr = self.client.get_pull_request(owner, repo, pr_number).await?;
-                if fresh_pr.has_conflicts() {
-                    warn!(
-                        pr_number,
-                        "Docs PR has conflicts (after re-fetch) — short-circuiting CI poll and closing"
-                    );
-                    return self
-                        .close_docs_pr_with_conflicts(owner, repo, &fresh_pr)
-                        .await;
-                }
-            }
-        }
 
         let poll_result = self
             .poller
@@ -2197,17 +2220,6 @@ impl VesselNode {
         pr_info: PrInfo,
     ) -> Result<VesselOutcome> {
         let pr_number = pr_info.number;
-
-        if Self::is_docs_pr(&pr_info) {
-            info!(
-                pr_number,
-                branch = %pr_info.head_branch,
-                "Docs PR has merge conflicts — closing to allow lore to regenerate"
-            );
-            return self
-                .close_docs_pr_with_conflicts(owner, repo, &pr_info)
-                .await;
-        }
 
         let ticket_id = pr_info.ticket_id.clone();
         // Release the frozen candidate before touching its worktree. A merge with
@@ -3086,45 +3098,6 @@ impl VesselNode {
         store.set(&key, json!(next)).await;
     }
 
-    fn is_docs_pr(pr_info: &PrInfo) -> bool {
-        pr_info.head_branch.starts_with("lore/") || pr_info.ticket_id.as_deref() == Some("T-DOCS")
-    }
-
-    /// Close a docs PR that has conflicts, allowing lore to regenerate.
-    async fn close_docs_pr_with_conflicts(
-        &self,
-        owner: &str,
-        repo: &str,
-        pr_info: &PrInfo,
-    ) -> Result<VesselOutcome> {
-        let pr_number = pr_info.number;
-        let comment = "This documentation PR has merge conflicts with the main branch. \
-                       Closing to allow the lore agent to regenerate the documentation. \
-                       Lore will create a fresh docs PR on the next deployment cycle.";
-
-        match self
-            .client
-            .close_pull_request(owner, repo, pr_number, Some(comment))
-            .await
-        {
-            Ok(()) => {
-                info!(pr_number, "Closed conflicting docs PR");
-                Ok(VesselOutcome::DocsPrClosed {
-                    pr_number,
-                    reason: "Merge conflicts on docs PR — closed for regeneration".to_string(),
-                })
-            }
-            Err(e) => {
-                warn!(pr_number, error = %e, "Failed to close docs PR with conflicts");
-                Ok(VesselOutcome::Conflicts {
-                    ticket_id: None,
-                    pr_number,
-                    conflicted_files: vec!["Docs PR could not be closed".to_string()],
-                })
-            }
-        }
-    }
-
     /// Recycle workers (both FORGE and paired SENTINEL) back to Idle after a PR is merged.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
         let target_ticket = pr["ticket_id"].as_str();
@@ -3953,6 +3926,23 @@ mod tests {
 
     mod reconcile_rework;
     use reconcile_rework::run_reconcile_with_evidence;
+
+    /// `VesselNode::post`'s unoptimized frame (~1.7 MB) overflows the 2 MiB
+    /// test stack in CI's workspace build; run such tests on 8 MiB.
+    fn on_large_stack<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn merge_reservation_clears_only_for_definitive_rejection() {
@@ -4939,8 +4929,12 @@ mod tests {
         assert!(pending.iter().all(|pr| pr["number"] != 42));
     }
 
-    #[tokio::test]
-    async fn test_post_handles_address_review_outcome() {
+    #[test]
+    fn test_post_handles_address_review_outcome() {
+        on_large_stack(test_post_handles_address_review_outcome_body);
+    }
+
+    async fn test_post_handles_address_review_outcome_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(
@@ -5043,8 +5037,14 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+    #[test]
+    fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+        on_large_stack(
+            test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body,
+        );
+    }
+
+    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches_body() {
         let store = SharedStore::new_in_memory();
         store
             .set(

@@ -141,8 +141,6 @@ pub const ACTION_ADDRESS_REVIEW_DISPATCHED: &str = "address_review_dispatched";
 /// persisted rework directive as its chat initial prompt.
 pub const ACTION_REWORK_PROVISION_NEEDED: &str = "rework_provision_needed";
 pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
-pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
-pub const ACTION_DOCS_PENDING: &str = "docs_pending";
 pub const ACTION_AWAITING_HUMAN: &str = "awaiting_human";
 pub const ACTION_PLANNING_GATE: &str = "planning_gate";
 
@@ -207,6 +205,24 @@ pub fn review_action_key(ticket_id: &str, review_type: &str) -> String {
 /// Key suffix for vessel deployment status.
 /// Full key: `ticket:{id}:deployment`
 pub const KEY_TICKET_DEPLOYMENT: &str = "deployment";
+
+/// Key suffix for the post-merge LORE documentation gate record.
+/// Full key: `ticket:{id}:docs` (see [`crate::docs_lifecycle::DocsRecord`]).
+pub const KEY_TICKET_DOCS: &str = "docs";
+/// Operator docs decision ([`crate::docs_lifecycle::DocsControl`]), stored
+/// under the controller-only `ctl:{tenant}:` prefix, never `ns:{tenant}:`.
+pub const KEY_TICKET_DOCS_CONTROL: &str = "docs_control";
+
+/// Key suffix for NEXUS's record of the last LORE instruction it delivered.
+/// Full key: `ticket:{id}:docs_delivery`. Controller-private; never an authority.
+pub const KEY_TICKET_DOCS_DELIVERY: &str = "docs_delivery";
+
+/// Tenant marker: merged tickets that predate the docs gate have been skipped.
+pub const KEY_DOCS_CUTOVER: &str = "docs:cutover_v1";
+
+/// Written whenever a closed docs record is reopened, so readers that cache
+/// closed records (NEXUS's LORE driver) know to refresh.
+pub const KEY_DOCS_REOPENED: &str = "docs:reopened";
 
 /// Key suffix for current ticket status.
 /// Full key: `ticket:{id}:status`
