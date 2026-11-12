@@ -159,7 +159,8 @@ def document_merged_ticket(nexus, merged):
     # The repository requires an approved review and a passing check; VESSEL
     # must hold while the check is pending, then merge once it passes.
     github('/pulls/' + str(docs_pr['number']) + '/reviews',
-        {'event': 'APPROVE', 'commit_id': docs_head, 'body': 'Human approval of the docs PR'})
+        {'event': 'APPROVE', 'commit_id': docs_head, 'body': 'Human approval of the docs PR'},
+        'ci-reviewer-token')
     github('/check-runs', {'name': 'acceptance', 'head_sha': docs_head, 'status': 'in_progress'},
         'ci-runner-token')
     pending_start = len(journal())
