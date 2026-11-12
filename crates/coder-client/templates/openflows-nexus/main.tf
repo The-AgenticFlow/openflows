@@ -510,13 +510,7 @@ resource "docker_container" "workspace" {
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "OPENFLOWS_DOCS_GATE_SECRET=${data.coder_parameter.docs_gate_secret.value}",
     "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS=${data.coder_parameter.docs_gate_secret_previous.value}",
-    # In connected-local mode, Agent GitHub API calls use the Manager-brokered
-    # token file instead of receiving the external-auth token directly.
-    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
-    # tenant owner's linked GitHub App token). Export it here: Coder injects the
-    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
-    # env var, so without this the controller's resolve_token() would find nothing.
-    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${var.connected_local ? "" : data.coder_external_auth.github[0].access_token}",
+    # Agent GitHub API calls use the Manager-brokered token file.
   ])
 
   networks_advanced {
