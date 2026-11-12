@@ -144,6 +144,22 @@ data "coder_parameter" "coder_chat_hook_secret" {
   mutable     = false
 }
 
+data "coder_parameter" "docs_gate_secret" {
+  name        = "docs_gate_secret"
+  description = "Optional dedicated secret (32+ bytes) for sealing operator docs approvals (OPENFLOWS_DOCS_GATE_SECRET). Controller only; empty falls back to the hook secret."
+  default     = ""
+  type        = "string"
+  mutable     = true
+}
+
+data "coder_parameter" "docs_gate_secret_previous" {
+  name        = "docs_gate_secret_previous"
+  description = "The previous docs gate secret during a rotation (OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS); approvals sealed with it still verify."
+  default     = ""
+  type        = "string"
+  mutable     = true
+}
+
 data "coder_parameter" "coder_chat_hook_url" {
   name        = "coder_chat_hook_url"
   description = "The exact hook URL Coder is configured to POST to (CODER_CHAT_HOOK_URL). When set it is the authoritative JWT audience the consumer validates against, keeping it in lockstep with Coder and preventing aud drift."
@@ -344,6 +360,8 @@ PY
     if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
       export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
+      export OPENFLOWS_DOCS_GATE_SECRET="${data.coder_parameter.docs_gate_secret.value}"
+      export OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS="${data.coder_parameter.docs_gate_secret_previous.value}"
     fi
     # Hosted mode already loaded the tenant-scoped Redis endpoint from the
     # mounted runtime secret above. Do not overwrite it with a Terraform
@@ -490,7 +508,15 @@ resource "docker_container" "workspace" {
     "CODER_SESSION_TOKEN=${data.coder_parameter.coder_session_token.value}",
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
-    # Agent GitHub API calls use the Manager-brokered token file.
+    "OPENFLOWS_DOCS_GATE_SECRET=${data.coder_parameter.docs_gate_secret.value}",
+    "OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS=${data.coder_parameter.docs_gate_secret_previous.value}",
+    # In connected-local mode, Agent GitHub API calls use the Manager-brokered
+    # token file instead of receiving the external-auth token directly.
+    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
+    # tenant owner's linked GitHub App token). Export it here: Coder injects the
+    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
+    # env var, so without this the controller's resolve_token() would find nothing.
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${var.connected_local ? "" : data.coder_external_auth.github[0].access_token}",
   ])
 
   networks_advanced {

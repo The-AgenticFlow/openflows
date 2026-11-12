@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod docs_lifecycle;
 pub mod env;
 pub mod identity;
 pub mod lifecycle;

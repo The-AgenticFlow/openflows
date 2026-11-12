@@ -22,6 +22,13 @@ needs_host_programs() {
     glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | sed -n 's/^glibc //p')"
     [ "$(printf '%s\n' 2.34 "$glibc" | sort -V | head -1)" != 2.34 ]
 }
+# release_base_url VERSION — where a release's files are downloaded from. OPENFLOWS_RELEASE_BASE_URL
+# replaces GitHub (tests serve candidate releases locally); it holds one folder per version,
+# named openflows-VERSION, as GitHub's download URLs do.
+release_base_url() {
+    local base="${OPENFLOWS_RELEASE_BASE_URL:-https://github.com/${RELEASE_REPO}/releases/download}"
+    printf '%s/openflows-%s' "${base%/}" "$1"
+}
 sha256_of() { if have sha256sum; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
 # install_archive VERSION TARGET DEST — download a release archive, verify its checksum and
 # install its programs. Returns 1 when the release has no such file, 2 on a checksum mismatch.
@@ -31,7 +38,8 @@ install_archive() {
     tmp="$(mktemp -d)"
     (
         cd "$tmp"
-        local base="https://github.com/${RELEASE_REPO}/releases/download/openflows-${version}"
+        local base
+        base="$(release_base_url "$version")"
         curl -fsSL -m 900 -o "${name}.tar.gz" "${base}/${name}.tar.gz" || exit 1
         curl -fsSL -m 60 -o "${name}.sha256" "${base}/${name}.tar.gz.sha256" || exit 1
         [ "$(awk '{print $1}' "${name}.sha256")" = "$(sha256_of "${name}.tar.gz")" ] || exit 2

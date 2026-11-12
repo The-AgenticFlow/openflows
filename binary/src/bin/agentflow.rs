@@ -13,6 +13,9 @@ use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+#[path = "agentflow/gate_docs.rs"]
+mod gate_docs;
+
 const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
@@ -183,6 +186,7 @@ enum GateCommands {
         #[arg(long)]
         phase: String,
     },
+    Docs(gate_docs::DocsArgs),
 }
 
 #[derive(Subcommand)]
@@ -427,40 +431,34 @@ async fn run_controller(reset_store: bool) -> Result<()> {
             openflows::nodes::VesselConfig::from_env()
         }),
     ));
-    let lore = if registry.get("lore").map(|e| e.enabled).unwrap_or(false) {
-        let lore_persona = resolver.persona_path("lore.agent.md");
-        match openflows::nodes::LoreNode::new_with_registry(
-            &orch_dir,
-            lore_persona,
-            registry_path.clone(),
-        ) {
-            Ok(node) => Some(std::sync::Arc::new(node)),
-            Err(e) => {
-                tracing::warn!(
-                    "lore agent is active but could not initialize — skipping: {}",
-                    e
-                );
-                None
+    // LORE is not a flow node: NEXUS drives it as a Coder workspace chat for
+    // merged tickets (see `agent-nexus/src/lore.rs`), gated by the operator
+    // through `openflows gate docs`. The flow never blocks on docs.
+    if registry.get("lore").is_some_and(|entry| entry.enabled) {
+        match config::docs_lifecycle::DocsGateKeys::from_env() {
+            Ok(Some(keys)) => {
+                tracing::info!(key_id = keys.key_id(), "LORE docs gate approvals verified with this key")
             }
+            Ok(None) => tracing::error!(
+                "LORE is enabled but no docs gate secret (OPENFLOWS_DOCS_GATE_SECRET or CODER_CHAT_HOOK_SECRET) is set: approved docs PRs will never be opened or merged"
+            ),
+            Err(error) => tracing::error!(%error, "LORE is enabled but the docs gate secret is invalid: approved docs PRs will never be opened or merged"),
         }
-    } else {
-        tracing::info!("lore agent is inactive — skipping lore node initialization");
-        None
-    };
+    }
 
     // ── Build flow graph ────────────────────────────────────────────────
     use openflows::state::{
         ACTION_ADDRESS_REVIEW_DISPATCHED, ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
-        ACTION_DEPLOYED, ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED,
-        ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PLANNING_GATE, ACTION_PR_OPENED,
-        ACTION_REWORK_PROVISION_NEEDED, ACTION_WORK_ASSIGNED,
+        ACTION_DEPLOYED, ACTION_DEPLOY_FAILED, ACTION_FAILED, ACTION_MERGE_PRS,
+        ACTION_PLANNING_GATE, ACTION_PR_OPENED, ACTION_REWORK_PROVISION_NEEDED,
+        ACTION_WORK_ASSIGNED,
     };
 
     let review_approve = "review_approve";
     let review_reject = "review_reject";
     let review_ready = "review_ready"; // Forge signals work is ready for PR review
 
-    let mut flow = pocketflow_core::Flow::new("nexus")
+    let flow = pocketflow_core::Flow::new("nexus")
         .add_node(
             "nexus",
             nexus,
@@ -494,8 +492,12 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 ("no_work", "nexus"),
             ],
         )
-        .add_node("vessel", vessel, {
-            let mut routes = vec![
+        .add_node(
+            "vessel",
+            vessel,
+            vec![
+                // Post-merge docs are polled by NEXUS, never run inline.
+                (ACTION_DEPLOYED, "nexus"),
                 (ACTION_DEPLOY_FAILED, "nexus"),
                 (ACTION_CI_FIX_NEEDED, "forge_pair"),
                 ("merge_blocked", "nexus"),
@@ -504,22 +506,8 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 (ACTION_REWORK_PROVISION_NEEDED, "nexus"),
                 (pocketflow_core::Action::AWAITING_HUMAN, "nexus"),
                 ("no_work", "nexus"),
-            ];
-            if lore.is_some() {
-                routes.insert(0, (ACTION_DEPLOYED, "lore"));
-            } else {
-                routes.insert(0, (ACTION_DEPLOYED, "nexus"));
-            }
-            routes
-        });
-
-    if let Some(ref lore_node) = lore {
-        flow = flow.add_node(
-            "lore",
-            lore_node.clone(),
-            vec![(ACTION_DOCS_COMPLETE, "nexus"), (ACTION_NO_WORK, "nexus")],
+            ],
         );
-    }
 
     // Safety cap against genuine routing cycles. Idle and in-progress states pause
     // the flow pass and are handled by the paced controller loop below.
@@ -854,9 +842,10 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                 match pocketflow_core::SharedStore::new_redis(&redis_url).await {
                     Ok(store) => {
                         // raw_keys + raw_del operate on full keys, so we purge the
-                        // real `ns:{name}:*` namespace instead of re-prefixing it.
-                        let pattern = format!("ns:{}:*", name);
-                        let keys: Vec<String> = store.raw_keys(&pattern).await;
+                        // real `ns:{name}:*` namespace (and its controller-only
+                        // `ctl:{name}:*` keys) instead of re-prefixing it.
+                        let mut keys = store.raw_keys(&format!("ns:{name}:*")).await;
+                        keys.extend(store.raw_keys(&format!("ctl:{name}:*")).await);
                         if !keys.is_empty() {
                             for key in &keys {
                                 store.raw_del(key).await;
@@ -948,8 +937,8 @@ async fn run_store(action: StoreCommands) -> Result<()> {
         }
         StoreCommands::Purge { name, yes } => {
             validate_tenant_name(&name)?;
-            let pattern = format!("ns:{}:*", name);
-            let keys: Vec<String> = store.raw_keys(&pattern).await;
+            let mut keys = store.raw_keys(&format!("ns:{name}:*")).await;
+            keys.extend(store.raw_keys(&format!("ctl:{name}:*")).await);
             if keys.is_empty() {
                 println!("  ✗ No keys found for tenant '{}'", name);
                 return Ok(());
@@ -1016,9 +1005,10 @@ async fn run_store(action: StoreCommands) -> Result<()> {
             println!("  (Restart the controller to pick up changes)");
         }
         StoreCommands::Wipe { yes } => {
-            // raw_keys("ns:*") matches every tenant namespace plus any other
-            // shared keys, so this is a true whole-store global reset.
-            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            // Every tenant namespace and its controller-only keys: a true
+            // whole-store global reset.
+            let mut keys = store.raw_keys("ns:*").await;
+            keys.extend(store.raw_keys("ctl:*").await);
             if keys.is_empty() {
                 println!("  (shared store is already empty — nothing to wipe)");
                 return Ok(());
@@ -1198,6 +1188,7 @@ async fn run_gate(action: GateCommands) -> Result<()> {
             let store = Harness::new(&redis_url, &tenant).await?;
             store.gate_status(&ticket, &phase).await?;
         }
+        GateCommands::Docs(args) => gate_docs::run(&redis_url, args).await?,
     }
 
     Ok(())

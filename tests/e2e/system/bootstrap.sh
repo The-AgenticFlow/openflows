@@ -8,6 +8,16 @@ scenario="${1:-bootstrap}"
 case "$scenario" in
     bootstrap) category=production-bootstrap; driver=production_bootstrap.py; model=bootstrap-model.json ;;
     system) category=connected-system; driver=connected_system.py; model=system-model.json ;;
+    # Upgrade, restart and rollback of a running stack (#528); Redis persists as in production.
+    upgrade) category=upgrade-rollback; driver=upgrade_rollback.py; model=bootstrap-model.json ;;
+    # One candidate release installed on a clean stack in one mode (#527): source, compose or binary.
+    install)
+        export OPENFLOWS_E2E_MODE="${2:-}"
+        case "$OPENFLOWS_E2E_MODE" in
+            source|compose|binary) ;;
+            *) printf 'Usage: %s install source|compose|binary\n' "$0" >&2; exit 2 ;;
+        esac
+        category="clean-install-$OPENFLOWS_E2E_MODE"; driver=clean_install.py; model=bootstrap-model.json ;;
     *) printf 'Unknown E2E scenario: %s\n' "$scenario" >&2; exit 2 ;;
 esac
 project="openflows-${scenario}-$(date +%s)-$$"
@@ -17,6 +27,7 @@ scratch=$(mktemp -d)
 export OPENFLOWS_SYSTEM_FIXTURE_IMAGE="$project-fixtures:ci"
 export OPENFLOWS_E2E_MODEL_SCENARIO="/opt/fixtures/$model"
 compose=(docker compose --env-file /dev/null -p "$project" -f "$PWD/tests/e2e/compose.yml" -f "$PWD/tests/e2e/system/bootstrap.compose.yml")
+[ "$scenario" != upgrade ] || compose+=(-f "$PWD/tests/e2e/system/upgrade.compose.yml")
 remove_resource() {
     local kind="$1" name="$2" filter remaining
     if [ "$kind" = image ]; then
@@ -61,6 +72,7 @@ cleanup() {
         done < <(sort -u "$scratch/volumes")
     fi
     remove_resource image "$project-workspace:ci" || result=1
+    [ "$scenario" != upgrade ] || remove_resource image "$project-workspace:ci-upgrade" || result=1
     remove_resource image "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" || result=1
     rm -rf "$scratch"
     exit "$result"
@@ -68,9 +80,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cargo build --locked -p openflows --bin openflows -p openflows-harness --bin openflows-harness 2>&1 | tee "$artifacts/build.log"
+cargo build --locked -p openflows --bin openflows --bin openflows-doctor -p openflows-harness --bin openflows-harness 2>&1 | tee "$artifacts/build.log"
 mkdir -p "$scratch/bin" "$scratch/home"
-cp target/debug/openflows target/debug/openflows-harness "$scratch/bin/"
+cp target/debug/openflows target/debug/openflows-doctor target/debug/openflows-harness "$scratch/bin/"
 docker build -t "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" tests/e2e/system 2>&1 | tee "$artifacts/fixtures-image.log"
 docker build -t "$project-workspace:ci" -f tests/e2e/system/workspace.Dockerfile tests/e2e/system 2>&1 | tee "$artifacts/workspace-image.log"
 "${compose[@]}" up -d --wait --wait-timeout 120
@@ -107,6 +119,8 @@ export OPENFLOWS_E2E_GITHUB_URL="http://$("${compose[@]}" port github-fixture 80
 export OPENFLOWS_E2E_GITHUB_CONTAINER="$("${compose[@]}" ps -q github-fixture)"
 # Keep the prefixed Nexus workspace name within Coder's 32-character limit.
 export OPENFLOWS_E2E_TENANT="ci-$(printf '%s' "$project" | sha256sum | cut -c1-12)"
+# The upgrade driver restarts services and runs setup from a copy of this checkout.
+export OPENFLOWS_E2E_PROJECT="$project" OPENFLOWS_E2E_CHECKOUT="$PWD" OPENFLOWS_E2E_SCRATCH="$scratch"
 driver="$PWD/tests/e2e/system/$driver"
 # Avoid loading the developer's .env or persisted bootstrap credentials.
 cd "$scratch"

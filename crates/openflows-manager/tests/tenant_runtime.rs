@@ -401,65 +401,8 @@ async fn registered_resuming_nexus_can_commit_a_repository_lease() {
         .expect("registered workspace must receive a scoped lease before readiness");
 }
 
-#[tokio::test]
-#[ignore = "requires isolated PostgreSQL"]
-async fn missing_tenant_secrets_recover_existing_unique_rows() {
-    let h = harness().await;
-    let tenant = create_tenant(&h, "secret-recovery", 1, "secret-recovery").await;
-    let redis = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    let hook = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    h.secret_provider.delete(&redis.secret_ref).await.unwrap();
-    h.secret_provider.delete(&hook.secret_ref).await.unwrap();
-    // Reproduce both a lost provider and a previous attempt that already
-    // revoked the row before failing to allocate its replacement.
-    sqlx::query("UPDATE tenant_redis_credentials SET revoked_at = now() WHERE tenant_id = $1")
-        .bind(tenant.0)
-        .execute(&h.pool)
-        .await
-        .unwrap();
-    let recovered = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    let recovered_hook = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    assert_eq!(recovered.generation, redis.generation + 1);
-    assert_eq!(recovered_hook.generation, hook.generation + 1);
-    assert_ne!(recovered.credential_hash, redis.credential_hash);
-    assert_ne!(recovered_hook.key_hash, hook.key_hash);
-    assert_eq!(recovered.namespace, redis.namespace);
-    assert_eq!(recovered.username, redis.username);
-    assert!(h.secret_provider.get(&recovered.secret_ref).await.is_ok());
-    assert!(h
-        .secret_provider
-        .get(&recovered_hook.secret_ref)
-        .await
-        .is_ok());
-    let again = h
-        .tenant_repo
-        .ensure_redis_credential(h.org, tenant, "recovery-redis")
-        .await
-        .unwrap();
-    assert_eq!(again.credential_hash, recovered.credential_hash);
-    let again = h
-        .tenant_repo
-        .ensure_hook_key(h.org, tenant, "recovery-hook")
-        .await
-        .unwrap();
-    assert_eq!(again.key_hash, recovered_hook.key_hash);
-}
+#[path = "tenant_runtime/redis_credentials.rs"]
+mod redis_credentials;
 
 // ---------------------------------------------------------------------------
 // Cross-organization and cross-tenant access denial.

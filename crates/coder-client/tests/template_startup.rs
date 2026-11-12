@@ -101,6 +101,59 @@ fn hosted_runtime_bundles_are_copied_without_relaxing_host_permissions() {
 }
 
 #[test]
+fn every_template_mounts_the_runtime_bundle_where_the_harness_reads_it() {
+    // Delivery hands a template an opaque handle. This is the contract that makes
+    // the handle usable: the bundle shows up inside the container at the path the
+    // harness reads at startup, from the parameter the Manager sets, read-only.
+    const BUNDLE_PATH: &str = "/run/openflows/runtime.json";
+    for (role, template) in [
+        (
+            "nexus",
+            include_str!("../templates/openflows-nexus/main.tf"),
+        ),
+        (
+            "forge",
+            include_str!("../templates/openflows-forge/main.tf"),
+        ),
+        (
+            "sentinel",
+            include_str!("../templates/openflows-sentinel/main.tf"),
+        ),
+        (
+            "vessel",
+            include_str!("../templates/openflows-vessel/main.tf"),
+        ),
+        ("lore", include_str!("../templates/openflows-lore/main.tf")),
+    ] {
+        let volume = template
+            .split("dynamic \"volumes\"")
+            .map(|block| block.split_whitespace().collect::<Vec<_>>().join(" "))
+            .find(|block| {
+                block.contains("host_path = data.coder_parameter.runtime_secret_ref.value")
+            })
+            .unwrap_or_else(|| panic!("{role} has no runtime bundle volume"));
+        assert!(
+            volume.contains(&format!("container_path = \"{BUNDLE_PATH}\"")),
+            "{role} must mount the bundle at {BUNDLE_PATH}"
+        );
+        assert!(
+            volume.contains("host_path = data.coder_parameter.runtime_secret_ref.value"),
+            "{role} must mount the handle the Manager delivers"
+        );
+        assert!(
+            volume.contains("read_only = true"),
+            "{role} must mount the bundle read-only"
+        );
+        assert!(
+            template.contains(&format!(
+                "\"OPENFLOWS_RUNTIME_CREDENTIAL_FILE={BUNDLE_PATH}\""
+            )),
+            "{role} must point the harness at the mounted bundle"
+        );
+    }
+}
+
+#[test]
 fn sentinel_clone_fallback_uses_the_workspace_parameter() {
     let template = include_str!("../templates/openflows-sentinel/main.tf");
     assert!(template.contains(

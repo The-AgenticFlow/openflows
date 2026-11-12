@@ -266,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                     with self.server.journal.open('a') as journal:
                         journal.write(json.dumps({'method': self.command, 'path': path,
                             'status': status, 'response': response,
-                            'request': body if self.server.service == 'model' else None}) + '\n')
+                            'request': body if self.server.service in ('model', 'github') else None}) + '\n')
         if status == 200 and self.server.service == 'model' and body.get('stream'):
             self.send_stream(response)
         else:

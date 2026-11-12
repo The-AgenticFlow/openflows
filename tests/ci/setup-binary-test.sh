@@ -30,6 +30,7 @@ curl() {
         if [ "$1" = -o ]; then out="$2"; shift; fi
         shift
     done
+    printf '%s\n' "$1" >>"${WORK}/urls"
     arg="${FAKE_RELEASE}/${1##*/}"
     [ -f "$arg" ] || return 22
     cp "$arg" "$out"
@@ -83,6 +84,14 @@ expect_eq "installs" "$?" 0
 expect_eq "installs the right program" "$("${DEST}/openflows-harness")" "openflows-harness 2.0.0 x86_64-unknown-linux-gnu"
 expect_eq "leaves no temporary files" "$(find "$DEST" -name '*.tmp' | wc -l | tr -d ' ')" 0
 
+expect_eq "downloads from GitHub by default" "$(tail -2 "${WORK}/urls" | head -1)" \
+    "https://github.com/The-AgenticFlow/openflows/releases/download/openflows-2.0.0/openflows-2.0.0-x86_64-unknown-linux-gnu.tar.gz"
+expect_eq "and its checksum from beside it" "$(tail -1 "${WORK}/urls")" \
+    "https://github.com/The-AgenticFlow/openflows/releases/download/openflows-2.0.0/openflows-2.0.0-x86_64-unknown-linux-gnu.tar.gz.sha256"
+OPENFLOWS_RELEASE_BASE_URL=http://127.0.0.1:8000/releases/ install_archive 2.0.0 x86_64-unknown-linux-gnu "${WORK}/override"
+expect_eq "OPENFLOWS_RELEASE_BASE_URL replaces GitHub" "$(tail -2 "${WORK}/urls" | head -1)" \
+    "http://127.0.0.1:8000/releases/openflows-2.0.0/openflows-2.0.0-x86_64-unknown-linux-gnu.tar.gz"
+
 install_archive 1.8.1 x86_64-unknown-linux-gnu "${WORK}/none"
 expect_eq "a release without files is reported as missing" "$?" 1
 expect_eq "and installs nothing" "$([ -e "${WORK}/none" ] && echo yes || echo no)" no
@@ -91,6 +100,8 @@ publish 2.0.1 x86_64-unknown-linux-gnu
 printf 'tampered' >>"${FAKE_RELEASE}/openflows-2.0.1-x86_64-unknown-linux-gnu.tar.gz"
 install_archive 2.0.1 x86_64-unknown-linux-gnu "$DEST"
 expect_eq "a wrong checksum is refused" "$?" 2
+OPENFLOWS_RELEASE_BASE_URL=http://127.0.0.1:8000/releases install_archive 2.0.1 x86_64-unknown-linux-gnu "$DEST"
+expect_eq "also from OPENFLOWS_RELEASE_BASE_URL" "$?" 2
 expect_eq "and keeps the installed programs" "$("${DEST}/openflows")" "openflows 2.0.0 x86_64-unknown-linux-gnu"
 
 echo "Choosing the version"

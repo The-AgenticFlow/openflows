@@ -37,13 +37,15 @@ the new centralized `crates/config/src/env.rs` layer.
 | `OPENFLOWS_TICKET` | openflows-harness | required | `TenantConfig.ticket` |
 | `OPENFLOWS_ROLE` | openflows-harness | required | `TenantConfig.role` |
 | `OPENFLOWS_HOME` | agent-vessel, binary/orchestration | in-use | `TenantConfig.home` (default `~/.openflows`) |
+| `OPENFLOWS_DOCS_GATE_SECRET` | config (docs gate), agent-nexus, agent-vessel, binary | in-use · optional | `DocsGateConfig.secret` (>= 32 bytes; falls back to `CODER_CHAT_HOOK_SECRET`) |
+| `OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS` | config (docs gate), agent-nexus, agent-vessel | in-use · optional | `DocsGateConfig.previous_secret` (verifies approvals sealed before a rotation) |
 | `OPENFLOWS_REGISTRY_PATH` | coder-client, nexus, binary | in-use · internal | `TenantConfig.registry_path` |
 | `OPENFLOWS_REGISTRY_JSON` | coder-client, nexus, binary | in-use · internal | `TenantConfig.registry_json` |
 | `OPENFLOWS_NEXUS_API_TOKEN` | coder-client | in-use · legacy-alias | `TenantConfig.nexus_api_token`; reconcile with `NEXUS_CODER_API_TOKEN` |
 | `NEXUS_CODER_API_TOKEN` | coder-client | legacy-alias | Merge into `OPENFLOWS_NEXUS_API_TOKEN` |
 | `OPENFLOWS_TAR` | coder-client/build.rs | in-use | `TenantConfig.tar` (default `tar`) |
 | `ARTIFACTS_DIR` | agent-nexus, binary | in-use · internal | `TenantConfig`/`AgentConfig` |
-| `AGENTFLOW_WORKSPACE_ROOT` | agent-lore, agent-vessel | in-use · legacy-alias | `AgentConfig.workspace_root` (canonical) |
+| `AGENTFLOW_WORKSPACE_ROOT` | agent-vessel | in-use · legacy-alias | `AgentConfig.workspace_root` (canonical) |
 | `WORKSPACE_ROOT` | agent-nexus, agent-vessel | legacy-alias | `AgentConfig.legacy_workspace_root` (deprecated) |
 | `HOME` / `USERPROFILE` | coder-client, nexus, vessel, binary | in-use (platform) | Use `dirs` semantics / `TenantConfig.openflows_home()` |
 | `GITHUB_TOKEN` | — (removed) | **removed** | `GithubConfig.token` deleted with the PAT flow (#205); resolves from `OPENFLOWS_GITHUB_API_TOKEN_FILE` |

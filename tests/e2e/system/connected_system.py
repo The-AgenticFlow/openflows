@@ -96,9 +96,109 @@ def journal():
     return [json.loads(line) for line in docker('cat', '/tmp/github/github-requests.jsonl').splitlines()]
 
 
-def assert_no_merge_attempt():
-    assert not any(entry['method'] == 'PUT' and entry['path'].endswith('/merge') for entry in journal()), \
+def assert_no_merge_attempt(pr_number=None):
+    suffix = f'/pulls/{pr_number}/merge' if pr_number else '/merge'
+    assert not any(entry['method'] == 'PUT' and entry['path'].endswith(suffix) for entry in journal()), \
         'The controller attempted a merge before all gates passed'
+
+
+def docs_record():
+    result = subprocess.run(['openflows', 'gate', 'docs', '--tenant', bootstrap.TENANT,
+        '--ticket', 'T-001', '--status'],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=True)
+    record = json.loads(next(line for line in reversed(result.stdout.splitlines()) if line.startswith('{')))
+    save('docs-record.json', record)
+    return record
+
+
+def role_workspaces(role):
+    return [ws for ws in bootstrap.coder('/workspaces')['workspaces'] if f'{role}-' in ws['name'].lower()]
+
+
+def document_merged_ticket(nexus, merged):
+    """LORE documents the merged ticket; the operator approves; VESSEL squash-merges the docs PR."""
+    git_dir = '--git-dir=/tmp/github/repo.git'
+    lore_seen = []
+
+    def docs_ready():
+        observe()
+        lore_seen.extend(ws['id'] for ws in role_workspaces('lore'))
+        assert not github('/pulls'), 'A docs PR was opened before the operator approved the docs'
+        record = docs_record()
+        return record if record['phase'] == 'docs_ready' else False
+    record = bootstrap.wait('NEXUS/LORE did not submit docs for the merged ticket', docs_ready, seconds=600)
+    assert lore_seen, 'NEXUS never provisioned a real LORE workspace'
+    docs_head = record['head']
+    assert record['branch'] == 'lore/T-001' and record['base'] == 'main' and record['revision'] == 1
+    assert record['files'] == ['CHANGELOG.md'], record['files']
+    assert docker('git', git_dir, 'rev-parse', 'refs/heads/lore/T-001') == docs_head
+    assert docker('git', git_dir, 'rev-parse', docs_head + '^') == merged
+    assert 'LORE_DOCS_T001' in docker('git', git_dir, 'show', docs_head + ':CHANGELOG.md')
+    assert docker('git', git_dir, 'rev-parse', 'main') == merged, 'LORE changed the default branch itself'
+    # Pushed work awaits a human: LORE's workspace is released, not kept.
+    bootstrap.wait('NEXUS did not delete the LORE workspace while docs await the operator',
+        lambda: (observe(), not role_workspaces('lore'))[1], seconds=240)
+    assert not github('/pulls')
+    print(f'LORE pushed lore/T-001 at {docs_head[:8]} and submitted it; its workspace was deleted.', flush=True)
+
+    subprocess.run(['openflows', 'gate', 'docs', '--tenant', bootstrap.TENANT, '--ticket', 'T-001',
+        '--verdict', 'approve', '--revision', str(record['revision']), '--head', docs_head[:12],
+        '--notes', 'Operator approves the changelog entry'],
+        stdin=subprocess.DEVNULL, check=True, timeout=30)
+
+    def published():
+        pulls = [pr for pr in github('/pulls') if pr['head']['ref'] == 'lore/T-001']
+        record = docs_record()
+        return (pulls[0], record) if pulls and record['phase'] == 'published' else False
+    docs_pr, record = bootstrap.wait('NEXUS did not open the approved docs PR', published, seconds=180)
+    assert record['pr_number'] == docs_pr['number']
+    assert docs_pr['base']['ref'] == 'main' and docs_pr['head']['sha'] == docs_head
+    assert not role_workspaces('lore'), 'Publishing the docs PR must not need a LORE workspace'
+    save('docs-pr.json', docs_pr)
+
+    # The repository requires an approved review and a passing check; VESSEL
+    # must hold while the check is pending, then merge once it passes.
+    github('/pulls/' + str(docs_pr['number']) + '/reviews',
+        {'event': 'APPROVE', 'commit_id': docs_head, 'body': 'Human approval of the docs PR'})
+    github('/check-runs', {'name': 'acceptance', 'head_sha': docs_head, 'status': 'in_progress'},
+        'ci-runner-token')
+    pending_start = len(journal())
+
+    def held_for_ci():
+        assert_no_merge_attempt(docs_pr['number'])
+        return any(entry['method'] == 'GET' and
+            entry['path'] == f'/repos/test/repo/commits/{docs_head}/check-suites' and
+            any(check['status'] == 'in_progress' for check in entry['response'].get('check_suites', []))
+            for entry in journal()[pending_start:])
+    bootstrap.wait('VESSEL did not check CI on the docs PR', held_for_ci, seconds=180)
+    assert_no_merge_attempt(docs_pr['number'])
+    ci(docs_head)
+
+    docs_merged = bootstrap.wait('VESSEL did not merge the approved and tested docs PR',
+        lambda: (current if (current := github('/pulls/' + str(docs_pr['number'])))['merged'] else False),
+        seconds=240)
+    docs_merge = docs_merged['merge_commit_sha']
+    merges = [entry for entry in journal() if entry['method'] == 'PUT' and
+        entry['path'] == f'/repos/test/repo/pulls/{docs_pr["number"]}/merge' and entry['status'] == 200]
+    assert len(merges) == 1, merges
+    assert merges[0]['request']['merge_method'] == 'squash' and merges[0]['request']['sha'] == docs_head
+    assert docker('git', git_dir, 'rev-parse', 'main') == docs_merge
+    assert docker('git', git_dir, 'rev-parse', docs_merge + '^') == merged
+    assert docker('git', git_dir, 'rev-parse', docs_merge + '^{tree}') == \
+        docker('git', git_dir, 'rev-parse', docs_head + '^{tree}')
+    ci(docs_merge)
+
+    def closed():
+        observe()
+        record = docs_record()
+        return record if record['phase'] == 'merged' else False
+    record = bootstrap.wait('The docs record did not close after the docs PR merged', closed, seconds=120)
+    assert record['pr_number'] == docs_pr['number']
+    assert not role_workspaces('lore')
+    print(f'Operator approval opened docs PR #{docs_pr["number"]}; VESSEL held it for CI, then '
+        f'squash-merged it as {docs_merge[:8]}.', flush=True)
+    return {'docs_head': docs_head, 'docs_pr': docs_merged, 'docs_merge': docs_merge,
+        'lore_workspaces': sorted(set(lore_seen)), 'docs_record': record}
 
 
 def collect_verifications():
@@ -230,7 +330,7 @@ def restart_controller(nexus, expected_head):
 
 
 def run():
-    workspace, templates, organization, nexus = bootstrap.setup_tenant('system-e2e')
+    workspace, templates, organization, nexus = bootstrap.setup_tenant('system-e2e', lore=True)
     try:
         original_main = docker('git', '--git-dir=/tmp/github/repo.git', 'rev-parse', 'refs/heads/main')
         issue = github('/issues', {'title': 'Fix answer.txt to return 42',
@@ -407,13 +507,17 @@ def run():
         ci(merged)
 
         def cleaned():
-            remaining = observe()
+            observe()
             status = operator_status()
             ticket = next(t for t in status['tickets'] if t['id'] == 'T-001')
-            return len(remaining) == 1 and remaining[0]['id'] == workspace['id'] and \
+            return not role_workspaces('forge') and not role_workspaces('sentinel') and \
                 ticket['status']['type'] == 'merged'
         bootstrap.wait('Controller did not complete the ticket and remove both role workspaces', cleaned, seconds=240)
         assert github('/issues/1')['state'] == 'closed'
+        docs = document_merged_ticket(nexus, merged)
+        remaining = observe()
+        assert len(remaining) == 1 and remaining[0]['id'] == workspace['id'], \
+            f'Only NEXUS may remain after the docs merge: {[ws["name"] for ws in remaining]}'
         log = bootstrap.ssh(nexus, 'cat /tmp/openflows-controller.log')
         (ARTIFACTS / 'controller.log').write_text(log)
         log = re.sub(r'\x1b\[[0-9;]*m', '', log)
@@ -424,10 +528,11 @@ def run():
         save('system-evidence.json', {'full_issue_to_merge': True, 'issue': issue, 'pr': merged_pr,
             'candidate_heads': [head_1, head_2, head_3, head_4], 'tested_head': head, 'merged_head': merged,
             'hook_denials': len(HOOK_DENIALS), 'role_chats': list(CHATS.values()),
-            'workspaces': list(WORKSPACES.values()), 'verification': state['verification_task']})
+            'workspaces': list(WORKSPACES.values()), 'verification': state['verification_task'],
+            'docs': docs})
         bootstrap.coder('/workspaces/' + workspace['id'] + '/builds', {'transition': 'delete'})
         bootstrap.wait('NEXUS deletion did not complete', lambda: not bootstrap.coder('/workspaces')['workspaces'])
-        print('PASS: actual issue routing, role chats, signed hooks, PreToolUse denial, plan/testing rejection loops, CI failure /ci_fix rework, repeated human REQUEST_CHANGES rework, second-reviewer approval after addressed change requests, controller restart recovery, human/CI gates, squash merge, acceptance and cleanup.', flush=True)
+        print('PASS: actual issue routing, role chats, signed hooks, PreToolUse denial, plan/testing rejection loops, CI failure /ci_fix rework, repeated human REQUEST_CHANGES rework, second-reviewer approval after addressed change requests, controller restart recovery, human/CI gates, squash merge, acceptance, LORE docs gate and docs PR squash merge, and cleanup.', flush=True)
     finally:
         errors = []
         for collect in (observe, lambda: (ARTIFACTS / 'controller-final.log').write_text(

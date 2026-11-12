@@ -429,6 +429,15 @@ impl CoderBootstrapper {
                     .and_then(|c| c.hooks.chat_hook_url_effective())
             })
             .unwrap_or_default();
+        // The docs gate secrets go to the controller only (never to workers).
+        let docs_gate = self
+            .env
+            .as_ref()
+            .map(|e| e.docs_gate.clone())
+            .or_else(|| config::EnvConfig::from_env().ok().map(|c| c.docs_gate));
+        let (docs_gate_secret, docs_gate_previous) = docs_gate
+            .map(|g| (g.secret, g.previous_secret))
+            .unwrap_or_default();
         let workspace = client
             .create_workspace_for_user(
                 &admin.id,
@@ -444,6 +453,8 @@ impl CoderBootstrapper {
                         "github_repository": github_repo,
                         "coder_chat_hook_secret": hook_secret,
                         "coder_chat_hook_url": hook_url,
+                        "docs_gate_secret": docs_gate_secret.unwrap_or_default(),
+                        "docs_gate_secret_previous": docs_gate_previous.unwrap_or_default(),
                         "registry_json": registry_json,
                         "start_controller": true,
                     }),

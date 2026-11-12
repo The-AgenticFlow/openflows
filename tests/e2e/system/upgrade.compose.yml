@@ -1,0 +1,10 @@
+# Upgrade scenario only (#528): keep Redis data across restarts as the production
+# docker-compose.yml does, so a restart test measures OpenFlows, not the test stack.
+services:
+  redis:
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
