@@ -6,11 +6,12 @@
 //! organization release bindings. All reads are organization-scoped.
 
 use crate::error::ManagerError;
-use crate::id::{OrganizationId, ProvisionerId, ReleaseId};
+use crate::id::{OrganizationId, ProvisionerId, ReleaseId, TenantId, WorkspaceId};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
+use super::backend::ProvisionerBackend;
 use super::packaging::{Role, RoleManifestEntry, TemplateManifest};
 
 /// A persisted template release (from `template_releases`).
@@ -30,10 +31,14 @@ pub struct ReleaseRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ReleaseRoleRow {
     pub release_id: uuid::Uuid,
+    pub backend: String,
     pub role: String,
     pub archive_digest: String,
     pub parameter_schema_version: i32,
+    pub architecture: String,
+    pub image_repository: Option<String>,
     pub image_digest: Option<String>,
+    pub workspace_runtime_release: Option<String>,
 }
 
 /// A per-organization template publication (`organization_template_versions`).
@@ -42,6 +47,7 @@ pub struct OrgTemplateVersionRow {
     pub id: uuid::Uuid,
     pub organization_id: uuid::Uuid,
     pub release_id: uuid::Uuid,
+    pub backend: String,
     pub role: String,
     pub coder_template_id: Option<String>,
     pub coder_version_id: Option<String>,
@@ -101,17 +107,28 @@ impl ReleaseRepository {
         .await
         .map_err(|e| translate_release_insert(e, &manifest.release))?;
 
-        for (role, entry) in &manifest.roles {
+        let variants: Vec<&RoleManifestEntry> = if manifest.variants.is_empty() {
+            manifest.roles.values().collect()
+        } else {
+            manifest.all_variants().map(|(_, entry)| entry).collect()
+        };
+
+        for entry in variants {
             sqlx::query(
                 "INSERT INTO template_release_roles
-                    (release_id, role, archive_digest, parameter_schema_version, image_digest)
-                 VALUES ($1, $2, $3, $4, $5)",
+                    (release_id, backend, role, archive_digest, parameter_schema_version,
+                     architecture, image_repository, image_digest, workspace_runtime_release)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(release_id.0)
-            .bind(role.as_str())
+            .bind(entry.backend.as_str())
+            .bind(entry.role.as_str())
             .bind(&entry.sha256)
             .bind(entry.parameter_schema_version as i32)
+            .bind(&entry.architecture)
+            .bind(&entry.image_repository)
             .bind(&entry.image_digest)
+            .bind(&entry.workspace_runtime_release)
             .execute(&mut *tx)
             .await
             .map_err(ManagerError::from)?;
@@ -196,12 +213,44 @@ impl ReleaseRepository {
         }
     }
 
-    async fn load_roles(
+    /// Fetch a release and all its `(backend, role)` variants by id.
+    pub async fn get_release_variants(
+        &self,
+        release_id: ReleaseId,
+    ) -> Result<
+        Option<(
+            ReleaseRow,
+            BTreeMap<(ProvisionerBackend, Role), RoleManifestEntry>,
+        )>,
+        ManagerError,
+    > {
+        let row = sqlx::query_as::<_, ReleaseRow>(
+            "SELECT id, version, manifest_sha256, artifact_uri, status,
+                    approved_by, approved_at, created_at
+               FROM template_releases
+              WHERE id = $1",
+        )
+        .bind(release_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ManagerError::from)?;
+        match row {
+            Some(row) => {
+                let variants = self.load_variants(row.id).await?;
+                Ok(Some((row, variants)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Load all `(backend, role)` variants for a release.
+    pub async fn load_variants(
         &self,
         release_id: uuid::Uuid,
-    ) -> Result<BTreeMap<Role, RoleManifestEntry>, ManagerError> {
+    ) -> Result<BTreeMap<(ProvisionerBackend, Role), RoleManifestEntry>, ManagerError> {
         let rows = sqlx::query_as::<_, ReleaseRoleRow>(
-            "SELECT release_id, role, archive_digest, parameter_schema_version, image_digest
+            "SELECT release_id, backend, role, archive_digest, parameter_schema_version,
+                    architecture, image_repository, image_digest, workspace_runtime_release
                FROM template_release_roles
               WHERE release_id = $1",
         )
@@ -211,6 +260,12 @@ impl ReleaseRepository {
         .map_err(ManagerError::from)?;
         let mut map = BTreeMap::new();
         for r in rows {
+            let backend: ProvisionerBackend = r.backend.parse().map_err(|_| {
+                ManagerError::Service(anyhow::anyhow!(
+                    "unknown backend in database: {}",
+                    r.backend
+                ))
+            })?;
             let role = match r.role.as_str() {
                 "nexus" => Role::Nexus,
                 "forge" => Role::Forge,
@@ -224,15 +279,38 @@ impl ReleaseRepository {
                 }
             };
             map.insert(
-                role,
+                (backend, role),
                 RoleManifestEntry {
                     role,
-                    archive: role.archive_name(),
+                    backend,
+                    archive: role.archive_name_for_backend(backend),
                     sha256: r.archive_digest,
                     parameter_schema_version: r.parameter_schema_version as u32,
+                    architecture: r.architecture,
+                    image_repository: r.image_repository,
                     image_digest: r.image_digest,
+                    workspace_runtime_release: r.workspace_runtime_release,
                 },
             );
+        }
+        Ok(map)
+    }
+
+    async fn load_roles(
+        &self,
+        release_id: uuid::Uuid,
+    ) -> Result<BTreeMap<Role, RoleManifestEntry>, ManagerError> {
+        let variants = self.load_variants(release_id).await?;
+        let mut map = BTreeMap::new();
+        for ((backend, role), entry) in &variants {
+            if *backend == ProvisionerBackend::Docker {
+                map.insert(*role, entry.clone());
+            }
+        }
+        if map.is_empty() {
+            for ((_, role), entry) in variants {
+                map.entry(role).or_insert(entry);
+            }
         }
         Ok(map)
     }
@@ -276,8 +354,8 @@ impl ReleaseRepository {
     }
 
     /// Persist/refresh a per-organization template publication record. The
-    /// UNIQUE(org, release, role) constraint makes duplicate publication
-    /// converge rather than append.
+    /// UNIQUE(org, release, backend, role) constraint makes duplicate
+    /// publication converge rather than append.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_org_template_version(
         &self,
@@ -290,12 +368,41 @@ impl ReleaseRepository {
         status: &str,
         error_code: Option<&str>,
     ) -> Result<(), ManagerError> {
+        self.upsert_org_template_version_for_backend(
+            organization_id,
+            release_id,
+            ProvisionerBackend::Docker,
+            role,
+            template_id,
+            version_id,
+            import_job_id,
+            status,
+            error_code,
+        )
+        .await
+    }
+
+    /// Persist/refresh a per-organization template publication record for a
+    /// specific provisioner backend.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_org_template_version_for_backend(
+        &self,
+        organization_id: OrganizationId,
+        release_id: ReleaseId,
+        backend: ProvisionerBackend,
+        role: Role,
+        template_id: &str,
+        version_id: &str,
+        import_job_id: &str,
+        status: &str,
+        error_code: Option<&str>,
+    ) -> Result<(), ManagerError> {
         sqlx::query(
             "INSERT INTO organization_template_versions
-                (id, organization_id, release_id, role, coder_template_id,
+                (id, organization_id, release_id, backend, role, coder_template_id,
                  coder_version_id, import_job_id, status, error_code)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (organization_id, release_id, role)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (organization_id, release_id, backend, role)
              DO UPDATE SET coder_template_id = EXCLUDED.coder_template_id,
                            coder_version_id = EXCLUDED.coder_version_id,
                            import_job_id = EXCLUDED.import_job_id,
@@ -306,6 +413,7 @@ impl ReleaseRepository {
         .bind(uuid::Uuid::new_v4())
         .bind(organization_id.0)
         .bind(release_id.0)
+        .bind(backend.as_str())
         .bind(role.as_str())
         .bind(template_id)
         .bind(version_id)
@@ -318,26 +426,134 @@ impl ReleaseRepository {
         Ok(())
     }
 
-    /// Read the persisted publication for (org, release, role).
+    /// Read the persisted publication for (org, release, docker, role).
     pub async fn get_org_template_version(
         &self,
         organization_id: OrganizationId,
         release_id: ReleaseId,
         role: Role,
     ) -> Result<Option<OrgTemplateVersionRow>, ManagerError> {
+        self.get_org_template_version_for_backend(
+            organization_id,
+            release_id,
+            ProvisionerBackend::Docker,
+            role,
+        )
+        .await
+    }
+
+    /// Read the persisted publication for (org, release, backend, role).
+    pub async fn get_org_template_version_for_backend(
+        &self,
+        organization_id: OrganizationId,
+        release_id: ReleaseId,
+        backend: ProvisionerBackend,
+        role: Role,
+    ) -> Result<Option<OrgTemplateVersionRow>, ManagerError> {
         let row = sqlx::query_as::<_, OrgTemplateVersionRow>(
-            "SELECT id, organization_id, release_id, role, coder_template_id,
+            "SELECT id, organization_id, release_id, backend, role, coder_template_id,
                     coder_version_id, import_job_id, status, error_code, created_at, updated_at
                FROM organization_template_versions
-              WHERE organization_id = $1 AND release_id = $2 AND role = $3",
+              WHERE organization_id = $1 AND release_id = $2 AND backend = $3 AND role = $4",
         )
         .bind(organization_id.0)
         .bind(release_id.0)
+        .bind(backend.as_str())
         .bind(role.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(ManagerError::from)?;
         Ok(row)
+    }
+
+    /// Read a tenant's pinned release and backend, if set.
+    pub async fn get_tenant_pin(
+        &self,
+        organization_id: OrganizationId,
+        tenant_id: TenantId,
+    ) -> Result<Option<(Option<ReleaseId>, Option<ProvisionerBackend>)>, ManagerError> {
+        let row: Option<(Option<uuid::Uuid>, Option<String>)> = sqlx::query_as(
+            "SELECT pinned_release_id, pinned_backend
+               FROM tenants
+              WHERE organization_id = $1 AND id = $2",
+        )
+        .bind(organization_id.0)
+        .bind(tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(ManagerError::from)?;
+        match row {
+            None => Ok(None),
+            Some((release_id, backend)) => {
+                let parsed_backend = backend
+                    .map(|b| {
+                        b.parse::<ProvisionerBackend>().map_err(|_| {
+                            ManagerError::Service(anyhow::anyhow!(
+                                "unknown pinned_backend in database: {b}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                Ok(Some((release_id.map(ReleaseId::from_uuid), parsed_backend)))
+            }
+        }
+    }
+
+    /// Pin a tenant to a release and backend only if not already pinned.
+    pub async fn set_tenant_pin_if_unset(
+        &self,
+        organization_id: OrganizationId,
+        tenant_id: TenantId,
+        release_id: ReleaseId,
+        backend: ProvisionerBackend,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE tenants
+                SET pinned_release_id = COALESCE(pinned_release_id, $3),
+                    pinned_backend = COALESCE(pinned_backend, $4),
+                    updated_at = now()
+              WHERE organization_id = $1
+                AND id = $2
+                AND (pinned_release_id IS NULL OR pinned_backend IS NULL)",
+        )
+        .bind(organization_id.0)
+        .bind(tenant_id.0)
+        .bind(release_id.0)
+        .bind(backend.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Pin a workspace to a release, backend, and optional Coder version id.
+    pub async fn set_workspace_pin(
+        &self,
+        organization_id: OrganizationId,
+        workspace_id: WorkspaceId,
+        release_id: ReleaseId,
+        backend: ProvisionerBackend,
+        version_id: Option<&str>,
+    ) -> Result<bool, ManagerError> {
+        let affected = sqlx::query(
+            "UPDATE workspaces
+                SET pinned_release_id = $3,
+                    pinned_backend = $4,
+                    pinned_version_id = COALESCE($5, pinned_version_id),
+                    updated_at = now()
+              WHERE organization_id = $1 AND id = $2",
+        )
+        .bind(organization_id.0)
+        .bind(workspace_id.0)
+        .bind(release_id.0)
+        .bind(backend.as_str())
+        .bind(version_id)
+        .execute(&self.pool)
+        .await
+        .map_err(ManagerError::from)?
+        .rows_affected();
+        Ok(affected == 1)
     }
 
     /// Bind an organization to an approved release (the release it is

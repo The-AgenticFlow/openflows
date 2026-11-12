@@ -187,9 +187,10 @@ async fn promote_once(
             }
         }
     };
-    let publish = approvals.releases.promote_to_org(
+    let publish = approvals.releases.promote_to_org_for_backend(
         guard.organization_id,
         release_id,
+        &worker.compatibility_target,
         worker.adapter.as_ref(),
         worker.artifacts.as_ref().expect("checked above"),
     );

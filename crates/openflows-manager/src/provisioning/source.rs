@@ -17,6 +17,7 @@ use crate::templates::packaging::{
     sha256_hex, validate_archive, verify_archive_digest, Role, TemplateManifest,
 };
 use crate::templates::service::ReleaseArtifacts;
+use crate::templates::ProvisionerBackend;
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -155,7 +156,9 @@ impl HostedReleaseSource {
                 let manifest = TemplateManifest::parse(&cached.manifest_json).map_err(|e| {
                     ManagerError::Config(format!("cached manifest is invalid: {e}"))
                 })?;
-                if let Ok(artifacts) = build_artifacts_from_cache(&manifest, cached.archives) {
+                if let Ok(artifacts) =
+                    build_artifacts_from_cache(&manifest, cached.variant_archives)
+                {
                     let manifest_digest = manifest.manifest_sha256()?;
                     return Ok(ResolvedRelease {
                         artifacts,
@@ -226,13 +229,14 @@ impl HostedReleaseSource {
             )));
         }
 
-        let mut archives = BTreeMap::new();
-        for (role, entry) in &manifest.roles {
+        let mut variant_archives = BTreeMap::new();
+        for ((backend, role), entry) in manifest.all_variants() {
             let asset_url = asset_urls.get(&entry.archive).ok_or_else(|| {
                 ManagerError::Config(format!(
-                    "hosted release {reference} is missing the archive asset '{}' for role '{}'",
+                    "hosted release {reference} is missing the archive asset '{}' for role '{}' ({})",
                     entry.archive,
-                    role.as_str()
+                    role.as_str(),
+                    backend
                 ))
             })?;
             let archive = self
@@ -241,33 +245,42 @@ impl HostedReleaseSource {
                 .await
                 .map_err(|e| {
                     ManagerError::Config(format!(
-                        "failed to download archive for role '{}': {e}",
-                        role.as_str()
+                        "failed to download archive for role '{}' ({}): {e}",
+                        role.as_str(),
+                        backend
                     ))
                 })?;
             verify_archive_digest(&archive, &entry.sha256).map_err(|e| {
                 ManagerError::Config(format!(
-                    "role '{}' archive does not match manifest digest: {e}",
-                    role.as_str()
+                    "role '{}' ({}) archive does not match manifest digest: {e}",
+                    role.as_str(),
+                    backend
                 ))
             })?;
             validate_archive(&archive).map_err(|e| {
-                ManagerError::Config(format!("role '{}' archive is unsafe: {e}", role.as_str()))
+                ManagerError::Config(format!(
+                    "role '{}' ({}) archive is unsafe: {e}",
+                    role.as_str(),
+                    backend
+                ))
             })?;
-            archives.insert(*role, archive);
+            variant_archives.insert((backend, role), archive);
         }
 
-        for role in &manifest.required_roles {
-            if !archives.contains_key(role) {
-                return Err(ManagerError::Config(format!(
-                    "hosted release {reference} is missing the required role '{}'",
-                    role.as_str()
-                )));
+        for backend in manifest.backends() {
+            for role in &manifest.required_roles {
+                if !variant_archives.contains_key(&(backend, *role)) {
+                    return Err(ManagerError::Config(format!(
+                        "hosted release {reference} is missing required role '{}' ({})",
+                        role.as_str(),
+                        backend
+                    )));
+                }
             }
         }
 
         Ok(ResolvedRelease {
-            artifacts: ReleaseArtifacts { manifest, archives },
+            artifacts: ReleaseArtifacts::from_backend_archives(manifest, variant_archives),
             source_reference: reference.to_string(),
             manifest_digest: actual_manifest_digest,
         })
@@ -296,22 +309,23 @@ fn github_release_metadata_url(config: &HostedReleaseConfig) -> Result<String, M
 /// Reassemble validated artifacts from a cached manifest and archive bytes.
 fn build_artifacts_from_cache(
     manifest: &TemplateManifest,
-    archives: BTreeMap<Role, Vec<u8>>,
+    variant_archives: BTreeMap<(ProvisionerBackend, Role), Vec<u8>>,
 ) -> Result<ReleaseArtifacts, ManagerError> {
-    for (role, entry) in &manifest.roles {
-        let archive = archives.get(role).ok_or_else(|| {
+    for ((backend, role), entry) in manifest.all_variants() {
+        let archive = variant_archives.get(&(backend, role)).ok_or_else(|| {
             ManagerError::Config(format!(
-                "cached release is missing archive for role '{}'",
-                role.as_str()
+                "cached release is missing archive for role '{}' ({})",
+                role.as_str(),
+                backend
             ))
         })?;
         verify_archive_digest(archive, &entry.sha256)?;
         validate_archive(archive)?;
     }
-    Ok(ReleaseArtifacts {
-        manifest: manifest.clone(),
-        archives,
-    })
+    Ok(ReleaseArtifacts::from_backend_archives(
+        manifest.clone(),
+        variant_archives,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -482,20 +496,19 @@ impl ReleaseCache {
         {
             return Ok(None);
         }
-        let mut archives = BTreeMap::new();
-        for role in manifest.roles.keys() {
-            let archive_path = entry_dir.join(role.archive_name());
-            let Ok(bytes) = std::fs::read(&archive_path) else {
+        let mut variant_archives = BTreeMap::new();
+        for ((backend, role), entry) in manifest.all_variants() {
+            let Ok(bytes) = std::fs::read(entry_dir.join(&entry.archive)) else {
                 return Ok(None);
             };
-            archives.insert(*role, bytes);
+            variant_archives.insert((backend, role), bytes);
         }
-        if build_artifacts_from_cache(&manifest, archives.clone()).is_err() {
+        if build_artifacts_from_cache(&manifest, variant_archives.clone()).is_err() {
             return Ok(None);
         }
         Ok(Some(CachedRelease {
             manifest_json,
-            archives,
+            variant_archives,
         }))
     }
 
@@ -524,7 +537,11 @@ impl ReleaseCache {
             ));
         }
         let entry_bytes = manifest_bytes.len()
-            + artifacts.archives.values().map(Vec::len).sum::<usize>()
+            + artifacts
+                .variant_archives
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
             + CACHE_ENTRY_MARKER.len();
         if entry_bytes > self.max_total_bytes {
             return Err(std::io::Error::new(
@@ -593,8 +610,11 @@ impl ReleaseCache {
         artifacts: &ReleaseArtifacts,
     ) -> std::io::Result<()> {
         std::fs::write(entry_dir.join("manifest.json"), manifest_bytes)?;
-        for (role, archive) in &artifacts.archives {
-            std::fs::write(entry_dir.join(role.archive_name()), archive)?;
+        for ((backend, role), entry) in artifacts.manifest.all_variants() {
+            let archive = artifacts.archive_for(backend, role).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing variant archive")
+            })?;
+            std::fs::write(entry_dir.join(&entry.archive), archive)?;
         }
         std::fs::write(entry_dir.join(CACHE_ENTRY_MARKER), b"openflows\n")?;
         Ok(())
@@ -699,8 +719,8 @@ impl ReleaseCache {
 pub struct CachedRelease {
     /// The canonical manifest JSON bytes.
     pub manifest_json: Vec<u8>,
-    /// role -> verified archive bytes.
-    pub archives: BTreeMap<Role, Vec<u8>>,
+    /// (backend, role) -> verified archive bytes.
+    pub variant_archives: BTreeMap<(ProvisionerBackend, Role), Vec<u8>>,
 }
 
 /// Total size of the files directly under `dir`.
@@ -796,25 +816,18 @@ mod tests {
             archives.insert(role, archive);
             roles.insert(
                 role,
-                RoleManifestEntry {
-                    role,
-                    archive: role.archive_name(),
-                    sha256,
-                    parameter_schema_version: 1,
-                    image_digest: None,
-                },
+                RoleManifestEntry::docker(role, role.archive_name(), sha256, 1, None),
             );
         }
-        let manifest = TemplateManifest {
-            schema_version: 1,
-            release: "2026.10.0".into(),
-            required_roles: vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
+        let manifest = TemplateManifest::from_v1_roles(
+            "2026.10.0",
+            vec![Role::Nexus, Role::Forge, Role::Sentinel, Role::Vessel],
             roles,
-        };
+        );
         let manifest_json = manifest.to_canonical_json().unwrap();
         assets.insert("manifest.json".into(), manifest_json.clone());
         (
-            ReleaseArtifacts { manifest, archives },
+            ReleaseArtifacts::new(manifest, archives),
             manifest_json,
             assets,
             dir,
@@ -1315,7 +1328,7 @@ mod tests {
         let cached = cache.load(&digest).unwrap().expect("cached entry");
         assert_eq!(sha256_hex(&cached.manifest_json), digest);
         let manifest = TemplateManifest::parse(&cached.manifest_json).unwrap();
-        let rebuilt = build_artifacts_from_cache(&manifest, cached.archives).unwrap();
+        let rebuilt = build_artifacts_from_cache(&manifest, cached.variant_archives).unwrap();
         assert_eq!(
             rebuilt.archives.get(&Role::Nexus),
             artifacts.archives.get(&Role::Nexus)
@@ -1338,8 +1351,8 @@ mod tests {
         cache.store(&digest, &artifacts, "test").unwrap();
         cache.store(&digest, &artifacts, "test").unwrap();
         assert_eq!(
-            cache.load(&digest).unwrap().unwrap().archives,
-            artifacts.archives
+            cache.load(&digest).unwrap().unwrap().variant_archives,
+            artifacts.variant_archives
         );
     }
 

@@ -743,6 +743,11 @@ impl ManagerServices {
             .approve_configured_release(release_id)
             .await?;
 
+        let backend: crate::templates::ProvisionerBackend = config.provisioner_backend.parse()?;
+        let target = crate::provisioning::compatibility_target_from_env(
+            backend,
+            config.mode == crate::config::Mode::Hosted,
+        )?;
         let worker = crate::provisioning::OrgProvisionWorker::new(
             self.db.pool().clone(),
             self.organizations.clone(),
@@ -754,10 +759,8 @@ impl ManagerServices {
             config.provisioner_backend.clone(),
             config.coder_version_baseline.clone(),
         );
-        self.org_provision = Some(worker);
+        self.org_provision = Some(worker.with_compatibility_target(target.clone()));
 
-        // Durable tenant-provisioning worker sharing the same platform Coder
-        // adapter, quota service, and tenant runtime repository.
         let tenant_worker = crate::provisioning::TenantProvisionWorker::new(
             self.db.pool().clone(),
             self.organizations.clone(),
@@ -767,6 +770,7 @@ impl ManagerServices {
             self.release_repo.clone(),
             adapter,
         )
+        .with_compatibility_target(target)
         .with_runtime_endpoints(
             crate::config::runtime_manager_url(&config.auth.public_url)
                 .map_err(crate::error::ManagerError::Config)?,
