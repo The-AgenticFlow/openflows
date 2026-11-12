@@ -454,6 +454,24 @@ def run():
 
         # A pending check is a declared external state, never a fabricated success.
         github('/check-runs', {'name': 'acceptance', 'head_sha': head, 'status': 'in_progress'}, 'ci-runner-token')
+
+        # ── #396: a second reviewer approves after rework addressed the operator's change request ──
+        # The operator's latest GitHub review is still the round 2 REQUEST_CHANGES on head_3, which
+        # the rework to head_4 addressed. It must not hide another reviewer's approval of head_4.
+        github('/pulls/' + str(pr['number']) + '/reviews', {'event': 'APPROVE', 'commit_id': head,
+            'body': 'Second reviewer approves the reworked candidate'}, 'ci-reviewer-token')
+        def reconciled_second_reviewer():
+            assert not github('/pulls/' + str(pr['number']))['merged'], 'Merged while CI was pending'
+            assert_no_merge_attempt()
+            human = lifecycle(nexus).get('pr_human') or {}
+            return bool(human.get('approved')) and human.get('head') == head and \
+                'Approved on GitHub by reviewer' in human.get('report', '')
+        bootstrap.wait('VESSEL did not reconcile the second reviewer approval past the addressed change request',
+            reconciled_second_reviewer, seconds=120)
+        save('after-reviewer-approval.json', lifecycle(nexus))
+        print('Second reviewer approval of the reworked head reconciled past the addressed change request.', flush=True)
+        state = lifecycle(nexus)  # Reconciliation may have completed review delivery.
+
         subprocess.run(['openflows', 'gate', 'decide', '--tenant', bootstrap.TENANT, '--ticket', 'T-001',
             '--phase', 'submit', '--revision', str(state['revision']), '--round', str(state['review_round']),
             '--head', head, '--verdict', 'approve', '--notes', 'Operator approves the verified candidate'],
@@ -513,7 +531,7 @@ def run():
             'docs': docs})
         bootstrap.coder('/workspaces/' + workspace['id'] + '/builds', {'transition': 'delete'})
         bootstrap.wait('NEXUS deletion did not complete', lambda: not bootstrap.coder('/workspaces')['workspaces'])
-        print('PASS: actual issue routing, role chats, signed hooks, PreToolUse denial, plan/testing rejection loops, CI failure /ci_fix rework, repeated human REQUEST_CHANGES rework, controller restart recovery, human/CI gates, squash merge, acceptance, LORE docs gate and docs PR squash merge, and cleanup.', flush=True)
+        print('PASS: actual issue routing, role chats, signed hooks, PreToolUse denial, plan/testing rejection loops, CI failure /ci_fix rework, repeated human REQUEST_CHANGES rework, second-reviewer approval after addressed change requests, controller restart recovery, human/CI gates, squash merge, acceptance, LORE docs gate and docs PR squash merge, and cleanup.', flush=True)
     finally:
         errors = []
         for collect in (observe, lambda: (ARTIFACTS / 'controller-final.log').write_text(
