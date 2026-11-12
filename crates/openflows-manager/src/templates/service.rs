@@ -261,7 +261,7 @@ impl ReleaseService {
                 })?;
 
             let template_name = role.template_name();
-            let version_name = release_id.to_string();
+            let version_name = version_name_for_backend(release_id, target.backend);
             let result = adapter
                 .ensure_template_version(&coder_org, &template_name, &version_name, archive)
                 .await?;
@@ -480,6 +480,19 @@ pub fn internal_org_name(organization_id: OrganizationId) -> String {
     }
 
     format!("of-{encoded}")
+}
+
+/// Derive the Coder template version name for a release and backend.
+///
+/// Docker preserves the bare release UUID for compatibility with existing
+/// deployments, pinned workspaces, and rollback; non-Docker backends include
+/// their backend suffix so variants published into the same Coder organization
+/// never collide on version name.
+pub fn version_name_for_backend(release_id: ReleaseId, backend: ProvisionerBackend) -> String {
+    match backend {
+        ProvisionerBackend::Docker => release_id.to_string(),
+        ProvisionerBackend::Kubernetes => format!("{release_id}-{}", backend.as_str()),
+    }
 }
 
 #[cfg(test)]

@@ -280,12 +280,7 @@ impl TemplateManifest {
                 .ok_or_else(|| ManagerError::InvalidInput("role entry missing sha256".into()))?
                 .to_string();
             validate_sha256(&sha256)?;
-            let parameter_schema_version = entry
-                .get("parameter_schema_version")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    ManagerError::InvalidInput("role entry missing parameter_schema_version".into())
-                })?;
+            let parameter_schema_version = parse_parameter_schema_version(entry, "role entry")?;
             let image_digest = entry
                 .get("image_digest")
                 .and_then(|v| v.as_str())
@@ -294,7 +289,7 @@ impl TemplateManifest {
                 role,
                 archive,
                 sha256,
-                parameter_schema_version as u32,
+                parameter_schema_version,
                 image_digest,
             );
             variants.insert((ProvisionerBackend::Docker, role), parsed.clone());
@@ -375,12 +370,7 @@ impl TemplateManifest {
                 .to_string();
             validate_sha256(&sha256)?;
 
-            let parameter_schema_version = item
-                .get("parameter_schema_version")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    ManagerError::InvalidInput("variant missing parameter_schema_version".into())
-                })?;
+            let parameter_schema_version = parse_parameter_schema_version(item, "variant")?;
 
             let arch_raw = item
                 .get("architecture")
@@ -406,7 +396,7 @@ impl TemplateManifest {
                 backend,
                 archive,
                 sha256,
-                parameter_schema_version: parameter_schema_version as u32,
+                parameter_schema_version,
                 architecture,
                 image_repository,
                 image_digest,
@@ -710,6 +700,23 @@ fn role_from_str(s: &str) -> Result<Role, ManagerError> {
     }
 }
 
+fn parse_parameter_schema_version(
+    obj: &serde_json::Value,
+    context: &str,
+) -> Result<u32, ManagerError> {
+    let raw = obj
+        .get("parameter_schema_version")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ManagerError::InvalidInput(format!("{context} missing parameter_schema_version"))
+        })?;
+    u32::try_from(raw).map_err(|_| {
+        ManagerError::InvalidInput(format!(
+            "{context} parameter_schema_version {raw} exceeds u32::MAX"
+        ))
+    })
+}
+
 fn validate_sha256(s: &str) -> Result<(), ManagerError> {
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ManagerError::InvalidInput(format!(
@@ -972,5 +979,22 @@ mod tests {
         }
         let archive = encoder.finish().unwrap();
         assert!(validate_archive(&archive).is_err());
+    }
+
+    #[test]
+    fn oversized_parameter_schema_version_is_rejected() {
+        let oversized = (u32::MAX as u64) + 2;
+        let sha = "a".repeat(64);
+        let req = r#"["nexus","forge","sentinel","vessel","lore"]"#;
+        let v1 = format!(
+            r#"{{"schema_version":1,"release":"v1","required_roles":{req},"roles":{{"nexus":{{"archive":"openflows-nexus.tar.gz","sha256":"{sha}","parameter_schema_version":{oversized}}}}}}}"#
+        );
+        let v2 = format!(
+            r#"{{"schema_version":2,"release":"v2","required_roles":{req},"variants":[{{"role":"nexus","backend":"kubernetes","archive":"openflows-kubernetes-nexus.tar.gz","sha256":"{sha}","parameter_schema_version":{oversized},"architecture":"amd64","image_digest":"sha256:{sha}"}}]}}"#
+        );
+        for raw in [v1, v2] {
+            let err = TemplateManifest::parse(raw.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("exceeds u32::MAX"), "{err}");
+        }
     }
 }

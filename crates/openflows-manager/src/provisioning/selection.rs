@@ -153,10 +153,33 @@ async fn resolve_tenant_release_id(
     tenant_id: TenantId,
     target: &ReleaseCompatibilityTarget,
 ) -> Result<Option<ReleaseId>, ManagerError> {
+    let workspace_backends = release_repo
+        .get_tenant_workspace_backends(org_id, tenant_id)
+        .await?;
+    for wb in workspace_backends {
+        // Any legacy workspace with a NULL backend pin belongs to Docker.
+        let effective = wb.unwrap_or(ProvisionerBackend::Docker);
+        if effective != target.backend {
+            return Err(ManagerError::api(
+                err::RELEASE_NOT_RESOLVED,
+                format!(
+                    "tenant has existing '{}' workspace and cannot use '{}'",
+                    effective, target.backend
+                ),
+            ));
+        }
+    }
+
     if let Some((pinned_release_id, pinned_backend)) =
         release_repo.get_tenant_pin(org_id, tenant_id).await?
     {
-        if let Some(backend) = pinned_backend {
+        // A legacy tenant with a release pin and NULL backend pin belongs to Docker.
+        let effective_backend = pinned_backend.or_else(|| {
+            pinned_release_id
+                .is_some()
+                .then_some(ProvisionerBackend::Docker)
+        });
+        if let Some(backend) = effective_backend {
             if backend != target.backend {
                 return Err(ManagerError::api(
                     err::RELEASE_NOT_RESOLVED,
@@ -328,7 +351,7 @@ pub async fn record_workspace_and_tenant_pin(
     release_repo
         .set_tenant_pin_if_unset(org_id, tenant_id, spec.release_id, spec.backend)
         .await?;
-    release_repo
+    let updated = release_repo
         .set_workspace_pin(
             org_id,
             workspace_id,
@@ -337,6 +360,12 @@ pub async fn record_workspace_and_tenant_pin(
             Some(&spec.version_id.0),
         )
         .await?;
+    if !updated {
+        return Err(ManagerError::api(
+            err::RELEASE_NOT_RESOLVED,
+            "workspace is pinned to a different backend",
+        ));
+    }
     Ok(())
 }
 

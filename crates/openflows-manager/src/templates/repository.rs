@@ -499,6 +499,44 @@ impl ReleaseRepository {
         }
     }
 
+    /// Return the `pinned_backend` values for all workspaces belonging to `tenant_id`.
+    pub async fn get_tenant_workspace_backends(
+        &self,
+        organization_id: OrganizationId,
+        tenant_id: TenantId,
+    ) -> Result<Vec<Option<ProvisionerBackend>>, ManagerError> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT pinned_backend
+               FROM workspaces
+              WHERE organization_id = $1
+                AND tenant_id = $2
+                AND (
+                    pinned_backend IS NOT NULL
+                    OR pinned_version_id IS NOT NULL
+                    OR pinned_release_id IS NOT NULL
+                    OR coder_workspace_id IS NOT NULL
+                )",
+        )
+        .bind(organization_id.0)
+        .bind(tenant_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(ManagerError::from)?;
+        rows.into_iter()
+            .map(|(backend,)| {
+                backend
+                    .map(|b| {
+                        b.parse::<ProvisionerBackend>().map_err(|_| {
+                            ManagerError::Service(anyhow::anyhow!(
+                                "unknown workspace pinned_backend in database: {b}"
+                            ))
+                        })
+                    })
+                    .transpose()
+            })
+            .collect()
+    }
+
     /// Pin a tenant to a release and backend only if not already pinned.
     pub async fn set_tenant_pin_if_unset(
         &self,
@@ -514,6 +552,7 @@ impl ReleaseRepository {
                     updated_at = now()
               WHERE organization_id = $1
                 AND id = $2
+                AND (pinned_release_id IS NULL OR $4::text = 'docker')
                 AND (pinned_release_id IS NULL OR pinned_backend IS NULL)",
         )
         .bind(organization_id.0)
@@ -542,7 +581,10 @@ impl ReleaseRepository {
                     pinned_backend = $4,
                     pinned_version_id = COALESCE($5, pinned_version_id),
                     updated_at = now()
-              WHERE organization_id = $1 AND id = $2",
+              WHERE organization_id = $1
+                AND id = $2
+                AND (pinned_backend IS NULL OR pinned_backend = $4::text)
+                AND (pinned_version_id IS NULL OR pinned_backend IS NOT NULL OR $4::text = 'docker')",
         )
         .bind(organization_id.0)
         .bind(workspace_id.0)

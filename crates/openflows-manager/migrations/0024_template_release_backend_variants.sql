@@ -57,3 +57,17 @@ ALTER TABLE workspaces
     ADD COLUMN IF NOT EXISTS pinned_backend TEXT
         CHECK (pinned_backend IN ('docker', 'kubernetes')),
     ADD COLUMN IF NOT EXISTS pinned_release_id UUID REFERENCES template_releases(id);
+
+-- All workspaces and already-pinned/provisioned tenants created prior to
+-- backend-specific release support belong to Docker deployments.
+UPDATE workspaces
+   SET pinned_backend = 'docker'
+ WHERE pinned_backend IS NULL;
+
+UPDATE tenants
+   SET pinned_backend = 'docker'
+ WHERE pinned_backend IS NULL
+   AND (
+       pinned_release_id IS NOT NULL
+       OR EXISTS (SELECT 1 FROM workspaces w WHERE w.tenant_id = tenants.id)
+   );
