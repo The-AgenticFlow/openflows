@@ -160,6 +160,17 @@ pub fn secret_access_review(
     account: &str,
     verb: &str,
 ) -> Result<SubjectAccessReview, ManagerError> {
+    account_review(namespace, account_namespace, account, ("", "secrets", verb))
+}
+
+/// Asks the API server whether a service account may do `(api group, resource, verb)` in `namespace`.
+pub fn account_review(
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+    right: (&str, &str, &str),
+) -> Result<SubjectAccessReview, ManagerError> {
+    let (group, resource, verb) = right;
     typed(json!({
         "apiVersion": "authorization.k8s.io/v1", "kind": "SubjectAccessReview",
         "spec": {
@@ -171,7 +182,9 @@ pub fn secret_access_review(
                 format!("system:serviceaccounts:{account_namespace}"),
                 "system:authenticated",
             ],
-            "resourceAttributes": { "namespace": namespace, "verb": verb, "resource": "secrets" },
+            "resourceAttributes": {
+                "namespace": namespace, "group": group, "resource": resource, "verb": verb,
+            },
         },
     }))
 }

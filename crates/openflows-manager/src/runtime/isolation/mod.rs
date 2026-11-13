@@ -478,6 +478,11 @@ impl TenantIsolation for KubernetesIsolation {
     ) -> Result<(), ManagerError> {
         let settings = &self.settings;
         let name = manifests::namespace_name(&settings.namespace_prefix, organization_id);
+        // Refuse before creating anything.
+        if let Some((account_namespace, account)) = &settings.provisioner_account {
+            self.provisioner_cannot_read_secrets(&name, account_namespace, account)
+                .await?;
+        }
         apply(
             &Api::<Namespace>::all(self.client.clone()),
             &name,
@@ -505,6 +510,8 @@ impl TenantIsolation for KubernetesIsolation {
         if let Some((account_namespace, account)) = &settings.delivery_account {
             self.grant_secret_delivery(&name, account_namespace, account)
                 .await?;
+            identity::check_namespace_separation(&self.client, &name, (account_namespace, account))
+                .await?;
         }
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), &name);
         let mut wanted = manifests::base_policies(settings, &name)?;
@@ -512,10 +519,6 @@ impl TenantIsolation for KubernetesIsolation {
         for policy in &wanted {
             let policy_name = policy.metadata.name.as_deref().unwrap_or_default();
             apply(&policies, policy_name, policy).await?;
-        }
-        if let Some((account_namespace, account)) = &settings.provisioner_account {
-            self.provisioner_cannot_read_secrets(&name, account_namespace, account)
-                .await?;
         }
         tracing::info!(%organization_id, %tenant_id, namespace = %name, "tenant isolation in place");
         Ok(())

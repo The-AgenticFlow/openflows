@@ -145,11 +145,17 @@ current-context: delivery
 - The namespace identity cannot `get`, `list`, `watch`, `create`, `update`, `patch`
   or `delete` Secrets.
 - The delivery identity cannot create or change namespaces, network policies,
-  quotas, limit ranges, service accounts or role bindings.
+  quotas, limit ranges, service accounts or role bindings, and cannot `get`,
+  `list` or `watch` Secrets. It only writes them.
 
-Each time a namespace is set up, the Manager also asks the API server whether the
-delivery account can create, patch and delete Secrets there, and refuses if not.
-In local mode with a single identity none of this applies.
+Those startup checks see cluster-wide grants only. A binding made inside one
+namespace, which is how the delivery identity gets its Secret rights, is invisible
+to them. So each time a namespace is set up the Manager repeats the checks
+inside it: the namespace identity must not touch Secrets there, and the delivery
+account must not administer the namespace or read Secrets there. It also asks the
+API server whether the delivery account can create, patch and delete Secrets
+there, and refuses if not. In local mode with a single identity none of this
+applies.
 
 ### What the startup probe needs
 
@@ -188,8 +194,8 @@ The runtime credentials of every tenant are Secrets in the organization
 namespace, so the Coder provisioner must not be able to read them. The Manager
 does not write the provisioner's permissions, since they belong to the
 infrastructure. Set `OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT` and each time a
-tenant's namespace is set up the Manager asks the API server whether that account
-can `get`, `list` or `watch` Secrets there, counting the groups every service
+tenant's namespace is set up, before anything is created, the Manager asks the
+API server whether that account can `get`, `list` or `watch` Secrets there, counting the groups every service
 account belongs to (`system:serviceaccounts`, `system:serviceaccounts:<namespace>`,
 `system:authenticated`). If it can, the tenant is not set up
 and the error names the account and the verb. Without the setting no check runs,
