@@ -1,5 +1,18 @@
 # Scripts
 
+## Console
+
+```bash
+./scripts/console.sh
+```
+
+Starts the OpenFlows Console on `http://127.0.0.1:3000` and connects it to the Manager
+that is already running, however OpenFlows was set up (`./scripts/setup.sh`, the operator
+Compose file, or a Manager run from source). It looks for a ready Manager on `127.0.0.1:3002`
+and the Docker bridge address, checks the whole sign-in path, and says whether GitHub will
+return the browser to the Console. Options: `--port`, `--manager-url`, `--no-pull`, `--stop`.
+With no Manager running it offers to run `./scripts/setup.sh` first.
+
 ## Production Commands
 
 All production operations use `./scripts/prod.sh`:
