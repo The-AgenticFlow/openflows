@@ -63,16 +63,23 @@ installing it, so a corrupted or truncated download is caught.
 
 Release pinning is separate from that integrity check, and on by default. The
 harness computes the digest of the bundle compiled into its own binary and asks
-the Manager for exactly that release, so a Manager serving another release
+the Manager for exactly that bundle, so a Manager serving a different one
 answers 404 with both digests in the message and the workspace refuses to boot
 with assets its code was not built against. Two ways out, both deliberate:
-`--digest` pins a different release, and `--any-release` installs whichever
-release the Manager serves.
+`--digest` pins a bundle named by the caller, and `--any-release` installs
+whichever bundle the Manager serves.
 
-The consequence for operators: the Manager and the workspace images move
-together. Upgrading one before the other makes every workspace rebuild fail
-loudly until the second catches up, which is the intended behaviour and is
-recorded in the [production runbook](operator-production-runbook.md).
+The check is on the bundle, not on a release number. A release that changes
+nothing under `orchestration/` compiles to the same digest as the one before it,
+so a harness from either still installs. What it catches is a Manager whose
+assets differ from the harness's, which is the only case where mixing them
+changes what a worker reads.
+
+The consequence for operators: the `harness_version` the worker templates
+download has to name the release the Manager runs. Deploying one half ahead of
+the other makes workspace rebuilds fail loudly once the bundles differ, which is
+the intended behaviour and is recorded in the
+[production runbook](operator-production-runbook.md).
 
 ## The golden repository seed
 
