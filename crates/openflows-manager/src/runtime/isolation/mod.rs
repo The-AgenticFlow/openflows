@@ -9,6 +9,7 @@
 //! In hosted mode the Manager also proves, at startup, that the cluster really
 //! enforces these rules ([`probe`]) and refuses to start when it does not.
 
+pub mod binding;
 pub mod identity;
 pub mod manifests;
 mod probe;
@@ -28,6 +29,7 @@ use serde::Serialize;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+pub use binding::check_binding_rule;
 pub use identity::{check_separation, delivery_client, DELIVERY_KUBECONFIG_ENV};
 pub use probe::run as run_probe;
 

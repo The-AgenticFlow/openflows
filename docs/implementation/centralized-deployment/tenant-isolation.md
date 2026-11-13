@@ -94,7 +94,7 @@ rules:
     verbs: [get, create, patch]           # binds the delivery identity per namespace
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles]
-    verbs: [bind]
+    verbs: [bind]                         # limited by the binding rule below
     resourceNames: [openflows-secret-writer]
 ```
 
@@ -139,6 +139,48 @@ contexts:
 current-context: delivery
 ```
 
+**Limit who may bind the Secret-writer role.** The namespace identity may create
+role bindings and bind `openflows-secret-writer`. Left alone, it could bind that
+role to itself in any namespace and so overwrite or delete tenant Secrets. The
+operator installs this admission rule, which allows exactly one binding of the
+role: the fixed name, a namespace labelled `openflows.io/organization`, and only
+the delivery account. It needs Kubernetes 1.30 or newer. The operator installs it,
+not the Manager, since an identity that could install the rule could remove it.
+Edit the account to match `OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT`:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openflows-secret-writer-bindings
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings"]
+  matchConditions:
+    - name: binds-the-secret-writer-role
+      expression: "object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'openflows-secret-writer'"
+  validations:
+    - expression: "object.metadata.name == 'openflows-secret-delivery'"
+      message: "a binding of openflows-secret-writer must be named openflows-secret-delivery"
+    - expression: "has(namespaceObject.metadata.labels) && 'openflows.io/organization' in namespaceObject.metadata.labels"
+      message: "openflows-secret-writer may only be bound in a namespace labelled openflows.io/organization"
+    - expression: "has(object.subjects) && size(object.subjects) == 1 && object.subjects[0].kind == 'ServiceAccount' && object.subjects[0].namespace == 'openflows' && object.subjects[0].name == 'secret-delivery'"
+      message: "openflows-secret-writer may only be bound to the delivery service account openflows/secret-delivery"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openflows-secret-writer-bindings
+spec:
+  policyName: openflows-secret-writer-bindings
+  validationActions: [Deny]
+```
+
 **What the Manager checks at startup in hosted mode**
 - The kubeconfig and the service account are both set.
 - The kubeconfig authenticates as that service account.
@@ -147,6 +189,12 @@ current-context: delivery
 - The delivery identity cannot create or change namespaces, network policies,
   quotas, limit ranges, service accounts or role bindings, and cannot `get`,
   `list` or `watch` Secrets. It only writes them.
+- The cluster enforces the binding rule above. The Manager tries a binding of
+  `openflows-secret-writer` to another service account, and one under another
+  name, as dry runs that save nothing, and does not start unless both are
+  refused. It also tries the delivery account's own binding, which must be
+  accepted. A probe namespace, if you set one, must carry the label
+  `openflows.io/organization=probe` for this.
 
 Those startup checks see cluster-wide grants only. A binding made inside one
 namespace, which is how the delivery identity gets its Secret rights, is invisible
@@ -250,6 +298,8 @@ Failures name the cause:
 | Message | Fix |
 | --- | --- |
 | `... reached a pod of another. The cluster does not enforce NetworkPolicy` | Install a network plugin that enforces it (Calico, Cilium). Many clusters accept the objects and ignore them. On EKS the VPC CNI needs network policy enabled, or install Calico or Cilium |
+| `a binding of openflows-secret-writer ... was accepted` | The binding rule is not installed or not enforced. Install the admission policy above; it needs Kubernetes 1.30 or newer |
+| `the rule refuses the delivery account's own binding` | The account in the rule differs from `OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT`, or the probe namespace lacks the `openflows.io/organization=probe` label |
 | `a pod guarded by an ingress rule was still reachable` or `... egress rule could still connect out` | The plugin enforces only one direction of NetworkPolicy, or none of it. Check its policy settings, or install Calico or Cilium |
 | `a pod with no rules could not reach another pod with no rules` | The network plugin is unhealthy |
 | `... could not reach another pod of its own tenant` | The network plugin is unhealthy, or `OPENFLOWS_K8S_PROBE_IMAGE` lacks `nc` or `sh` |
@@ -287,7 +337,7 @@ were not verified on an EKS cluster.
 
 ## Testing against a real cluster
 
-The tests in `crates/openflows-manager/tests/k8s_isolation.rs` use the cluster of
+The tests in `crates/openflows-manager/tests/k8s_isolation/` use the cluster of
 the current kubeconfig context. With [kind](https://kind.sigs.k8s.io), create a
 cluster without its default network plugin and install Calico:
 

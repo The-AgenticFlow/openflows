@@ -7,6 +7,9 @@
 use super::IsolationSettings;
 use crate::error::ManagerError;
 use crate::id::{OrganizationId, TenantId};
+use k8s_openapi::api::admissionregistration::v1::{
+    ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
+};
 use k8s_openapi::api::authorization::v1::SubjectAccessReview;
 use k8s_openapi::api::core::v1::{LimitRange, Namespace, ResourceQuota, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
@@ -40,6 +43,8 @@ pub const LIMIT_RANGE_NAME: &str = "openflows-defaults";
 /// ClusterRole, created by the operator, that lets an identity write Secrets and nothing else.
 pub const SECRET_WRITER_ROLE: &str = "openflows-secret-writer";
 pub const SECRET_DELIVERY_BINDING: &str = "openflows-secret-delivery";
+/// Name of the admission policy, and its binding, that limit who may be bound to the Secret writer.
+pub const BINDING_RULE_NAME: &str = "openflows-secret-writer-bindings";
 /// Verbs the Secret-delivery identity needs on Secrets.
 pub const SECRET_WRITE_VERBS: [&str; 3] = ["create", "patch", "delete"];
 /// Verbs the Coder provisioner must not hold on Secrets.
@@ -143,14 +148,81 @@ pub fn secret_delivery_binding(
     account_namespace: &str,
     account: &str,
 ) -> Result<RoleBinding, ManagerError> {
+    secret_writer_binding(
+        SECRET_DELIVERY_BINDING,
+        namespace,
+        account_namespace,
+        account,
+    )
+}
+
+/// A RoleBinding of the Secret-writer role under any name, for any service account. The
+/// admission rule accepts exactly one of these; the startup check builds the others.
+pub fn secret_writer_binding(
+    name: &str,
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+) -> Result<RoleBinding, ManagerError> {
     typed(json!({
         "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
-        "metadata": meta(SECRET_DELIVERY_BINDING, Some(namespace), None),
+        "metadata": meta(name, Some(namespace), None),
         "roleRef": {
             "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": SECRET_WRITER_ROLE,
         },
         "subjects": [{ "kind": "ServiceAccount", "name": account, "namespace": account_namespace }],
     }))
+}
+
+/// CEL expressions of the admission rule. The operator manifest in `tenant-isolation.md` carries
+/// the same text, and a test keeps the two equal.
+pub const RULE_APPLIES_TO: &str =
+    "object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'openflows-secret-writer'";
+pub const RULE_NAME: &str = "object.metadata.name == 'openflows-secret-delivery'";
+pub const RULE_NAMESPACE: &str = "has(namespaceObject.metadata.labels) && 'openflows.io/organization' in namespaceObject.metadata.labels";
+
+pub fn rule_subject(account_namespace: &str, account: &str) -> String {
+    format!(
+        "has(object.subjects) && size(object.subjects) == 1 && object.subjects[0].kind == \
+         'ServiceAccount' && object.subjects[0].namespace == '{account_namespace}' && \
+         object.subjects[0].name == '{account}'"
+    )
+}
+
+/// The admission rule that stops the namespace identity binding the Secret-writer role to
+/// itself. A binding of the role must have the fixed name, sit in a namespace labelled as an
+/// organization's, and bind only the delivery account. The operator installs it, not the
+/// Manager, since an identity that could install it could remove it.
+pub fn secret_writer_rule(
+    account_namespace: &str,
+    account: &str,
+) -> Result<(ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding), ManagerError> {
+    let policy = typed(json!({
+        "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy",
+        "metadata": { "name": BINDING_RULE_NAME },
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": { "resourceRules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"], "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"], "resources": ["rolebindings"],
+            }]},
+            "matchConditions": [{ "name": "binds-the-secret-writer-role", "expression": RULE_APPLIES_TO }],
+            "validations": [
+                { "expression": RULE_NAME,
+                  "message": "a binding of openflows-secret-writer must be named openflows-secret-delivery" },
+                { "expression": RULE_NAMESPACE,
+                  "message": "openflows-secret-writer may only be bound in a namespace labelled openflows.io/organization" },
+                { "expression": rule_subject(account_namespace, account),
+                  "message": format!("openflows-secret-writer may only be bound to the delivery service account {account_namespace}/{account}") },
+            ],
+        },
+    }))?;
+    let binding = typed(json!({
+        "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": { "name": BINDING_RULE_NAME },
+        "spec": { "policyName": BINDING_RULE_NAME, "validationActions": ["Deny"] },
+    }))?;
+    Ok((policy, binding))
 }
 
 /// Asks the API server whether a service account may use `verb` on Secrets in `namespace`.
@@ -558,6 +630,71 @@ mod tests {
         assert_eq!(subject.kind, "ServiceAccount");
         assert_eq!(subject.name, "delivery");
         assert_eq!(subject.namespace.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn the_rule_applies_only_to_bindings_of_the_secret_writer_role() {
+        let (policy, binding) = secret_writer_rule("openflows", "secret-delivery").expect("rule");
+        let spec = serde_json::to_value(policy.spec.expect("spec")).expect("serialize");
+
+        assert_eq!(spec["matchConditions"][0]["expression"], RULE_APPLIES_TO);
+        assert_eq!(
+            spec["matchConstraints"]["resourceRules"][0]["resources"][0],
+            "rolebindings"
+        );
+        assert_eq!(spec["failurePolicy"], "Fail");
+        assert_eq!(
+            serde_json::to_value(binding.spec.expect("binding spec")).expect("serialize")
+                ["validationActions"][0],
+            "Deny"
+        );
+    }
+
+    #[test]
+    fn the_rule_checks_the_name_the_namespace_and_the_subject() {
+        let (policy, _) = secret_writer_rule("openflows", "secret-delivery").expect("rule");
+        let validations =
+            serde_json::to_value(policy.spec.expect("spec").validations).expect("serialize");
+        let expressions: Vec<String> = validations
+            .as_array()
+            .expect("validations")
+            .iter()
+            .map(|v| v["expression"].as_str().expect("expression").to_string())
+            .collect();
+
+        assert_eq!(
+            expressions,
+            [
+                RULE_NAME.to_string(),
+                RULE_NAMESPACE.to_string(),
+                rule_subject("openflows", "secret-delivery"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_operator_manifest_in_the_doc_carries_the_same_rule() {
+        let doc = include_str!(
+            "../../../../../docs/implementation/centralized-deployment/tenant-isolation.md"
+        );
+
+        for expression in [
+            RULE_APPLIES_TO.to_string(),
+            RULE_NAME.to_string(),
+            RULE_NAMESPACE.to_string(),
+            rule_subject("openflows", "secret-delivery"),
+        ] {
+            assert!(doc.contains(&expression), "the doc lacks: {expression}");
+        }
+    }
+
+    #[test]
+    fn a_binding_can_carry_any_name_and_subject() {
+        let binding = secret_writer_binding("other", "ns", "default", "someone").expect("binding");
+
+        assert_eq!(binding.metadata.name.as_deref(), Some("other"));
+        assert_eq!(binding.role_ref.name, SECRET_WRITER_ROLE);
+        assert_eq!(binding.subjects.expect("subjects")[0].name, "someone");
     }
 
     #[test]

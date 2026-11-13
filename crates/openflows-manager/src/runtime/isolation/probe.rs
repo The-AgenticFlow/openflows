@@ -87,7 +87,21 @@ pub async fn run(client: &Client, settings: &IsolationSettings) -> Result<(), Ma
         free_to_free,
         free_to_ingress_guarded,
         egress_guarded_to_free,
-    })
+    })?;
+    binding_probe(client, settings).await
+}
+
+/// The Secret-writer binding rule, in the probe namespace or a throwaway one.
+async fn binding_probe(client: &Client, settings: &IsolationSettings) -> Result<(), ManagerError> {
+    match &settings.probe_namespace {
+        Some(namespace) => super::check_binding_rule(client, settings, namespace).await,
+        None => {
+            let name = create_namespace(client, settings, "openflows-probe-bind").await?;
+            let outcome = super::check_binding_rule(client, settings, &name).await;
+            remove_namespace(client, &name).await;
+            outcome
+        }
+    }
 }
 
 async fn create_namespace(
@@ -101,6 +115,9 @@ async fn create_namespace(
     );
     let mut labels = manifests::pod_security_labels(settings);
     labels["app.kubernetes.io/managed-by"] = json!("openflows-manager");
+    // The Secret-writer binding rule only allows bindings in namespaces labelled as an
+    // organization's, so the binding check needs this label to try the allowed binding.
+    labels[manifests::ORGANIZATION_LABEL] = json!("probe");
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Namespace",
         "metadata": { "name": name, "labels": labels },
