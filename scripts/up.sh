@@ -27,7 +27,11 @@ ENV_FILE="${ROOT}/.env.openflows"
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f "${ROOT}/deployment.compose.yml")
 
 die() { printf 'error: %s\n' "$1" >&2; [ -z "${2:-}" ] || printf '%s\n' "$2" >&2; exit 1; }
-env_get() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true; }
+# The value Compose would read from the env file: the last assignment, without surrounding quotes.
+env_get() {
+    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- \
+        | sed -E "s/^\"(.*)\"\$/\\1/; s/^'(.*)'\$/\\1/" || true
+}
 env_set() { # env_set KEY VALUE: replace the line or append
     if grep -qE "^$1=" "$ENV_FILE"; then sed -i "s#^$1=.*#$1=$2#" "$ENV_FILE"; else printf '%s=%s\n' "$1" "$2" >>"$ENV_FILE"; fi
 }
@@ -46,13 +50,15 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 is not installe
 [ -f "$ENV_FILE" ] || die ".env.openflows is missing." \
     "Copy .env.openflows.example to .env.openflows, fill it in and create the secrets (operator-local-runbook.md, steps 1-2)."
 
-# The compose file mounts these secret files; Docker fails with an unhelpful "bind source path does not
-# exist" if they are missing. An install made with ./scripts/setup.sh keeps its secrets elsewhere and
-# runs a different Manager (openflows-local-manager), so it must not use this script.
-SECRET_DIR="$(env_get OPENFLOWS_SECRET_DIR)"; SECRET_DIR="${SECRET_DIR:-.openflows/secrets}"
+# The compose file mounts these two secret files individually; Docker fails with an unhelpful "bind
+# source path does not exist" if they are missing. The other secrets (GitHub App key and so on) are
+# read by the Manager from the mounted directory under names the *_REF settings can change, so they
+# are not checked here. An install made with ./scripts/setup.sh keeps its secrets elsewhere and runs a
+# different Manager (openflows-local-manager), so it must not use this script.
+SECRET_DIR="${OPENFLOWS_SECRET_DIR:-$(env_get OPENFLOWS_SECRET_DIR)}"; SECRET_DIR="${SECRET_DIR:-.openflows/secrets}"
 case "$SECRET_DIR" in /*) ;; *) SECRET_DIR="${ROOT}/${SECRET_DIR}" ;; esac
 missing=()
-for f in coder-hook-secret coder-github-client-secret github-client-secret github-app-private-key github-webhook-secret; do
+for f in coder-hook-secret coder-github-client-secret; do
     [ -f "${SECRET_DIR}/${f}" ] || missing+=("$f")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -72,14 +78,14 @@ fi
 
 # The Manager container runs as the user who owns the secret files and needs
 # the Docker group to create tenant containers. Set these in .env.openflows to override.
-[ -n "$(env_get OPENFLOWS_MANAGER_UID)" ] || env_set OPENFLOWS_MANAGER_UID "$(id -u)"
-[ -n "$(env_get OPENFLOWS_MANAGER_GID)" ] || env_set OPENFLOWS_MANAGER_GID "$(id -g)"
-if [ -z "$(env_get DOCKER_GID)" ]; then
+[ -n "${OPENFLOWS_MANAGER_UID:-$(env_get OPENFLOWS_MANAGER_UID)}" ] || env_set OPENFLOWS_MANAGER_UID "$(id -u)"
+[ -n "${OPENFLOWS_MANAGER_GID:-$(env_get OPENFLOWS_MANAGER_GID)}" ] || env_set OPENFLOWS_MANAGER_GID "$(id -g)"
+if [ -z "${DOCKER_GID:-$(env_get DOCKER_GID)}" ]; then
     env_set DOCKER_GID "$(stat -c %g /var/run/docker.sock 2>/dev/null || stat -f %g /var/run/docker.sock 2>/dev/null || echo 999)"
 fi
 
 # Same absolute path on the host and in the container: the host Docker daemon bind-mounts it into tenants.
-PROV_DIR="$(env_get OPENFLOWS_PROVISIONER_SECRET_DIR)"
+PROV_DIR="${OPENFLOWS_PROVISIONER_SECRET_DIR:-$(env_get OPENFLOWS_PROVISIONER_SECRET_DIR)}"
 [ -n "$PROV_DIR" ] || { PROV_DIR="${ROOT}/.local/provisioners"; env_set OPENFLOWS_PROVISIONER_SECRET_DIR "$PROV_DIR"; }
 mkdir -p "$PROV_DIR"
 
