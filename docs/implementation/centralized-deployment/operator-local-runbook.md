@@ -36,18 +36,20 @@ chmod 600 .env.openflows
 Edit `.env.openflows`: replace the example URLs, database passwords, GitHub
 IDs/slug, and workspace image digest. Keep local mode, the filesystem secret
 provider, and the Docker provisioner. Keep `OPENFLOWS_HOOK_URL` on the private
-`host.docker.internal` Manager route; Coder uses it for authenticated Chat
+Manager route (`http://manager:3002/...` when Manager runs in Compose, as in
+the example; `host.docker.internal` when it runs on the host); Coder uses it for authenticated Chat
 lifecycle hooks and their JWT audience. Keep the supplied
 `OPENFLOWS_RUNTIME_RELAY_BASE_URL=http://127.0.0.1:7081/tenants/{tenant}`.
-Keep `OPENFLOWS_RUNTIME_MANAGER_URL=http://host.docker.internal:3002` when
-Manager runs on the Docker host. Workspaces use this private route for runtime
+Keep `OPENFLOWS_RUNTIME_MANAGER_URL=http://manager:3002` when Manager runs in
+Compose, or `http://host.docker.internal:3002` when it runs on the Docker host. Workspaces use this private route for runtime
 registration, heartbeats, and credential requests; GitHub and browsers still
 use `OPENFLOWS_PUBLIC_URL`. Check that the private URL responds from a Coder
 workspace before starting tenants.
 Compose starts a local relay that forwards signed hooks to each tenant's
 Nexus container on port 3001. Port 7081 is bound to loopback, not the public
-tunnel. The Manager runs on the host in this runbook; a containerized Manager
-would use `http://runtime-relay:8080/tenants/{tenant}` instead.
+tunnel. The Compose `manager` service already uses
+`http://runtime-relay:8080/tenants/{tenant}`; a Manager run on the host keeps
+the loopback value above.
 
 Because Coder and tenant workspaces reach the host Manager over the Docker
 network, the Manager must bind to a container-reachable address, not only
@@ -118,10 +120,47 @@ make dev-sync
 ```
 
 Run it again after changing controller or harness code. It is not needed just
-to start the Manager or check its API. Then start the services:
+to start the Manager or check its API. Then start everything (Coder, databases,
+Redis, relay, the Manager, and the Console) with one command:
 
 ```sh
 docker compose --env-file .env.openflows -f deployment.compose.yml up -d
+```
+
+The Manager image is built from this checkout the first time (a few minutes).
+The Console is pulled from GHCR and served on `http://127.0.0.1:3000`; it
+reaches Manager at `http://manager:3002` over the Compose network. On a new
+install, run the one-time setup and checks through the same image, then restart
+the Manager:
+
+```sh
+docker compose --env-file .env.openflows -f deployment.compose.yml run --rm manager setup
+docker compose --env-file .env.openflows -f deployment.compose.yml run --rm manager doctor
+docker compose --env-file .env.openflows -f deployment.compose.yml restart manager
+```
+
+Tenant provisioner credentials are bind-mounted into tenant containers by the
+host Docker daemon, so Compose mounts `.local/provisioners` (or
+`OPENFLOWS_PROVISIONER_SECRET_DIR`, an absolute path) at the same path in the
+Manager container. Create it first (`mkdir -p .local/provisioners`) so it is
+owned by your user, not root.
+
+An install is tied to one Manager mode: setup saves `CODER_URL` in
+`deployment.json`, and `doctor` stops with "deployment URLs differ from saved
+setup state" if it changes. An install first set up with the host Manager
+(`CODER_URL=http://localhost:7080`) needs `coder_url` in the saved
+`deployment.json` changed to `http://coder:7080` before the Compose Manager
+will start, and back again to return to the host Manager.
+
+If your user id or `docker` group id is not 1000/999, set `OPENFLOWS_MANAGER_UID`,
+`OPENFLOWS_MANAGER_GID` and `DOCKER_GID` in `.env.openflows`.
+
+To run Manager on the host instead (for example to iterate on its code), stop
+the Compose one with `docker compose ... stop manager`, set
+`OPENFLOWS_MANAGER_URL=http://host.docker.internal:3002` for the Console, and
+use the host Manager values from the [Linux hosts](#linux-hosts) table:
+
+```sh
 cargo run -p openflows-manager -- --config .env.openflows setup
 cargo run -p openflows-manager -- --config .env.openflows doctor
 cargo run -p openflows-manager -- --config .env.openflows serve
