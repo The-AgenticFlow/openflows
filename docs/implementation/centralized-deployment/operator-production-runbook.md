@@ -100,3 +100,13 @@ Coder health, failed operations, credential expiry, and secret-version growth.
 Changed templates need a new `OPENFLOWS_RELEASE_NAME`. Moving a local
 installation to hosted mode requires an explicit database-and-secret
 migration, not an environment-variable change.
+
+### Upgrade order
+
+The workspace harness pins the artifact bundle to the release its binary was
+built with, so the Manager and the workspace images move together. Upgrading
+either one first makes workspace rebuilds fail with a 404 that names both
+digests, and they keep failing until the other half catches up. Upgrade both in
+one window. `openflows-harness artifacts fetch --any-release` installs whichever
+release the Manager serves, which is a deliberate mixed fleet for a migration
+window, not something to leave in a template.

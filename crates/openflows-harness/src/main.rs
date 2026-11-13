@@ -39,8 +39,12 @@ enum ArtifactAction {
         #[arg(long)]
         token: Option<String>,
         /// Pin a bundle digest; the Manager must serve exactly that release
-        #[arg(long)]
+        #[arg(long, conflicts_with = "any_release")]
         digest: Option<String>,
+        /// Install whichever release the Manager serves instead of the one this
+        /// binary was built with
+        #[arg(long)]
+        any_release: bool,
     },
 }
 
@@ -528,6 +532,7 @@ async fn main() -> Result<()> {
                 manager_url,
                 token,
                 digest,
+                any_release,
             } => {
                 let manager_url = manager_url
                     .or_else(|| std::env::var("OF_MANAGER_URL").ok())
@@ -535,13 +540,25 @@ async fn main() -> Result<()> {
                 let token = token
                     .or_else(|| std::env::var("OF_RUNTIME_ACCESS_TOKEN").ok())
                     .context("--token or OF_RUNTIME_ACCESS_TOKEN is required")?;
-                let installed = openflows_harness::artifacts::fetch(
-                    &manager_url,
-                    &token,
-                    digest.as_deref(),
-                    &dir,
-                )
-                .await?;
+                let installed = match (digest, any_release) {
+                    (Some(digest), _) => {
+                        openflows_harness::artifacts::fetch(
+                            &manager_url,
+                            &token,
+                            Some(&digest),
+                            &dir,
+                        )
+                        .await?
+                    }
+                    (None, true) => {
+                        openflows_harness::artifacts::fetch(&manager_url, &token, None, &dir)
+                            .await?
+                    }
+                    (None, false) => {
+                        openflows_harness::artifacts::fetch_own_release(&manager_url, &token, &dir)
+                            .await?
+                    }
+                };
                 println!(
                     "installed {} artifacts ({}) into {}",
                     installed.files,

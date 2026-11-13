@@ -36,6 +36,40 @@ struct DownloadError {
     error: anyhow::Error,
 }
 
+/// The digest of the artifact bundle this binary was built with.
+///
+/// The harness and the Manager are built from the same release, so this is the
+/// release a workspace can run without mixing assets and code. It is computed
+/// rather than configured, so a workspace cannot claim a release it does not
+/// carry.
+pub fn release_digest() -> Result<String> {
+    let archive = workspace_assets::archive().context("cannot serialize the bundled artifacts")?;
+    Ok(workspace_assets::digest(&archive))
+}
+
+/// Install the bundle of the release this binary was built with.
+///
+/// This is what a workspace should call at boot: a Manager still serving an
+/// older or newer release is refused instead of quietly handing over assets
+/// that do not match the harness running them. Pass an explicit pin through
+/// [`fetch`] when the expected release is known some other way.
+pub async fn fetch_own_release(
+    manager_url: &str,
+    access_token: &str,
+    dir: &Path,
+) -> Result<Installed> {
+    let expected = release_digest()?;
+    fetch(manager_url, access_token, Some(&expected), dir)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot install the artifact bundle of this workspace release ({expected}); \
+                 the Manager must serve that release, or pass --any-release to install \
+                 whichever release it serves"
+            )
+        })
+}
+
 /// Download the bundle and install it into `dir`, returning what was installed.
 ///
 /// With `pin`, the Manager must serve that exact digest. Without it, the
