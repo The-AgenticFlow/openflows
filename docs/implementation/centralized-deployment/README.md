@@ -12,6 +12,7 @@ Date: 2026-10-07. Status: implementation specification, not shipped behavior.
 6. [Compatibility and integration contract](compatibility-report.md): WP-00 inventory, Coder version/capability matrix, verification harness, open decisions.
 7. [Model handoff](05-model-handoff.md): prompt to start implementation.
 8. [Hosted template releases](06-hosted-template-releases.md): versioned remote release source for production deployments.
+9. [Workspace artifact delivery](artifacts-inventory.md): what each role needs at boot, what the shared volume still carries, and the delivery contract that replaces it.
 
 Operator instructions are separate from the design specifications: follow the
 [local runbook](operator-local-runbook.md) for a single-host evaluation or the
