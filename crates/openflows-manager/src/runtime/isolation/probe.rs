@@ -21,7 +21,9 @@ use k8s_openapi::api::core::v1::{Namespace, Pod};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{DeleteParams, PostParams};
 use kube::{Api, Client};
+use serde::de::DeserializeOwned;
 use serde_json::json;
+use std::fmt::Debug;
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
 
@@ -32,6 +34,18 @@ const POLL: Duration = Duration::from_secs(2);
 const PROBE_LABEL: &str = "openflows.io/probe";
 const INGRESS_GUARDED: &str = "ingress-guarded";
 const EGRESS_GUARDED: &str = "egress-guarded";
+const TENANT_PODS: [&str; 4] = ["server", "same-tenant", "other-tenant", "unlabelled"];
+const DIRECTION_PODS: [&str; 5] = [
+    "server-free",
+    "server-ingress-guarded",
+    "free-to-free",
+    "free-to-ingress-guarded",
+    "egress-guarded-to-free",
+];
+const DIRECTION_POLICIES: [&str; 2] = [
+    "openflows-probe-deny-ingress",
+    "openflows-probe-deny-egress",
+];
 
 fn fail(message: impl Into<String>) -> ManagerError {
     ManagerError::Config(format!("tenant isolation probe failed: {}", message.into()))
@@ -48,12 +62,22 @@ struct Outcome {
     egress_guarded_to_free: bool,
 }
 
-/// Run both probes; their throwaway namespaces are removed whatever the outcome.
+/// Run both probes. By default each runs in a throwaway namespace of its own that is removed
+/// whatever the outcome. With a probe namespace configured they run one after the other in it,
+/// and each removes its own pods and rules, so the Manager needs no right to delete namespaces.
 pub async fn run(client: &Client, settings: &IsolationSettings) -> Result<(), ManagerError> {
-    let (tenants, directions) = tokio::join!(
-        tenant_probe(client, settings),
-        direction_probe(client, settings)
-    );
+    let (tenants, directions) = match &settings.probe_namespace {
+        Some(namespace) => {
+            require_namespace(client, namespace).await?;
+            let tenants = tenant_probe_in(client, settings, namespace).await;
+            let directions = direction_probe_in(client, settings, namespace).await;
+            (tenants, directions)
+        }
+        None => tokio::join!(
+            tenant_probe(client, settings),
+            direction_probe(client, settings)
+        ),
+    };
     let (same_tenant, other_tenant, unlabelled) = tenants?;
     let (free_to_free, free_to_ingress_guarded, egress_guarded_to_free) = directions?;
     judge(Outcome {
@@ -66,17 +90,20 @@ pub async fn run(client: &Client, settings: &IsolationSettings) -> Result<(), Ma
     })
 }
 
-async fn create_namespace(client: &Client, prefix: &str) -> Result<String, ManagerError> {
+async fn create_namespace(
+    client: &Client,
+    settings: &IsolationSettings,
+    prefix: &str,
+) -> Result<String, ManagerError> {
     let name = format!(
         "{prefix}-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
+    let mut labels = manifests::pod_security_labels(settings);
+    labels["app.kubernetes.io/managed-by"] = json!("openflows-manager");
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Namespace",
-        "metadata": { "name": name, "labels": {
-            "pod-security.kubernetes.io/enforce": "restricted",
-            "app.kubernetes.io/managed-by": "openflows-manager",
-        }},
+        "metadata": { "name": name, "labels": labels },
     }))
     .map_err(|e| fail(e.to_string()))?;
     Api::<Namespace>::all(client.clone())
@@ -95,21 +122,100 @@ async fn remove_namespace(client: &Client, name: &str) {
     }
 }
 
+async fn require_namespace(client: &Client, name: &str) -> Result<(), ManagerError> {
+    Api::<Namespace>::all(client.clone())
+        .get(name)
+        .await
+        .map(drop)
+        .map_err(|e| {
+            fail(format!(
+                "the probe namespace '{name}' cannot be used ({e}); create it empty, or unset \
+                 OPENFLOWS_K8S_PROBE_NAMESPACE to let the probe create its own"
+            ))
+        })
+}
+
+fn new_tenant() -> TenantId {
+    TenantId::from_uuid(uuid::Uuid::new_v4())
+}
+
 async fn tenant_probe(
     client: &Client,
     settings: &IsolationSettings,
 ) -> Result<(bool, bool, bool), ManagerError> {
-    let name = create_namespace(client, "openflows-probe").await?;
-    let outcome = tenant_checks(client, settings, &name).await;
+    let name = create_namespace(client, settings, "openflows-probe").await?;
+    let outcome = tenant_checks(client, settings, &name, new_tenant(), new_tenant()).await;
     remove_namespace(client, &name).await;
     outcome
+}
+
+/// The tenant probe in a namespace that already exists, cleaning up after itself.
+async fn tenant_probe_in(
+    client: &Client,
+    settings: &IsolationSettings,
+    namespace: &str,
+) -> Result<(bool, bool, bool), ManagerError> {
+    let (tenant_a, tenant_b) = (new_tenant(), new_tenant());
+    let mut policies = base_policy_names(settings, namespace)?;
+    policies.push(manifests::tenant_policy_name(tenant_a));
+    policies.push(manifests::tenant_policy_name(tenant_b));
+    clean(client, namespace, &TENANT_PODS, &policies).await;
+    let outcome = tenant_checks(client, settings, namespace, tenant_a, tenant_b).await;
+    clean(client, namespace, &TENANT_PODS, &policies).await;
+    outcome
+}
+
+/// The direction probe in a namespace that already exists, cleaning up after itself.
+async fn direction_probe_in(
+    client: &Client,
+    settings: &IsolationSettings,
+    namespace: &str,
+) -> Result<(bool, bool, bool), ManagerError> {
+    let policies: Vec<String> = DIRECTION_POLICIES.iter().map(|p| p.to_string()).collect();
+    clean(client, namespace, &DIRECTION_PODS, &policies).await;
+    let outcome = direction_checks(client, settings, namespace).await;
+    clean(client, namespace, &DIRECTION_PODS, &policies).await;
+    outcome
+}
+
+fn base_policy_names(
+    settings: &IsolationSettings,
+    namespace: &str,
+) -> Result<Vec<String>, ManagerError> {
+    Ok(manifests::base_policies(settings, namespace)?
+        .into_iter()
+        .filter_map(|policy| policy.metadata.name)
+        .collect())
+}
+
+/// Remove what a probe made, and any leftovers of an earlier run that was cut short.
+async fn clean(client: &Client, namespace: &str, pods: &[&str], policies: &[String]) {
+    let policy_api = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
+    for name in policies {
+        delete_quietly(&policy_api, name, &DeleteParams::default()).await;
+    }
+    let pod_api = Api::<Pod>::namespaced(client.clone(), namespace);
+    for name in pods {
+        delete_quietly(&pod_api, name, &DeleteParams::default().grace_period(0)).await;
+    }
+}
+
+async fn delete_quietly<K>(api: &Api<K>, name: &str, params: &DeleteParams)
+where
+    K: Clone + DeserializeOwned + Debug,
+{
+    match api.delete(name, params).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(status)) if status.code == 404 => {}
+        Err(error) => tracing::warn!(%name, %error, "could not remove an isolation probe object"),
+    }
 }
 
 async fn direction_probe(
     client: &Client,
     settings: &IsolationSettings,
 ) -> Result<(bool, bool, bool), ManagerError> {
-    let name = create_namespace(client, "openflows-probe-dir").await?;
+    let name = create_namespace(client, settings, "openflows-probe-dir").await?;
     let outcome = direction_checks(client, settings, &name).await;
     remove_namespace(client, &name).await;
     outcome
@@ -120,9 +226,9 @@ async fn tenant_checks(
     client: &Client,
     settings: &IsolationSettings,
     namespace: &str,
+    tenant_a: TenantId,
+    tenant_b: TenantId,
 ) -> Result<(bool, bool, bool), ManagerError> {
-    let tenant_a = TenantId::from_uuid(uuid::Uuid::new_v4());
-    let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4());
     let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
     let mut wanted = manifests::base_policies(settings, namespace)?;
     wanted.push(manifests::tenant_policy(namespace, tenant_a)?);

@@ -11,13 +11,13 @@ rebuild) the Manager applies these objects. Repeating it is safe.
 
 | Object | Purpose |
 | --- | --- |
-| Namespace `<OPENFLOWS_K8S_NAMESPACE_PREFIX><organization id>` | One per organization, enforcing the `restricted` Pod Security Standard |
+| Namespace `<OPENFLOWS_K8S_NAMESPACE_PREFIX><organization id>` | One per organization, enforcing the `restricted` Pod Security Standard. `enforce` is pinned to a version (default `v1.33`) so a cluster upgrade cannot start rejecting pods; `audit` and `warn` follow the latest, so an upgrade shows up as warnings first |
 | ResourceQuota `openflows-quota` | Ceiling on pods, CPU, memory and storage for the organization |
 | LimitRange `openflows-defaults` | Default container requests and limits so pods fit the quota |
 | ServiceAccount `default` | Stops pods that name no account from receiving a Kubernetes API token |
 | NetworkPolicy `openflows-default-deny` | Denies all ingress and egress for every pod |
 | NetworkPolicy `openflows-allow-dns` | Egress to CoreDNS (`k8s-app=kube-dns` in `kube-system`) and, when set, the node-local DNS cache |
-| NetworkPolicy `openflows-allow-platform` | Egress to the platform namespace and any platform CIDRs, on the platform ports |
+| NetworkPolicy `openflows-allow-platform` | Egress for tenant-labelled pods to the platform namespace and any platform CIDRs, on the platform ports. A pod without the tenant label gets none of it |
 | NetworkPolicy `openflows-allow-public-egress` | Egress to the internet except private, link-local and carrier-grade NAT ranges |
 | NetworkPolicy `openflows-tenant-<tenant id>` | Ingress and egress between pods of that tenant only |
 | NetworkPolicy `openflows-provisioner` | Only when `OPENFLOWS_K8S_PROVISIONER_SELECTOR` is set |
@@ -47,6 +47,8 @@ namespace stays.
 | `OPENFLOWS_K8S_PROVISIONER_SELECTOR` | none | `key=value` label of the Coder provisioner pods |
 | `OPENFLOWS_K8S_API_EGRESS_CIDRS` | none | Kubernetes API address, for the provisioner policy |
 | `OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT` | none | `namespace/name` of the provisioner's service account; see below |
+| `OPENFLOWS_K8S_POD_SECURITY_VERSION` | `v1.33` | Pod Security Standard version that `enforce` is pinned to, or `latest`. Raise it deliberately after checking the `audit` and `warn` messages |
+| `OPENFLOWS_K8S_PROBE_NAMESPACE` | none | Existing empty namespace for the startup probe; see below. Unset, the probe creates and deletes its own |
 | `OPENFLOWS_K8S_NODE_LOCAL_DNS` | none | Address of the NodeLocal DNSCache listener, usually `169.254.20.10`. Set it on clusters that run NodeLocal DNSCache: pods query it instead of CoreDNS, and it sits in a range the public egress rule excludes |
 | `OPENFLOWS_K8S_PROBE_IMAGE` | `docker.io/library/busybox:1.37.0` | Image with `sh` and `nc` for the startup probe; pin or mirror it |
 | `OPENFLOWS_K8S_QUOTA_PODS`, `_REQUESTS_CPU`, `_REQUESTS_MEMORY`, `_LIMITS_CPU`, `_LIMITS_MEMORY`, `_PVCS`, `_STORAGE` | `50`, `20`, `64Gi`, `40`, `128Gi`, `50`, `500Gi` | Quota per organization namespace |
@@ -58,29 +60,54 @@ Coder and, with `OPENFLOWS_K8S_API_EGRESS_CIDRS`, to the Kubernetes API.
 ## Manager permissions
 
 The Manager's identity needs, in addition to the Secret permissions described in
-the [production runbook](operator-production-runbook.md):
+the [production runbook](operator-production-runbook.md), a cluster role for the
+organization namespaces it sets up:
 
 ```yaml
 rules:
   - apiGroups: [""]
     resources: [namespaces]
-    verbs: [get, create, patch, delete]   # delete only for the startup probe's throwaway namespace
+    verbs: [get, create, patch]
   - apiGroups: [""]
     resources: [resourcequotas, limitranges, serviceaccounts]
     verbs: [get, create, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, create, patch, delete]   # delete removes a deleted tenant's rule
   - apiGroups: [authorization.k8s.io]
     resources: [subjectaccessreviews]
     verbs: [create]                       # the provisioner check below
+```
+
+The startup probe needs more, in one of two ways.
+
+**Recommended: a probe namespace.** Create an empty namespace once, labelled
+`pod-security.kubernetes.io/enforce=restricted`, set
+`OPENFLOWS_K8S_PROBE_NAMESPACE` to its name, and grant the Manager this Role in
+that namespace only. The probe runs there and removes its own pods and rules, so
+the Manager never needs to create or delete a namespace for it:
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, create, delete]
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
     verbs: [get, create, patch, delete]
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, create, delete]          # startup probe only
 ```
 
-Granting this cluster-wide lets the Manager create and wall namespaces. A
-separate delivery identity for Secrets, as the design describes, is not split out yet.
+The two probes then run one after the other, and the namespace is meant for one
+Manager at a time. Start replicas one by one, or give each its own namespace.
+
+**Default: throwaway namespaces.** With the setting unset the probe creates and
+deletes two namespaces itself. That needs `delete` on `namespaces` and `get` and
+`create` on `pods`, all cluster-wide. Because `delete` cannot be limited to the
+probe's namespaces, it lets the Manager delete any namespace in the cluster. Use
+the probe namespace instead wherever that matters.
+
+Granting the cluster role lets the Manager create and wall namespaces. A separate
+delivery identity for Secrets, as the design describes, is not split out yet.
 
 ## Provisioner access to Secrets
 
@@ -92,7 +119,8 @@ tenant's namespace is set up the Manager asks the API server whether that accoun
 can `get`, `list` or `watch` Secrets there, counting the groups every service
 account belongs to (`system:serviceaccounts`, `system:serviceaccounts:<namespace>`,
 `system:authenticated`). If it can, the tenant is not set up
-and the error names the account and the verb. Without the setting no check runs.
+and the error names the account and the verb. Without the setting no check runs,
+and in hosted mode the Manager logs a warning at startup saying so.
 
 **Limit.** This check closes one route: reading Secrets through the Kubernetes
 API. It does not stop the provisioner from reaching them another way. The
@@ -114,8 +142,8 @@ limit.
 ## Startup probe
 
 In hosted mode on Kubernetes the Manager refuses to start unless the cluster
-enforces the rules. It runs two probes at the same time, each in its own
-throwaway namespace.
+enforces the rules. It runs two probes, each in its own throwaway namespace and
+at the same time, or one after the other in the probe namespace if one is set.
 
 The tenant probe applies the same rules and starts a server for tenant A with
 three clients:
@@ -137,7 +165,8 @@ free client that no rule touches:
 | Free client to a server guarded only by an ingress rule | Fail |
 | Client guarded only by an egress rule to the free server | Fail |
 
-Both namespaces are removed afterwards. Failures name the cause:
+The throwaway namespaces are removed afterwards; a probe namespace is left empty.
+Failures name the cause:
 
 | Message | Fix |
 | --- | --- |
@@ -146,7 +175,8 @@ Both namespaces are removed afterwards. Failures name the cause:
 | `a pod with no rules could not reach another pod with no rules` | The network plugin is unhealthy |
 | `... could not reach another pod of its own tenant` | The network plugin is unhealthy, or `OPENFLOWS_K8S_PROBE_IMAGE` lacks `nc` or `sh` |
 | `probe pod ... did not start in time` | The cluster cannot pull the probe image, or pods cannot run in a `restricted` namespace. Mirror the image and set `OPENFLOWS_K8S_PROBE_IMAGE` |
-| `cannot create a probe namespace` | The Manager lacks the permissions above |
+| `cannot create a probe namespace` | The Manager lacks the permissions above, or set `OPENFLOWS_K8S_PROBE_NAMESPACE` to a namespace that exists |
+| `the probe namespace '...' cannot be used` | The namespace in `OPENFLOWS_K8S_PROBE_NAMESPACE` does not exist, or the Manager cannot read it |
 
 The probe runs once at startup. Re-run it by restarting the Manager after any
 change to the network plugin.

@@ -73,11 +73,26 @@ pub fn namespace(
 ) -> Result<Namespace, ManagerError> {
     let name = namespace_name(&settings.namespace_prefix, organization_id);
     let mut metadata = meta(&name, None, Some(organization_id));
-    for key in ["enforce", "audit", "warn"] {
-        metadata["labels"][format!("pod-security.kubernetes.io/{key}")] = json!("restricted");
+    if let Some(labels) = pod_security_labels(settings).as_object() {
+        for (key, value) in labels {
+            metadata["labels"][key] = value.clone();
+        }
     }
-    metadata["labels"]["pod-security.kubernetes.io/enforce-version"] = json!("latest");
     typed(json!({ "apiVersion": "v1", "kind": "Namespace", "metadata": metadata }))
+}
+
+/// Pod Security labels. `enforce` is pinned, so a cluster upgrade cannot start rejecting pods
+/// that were admitted the day before. `audit` and `warn` follow the latest standard, so an
+/// upgrade shows up as warnings first.
+pub fn pod_security_labels(settings: &IsolationSettings) -> Value {
+    json!({
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": settings.pod_security_version,
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/audit-version": "latest",
+        "pod-security.kubernetes.io/warn": "restricted",
+        "pod-security.kubernetes.io/warn-version": "latest",
+    })
 }
 
 /// Ceiling on what the organization's namespace may consume.
@@ -187,6 +202,9 @@ pub fn base_policies(
     namespace: &str,
 ) -> Result<Vec<NetworkPolicy>, ManagerError> {
     let all_pods = json!({});
+    // Only pods that carry the tenant label may reach the platform services.
+    let tenant_pods =
+        json!({ "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }] });
     let mut policies = vec![
         policy(
             DEFAULT_DENY,
@@ -204,7 +222,7 @@ pub fn base_policies(
         policy(
             ALLOW_PLATFORM,
             namespace,
-            json!({ "podSelector": all_pods, "policyTypes": ["Egress"], "egress": [{
+            json!({ "podSelector": tenant_pods, "policyTypes": ["Egress"], "egress": [{
                 "to": platform_peers(settings),
                 "ports": tcp_ports(&settings.platform_ports),
             }]}),
@@ -291,6 +309,56 @@ mod tests {
         );
         assert_eq!(labels["pod-security.kubernetes.io/enforce"], "restricted");
         assert_eq!(labels[ORGANIZATION_LABEL], org().to_string());
+    }
+
+    #[test]
+    fn enforce_is_pinned_while_audit_and_warn_follow_the_latest_standard() {
+        let ns = namespace(&IsolationSettings::default(), org()).expect("namespace");
+        let labels = ns.metadata.labels.expect("labels");
+
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce-version"],
+            "v1.33"
+        );
+        assert_eq!(labels["pod-security.kubernetes.io/audit-version"], "latest");
+        assert_eq!(labels["pod-security.kubernetes.io/warn-version"], "latest");
+    }
+
+    #[test]
+    fn the_pinned_version_follows_the_setting() {
+        let settings = IsolationSettings {
+            pod_security_version: "v1.35".into(),
+            ..IsolationSettings::default()
+        };
+        let labels = namespace(&settings, org())
+            .expect("namespace")
+            .metadata
+            .labels
+            .expect("labels");
+
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce-version"],
+            "v1.35"
+        );
+    }
+
+    #[test]
+    fn platform_access_is_limited_to_tenant_labelled_pods() {
+        let policies = base_policies(&IsolationSettings::default(), "ns").expect("policies");
+        let selector_of = |name: &str| {
+            let policy = policies
+                .iter()
+                .find(|p| p.metadata.name.as_deref() == Some(name))
+                .expect("policy");
+            spec(policy)["podSelector"].clone()
+        };
+
+        assert_eq!(
+            selector_of(ALLOW_PLATFORM),
+            json!({ "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }] })
+        );
+        assert_eq!(selector_of(ALLOW_DNS), json!({}));
+        assert_eq!(selector_of(ALLOW_PUBLIC), json!({}));
     }
 
     #[test]

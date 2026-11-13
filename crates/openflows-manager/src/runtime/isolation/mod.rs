@@ -53,9 +53,15 @@ pub const PROVISIONER_ACCOUNT_ENV: &str = "OPENFLOWS_K8S_PROVISIONER_SERVICE_ACC
 pub const PROBE_IMAGE_ENV: &str = "OPENFLOWS_K8S_PROBE_IMAGE";
 /// Address of the node-local DNS cache, such as `169.254.20.10`, on clusters that run NodeLocal DNSCache.
 pub const NODE_LOCAL_DNS_ENV: &str = "OPENFLOWS_K8S_NODE_LOCAL_DNS";
+/// Pod Security Standard version that `enforce` is pinned to, such as `v1.33`.
+pub const POD_SECURITY_VERSION_ENV: &str = "OPENFLOWS_K8S_POD_SECURITY_VERSION";
+/// A pre-created empty namespace for the startup probe, so the Manager needs no right to
+/// create or delete namespaces for it.
+pub const PROBE_NAMESPACE_ENV: &str = "OPENFLOWS_K8S_PROBE_NAMESPACE";
 
 const DEFAULT_PLATFORM_NAMESPACE: &str = "openflows";
 const DEFAULT_PLATFORM_PORTS: [u16; 3] = [3002, 6379, 7080];
+const DEFAULT_POD_SECURITY_VERSION: &str = "v1.33";
 const DEFAULT_PROBE_IMAGE: &str = "docker.io/library/busybox:1.37.0";
 /// `(resource, environment variable, default)`.
 const QUOTA_SETTINGS: [(&str, &str, &str); 7] = [
@@ -90,6 +96,10 @@ pub struct IsolationSettings {
     pub probe_image: String,
     /// Node-local DNS cache address; pods query it instead of CoreDNS when it runs.
     pub node_local_dns: Option<String>,
+    /// Version of the Pod Security Standard that `enforce` is pinned to.
+    pub pod_security_version: String,
+    /// Existing empty namespace the probe runs in; when unset it creates and removes its own.
+    pub probe_namespace: Option<String>,
     /// Resource name and amount of every quota line.
     pub quota: Vec<(String, String)>,
 }
@@ -106,6 +116,8 @@ impl Default for IsolationSettings {
             provisioner_account: None,
             probe_image: DEFAULT_PROBE_IMAGE.to_string(),
             node_local_dns: None,
+            pod_security_version: DEFAULT_POD_SECURITY_VERSION.to_string(),
+            probe_namespace: None,
             quota: QUOTA_SETTINGS
                 .iter()
                 .map(|(resource, _, default)| (resource.to_string(), default.to_string()))
@@ -141,6 +153,12 @@ impl IsolationSettings {
         }
         if let Some(account) = get(PROVISIONER_ACCOUNT_ENV) {
             settings.provisioner_account = Some(parse_account(&account)?);
+        }
+        if let Some(version) = get(POD_SECURITY_VERSION_ENV) {
+            settings.pod_security_version = parse_pod_security_version(&version)?;
+        }
+        if let Some(namespace) = get(PROBE_NAMESPACE_ENV) {
+            settings.probe_namespace = Some(parse_probe_namespace(&namespace)?);
         }
         if let Some(address) = get(NODE_LOCAL_DNS_ENV) {
             settings.node_local_dns = Some(parse_address(&address)?);
@@ -230,6 +248,42 @@ fn parse_account(value: &str) -> Result<(String, String), ManagerError> {
         _ => Err(ManagerError::Config(format!(
             "{PROVISIONER_ACCOUNT_ENV} must look like openflows/coder-provisioner"
         ))),
+    }
+}
+
+fn parse_pod_security_version(value: &str) -> Result<String, ManagerError> {
+    let value = value.trim();
+    let numbered = value.strip_prefix('v').is_some_and(|rest| {
+        rest.split_once('.').is_some_and(|(major, minor)| {
+            [major, minor]
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+    });
+    if numbered || value == "latest" {
+        Ok(value.to_string())
+    } else {
+        Err(ManagerError::Config(format!(
+            "{POD_SECURITY_VERSION_ENV} must be latest or a version such as v1.33"
+        )))
+    }
+}
+
+fn parse_probe_namespace(value: &str) -> Result<String, ManagerError> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 63
+        && value.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && value.ends_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(ManagerError::Config(format!(
+            "{PROBE_NAMESPACE_ENV} must be a namespace name: lowercase letters, digits and dashes"
+        )))
     }
 }
 
@@ -425,6 +479,12 @@ pub async fn resolve(config: &ManagerConfig) -> Result<Arc<dyn TenantIsolation>,
         return Ok(Arc::new(NoIsolation));
     }
     let settings = IsolationSettings::from_env()?;
+    if config.mode == Mode::Hosted && settings.provisioner_account.is_none() {
+        tracing::warn!(
+            "{PROVISIONER_ACCOUNT_ENV} is not set: whether the Coder provisioner can read tenant \
+             Secrets through the Kubernetes API is not checked"
+        );
+    }
     let client = cluster_client()
         .await
         .map_err(|e| ManagerError::Config(format!("tenant isolation needs cluster access: {e}")))?;
@@ -465,6 +525,8 @@ mod tests {
             (PROVISIONER_SELECTOR_ENV, "app=coder-provisioner"),
             (PROVISIONER_ACCOUNT_ENV, "platform/provisioner"),
             (NODE_LOCAL_DNS_ENV, "169.254.20.10"),
+            (POD_SECURITY_VERSION_ENV, "v1.35"),
+            (PROBE_NAMESPACE_ENV, "openflows-probe"),
             ("OPENFLOWS_K8S_QUOTA_PODS", "10"),
         ])
         .expect("settings");
@@ -478,6 +540,8 @@ mod tests {
         );
         assert_eq!(settings.quota[0], ("pods".into(), "10".into()));
         assert_eq!(settings.node_local_dns.as_deref(), Some("169.254.20.10"));
+        assert_eq!(settings.pod_security_version, "v1.35");
+        assert_eq!(settings.probe_namespace.as_deref(), Some("openflows-probe"));
         assert_eq!(
             settings.provisioner_account,
             Some(("platform".into(), "provisioner".into()))
@@ -494,6 +558,9 @@ mod tests {
             (PROVISIONER_SELECTOR_ENV, "no-equals-sign"),
             (PROVISIONER_ACCOUNT_ENV, "no-namespace"),
             (NODE_LOCAL_DNS_ENV, "not-an-ip"),
+            (POD_SECURITY_VERSION_ENV, "1.33"),
+            (POD_SECURITY_VERSION_ENV, "v1"),
+            (PROBE_NAMESPACE_ENV, "Bad_Namespace"),
             ("OPENFLOWS_K8S_NAMESPACE_PREFIX", "Bad_Prefix-"),
             ("OPENFLOWS_K8S_QUOTA_PODS", "ten; drop"),
         ] {

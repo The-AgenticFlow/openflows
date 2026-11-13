@@ -9,7 +9,7 @@
 //! On one that does not (for example kind with its default plugin):
 //!   `cargo test --test k8s_isolation ignoring -- --ignored --test-threads=1`
 
-use k8s_openapi::api::core::v1::{Namespace, ServiceAccount};
+use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use kube::api::{DeleteParams, ListParams, PostParams};
@@ -222,4 +222,166 @@ async fn provisioner_able_to_read_secrets_through_a_group_is_refused() {
     .await;
 
     assert!(error.contains("can get Secrets"), "{error}");
+}
+
+fn short() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+async fn create_namespace(client: &Client, name: &str, labels: serde_json::Value) {
+    let namespace: Namespace = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Namespace",
+        "metadata": { "name": name, "labels": labels },
+    }))
+    .expect("namespace");
+    Api::<Namespace>::all(client.clone())
+        .create(&PostParams::default(), &namespace)
+        .await
+        .expect("create namespace");
+}
+
+async fn delete_namespace(client: &Client, name: &str) {
+    let _ = Api::<Namespace>::all(client.clone())
+        .delete(name, &DeleteParams::default())
+        .await;
+}
+
+async fn create_pod(pods: &Api<Pod>, name: &str, labels: serde_json::Value, script: &str) {
+    let pod: Pod = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": name, "labels": labels },
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": false,
+            "securityContext": {
+                "runAsNonRoot": true, "runAsUser": 65534,
+                "seccompProfile": { "type": "RuntimeDefault" },
+            },
+            "containers": [{
+                "name": "c", "image": IsolationSettings::default().probe_image,
+                "command": ["sh", "-c", script],
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": { "drop": ["ALL"] },
+                },
+            }],
+        },
+    }))
+    .expect("pod");
+    pods.create(&PostParams::default(), &pod)
+        .await
+        .expect("create pod");
+}
+
+/// The pod's IP once it runs.
+async fn wait_for_ip(pods: &Api<Pod>, name: &str) -> String {
+    for _ in 0..60 {
+        let pod = pods.get(name).await.expect("get pod");
+        if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.clone()) {
+            if pod.status.and_then(|s| s.phase).as_deref() == Some("Running") {
+                return ip;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    panic!("pod {name} did not start");
+}
+
+/// `true` when the pod ran to success, `false` when it failed.
+async fn finished_ok(pods: &Api<Pod>, name: &str) -> bool {
+    for _ in 0..60 {
+        let phase = pods
+            .get(name)
+            .await
+            .expect("get pod")
+            .status
+            .and_then(|s| s.phase);
+        match phase.as_deref() {
+            Some("Succeeded") => return true,
+            Some("Failed") => return false,
+            _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    }
+    panic!("pod {name} did not finish");
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster that enforces NetworkPolicy"]
+async fn probe_in_a_pre_created_namespace_passes_and_leaves_it_empty() {
+    let client = client().await;
+    let name = format!("of507-probe-{}", short());
+    let settings = IsolationSettings {
+        probe_namespace: Some(name.clone()),
+        ..IsolationSettings::default()
+    };
+    create_namespace(&client, &name, manifests::pod_security_labels(&settings)).await;
+
+    let outcome = run_probe(&client, &settings).await;
+
+    let pods = Api::<Pod>::namespaced(client.clone(), &name)
+        .list(&ListParams::default())
+        .await
+        .expect("list pods")
+        .items
+        .len();
+    let policies = policy_names(&client, &name).await;
+    let still_there = Api::<Namespace>::all(client.clone())
+        .get(&name)
+        .await
+        .is_ok();
+    delete_namespace(&client, &name).await;
+    outcome.expect("the probe passes in a pre-created namespace");
+    assert_eq!(pods, 0, "pods left behind");
+    assert!(policies.is_empty(), "policies left behind: {policies:?}");
+    assert!(still_there, "the probe namespace must not be deleted");
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster that enforces NetworkPolicy"]
+async fn platform_access_is_gated_by_the_tenant_label() {
+    let client = client().await;
+    let platform = format!("of507-platform-{}", short());
+    let settings = IsolationSettings {
+        namespace_prefix: "of507q-".into(),
+        platform_namespace: platform.clone(),
+        platform_ports: vec![8080],
+        ..IsolationSettings::default()
+    };
+    let (org, tenant, _) = ids();
+    let org_namespace = manifests::namespace_name(&settings.namespace_prefix, org);
+    create_namespace(&client, &platform, serde_json::json!({})).await;
+    let platform_pods = Api::<Pod>::namespaced(client.clone(), &platform);
+    create_pod(
+        &platform_pods,
+        "service",
+        serde_json::json!({}),
+        "while true; do echo ok | nc -l -p 8080; done",
+    )
+    .await;
+    let service_ip = wait_for_ip(&platform_pods, "service").await;
+    KubernetesIsolation::new(client.clone(), settings)
+        .ensure_tenant(org, tenant)
+        .await
+        .expect("tenant set up");
+
+    let reach = format!("echo hi | nc -w 3 {service_ip} 8080 | grep -q ok");
+    let pods = Api::<Pod>::namespaced(client.clone(), &org_namespace);
+    create_pod(
+        &pods,
+        "labelled",
+        serde_json::json!({ manifests::TENANT_LABEL: tenant.to_string() }),
+        &reach,
+    )
+    .await;
+    create_pod(&pods, "unlabelled", serde_json::json!({}), &reach).await;
+    let labelled = finished_ok(&pods, "labelled").await;
+    let unlabelled = finished_ok(&pods, "unlabelled").await;
+
+    delete_namespace(&client, &org_namespace).await;
+    delete_namespace(&client, &platform).await;
+    assert!(labelled, "a tenant pod must reach the platform service");
+    assert!(
+        !unlabelled,
+        "an unlabelled pod must not reach the platform service"
+    );
 }
