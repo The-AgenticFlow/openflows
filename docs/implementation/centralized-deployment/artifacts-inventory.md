@@ -56,13 +56,30 @@ Manager runs with `no-cache`, `/runtime/artifacts/{digest}` returns only that
 exact archive with a one-year immutable cache header, and answers 404 with the
 available digest when a workspace pins one the Manager does not carry.
 
-`openflows-harness artifacts fetch --dir --manager-url --token --digest` is the
-client. It makes three attempts, retries only a network failure or a server
-error, and always checks the served archive against the `x-artifact-digest`
-header before installing it, so a corrupted or truncated download is caught. The
-optional `--digest` adds a second, different guarantee: the Manager must serve
-that exact release or answer 404, which turns a rebuild across an upgrade into a
-failure instead of a silent release change.
+`openflows-harness artifacts fetch --dir --manager-url --token` is the client. It
+makes three attempts, retries only a network failure or a server error, and
+always checks the served archive against the `x-artifact-digest` header before
+installing it, so a corrupted or truncated download is caught.
+
+Release pinning is separate from that integrity check, and on by default. The
+harness computes the digest of the bundle compiled into its own binary and asks
+the Manager for exactly that bundle, so a Manager serving a different one
+answers 404 with both digests in the message and the workspace refuses to boot
+with assets its code was not built against. Two ways out, both deliberate:
+`--digest` pins a bundle named by the caller, and `--any-release` installs
+whichever bundle the Manager serves.
+
+The check is on the bundle, not on a release number. A release that changes
+nothing under `orchestration/` compiles to the same digest as the one before it,
+so a harness from either still installs. What it catches is a Manager whose
+assets differ from the harness's, which is the only case where mixing them
+changes what a worker reads.
+
+The consequence for operators: the `harness_version` the worker templates
+download has to name the release the Manager runs. Deploying one half ahead of
+the other makes workspace rebuilds fail loudly once the bundles differ, which is
+the intended behaviour and is recorded in the
+[production runbook](operator-production-runbook.md).
 
 ## The golden repository seed
 
@@ -123,7 +140,6 @@ Two things, and only the second is a real coupling:
 | --- | --- | --- |
 | The local tree is materialised once | `ensure_orchestration_dir` writes only missing files and only warns when `.version` differs, so an upgraded controller keeps publishing the previous release's assets until someone runs `--reset-orchestration` | [`binary/src/orchestration.rs`](../../../binary/src/orchestration.rs) |
 | The local copy is never verified | Nothing checks that the mounted assets are the ones the running release built, and that path has no digest to check them against | Templates, `ASSETS_DIR` branch |
-| No release pin in the templates | `artifacts fetch` is called without `--digest`, so a rebuild after a Manager upgrade installs the new release's assets. Integrity is still verified against the served digest and the installed digest is logged, but nothing compares it with the release the workspace or its template expects | [`openflows-forge/main.tf`](../../../crates/coder-client/templates/openflows-forge/main.tf) and the three siblings |
 | No installed-digest marker | The harness reports what it installed, but nothing keeps it where an operator or the Manager can read it | [`crates/openflows-harness/src/artifacts.rs`](../../../crates/openflows-harness/src/artifacts.rs) |
 | Hosted workers still mount the volume | A volume that carries only an optimisation is still part of what a hosted workspace has to be isolated from | Templates, `volumes` blocks |
 | Unbounded git waits in three roles | A hung pull, fetch or clone stalls Sentinel, Vessel and Lore with no timeout, where Forge bounds each call and warns instead of hanging | [`openflows-sentinel/main.tf`](../../../crates/coder-client/templates/openflows-sentinel/main.tf) and the other two |
