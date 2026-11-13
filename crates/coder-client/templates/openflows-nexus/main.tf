@@ -215,7 +215,10 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    # Fix artifacts directory ownership (shared volume is created as root)
+    # Fix artifacts directory ownership. Local mode mounts the shared volume
+    # under this path as root; hosted mode mounts nothing here, so create the
+    # parent first and let the controller publish its tree into it.
+    sudo mkdir -p /home/coder/.openflows
     sudo chown -R coder:coder /home/coder/.openflows
 
     # TEMPORARY: Use mounted dev binary for local testing
@@ -327,8 +330,12 @@ PY
     # mount clone"). Nexus owns the artifacts volume (writable here) and holds
     # the git credentials / network egress, so the expensive fetch happens once.
     # The golden tree is refreshed (fetch + reset) before any worker copies it.
+    #
+    # Local mode only. A hosted workspace clones from the remote with its own
+    # brokered credential, so there is no shared volume to seed and no copy for
+    # another workspace to read.
     GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
-    if [ -n "${data.coder_parameter.repo_url.value}" ]; then
+    if [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -n "${data.coder_parameter.repo_url.value}" ]; then
       if [ -d "$GOLDEN_REPO/.git" ]; then
         cd "$GOLDEN_REPO" && git fetch --prune 2>/dev/null || true
         git reset --hard "origin/HEAD" 2>/dev/null || git reset --hard 2>/dev/null || true
@@ -409,12 +416,14 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Tenant artifacts volume. Nexus seeds the golden repository clone here and
-# publishes the instruction bundle for local workspaces; workers mount it
-# read-only. Hosted workspaces fetch the same bundle from the Manager instead,
-# so this volume only carries the repository seed there.
+# Tenant artifacts volume, local mode only. Nexus seeds the golden repository
+# clone here and publishes the instruction bundle; local workers mount it
+# read-only. A hosted workspace installs the bundle from the Manager and clones
+# from the remote with its own brokered credential, so hosted mode creates no
+# shared volume and requires no read-write-many storage.
 resource "docker_volume" "artifacts" {
-  name = "openflows-artifacts-${data.coder_parameter.tenant.value}"
+  count = data.coder_parameter.hosted.value != "true" ? 1 : 0
+  name  = "openflows-artifacts-${data.coder_parameter.tenant.value}"
 }
 
 resource "docker_container" "workspace" {
@@ -437,10 +446,15 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel)
-  volumes {
-    container_path = "/home/coder/.openflows/artifacts"
-    volume_name    = docker_volume.artifacts.name
+  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel).
+  # Local mode only: a hosted Nexus keeps the tree in its own workspace and
+  # publishes nothing that another workspace has to mount.
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
+    content {
+      container_path = "/home/coder/.openflows/artifacts"
+      volume_name    = docker_volume.artifacts[0].name
+    }
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)

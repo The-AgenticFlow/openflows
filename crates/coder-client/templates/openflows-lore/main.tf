@@ -445,12 +445,17 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared artifact files (repo golden seed, plans, skills).
-  # This volume is created by the Nexus workspace and is read-only here.
-  volumes {
-    container_path = "/home/coder/.openflows/artifacts"
-    volume_name    = "openflows-artifacts-${local.tenant}"
-    read_only      = true
+  # Local mode reads the artifact tree and the repository seed from the tenant
+  # volume, which the Nexus workspace creates. A hosted workspace installs the
+  # tree from the Manager bundle and clones with its own credential, so it
+  # mounts no shared storage.
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
+    content {
+      container_path = "/home/coder/.openflows/artifacts"
+      volume_name    = "openflows-artifacts-${local.tenant}"
+      read_only      = true
+    }
   }
 
   # Dev binaries for local testing; the startup script prefers them over a download.

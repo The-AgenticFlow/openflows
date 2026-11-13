@@ -481,13 +481,17 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount the tenant artifacts volume read-only. It carries the repository
-  # seed; hosted workspaces install the role assets from the Manager bundle, so
-  # nothing is written here for sentinel (plans travel through Redis).
-  volumes {
-    container_path = "/home/coder/.openflows/artifacts"
-    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
-    read_only      = true
+  # Local mode reads the artifact tree and the repository seed from the tenant
+  # volume. A hosted workspace installs the tree from the Manager bundle and
+  # clones with its own credential, so it mounts no shared storage; plans travel
+  # through Redis either way.
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
+    content {
+      container_path = "/home/coder/.openflows/artifacts"
+      volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
+      read_only      = true
+    }
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases).

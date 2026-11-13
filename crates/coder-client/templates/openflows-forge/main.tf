@@ -728,12 +728,16 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared artifact files (agent definitions, skills, standards, plans)
-  # This volume is created by the Nexus workspace
-  volumes {
-    container_path = "/home/coder/.openflows/artifacts"
-    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
-    read_only      = true
+  # Local mode reads the artifact tree from the tenant volume that the Nexus
+  # workspace fills. A hosted workspace installs the same tree from the Manager
+  # bundle and clones with its own credential, so it mounts no shared storage.
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
+    content {
+      container_path = "/home/coder/.openflows/artifacts"
+      volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
+      read_only      = true
+    }
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
