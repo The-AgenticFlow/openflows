@@ -58,8 +58,11 @@ available digest when a workspace pins one the Manager does not carry.
 
 `openflows-harness artifacts fetch --dir --manager-url --token --digest` is the
 client. It makes three attempts, retries only a network failure or a server
-error, and installs nothing unless the served digest matches the pinned one when
-a pin is given.
+error, and always checks the served archive against the `x-artifact-digest`
+header before installing it, so a corrupted or truncated download is caught. The
+optional `--digest` adds a second, different guarantee: the Manager must serve
+that exact release or answer 404, which turns a rebuild across an upgrade into a
+failure instead of a silent release change.
 
 ## The golden repository seed
 
@@ -71,20 +74,20 @@ fetch per tenant replaces one per workspace spawn.
 | Role | Mount | Seed handling |
 | --- | --- | --- |
 | Nexus | Read-write, created by `docker_volume.artifacts` | Clones, or fetches and resets a hard, then repairs ownership |
-| Forge | Read-only | Copy, fetch, checkout, with 45 second timeouts and a loud failure when the seed and the clone are both unavailable |
-| Sentinel | Read-only | Copy, fetch, checkout, then a network clone, with errors redirected to `/dev/null` and ignored |
-| Vessel | Read-only | Same as Sentinel |
-| Lore | Read-only | Same as Sentinel |
+| Forge | Read-only | Copy, refresh, checkout, then a network clone, each bounded by a 45 second timeout (90 for the clone), with a warning that names the failure |
+| Sentinel, Vessel, Lore | Read-only | The same steps with no timeouts: the intermediate pull, copy, fetch and checkout are silenced, and a failed clone writes to `/tmp/<role>_clone_err.log` and warns |
 
 The fallback already works in hosted mode: Forge configures a git credential
 store from the Manager's runtime credential exchange before it clones, so a
 worker without a seed can still clone a private repository, at the cost of one
 fetch per workspace instead of one per tenant. Sentinel, Vessel and Lore inherit
-the same credential setup and share the weaker error handling above.
+the same credential setup, and the same silenced intermediate steps and missing
+timeouts that the table above records.
 
-The four worker templates differ only in that hardening. Forge treats a missing
-repository as fatal, the other three can finish boot with an empty workspace,
-which is the failure the Forge comments call out as the original bug.
+Every worker, Forge included, ends its bootstrap with a guard that exits when
+`/home/coder/workspace/.git` is absent, so none of them finishes booting on an
+empty workspace. What separates Forge from the other three is timeouts and how
+loudly the intermediate steps report, not whether a missing repository is fatal.
 
 ## What is already off the volume
 
@@ -119,11 +122,11 @@ Two things, and only the second is a real coupling:
 | Gap | Effect today | Where |
 | --- | --- | --- |
 | The local tree is materialised once | `ensure_orchestration_dir` writes only missing files and only warns when `.version` differs, so an upgraded controller keeps publishing the previous release's assets until someone runs `--reset-orchestration` | [`binary/src/orchestration.rs`](../../../binary/src/orchestration.rs) |
-| The local copy is never verified | Nothing checks that the mounted assets are the ones the running release built, and the digest the bundle is named by is only reported, never compared | Templates, `ASSETS_DIR` branch |
-| Nothing pins the digest in the templates | `artifacts fetch` is called without `--digest`, so a rebuild across a Manager upgrade silently installs different assets | [`openflows-forge/main.tf`](../../../crates/coder-client/templates/openflows-forge/main.tf) and the three siblings |
+| The local copy is never verified | Nothing checks that the mounted assets are the ones the running release built, and that path has no digest to check them against | Templates, `ASSETS_DIR` branch |
+| No release pin in the templates | `artifacts fetch` is called without `--digest`, so a rebuild after a Manager upgrade installs the new release's assets. Integrity is still verified against the served digest and the installed digest is logged, but nothing compares it with the release the workspace or its template expects | [`openflows-forge/main.tf`](../../../crates/coder-client/templates/openflows-forge/main.tf) and the three siblings |
 | No installed-digest marker | The harness reports what it installed, but nothing keeps it where an operator or the Manager can read it | [`crates/openflows-harness/src/artifacts.rs`](../../../crates/openflows-harness/src/artifacts.rs) |
 | Hosted workers still mount the volume | A volume that carries only an optimisation is still part of what a hosted workspace has to be isolated from | Templates, `volumes` blocks |
-| Uneven failure handling | Three roles can boot with an empty workspace where Forge refuses | [`openflows-sentinel/main.tf`](../../../crates/coder-client/templates/openflows-sentinel/main.tf) and the other two |
+| Unbounded git waits in three roles | A hung pull, fetch or clone stalls Sentinel, Vessel and Lore with no timeout, where Forge bounds each call and warns instead of hanging | [`openflows-sentinel/main.tf`](../../../crates/coder-client/templates/openflows-sentinel/main.tf) and the other two |
 | Read-only mounts repaired with `sudo chown` | Nexus repairs ownership of a volume other roles mount read-only, which assumes the same uid on one host | [`openflows-nexus/main.tf`](../../../crates/coder-client/templates/openflows-nexus/main.tf) |
 
 ## Options for the repository seed
