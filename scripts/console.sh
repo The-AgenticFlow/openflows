@@ -25,7 +25,8 @@
 # interactive, so that part cannot be silent).
 #
 # The container is named openflows-console. Any Console container started by Compose
-# (deployment.compose.yml) is stopped first, because only one can own the port.
+# (deployment.compose.yml) is stopped first, because only one can own the port; it is restarted if the
+# new Console does not come up.
 # Set CONSOLE_IMAGE_TAG to pin a version (default: develop).
 
 set -euo pipefail
@@ -106,32 +107,58 @@ fi
 manager_ready "$MANAGER_URL" || die "The Manager at ${MANAGER_URL} does not answer /ready or /health."
 note "Manager: ${MANAGER_URL}"
 
-# Only one Console can own the port: stop ours and any started by Compose.
-docker rm -f "$NAME" >/dev/null 2>&1 || true
-for id in $(docker ps -q --filter label=com.docker.compose.service=console 2>/dev/null); do
-    case "$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" in
-        *openflows-console*) note "Stopping the Compose Console ($(docker inspect --format '{{.Name}}' "$id" | tr -d /))."; docker rm -f "$id" >/dev/null ;;
-    esac
-done
-if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
-    die "Port ${PORT} is already in use." "Use another one: ./scripts/console.sh --port 3100"
-fi
-
+# Prepare the replacement image first, so a mistyped tag cannot leave you without a Console.
 if [ "$PULL" = 1 ]; then
     docker pull -q "$IMAGE" >/dev/null 2>&1 \
         || docker image inspect "$IMAGE" >/dev/null 2>&1 \
-        || die "Cannot pull ${IMAGE}." "Check your network and that the image is public."
+        || die "Cannot pull ${IMAGE}." "Check your network, CONSOLE_IMAGE_TAG and that the image is public."
+else
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || die "${IMAGE} is not available locally; re-run without --no-pull."
+fi
+
+# Only one Console can own the port. Stop ours and any started by Compose, but keep them
+# so that they can be restarted if the new one does not come up.
+OLD=()
+ours="$(docker ps -aq --filter "name=^/${NAME}\$" 2>/dev/null || true)"
+if [ -n "$ours" ]; then
+    docker stop "$ours" >/dev/null 2>&1 || true
+    docker rename "$ours" "${NAME}-old" >/dev/null
+    OLD+=("$ours")
+fi
+for id in $(docker ps -q --filter label=com.docker.compose.service=console 2>/dev/null); do
+    case "$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" in
+        *openflows-console*)
+            note "Stopping the Compose Console ($(docker inspect --format '{{.Name}}' "$id" | tr -d /))."
+            docker stop "$id" >/dev/null; OLD+=("$id") ;;
+    esac
+done
+rollback_and_die() { # rollback_and_die MESSAGE [DETAIL]: remove the new Console and restart the old ones
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    for id in ${OLD[@]+"${OLD[@]}"}; do
+        if [ "$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null)" = "/${NAME}-old" ]; then
+            docker rename "${NAME}-old" "$NAME" >/dev/null 2>&1 || true
+        fi
+        docker start "$id" >/dev/null 2>&1 || true
+    done
+    [ "${#OLD[@]}" -eq 0 ] || note "The previous Console was restarted."
+    die "$@"
+}
+
+if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
+    rollback_and_die "Port ${PORT} is already in use." "Use another one: ./scripts/console.sh --port 3100"
 fi
 
 if [ "$DESKTOP" = 0 ]; then
     docker run -d --name "$NAME" --restart unless-stopped --network host \
         -e PORT="$PORT" -e HOSTNAME=127.0.0.1 \
-        -e OPENFLOWS_MANAGER_URL="$MANAGER_URL" "$IMAGE" >/dev/null
+        -e OPENFLOWS_MANAGER_URL="$MANAGER_URL" "$IMAGE" >/dev/null \
+        || rollback_and_die "Could not start the Console."
 else
     docker run -d --name "$NAME" --restart unless-stopped -p "127.0.0.1:${PORT}:3000" \
         --add-host host.docker.internal:host-gateway \
         -e OPENFLOWS_MANAGER_URL="$(printf '%s' "$MANAGER_URL" | sed -E 's#//(127\.0\.0\.1|localhost)#//host.docker.internal#')" \
-        "$IMAGE" >/dev/null
+        "$IMAGE" >/dev/null \
+        || rollback_and_die "Could not start the Console."
 fi
 
 CONSOLE="http://127.0.0.1:${PORT}"
@@ -142,39 +169,57 @@ for _ in $(seq 1 40); do
 done
 printf '\n'
 curl -fs -m 3 -o /dev/null "${CONSOLE}/login" 2>/dev/null \
-    || die "The Console did not start." "Check: docker logs ${NAME}"
+    || rollback_and_die "The Console did not start." "Check: docker logs ${NAME}"
 
-# End to end: the sign-in start must reach the Manager and answer with a redirect to GitHub.
+# End to end: the sign-in start must reach the Manager and answer with a redirect.
 headers="$(curl -s -m 10 -o /dev/null -D - "${CONSOLE}/auth/github/start" || true)"
 status="$(printf '%s' "$headers" | head -n1 | awk '{print $2}')"
 if [ "$status" != 307 ] && [ "$status" != 302 ]; then
-    die "The Console started but its sign-in does not reach the Manager (HTTP ${status:-none})." \
+    rollback_and_die "The Console started but its sign-in does not reach the Manager (HTTP ${status:-none})." \
 "Check: docker logs ${NAME} --tail 10
 Manager used: ${MANAGER_URL}"
 fi
 
-# GitHub returns the browser to the Manager's public URL, which must be the Console's origin.
+# The new Console works: the old ones are no longer needed.
+for id in ${OLD[@]+"${OLD[@]}"}; do docker rm -f "$id" >/dev/null 2>&1 || true; done
+
 location="$(printf '%s' "$headers" | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')"
-callback="$(python3 - "$location" <<'PY' 2>/dev/null || true
+parsed="$(python3 - "$location" <<'PY' 2>/dev/null || true
 import sys, urllib.parse as u
-q = u.parse_qs(u.urlparse(sys.argv[1]).query)
+p = u.urlparse(sys.argv[1])
+q = u.parse_qs(p.query)
+print(p.scheme + "://" + p.netloc)
 print((q.get("redirect_uri") or [""])[0])
 PY
 )"
+dest_origin="$(printf '%s\n' "$parsed" | sed -n 1p)"
+callback="$(printf '%s\n' "$parsed" | sed -n 2p)"
 
-cat <<EOF
+# The sign-in cookie belongs to the host the browser used, and GitHub returns to the callback host.
+# localhost and 127.0.0.1 are different hosts to a browser, so the address to open must match.
+open_url="$CONSOLE"
+case "$callback" in
+    "http://localhost:${PORT}/auth/github/callback") open_url="http://localhost:${PORT}" ;;
+    "http://127.0.0.1:${PORT}/auth/github/callback") open_url="http://127.0.0.1:${PORT}" ;;
+esac
 
-Console is running: ${CONSOLE}
+printf '\nConsole is running. Open exactly: %s\n' "$open_url"
+if [ "$dest_origin" != "https://github.com" ]; then
+    cat <<EOF
+
+The Manager's sign-in did not redirect to GitHub (it answered with: ${location:-nothing}).
+That is how the Manager from ./scripts/setup.sh works: it signs you in without GitHub OAuth,
+through its own console at ${MANAGER_URL}. The Console cannot sign in against it. Use the
+Manager's console, or run the operator setup (deployment.compose.yml) to sign in here.
 EOF
-if [ -n "$callback" ] && [ "$callback" != "${CONSOLE}/auth/github/callback" ] \
-    && [ "$callback" != "http://localhost:${PORT}/auth/github/callback" ]; then
+elif [ -n "$callback" ] && [ "$open_url" = "$CONSOLE" ] && [ "$callback" != "${CONSOLE}/auth/github/callback" ]; then
     cat <<EOF
 
 Heads up: after GitHub sign-in the browser is sent to
   ${callback}
 not to this Console. Signing in through the Console works only when the Manager's
-OPENFLOWS_PUBLIC_URL is http://localhost:${PORT} and the GitHub App lists
-http://localhost:${PORT}/auth/github/callback as a callback URL. Until then, use the
-Manager's own console at the address above.
+OPENFLOWS_PUBLIC_URL is http://localhost:${PORT} (or http://127.0.0.1:${PORT}) and the GitHub App
+lists that address plus /auth/github/callback as a callback URL. Until then, use the Manager's
+own console at ${MANAGER_URL}.
 EOF
 fi
