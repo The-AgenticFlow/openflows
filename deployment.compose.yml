@@ -54,6 +54,8 @@ services:
       # CODER_CHAT_HOOK_SECRET env var.
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:-}
       CODER_CHAT_HOOK_ENABLED: "true"
+      # Local installs reach Manager over plain HTTP; hosted ones must use HTTPS.
+      CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-false}
       CODER_PROVISIONER_DAEMONS: "1"
       # The Manager requests a 90-day admin key and renews it before expiry.
       # Do not extend the default lifetime of interactive user sessions.
@@ -70,7 +72,7 @@ services:
       coder-db:
         condition: service_healthy
     restart: unless-stopped
-  # Local Manager runs on the host; tenant containers remain on this network.
+  # Tenant containers and the Manager share this Compose network.
   runtime-relay:
     image: nginx:1.28-alpine
     user: "101:101"
@@ -88,16 +90,68 @@ services:
       timeout: 3s
       retries: 3
     restart: unless-stopped
+  # The OpenFlows Manager (control plane), built from this checkout so it always
+  # matches the Console. To run a published image instead, set
+  # OPENFLOWS_MANAGER_IMAGE (e.g. ghcr.io/the-agenticflow/openflows-manager:X.Y.Z)
+  # and start with `up -d --pull always`. Do not run a second Manager on the host.
+  # Container-side values below override the host-side ones in .env.openflows, which
+  # serves the host-run `cargo run ... serve` flow. One-time setup and checks:
+  #   docker compose --env-file .env.openflows -f deployment.compose.yml run --rm manager setup
+  #   docker compose --env-file .env.openflows -f deployment.compose.yml run --rm manager doctor
+  manager:
+    image: ${OPENFLOWS_MANAGER_IMAGE:-openflows-manager:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.manager
+    # The secret files are owner-only, so run as the user who owns them.
+    user: "${OPENFLOWS_MANAGER_UID:-1000}:${OPENFLOWS_MANAGER_GID:-1000}"
+    # Docker provisioner: tenant containers are created through the host socket.
+    group_add: ["${DOCKER_GID:-999}"]
+    env_file: [.env.openflows]
+    environment:
+      OPENFLOWS_MANAGER_ADDR: 0.0.0.0:3002
+      OPENFLOWS_DATABASE_URL: postgres://openflows:${OPENFLOWS_PG_PASSWORD:?Set OPENFLOWS_PG_PASSWORD}@openflows-db:5432/openflows_control_plane
+      OPENFLOWS_REDIS_ADMIN_URL: redis://redis:6379
+      REDIS_URL: redis://redis:6379
+      # Mounted into tenant provisioner containers by the host Docker daemon, so
+      # it must be the same absolute path on the host and in this container.
+      OPENFLOWS_PROVISIONER_SECRET_DIR: ${OPENFLOWS_PROVISIONER_SECRET_DIR:-${PWD}/.local/provisioners}
+      OPENFLOWS_SECRET_DIR: /run/openflows/secrets
+      CODER_URL: http://coder:7080
+      # The relay is a sibling container, not a host port.
+      OPENFLOWS_RUNTIME_RELAY_BASE_URL: http://runtime-relay:8080/tenants/{tenant}
+    ports: ["127.0.0.1:3002:3002"]
+    volumes:
+      - ${OPENFLOWS_SECRET_DIR:-.openflows/secrets}:/run/openflows/secrets
+      # Manager picks up ./.env.openflows from its working directory, which also
+      # derives the secret-file references (*_REF) the way the host flow does.
+      - ./.env.openflows:/home/openflows/.env.openflows:ro
+      - ${OPENFLOWS_PROVISIONER_SECRET_DIR:-${PWD}/.local/provisioners}:${OPENFLOWS_PROVISIONER_SECRET_DIR:-${PWD}/.local/provisioners}
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      openflows-db: {condition: service_started}
+      redis: {condition: service_started}
+      coder: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "openflows-manager", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
   # The Console UI, pulled from GHCR. It proxies Manager's /api/v1 and /auth
-  # through itself, so it only needs the host Manager's URL at runtime. The
-  # Manager itself runs on the host (see the comment on runtime-relay), so the
-  # container reaches it via host.docker.internal (host-gateway on Linux).
+  # through itself, reading OPENFLOWS_MANAGER_URL at container start. By default
+  # it reaches the `manager` service above over the Compose network. For a
+  # Manager run on the host instead, set
+  # OPENFLOWS_MANAGER_URL=http://host.docker.internal:3002.
   console:
     image: ghcr.io/the-agenticflow/openflows-console:${CONSOLE_IMAGE_TAG:-develop}
     ports: ["127.0.0.1:3000:3000"]
     environment:
-      OPENFLOWS_MANAGER_URL: ${OPENFLOWS_MANAGER_URL:-http://host.docker.internal:3002}
+      OPENFLOWS_MANAGER_URL: ${OPENFLOWS_MANAGER_URL:-http://manager:3002}
     extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      manager: {condition: service_started}
     restart: unless-stopped
 secrets:
   coder_github_secret:
