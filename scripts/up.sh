@@ -46,10 +46,23 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 is not installe
 [ -f "$ENV_FILE" ] || die ".env.openflows is missing." \
     "Copy .env.openflows.example to .env.openflows, fill it in and create the secrets (operator-local-runbook.md, steps 1-2)."
 
-# Checked before anything is changed, so a host-Manager install is left untouched.
-# An install set up with a host Manager saved a different CODER_URL; the Manager refuses to start until they match.
+# The compose file mounts these secret files; Docker fails with an unhelpful "bind source path does not
+# exist" if they are missing. An install made with ./scripts/setup.sh keeps its secrets elsewhere and
+# runs a different Manager (openflows-local-manager), so it must not use this script.
 SECRET_DIR="$(env_get OPENFLOWS_SECRET_DIR)"; SECRET_DIR="${SECRET_DIR:-.openflows/secrets}"
 case "$SECRET_DIR" in /*) ;; *) SECRET_DIR="${ROOT}/${SECRET_DIR}" ;; esac
+missing=()
+for f in coder-hook-secret coder-github-client-secret github-client-secret github-app-private-key github-webhook-secret; do
+    [ -f "${SECRET_DIR}/${f}" ] || missing+=("$f")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+    die "Missing secret file(s) in ${SECRET_DIR}: ${missing[*]}" \
+"This script is for the operator setup (operator-local-runbook.md, steps 1-2), which creates these files.
+If you installed with ./scripts/setup.sh, your stack is different: do not run this script."
+fi
+
+# Checked before anything is changed, so a host-Manager install is left untouched.
+# An install set up with a host Manager saved a different CODER_URL; the Manager refuses to start until they match.
 if [ -f "${SECRET_DIR}/deployment.json" ]; then
     saved="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("coder_url",""))' "${SECRET_DIR}/deployment.json")"
     [ "$saved" = "http://coder:7080" ] || die "Setup was saved for a host Manager (coder_url=${saved})." \
