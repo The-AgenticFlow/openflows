@@ -51,6 +51,8 @@ pub const API_CIDRS_ENV: &str = "OPENFLOWS_K8S_API_EGRESS_CIDRS";
 pub const PROVISIONER_ACCOUNT_ENV: &str = "OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT";
 /// Image with `nc` and `sh` used by the readiness probe.
 pub const PROBE_IMAGE_ENV: &str = "OPENFLOWS_K8S_PROBE_IMAGE";
+/// Address of the node-local DNS cache, such as `169.254.20.10`, on clusters that run NodeLocal DNSCache.
+pub const NODE_LOCAL_DNS_ENV: &str = "OPENFLOWS_K8S_NODE_LOCAL_DNS";
 
 const DEFAULT_PLATFORM_NAMESPACE: &str = "openflows";
 const DEFAULT_PLATFORM_PORTS: [u16; 3] = [3002, 6379, 7080];
@@ -86,6 +88,8 @@ pub struct IsolationSettings {
     /// Namespace and name of the provisioner's service account.
     pub provisioner_account: Option<(String, String)>,
     pub probe_image: String,
+    /// Node-local DNS cache address; pods query it instead of CoreDNS when it runs.
+    pub node_local_dns: Option<String>,
     /// Resource name and amount of every quota line.
     pub quota: Vec<(String, String)>,
 }
@@ -101,6 +105,7 @@ impl Default for IsolationSettings {
             api_cidrs: Vec::new(),
             provisioner_account: None,
             probe_image: DEFAULT_PROBE_IMAGE.to_string(),
+            node_local_dns: None,
             quota: QUOTA_SETTINGS
                 .iter()
                 .map(|(resource, _, default)| (resource.to_string(), default.to_string()))
@@ -136,6 +141,9 @@ impl IsolationSettings {
         }
         if let Some(account) = get(PROVISIONER_ACCOUNT_ENV) {
             settings.provisioner_account = Some(parse_account(&account)?);
+        }
+        if let Some(address) = get(NODE_LOCAL_DNS_ENV) {
+            settings.node_local_dns = Some(parse_address(&address)?);
         }
         if let Some(image) = get(PROBE_IMAGE_ENV) {
             settings.probe_image = image;
@@ -223,6 +231,18 @@ fn parse_account(value: &str) -> Result<(String, String), ManagerError> {
             "{PROVISIONER_ACCOUNT_ENV} must look like openflows/coder-provisioner"
         ))),
     }
+}
+
+fn parse_address(value: &str) -> Result<String, ManagerError> {
+    value
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .map(|address| address.to_string())
+        .map_err(|_| {
+            ManagerError::Config(format!(
+                "{NODE_LOCAL_DNS_ENV} must be an IP address such as 169.254.20.10"
+            ))
+        })
 }
 
 fn parse_selector(value: &str) -> Result<(String, String), ManagerError> {
@@ -444,6 +464,7 @@ mod tests {
             (PLATFORM_CIDRS_ENV, "10.1.2.3/32,10.9.0.0/16"),
             (PROVISIONER_SELECTOR_ENV, "app=coder-provisioner"),
             (PROVISIONER_ACCOUNT_ENV, "platform/provisioner"),
+            (NODE_LOCAL_DNS_ENV, "169.254.20.10"),
             ("OPENFLOWS_K8S_QUOTA_PODS", "10"),
         ])
         .expect("settings");
@@ -456,6 +477,7 @@ mod tests {
             Some(("app".into(), "coder-provisioner".into()))
         );
         assert_eq!(settings.quota[0], ("pods".into(), "10".into()));
+        assert_eq!(settings.node_local_dns.as_deref(), Some("169.254.20.10"));
         assert_eq!(
             settings.provisioner_account,
             Some(("platform".into(), "provisioner".into()))
@@ -471,6 +493,7 @@ mod tests {
             (API_CIDRS_ENV, "10.1.2.3/40"),
             (PROVISIONER_SELECTOR_ENV, "no-equals-sign"),
             (PROVISIONER_ACCOUNT_ENV, "no-namespace"),
+            (NODE_LOCAL_DNS_ENV, "not-an-ip"),
             ("OPENFLOWS_K8S_NAMESPACE_PREFIX", "Bad_Prefix-"),
             ("OPENFLOWS_K8S_QUOTA_PODS", "ten; drop"),
         ] {

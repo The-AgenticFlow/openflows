@@ -1,11 +1,18 @@
 //! Proves that the cluster enforces the tenant rules, not merely accepts them.
 //!
 //! A cluster whose network plugin ignores NetworkPolicy takes the objects
-//! without complaint and then lets every pod talk to every other. The probe
-//! applies the real rules in a throwaway namespace and checks three
-//! connections to a tenant A server: from tenant A (must work, the control that
-//! shows the probe itself is sound), from tenant B and from an unlabelled pod
-//! (both must fail).
+//! without complaint and then lets every pod talk to every other. Two probes run
+//! side by side in throwaway namespaces.
+//!
+//! The tenant probe applies the real rules and checks three connections to a
+//! tenant A server: from tenant A (must work, the control that shows the probe
+//! itself is sound), from tenant B and from an unlabelled pod (both must fail).
+//!
+//! A connection between two pods needs the source's egress rules and the
+//! destination's ingress rules to both allow it, so a block alone does not say
+//! which half is enforced. The direction probe tests each half on its own: a pod
+//! guarded only by an ingress rule must be unreachable from a free pod, and a pod
+//! guarded only by an egress rule must be unable to reach a free pod.
 
 use super::{apply, manifests, IsolationSettings};
 use crate::error::ManagerError;
@@ -22,18 +29,48 @@ const PORT: u16 = 8080;
 const SERVER_TIMEOUT: Duration = Duration::from_secs(120);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_secs(2);
+const PROBE_LABEL: &str = "openflows.io/probe";
+const INGRESS_GUARDED: &str = "ingress-guarded";
+const EGRESS_GUARDED: &str = "egress-guarded";
 
 fn fail(message: impl Into<String>) -> ManagerError {
     ManagerError::Config(format!("tenant isolation probe failed: {}", message.into()))
 }
 
-/// Run the probe; the throwaway namespace is removed whatever the outcome.
+/// What each probe connection did: `true` means the client reached the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Outcome {
+    same_tenant: bool,
+    other_tenant: bool,
+    unlabelled: bool,
+    free_to_free: bool,
+    free_to_ingress_guarded: bool,
+    egress_guarded_to_free: bool,
+}
+
+/// Run both probes; their throwaway namespaces are removed whatever the outcome.
 pub async fn run(client: &Client, settings: &IsolationSettings) -> Result<(), ManagerError> {
+    let (tenants, directions) = tokio::join!(
+        tenant_probe(client, settings),
+        direction_probe(client, settings)
+    );
+    let (same_tenant, other_tenant, unlabelled) = tenants?;
+    let (free_to_free, free_to_ingress_guarded, egress_guarded_to_free) = directions?;
+    judge(Outcome {
+        same_tenant,
+        other_tenant,
+        unlabelled,
+        free_to_free,
+        free_to_ingress_guarded,
+        egress_guarded_to_free,
+    })
+}
+
+async fn create_namespace(client: &Client, prefix: &str) -> Result<String, ManagerError> {
     let name = format!(
-        "openflows-probe-{}",
+        "{prefix}-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
-    let namespaces = Api::<Namespace>::all(client.clone());
     let namespace: Namespace = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Namespace",
         "metadata": { "name": name, "labels": {
@@ -42,22 +79,48 @@ pub async fn run(client: &Client, settings: &IsolationSettings) -> Result<(), Ma
         }},
     }))
     .map_err(|e| fail(e.to_string()))?;
-    namespaces
+    Api::<Namespace>::all(client.clone())
         .create(&PostParams::default(), &namespace)
         .await
         .map_err(|e| fail(format!("cannot create a probe namespace: {e}")))?;
-    let outcome = probe_in(client, settings, &name).await;
-    if let Err(error) = namespaces.delete(&name, &DeleteParams::default()).await {
+    Ok(name)
+}
+
+async fn remove_namespace(client: &Client, name: &str) {
+    if let Err(error) = Api::<Namespace>::all(client.clone())
+        .delete(name, &DeleteParams::default())
+        .await
+    {
         tracing::warn!(namespace = %name, %error, "could not remove the isolation probe namespace");
     }
+}
+
+async fn tenant_probe(
+    client: &Client,
+    settings: &IsolationSettings,
+) -> Result<(bool, bool, bool), ManagerError> {
+    let name = create_namespace(client, "openflows-probe").await?;
+    let outcome = tenant_checks(client, settings, &name).await;
+    remove_namespace(client, &name).await;
     outcome
 }
 
-async fn probe_in(
+async fn direction_probe(
+    client: &Client,
+    settings: &IsolationSettings,
+) -> Result<(bool, bool, bool), ManagerError> {
+    let name = create_namespace(client, "openflows-probe-dir").await?;
+    let outcome = direction_checks(client, settings, &name).await;
+    remove_namespace(client, &name).await;
+    outcome
+}
+
+/// Same-tenant, other-tenant and unlabelled connections to a tenant A server.
+async fn tenant_checks(
     client: &Client,
     settings: &IsolationSettings,
     namespace: &str,
-) -> Result<(), ManagerError> {
+) -> Result<(bool, bool, bool), ManagerError> {
     let tenant_a = TenantId::from_uuid(uuid::Uuid::new_v4());
     let tenant_b = TenantId::from_uuid(uuid::Uuid::new_v4());
     let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
@@ -73,60 +136,155 @@ async fn probe_in(
         .await?;
     }
 
+    let (a, b) = (tenant_a.to_string(), tenant_b.to_string());
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
-    let serve = format!("while true; do echo ok | nc -l -p {PORT}; done");
-    create_pod(
-        &pods,
-        pod(
-            "server",
-            namespace,
-            Some(tenant_a),
-            &settings.probe_image,
-            &serve,
-        )?,
-    )
-    .await?;
+    let image = &settings.probe_image;
+    let server = pod(
+        "server",
+        namespace,
+        &[(manifests::TENANT_LABEL, &a)],
+        image,
+        &serve(),
+    )?;
+    create_pod(&pods, server).await?;
     let server_ip = wait_for_ip(&pods, "server").await?;
 
-    let reach = format!("echo hi | nc -w 3 {server_ip} {PORT} | grep -q ok");
-    for (name, tenant) in [
-        ("same-tenant", Some(tenant_a)),
-        ("other-tenant", Some(tenant_b)),
-        ("unlabelled", None),
+    let reach = reach(&server_ip);
+    for (name, labels) in [
+        ("same-tenant", vec![(manifests::TENANT_LABEL, a.as_str())]),
+        ("other-tenant", vec![(manifests::TENANT_LABEL, b.as_str())]),
+        ("unlabelled", Vec::new()),
     ] {
-        create_pod(
-            &pods,
-            pod(name, namespace, tenant, &settings.probe_image, &reach)?,
-        )
-        .await?;
+        create_pod(&pods, pod(name, namespace, &labels, image, &reach)?).await?;
     }
-    let (same, other, unlabelled) = tokio::try_join!(
+    tokio::try_join!(
         wait_for_result(&pods, "same-tenant"),
         wait_for_result(&pods, "other-tenant"),
         wait_for_result(&pods, "unlabelled"),
+    )
+}
+
+/// Free to free (control), free to an ingress-guarded pod and an egress-guarded pod to a free one.
+async fn direction_checks(
+    client: &Client,
+    settings: &IsolationSettings,
+    namespace: &str,
+) -> Result<(bool, bool, bool), ManagerError> {
+    let policies = Api::<NetworkPolicy>::namespaced(client.clone(), namespace);
+    for (name, guarded, direction) in [
+        ("openflows-probe-deny-ingress", INGRESS_GUARDED, "Ingress"),
+        ("openflows-probe-deny-egress", EGRESS_GUARDED, "Egress"),
+    ] {
+        let policy: NetworkPolicy = serde_json::from_value(json!({
+            "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+            "metadata": { "name": name, "namespace": namespace },
+            "spec": {
+                "podSelector": { "matchLabels": { PROBE_LABEL: guarded } },
+                "policyTypes": [direction],
+            },
+        }))
+        .map_err(|e| fail(e.to_string()))?;
+        apply(&policies, name, &policy).await?;
+    }
+
+    let pods = Api::<Pod>::namespaced(client.clone(), namespace);
+    let image = &settings.probe_image;
+    create_pod(&pods, pod("server-free", namespace, &[], image, &serve())?).await?;
+    create_pod(
+        &pods,
+        pod(
+            "server-ingress-guarded",
+            namespace,
+            &[(PROBE_LABEL, INGRESS_GUARDED)],
+            image,
+            &serve(),
+        )?,
+    )
+    .await?;
+    let (free_ip, guarded_ip) = tokio::try_join!(
+        wait_for_ip(&pods, "server-free"),
+        wait_for_ip(&pods, "server-ingress-guarded"),
     )?;
-    judge(same, other, unlabelled)
+
+    create_pod(
+        &pods,
+        pod("free-to-free", namespace, &[], image, &reach(&free_ip))?,
+    )
+    .await?;
+    create_pod(
+        &pods,
+        pod(
+            "free-to-ingress-guarded",
+            namespace,
+            &[],
+            image,
+            &reach(&guarded_ip),
+        )?,
+    )
+    .await?;
+    create_pod(
+        &pods,
+        pod(
+            "egress-guarded-to-free",
+            namespace,
+            &[(PROBE_LABEL, EGRESS_GUARDED)],
+            image,
+            &reach(&free_ip),
+        )?,
+    )
+    .await?;
+    tokio::try_join!(
+        wait_for_result(&pods, "free-to-free"),
+        wait_for_result(&pods, "free-to-ingress-guarded"),
+        wait_for_result(&pods, "egress-guarded-to-free"),
+    )
+}
+
+fn serve() -> String {
+    format!("while true; do echo ok | nc -l -p {PORT}; done")
+}
+
+fn reach(server_ip: &str) -> String {
+    format!("echo hi | nc -w 3 {server_ip} {PORT} | grep -q ok")
 }
 
 /// Decide from which connections succeeded. Pure so every outcome is tested.
-fn judge(same_tenant: bool, other_tenant: bool, unlabelled: bool) -> Result<(), ManagerError> {
-    if !same_tenant {
+fn judge(outcome: Outcome) -> Result<(), ManagerError> {
+    if !outcome.same_tenant {
         return Err(fail(
             "a pod could not reach another pod of its own tenant. Check that the network plugin \
              is healthy and that OPENFLOWS_K8S_PROBE_IMAGE contains nc and sh",
         ));
     }
-    if other_tenant {
+    if !outcome.free_to_free {
+        return Err(fail(
+            "a pod with no rules could not reach another pod with no rules. The network plugin \
+             looks unhealthy",
+        ));
+    }
+    if outcome.other_tenant {
         return Err(fail(
             "a pod of one tenant reached a pod of another. The cluster does not enforce \
              NetworkPolicy; install a network plugin that does (for example Calico or Cilium) \
              before hosting several tenants",
         ));
     }
-    if unlabelled {
+    if outcome.unlabelled {
         return Err(fail(
             "a pod without a tenant label reached a tenant pod. The default-deny rule is not \
              being enforced",
+        ));
+    }
+    if outcome.free_to_ingress_guarded {
+        return Err(fail(
+            "a pod guarded by an ingress rule was still reachable. The cluster does not enforce \
+             ingress NetworkPolicy; check the network plugin's policy settings",
+        ));
+    }
+    if outcome.egress_guarded_to_free {
+        return Err(fail(
+            "a pod guarded by an egress rule could still connect out. The cluster does not \
+             enforce egress NetworkPolicy; check the network plugin's policy settings",
         ));
     }
     Ok(())
@@ -135,13 +293,13 @@ fn judge(same_tenant: bool, other_tenant: bool, unlabelled: bool) -> Result<(), 
 fn pod(
     name: &str,
     namespace: &str,
-    tenant: Option<TenantId>,
+    extra_labels: &[(&str, &str)],
     image: &str,
     script: &str,
 ) -> Result<Pod, ManagerError> {
     let mut labels = json!({ "app.kubernetes.io/managed-by": "openflows-manager" });
-    if let Some(tenant) = tenant {
-        labels[manifests::TENANT_LABEL] = json!(tenant.to_string());
+    for (key, value) in extra_labels {
+        labels[*key] = json!(value);
     }
     serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Pod",
@@ -191,7 +349,10 @@ async fn wait_for_ip(pods: &Api<Pod>, name: &str) -> Result<String, ManagerError
             .get(name)
             .await
             .map_err(|e| fail(format!("cannot read probe pod '{name}': {e}")))?;
-        match (phase(&pod), pod.status.as_ref().and_then(|s| s.pod_ip.clone())) {
+        match (
+            phase(&pod),
+            pod.status.as_ref().and_then(|s| s.pod_ip.clone()),
+        ) {
             ("Running", Some(ip)) => return Ok(ip),
             ("Failed", _) => return Err(fail(format!("probe pod '{name}' failed to start"))),
             _ if Instant::now() >= deadline => {
@@ -228,37 +389,99 @@ async fn wait_for_result(pods: &Api<Pod>, name: &str) -> Result<bool, ManagerErr
 mod tests {
     use super::*;
 
+    fn healthy() -> Outcome {
+        Outcome {
+            same_tenant: true,
+            other_tenant: false,
+            unlabelled: false,
+            free_to_free: true,
+            free_to_ingress_guarded: false,
+            egress_guarded_to_free: false,
+        }
+    }
+
+    fn error_of(outcome: Outcome) -> String {
+        judge(outcome).expect_err("must fail").to_string()
+    }
+
     #[test]
-    fn isolation_holds_when_only_the_same_tenant_gets_through() {
-        assert!(judge(true, false, false).is_ok());
+    fn isolation_holds_when_only_the_allowed_connections_get_through() {
+        assert!(judge(healthy()).is_ok());
     }
 
     #[test]
     fn a_cross_tenant_connection_means_the_cluster_does_not_enforce_policy() {
-        let error = judge(true, true, false).expect_err("must fail").to_string();
+        let error = error_of(Outcome {
+            other_tenant: true,
+            ..healthy()
+        });
 
         assert!(error.contains("does not enforce"), "{error}");
         assert!(error.contains("Calico"), "{error}");
     }
 
     #[test]
-    fn a_blocked_control_means_the_probe_cannot_be_trusted() {
-        let error = judge(false, false, false)
-            .expect_err("must fail")
-            .to_string();
+    fn a_blocked_tenant_control_means_the_probe_cannot_be_trusted() {
+        let error = error_of(Outcome {
+            same_tenant: false,
+            ..healthy()
+        });
 
         assert!(error.contains("own tenant"), "{error}");
     }
 
     #[test]
+    fn a_blocked_free_control_means_the_network_is_unhealthy() {
+        let error = error_of(Outcome {
+            free_to_free: false,
+            ..healthy()
+        });
+
+        assert!(error.contains("unhealthy"), "{error}");
+    }
+
+    #[test]
     fn an_unlabelled_pod_getting_through_is_a_failure() {
-        assert!(judge(true, false, true).is_err());
+        assert!(judge(Outcome {
+            unlabelled: true,
+            ..healthy()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn missing_ingress_enforcement_is_reported_even_when_egress_blocks_tenants() {
+        let error = error_of(Outcome {
+            free_to_ingress_guarded: true,
+            ..healthy()
+        });
+
+        assert!(error.contains("ingress"), "{error}");
+        assert!(error.contains("does not enforce"), "{error}");
+    }
+
+    #[test]
+    fn missing_egress_enforcement_is_reported_even_when_ingress_blocks_tenants() {
+        let error = error_of(Outcome {
+            egress_guarded_to_free: true,
+            ..healthy()
+        });
+
+        assert!(error.contains("egress"), "{error}");
+        assert!(error.contains("does not enforce"), "{error}");
     }
 
     #[test]
     fn probe_pods_satisfy_the_restricted_pod_standard() {
-        let tenant = TenantId::from_uuid(uuid::Uuid::from_u128(5));
-        let pod = pod("p", "ns", Some(tenant), "img", "true").expect("pod");
+        let tenant = TenantId::from_uuid(uuid::Uuid::from_u128(5)).to_string();
+        let pod = pod(
+            "p",
+            "ns",
+            &[(manifests::TENANT_LABEL, &tenant)],
+            "img",
+            "true",
+        )
+        .expect("pod");
         let spec = serde_json::to_value(pod.spec.expect("spec")).expect("serialize");
 
         assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
@@ -272,13 +495,13 @@ mod tests {
         );
         assert_eq!(
             pod.metadata.labels.expect("labels")[manifests::TENANT_LABEL],
-            tenant.to_string()
+            tenant
         );
     }
 
     #[test]
-    fn an_unlabelled_probe_pod_has_no_tenant_label() {
-        let pod = pod("p", "ns", None, "img", "true").expect("pod");
+    fn a_probe_pod_without_extra_labels_has_no_tenant_label() {
+        let pod = pod("p", "ns", &[], "img", "true").expect("pod");
 
         assert!(!pod
             .metadata

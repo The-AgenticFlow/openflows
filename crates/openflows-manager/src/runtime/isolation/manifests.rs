@@ -127,6 +127,13 @@ pub fn secret_access_review(
         "apiVersion": "authorization.k8s.io/v1", "kind": "SubjectAccessReview",
         "spec": {
             "user": format!("system:serviceaccount:{account_namespace}:{account}"),
+            // The API server adds these groups to a real service account, and a
+            // binding to any of them grants the account access too.
+            "groups": [
+                "system:serviceaccounts",
+                format!("system:serviceaccounts:{account_namespace}"),
+                "system:authenticated",
+            ],
             "resourceAttributes": { "namespace": namespace, "verb": verb, "resource": "secrets" },
         },
     }))
@@ -145,6 +152,20 @@ fn tcp_ports(ports: &[u16]) -> Vec<Value> {
         .iter()
         .map(|port| json!({ "protocol": "TCP", "port": port }))
         .collect()
+}
+
+/// Egress peers for DNS: CoreDNS, and the node-local resolver where NodeLocal DNSCache runs.
+/// That cache answers on a link-local address, which the public egress rule excludes.
+fn dns_peers(settings: &IsolationSettings) -> Vec<Value> {
+    let mut peers = vec![json!({
+        "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } },
+        "podSelector": { "matchLabels": { "k8s-app": "kube-dns" } },
+    })];
+    if let Some(address) = &settings.node_local_dns {
+        let bits = if address.contains(':') { 128 } else { 32 };
+        peers.push(json!({ "ipBlock": { "cidr": format!("{address}/{bits}") } }));
+    }
+    peers
 }
 
 /// Egress peers for the platform services: their namespace plus any external CIDRs.
@@ -176,10 +197,7 @@ pub fn base_policies(
             ALLOW_DNS,
             namespace,
             json!({ "podSelector": all_pods, "policyTypes": ["Egress"], "egress": [{
-                "to": [{
-                    "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } },
-                    "podSelector": { "matchLabels": { "k8s-app": "kube-dns" } },
-                }],
+                "to": dns_peers(settings),
                 "ports": [{ "protocol": "UDP", "port": 53 }, { "protocol": "TCP", "port": 53 }],
             }]}),
         )?,
@@ -319,6 +337,52 @@ mod tests {
         assert_eq!(spec["egress"][0]["to"][0]["podSelector"], label);
     }
 
+    fn dns_peers_of(settings: &IsolationSettings) -> Vec<Value> {
+        let policies = base_policies(settings, "ns").expect("policies");
+        let dns = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(ALLOW_DNS))
+            .expect("dns policy");
+        spec(dns)["egress"][0]["to"]
+            .as_array()
+            .expect("peers")
+            .clone()
+    }
+
+    #[test]
+    fn dns_reaches_only_coredns_by_default() {
+        let peers = dns_peers_of(&IsolationSettings::default());
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0]["podSelector"]["matchLabels"]["k8s-app"],
+            "kube-dns"
+        );
+    }
+
+    #[test]
+    fn dns_also_reaches_the_node_local_resolver_when_configured() {
+        let settings = IsolationSettings {
+            node_local_dns: Some("169.254.20.10".into()),
+            ..IsolationSettings::default()
+        };
+
+        let peers = dns_peers_of(&settings);
+
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&json!({ "ipBlock": { "cidr": "169.254.20.10/32" } })));
+    }
+
+    #[test]
+    fn an_ipv6_node_local_resolver_gets_a_host_prefix() {
+        let settings = IsolationSettings {
+            node_local_dns: Some("fd00::10".into()),
+            ..IsolationSettings::default()
+        };
+
+        assert!(dns_peers_of(&settings).contains(&json!({ "ipBlock": { "cidr": "fd00::10/128" } })));
+    }
+
     #[test]
     fn two_tenants_get_different_policy_names() {
         assert_ne!(tenant_policy_name(tenant(1)), tenant_policy_name(tenant(2)));
@@ -363,6 +427,17 @@ mod tests {
             spec.user.as_deref(),
             Some("system:serviceaccount:platform:provisioner")
         );
+        let groups = spec.groups.expect("groups");
+        for group in [
+            "system:serviceaccounts",
+            "system:serviceaccounts:platform",
+            "system:authenticated",
+        ] {
+            assert!(
+                groups.iter().any(|g| g == group),
+                "missing {group}: {groups:?}"
+            );
+        }
         let attributes = spec.resource_attributes.expect("attributes");
         assert_eq!(attributes.namespace.as_deref(), Some("org-ns"));
         assert_eq!(attributes.resource.as_deref(), Some("secrets"));

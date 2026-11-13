@@ -135,14 +135,15 @@ async fn ignoring_cluster_fails_the_probe() {
     assert!(error.contains("does not enforce"), "{error}");
 }
 
-#[tokio::test]
-#[ignore = "needs a Kubernetes cluster"]
-async fn provisioner_able_to_read_secrets_is_refused() {
+/// Set a tenant up with a provisioner account that has no Secret access (accepted), grant
+/// `subject` read access to Secrets in the organization namespace, and return the error the
+/// next setup fails with.
+async fn refusal_after_granting(prefix: &str, account: &str, subject: serde_json::Value) -> String {
     let client = client().await;
     let (org, tenant, _) = ids();
     let settings = IsolationSettings {
-        provisioner_account: Some(("default".into(), "of507-provisioner".into())),
-        ..settings("of507p-")
+        provisioner_account: Some(("default".into(), account.into())),
+        ..settings(prefix)
     };
     let namespace = manifests::namespace_name(&settings.namespace_prefix, org);
     let isolation = KubernetesIsolation::new(client.clone(), settings);
@@ -152,7 +153,7 @@ async fn provisioner_able_to_read_secrets_is_refused() {
             &PostParams::default(),
             &serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "ServiceAccount",
-                "metadata": { "name": "of507-provisioner" },
+                "metadata": { "name": account },
             }))
             .expect("service account"),
         )
@@ -174,7 +175,7 @@ async fn provisioner_able_to_read_secrets_is_refused() {
         "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
         "metadata": { "name": "read-secrets", "namespace": namespace },
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "read-secrets" },
-        "subjects": [{ "kind": "ServiceAccount", "name": "of507-provisioner", "namespace": "default" }],
+        "subjects": [subject],
     }))
     .expect("binding");
     Api::<Role>::namespaced(client.clone(), &namespace)
@@ -186,17 +187,39 @@ async fn provisioner_able_to_read_secrets_is_refused() {
         .await
         .expect("create binding");
 
-    let error = isolation
-        .ensure_tenant(org, tenant)
-        .await
-        .expect_err("a provisioner that can read Secrets must be refused")
-        .to_string();
+    let result = isolation.ensure_tenant(org, tenant).await;
 
     let _ = Api::<Namespace>::all(client)
         .delete(&namespace, &DeleteParams::default())
         .await;
-    let _ = accounts
-        .delete("of507-provisioner", &DeleteParams::default())
-        .await;
+    let _ = accounts.delete(account, &DeleteParams::default()).await;
+    result
+        .expect_err("a provisioner that can read Secrets must be refused")
+        .to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster"]
+async fn provisioner_able_to_read_secrets_is_refused() {
+    let error = refusal_after_granting(
+        "of507p-",
+        "of507-provisioner",
+        serde_json::json!({ "kind": "ServiceAccount", "name": "of507-provisioner", "namespace": "default" }),
+    )
+    .await;
+
+    assert!(error.contains("can get Secrets"), "{error}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster"]
+async fn provisioner_able_to_read_secrets_through_a_group_is_refused() {
+    let error = refusal_after_granting(
+        "of507g-",
+        "of507-group-provisioner",
+        serde_json::json!({ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:serviceaccounts:default" }),
+    )
+    .await;
+
     assert!(error.contains("can get Secrets"), "{error}");
 }
