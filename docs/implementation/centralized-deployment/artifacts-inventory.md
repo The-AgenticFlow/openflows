@@ -90,9 +90,9 @@ fetch per tenant replaces one per workspace spawn.
 
 | Role | Mount | Seed handling |
 | --- | --- | --- |
-| Nexus | Read-write, created by `docker_volume.artifacts` | Clones, or fetches and resets a hard, then repairs ownership |
-| Forge | Read-only | Copy, refresh, checkout, then a network clone, each bounded by a 45 second timeout (90 for the clone), with a warning that names the failure |
-| Sentinel, Vessel, Lore | Read-only | The same steps with no timeouts: the intermediate pull, copy, fetch and checkout are silenced, and a failed clone writes to `/tmp/<role>_clone_err.log` and warns |
+| Nexus | Read-write tenant volume, local mode only | Clones, or fetches and resets a hard, then repairs ownership. Hosted mode seeds nothing |
+| Forge | Read-only tenant volume, local mode only | Copy, refresh, checkout, then a network clone, each bounded by a 45 second timeout (90 for the clone), with a warning that names the failure. Hosted mode clones directly |
+| Sentinel, Vessel, Lore | Read-only tenant volume, local mode only | The same steps with no timeouts: the intermediate pull, copy, fetch and checkout are silenced, and a failed clone writes to `/tmp/<role>_clone_err.log` and warns. Hosted mode clones directly |
 
 The fallback already works in hosted mode: Forge configures a git credential
 store from the Manager's runtime credential exchange before it clones, so a
@@ -122,17 +122,20 @@ local mode.
 
 ## What still needs the volume
 
-Two things, and only the second is a real coupling:
+One thing, in one mode:
 
-1. **The artifact tree in local mode.** The controller resolves its own tree
-   from `OPENFLOWS_HOME`, the executable directory or the working directory,
-   materialising any bundled file that is missing, then publishes `plugin/hooks/`
-   and `orchestration/` into `ARTIFACTS_DIR` for the workers. Local workers read
-   that mounted copy, because only the hosted path fetches from the Manager.
-2. **The golden repository seed in both modes.** Hosted workers still mount the
-   tenant volume read-only and prefer the seed. Removing the volume therefore
-   moves every workspace spawn to a network clone, which is a cost decision, not
-   a correctness one.
+1. **The artifact tree and the golden seed in local mode.** The controller
+   resolves its own tree from `OPENFLOWS_HOME`, the executable directory or the
+   working directory, materialising any bundled file that is missing, then
+   publishes `plugin/hooks/` and `orchestration/` into `ARTIFACTS_DIR` and keeps
+   the tenant clone at `$ARTIFACTS_DIR/repo`. Local workers read that mounted
+   copy, because only the hosted path fetches from the Manager.
+
+Hosted mode needs no shared storage at all. Each worker installs the bundle from
+the Manager and clones the repository with its own brokered credential, and the
+Nexus workspace keeps its tree inside its own workspace. The tenant volume is
+created and mounted only when the workspace is not hosted, which is what makes
+read-write-many storage optional instead of required.
 
 ## Gaps the delivery contract has to close
 
@@ -141,7 +144,6 @@ Two things, and only the second is a real coupling:
 | The local tree is materialised once | `ensure_orchestration_dir` writes only missing files and only warns when `.version` differs, so an upgraded controller keeps publishing the previous release's assets until someone runs `--reset-orchestration` | [`binary/src/orchestration.rs`](../../../binary/src/orchestration.rs) |
 | The local copy is never verified | Nothing checks that the mounted assets are the ones the running release built, and that path has no digest to check them against | Templates, `ASSETS_DIR` branch |
 | No installed-digest marker | The harness reports what it installed, but nothing keeps it where an operator or the Manager can read it | [`crates/openflows-harness/src/artifacts.rs`](../../../crates/openflows-harness/src/artifacts.rs) |
-| Hosted workers still mount the volume | A volume that carries only an optimisation is still part of what a hosted workspace has to be isolated from | Templates, `volumes` blocks |
 | Unbounded git waits in three roles | A hung pull, fetch or clone stalls Sentinel, Vessel and Lore with no timeout, where Forge bounds each call and warns instead of hanging | [`openflows-sentinel/main.tf`](../../../crates/coder-client/templates/openflows-sentinel/main.tf) and the other two |
 | Read-only mounts repaired with `sudo chown` | Nexus repairs ownership of a volume other roles mount read-only, which assumes the same uid on one host | [`openflows-nexus/main.tf`](../../../crates/coder-client/templates/openflows-nexus/main.tf) |
 

@@ -122,7 +122,14 @@ The Agent Harness (Harness B) is **installed and provisioned just like Harness A
 
 Every FORGE (or SENTINEL) spawn currently runs its own `git clone`/`pull` into its private docker volume (`openflows-forge/main.tf:213-225`). A full clone on every ephemeral spawn is slow and wasteful. The target design removes the network clone from the per-workspace path by reusing the existing tenant-shared read-only volume:
 
-**Topology (one network fetch, many local copies).**
+**Hosted mode does not take this path.** A hosted workspace has no shared volume
+to seed: it installs the artifact bundle from the Manager and clones the
+repository with a short-lived credential the Manager brokers for it. The golden
+clone stays a local-mode optimisation, which is what keeps read-write-many
+storage optional and keeps no copy of a customer repository outside the tenant's
+own workspaces.
+
+**Topology (one network fetch, many local copies, local mode).**
 
 ```
                 NEXUS (control plane, has creds + network)  [per tenant]
@@ -149,7 +156,7 @@ Every FORGE (or SENTINEL) spawn currently runs its own `git clone`/`pull` into i
 - **Per-tenant scoping.** The golden clone, its shared volume, and all copies are scoped per tenant: the volume is `openflows-artifacts-<tenant>` and lives under NEXUS's tenant workspace, so one tenant's repo snapshot is never visible to another tenant's workspaces. This composes with the `ns:{tenant}:` Redis keyspace for full tenant isolation.
 - **Read-only source.** The shared volume is mounted `read_only = true` (`openflows-forge/main.tf:296-301`), so a worker can never mutate the golden tree; NEXUS is the sole writer.
 - **Independent physical copies.** Each worker still gets its **own** tree on its **own** docker volume, so FORGE and SENTINEL never share a writable filesystem — the review-integrity property (SENTINEL cannot touch FORGE's tree) is intact. Golden-copying is purely a *seed*; it is not a live shared mount for writes.
-- **No credentials in workers.** The copy is offline; the only git/network dependency stays in NEXUS.
+- **No credentials in workers, local mode.** The copy is offline; the only git/network dependency stays in NEXUS. Hosted workers do hold a short-lived brokered credential, because they clone directly.
 
 **Freshness before work (no stale versions):**
 

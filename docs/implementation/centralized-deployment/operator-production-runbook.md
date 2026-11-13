@@ -63,6 +63,13 @@ backend with a non-filesystem store, set an absolute
 `OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
 Manager refuses to start without it.
 
+Hosted workspaces need no shared storage. The role templates mount the tenant
+`openflows-artifacts-<tenant>` volume only when the workspace is not hosted, so
+a hosted deployment creates none and requires no read-write-many volume; each
+workspace installs the artifact bundle from the Manager and clones the
+repository with its own brokered credential. Local installations keep the volume
+for the artifact tree and the golden repository seed.
+
 For a new, empty Coder, set `OPENFLOWS_CODER_BOOTSTRAP_EMAIL`; setup creates
 and retains the administrator credential and Manager key. Configure Coder's
 `CODER_MAX_ADMIN_TOKEN_LIFETIME` to at least `2160h`. For an existing Coder,
