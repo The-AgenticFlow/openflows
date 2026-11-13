@@ -70,6 +70,15 @@ workspace installs the artifact bundle from the Manager and clones the
 repository with its own brokered credential. Local installations keep the volume
 for the artifact tree and the golden repository seed.
 
+Recreating an existing hosted tenant's Nexus workspace plans a destroy of
+`docker_volume.artifacts`, because the template now declares it only in local
+mode. Docker refuses to remove a volume another container still mounts, so stop
+that tenant's role workspaces before the apply, or it fails with
+`volume is in use`. If the volume was already removed by hand, clear the plan
+with `terraform state rm 'docker_volume.artifacts[0]'` in the Nexus workspace.
+A local-mode tenant keeps the volume: the resource gains an index, and the
+existing object is adopted as `[0]` without replacement.
+
 For a new, empty Coder, set `OPENFLOWS_CODER_BOOTSTRAP_EMAIL`; setup creates
 and retains the administrator credential and Manager key. Configure Coder's
 `CODER_MAX_ADMIN_TOKEN_LIFETIME` to at least `2160h`. For an existing Coder,
