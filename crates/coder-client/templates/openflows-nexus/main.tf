@@ -215,7 +215,10 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    # Fix artifacts directory ownership (shared volume is created as root)
+    # Fix artifacts directory ownership. Local mode mounts the shared volume
+    # under this path as root; hosted mode mounts nothing here, so create the
+    # parent first and let the controller publish its tree into it.
+    sudo mkdir -p /home/coder/.openflows
     sudo chown -R coder:coder /home/coder/.openflows
 
     # TEMPORARY: Use mounted dev binary for local testing
