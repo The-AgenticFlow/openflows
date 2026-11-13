@@ -13,6 +13,7 @@ Date: 2026-10-07. Status: implementation specification, not shipped behavior.
 7. [Model handoff](05-model-handoff.md): prompt to start implementation.
 8. [Hosted template releases](06-hosted-template-releases.md): versioned remote release source for production deployments.
 9. [Workspace artifact delivery](artifacts-inventory.md): what each role needs at boot, what the shared volume still carries, and the delivery contract that replaces it.
+10. [Tenant isolation on Kubernetes](tenant-isolation.md): namespace walls, network rules and the startup probe.
 
 Operator instructions are separate from the design specifications: follow the
 [local runbook](operator-local-runbook.md) for a single-host evaluation or the

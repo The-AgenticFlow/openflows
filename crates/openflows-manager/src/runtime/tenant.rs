@@ -71,6 +71,7 @@ pub struct TenantRuntimeRepository {
     secret_provider: std::sync::Arc<dyn SecretProvider>,
     redis_isolation: std::sync::Arc<dyn crate::runtime::redis::RedisIsolationBackend>,
     delivery: std::sync::Arc<dyn crate::runtime::delivery::SecretDelivery>,
+    isolation: std::sync::Arc<dyn crate::runtime::isolation::TenantIsolation>,
 }
 
 impl TenantRuntimeRepository {
@@ -82,6 +83,7 @@ impl TenantRuntimeRepository {
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
             delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
+            isolation: std::sync::Arc::new(crate::runtime::isolation::NoIsolation),
         }
     }
 
@@ -96,6 +98,7 @@ impl TenantRuntimeRepository {
                 crate::runtime::redis::InMemoryRedisIsolation::default(),
             ),
             delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
+            isolation: std::sync::Arc::new(crate::runtime::isolation::NoIsolation),
         }
     }
 
@@ -109,6 +112,7 @@ impl TenantRuntimeRepository {
             secret_provider,
             redis_isolation,
             delivery: std::sync::Arc::new(crate::runtime::delivery::StoreReferenceDelivery),
+            isolation: std::sync::Arc::new(crate::runtime::isolation::NoIsolation),
         }
     }
 
