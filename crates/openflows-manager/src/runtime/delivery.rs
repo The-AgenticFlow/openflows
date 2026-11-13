@@ -185,13 +185,7 @@ impl KubernetesSecretDelivery {
 
     /// Connect with the in-cluster or kubeconfig identity.
     pub async fn connect(namespace_prefix: String) -> Result<Self, ManagerError> {
-        let client = crate::runtime::isolation::cluster_client()
-            .await
-            .map_err(|e| {
-                ManagerError::Config(format!(
-                    "kubernetes runtime secret delivery needs cluster access: {e}"
-                ))
-            })?;
+        let client = crate::runtime::isolation::delivery_client().await?;
         Ok(Self::new(client, namespace_prefix))
     }
 

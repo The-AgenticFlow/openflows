@@ -44,6 +44,8 @@ namespace stays.
 | `OPENFLOWS_K8S_PLATFORM_NAMESPACE` | `openflows` | Namespace of the Manager, Coder and Redis |
 | `OPENFLOWS_K8S_PLATFORM_EGRESS_PORTS` | `3002,6379,7080` | TCP ports pods may reach there |
 | `OPENFLOWS_K8S_PLATFORM_EGRESS_CIDRS` | none | Platform services outside the cluster, such as a managed Redis |
+| `OPENFLOWS_K8S_DELIVERY_KUBECONFIG` | none | Kubeconfig of the Secret delivery identity, apart from the namespace identity. Required in hosted mode; see below |
+| `OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT` | none | `namespace/name` of that identity's service account. Required in hosted mode: each organization namespace grants it Secret write access |
 | `OPENFLOWS_K8S_PROVISIONER_SELECTOR` | none | `key=value` label of the Coder provisioner pods |
 | `OPENFLOWS_K8S_API_EGRESS_CIDRS` | none | Kubernetes API address, for the provisioner policy |
 | `OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT` | none | `namespace/name` of the provisioner's service account; see below |
@@ -57,11 +59,21 @@ The default-deny rule covers every pod in the namespace, including a provisioner
 running there. Set `OPENFLOWS_K8S_PROVISIONER_SELECTOR` so it keeps its access to
 Coder and, with `OPENFLOWS_K8S_API_EGRESS_CIDRS`, to the Kubernetes API.
 
-## Manager permissions
+## The Manager's two identities
 
-The Manager's identity needs, in addition to the Secret permissions described in
-the [production runbook](operator-production-runbook.md), a cluster role for the
-organization namespaces it sets up:
+The Manager does two jobs that must not share an identity. In hosted mode it
+refuses to start unless they are separate.
+
+| Identity | Does | Must not be able to |
+| --- | --- | --- |
+| Namespace identity | Builds each organization's namespace, quota and rules, and binds the delivery identity | Read or write any Secret |
+| Secret delivery identity | Writes the runtime Secrets | Administer namespaces, quotas, rules or bindings, or read Secrets |
+
+Someone who can build namespaces then cannot read a tenant's credentials, and the
+identity that writes them cannot change the walls around them.
+
+**Namespace identity.** The Manager's own identity (in-cluster service account or
+kubeconfig). It needs this cluster role:
 
 ```yaml
 rules:
@@ -76,15 +88,77 @@ rules:
     verbs: [get, create, patch, delete]   # delete removes a deleted tenant's rule
   - apiGroups: [authorization.k8s.io]
     resources: [subjectaccessreviews]
-    verbs: [create]                       # the provisioner check below
+    verbs: [create]                       # the account checks below
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [get, create, patch]           # binds the delivery identity per namespace
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    verbs: [bind]
+    resourceNames: [openflows-secret-writer]
 ```
 
-The startup probe needs more, in one of two ways.
+**Secret delivery identity.** A second service account, for example
+`openflows/secret-delivery`, with no binding of its own. Create this cluster role
+once; nobody binds it cluster-wide:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openflows-secret-writer
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, patch, delete]
+```
+
+Set `OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT=openflows/secret-delivery`. For each
+organization namespace the namespace identity then creates a RoleBinding
+`openflows-secret-delivery` giving that account the role there, so it can write
+Secrets in organization namespaces and nowhere else. It cannot read them.
+
+Give the Manager a kubeconfig for that account in
+`OPENFLOWS_K8S_DELIVERY_KUBECONFIG`, for example with a projected token:
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+  - name: cluster
+    cluster:
+      server: https://kubernetes.default.svc
+      certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+users:
+  - name: delivery
+    user:
+      tokenFile: /var/run/secrets/openflows-delivery/token
+contexts:
+  - name: delivery
+    context: { cluster: cluster, user: delivery }
+current-context: delivery
+```
+
+**What the Manager checks at startup in hosted mode**
+- The kubeconfig and the service account are both set.
+- The kubeconfig authenticates as that service account.
+- The namespace identity cannot `get`, `list`, `watch`, `create`, `update`, `patch`
+  or `delete` Secrets.
+- The delivery identity cannot create or change namespaces, network policies,
+  quotas, limit ranges, service accounts or role bindings.
+
+Each time a namespace is set up, the Manager also asks the API server whether the
+delivery account can create, patch and delete Secrets there, and refuses if not.
+In local mode with a single identity none of this applies.
+
+### What the startup probe needs
+
+The namespace identity needs more for the startup probe, in one of two ways.
 
 **Recommended: a probe namespace.** Create an empty namespace once, labelled
 `pod-security.kubernetes.io/enforce=restricted`, set
-`OPENFLOWS_K8S_PROBE_NAMESPACE` to its name, and grant the Manager this Role in
-that namespace only. The probe runs there and removes its own pods and rules, so
+`OPENFLOWS_K8S_PROBE_NAMESPACE` to its name, and grant the namespace identity this Role
+in that namespace only. The probe runs there and removes its own pods and rules, so
 the Manager never needs to create or delete a namespace for it:
 
 ```yaml
@@ -106,8 +180,7 @@ deletes two namespaces itself. That needs `delete` on `namespaces` and `get` and
 probe's namespaces, it lets the Manager delete any namespace in the cluster. Use
 the probe namespace instead wherever that matters.
 
-Granting the cluster role lets the Manager create and wall namespaces. A separate
-delivery identity for Secrets, as the design describes, is not split out yet.
+Granting the cluster role lets the Manager create and wall namespaces.
 
 ## Provisioner access to Secrets
 

@@ -9,14 +9,19 @@
 //! On one that does not (for example kind with its default plugin):
 //!   `cargo test --test k8s_isolation ignoring -- --ignored --test-threads=1`
 
-use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
+use k8s_openapi::api::authentication::v1::TokenRequest;
+use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
+use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
 use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::{Api, Client};
-use openflows_manager::id::{OrganizationId, TenantId};
+use openflows_manager::id::{OrganizationId, TenantId, WorkspaceId};
+use openflows_manager::runtime::delivery::{
+    secret_name, DeliveryTarget, KubernetesSecretDelivery, SecretDelivery,
+};
 use openflows_manager::runtime::isolation::{
-    cluster_client, manifests, run_probe, IsolationSettings, KubernetesIsolation, TenantIsolation,
+    check_separation, cluster_client, identity, manifests, run_probe, IsolationSettings,
+    KubernetesIsolation, TenantIsolation,
 };
 
 fn settings(prefix: &str) -> IsolationSettings {
@@ -384,4 +389,206 @@ async fn platform_access_is_gated_by_the_tenant_label() {
         !unlabelled,
         "an unlabelled pod must not reach the platform service"
     );
+}
+
+/// Two real identities: one that sets namespaces up and one that writes Secrets.
+struct Rig {
+    admin: Client,
+    namespace: Client,
+    delivery: Client,
+    delivery_account: String,
+    tag: String,
+}
+
+async fn client_for(accounts: &Api<ServiceAccount>, name: &str) -> Client {
+    let request: TokenRequest = serde_json::from_value(serde_json::json!({
+        "apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
+        "spec": { "audiences": [], "expirationSeconds": 3600 },
+    }))
+    .expect("token request");
+    let token = accounts
+        .create_token_request(name, &PostParams::default(), &request)
+        .await
+        .expect("token")
+        .status
+        .expect("token status")
+        .token;
+    let mut config = kube::Config::infer().await.expect("kube config");
+    config.auth_info =
+        serde_json::from_value(serde_json::json!({ "token": token })).expect("auth info");
+    Client::try_from(config).expect("client")
+}
+
+async fn rig() -> Rig {
+    let admin = client().await;
+    let tag = short();
+    let accounts = Api::<ServiceAccount>::namespaced(admin.clone(), "default");
+    let namespace_account = format!("of507-namespace-{tag}");
+    let delivery_account = format!("of507-delivery-{tag}");
+    for name in [&namespace_account, &delivery_account] {
+        accounts
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(serde_json::json!({
+                    "apiVersion": "v1", "kind": "ServiceAccount", "metadata": { "name": name },
+                }))
+                .expect("service account"),
+            )
+            .await
+            .expect("create service account");
+    }
+    let role: ClusterRole = serde_json::from_value(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+        "metadata": { "name": namespace_account },
+        "rules": [
+            { "apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "create", "patch"] },
+            { "apiGroups": [""], "resources": ["resourcequotas", "limitranges", "serviceaccounts"],
+              "verbs": ["get", "create", "patch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"],
+              "verbs": ["get", "create", "patch", "delete"] },
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"],
+              "verbs": ["create"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["rolebindings"],
+              "verbs": ["get", "create", "patch"] },
+            { "apiGroups": ["rbac.authorization.k8s.io"], "resources": ["clusterroles"],
+              "verbs": ["bind"], "resourceNames": [manifests::SECRET_WRITER_ROLE] },
+        ],
+    }))
+    .expect("cluster role");
+    let binding: ClusterRoleBinding = serde_json::from_value(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+        "metadata": { "name": namespace_account },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": namespace_account,
+        },
+        "subjects": [{ "kind": "ServiceAccount", "name": namespace_account, "namespace": "default" }],
+    }))
+    .expect("cluster role binding");
+    let secret_writer: ClusterRole = serde_json::from_value(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+        "metadata": { "name": manifests::SECRET_WRITER_ROLE },
+        "rules": [{ "apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "patch", "delete"] }],
+    }))
+    .expect("secret writer role");
+    let roles = Api::<ClusterRole>::all(admin.clone());
+    roles
+        .create(&PostParams::default(), &role)
+        .await
+        .expect("create role");
+    let _ = roles.create(&PostParams::default(), &secret_writer).await;
+    Api::<ClusterRoleBinding>::all(admin.clone())
+        .create(&PostParams::default(), &binding)
+        .await
+        .expect("create binding");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    Rig {
+        namespace: client_for(&accounts, &namespace_account).await,
+        delivery: client_for(&accounts, &delivery_account).await,
+        admin,
+        delivery_account,
+        tag,
+    }
+}
+
+async fn teardown(rig: &Rig) {
+    let name = format!("of507-namespace-{}", rig.tag);
+    let _ = Api::<ClusterRoleBinding>::all(rig.admin.clone())
+        .delete(&name, &DeleteParams::default())
+        .await;
+    let roles = Api::<ClusterRole>::all(rig.admin.clone());
+    let _ = roles.delete(&name, &DeleteParams::default()).await;
+    let _ = roles
+        .delete(manifests::SECRET_WRITER_ROLE, &DeleteParams::default())
+        .await;
+    let accounts = Api::<ServiceAccount>::namespaced(rig.admin.clone(), "default");
+    for account in [&name, &rig.delivery_account] {
+        let _ = accounts.delete(account, &DeleteParams::default()).await;
+    }
+}
+
+fn forbidden<T>(result: Result<T, kube::Error>) -> bool {
+    matches!(result, Err(kube::Error::Api(status)) if status.code == 403)
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster"]
+async fn separate_identities_each_do_only_their_own_job() {
+    let rig = rig().await;
+    let settings = IsolationSettings {
+        delivery_account: Some(("default".into(), rig.delivery_account.clone())),
+        ..settings("of507d-")
+    };
+    let (org, tenant, _) = ids();
+    let namespace = manifests::namespace_name(&settings.namespace_prefix, org);
+    let workspace = WorkspaceId::from_uuid(uuid::Uuid::new_v4());
+
+    let separated = check_separation(&rig.namespace, &rig.delivery).await;
+    let username = identity::username(&rig.delivery).await;
+    let set_up = KubernetesIsolation::new(rig.namespace.clone(), settings.clone())
+        .ensure_tenant(org, tenant)
+        .await;
+    let target = DeliveryTarget {
+        organization_id: org,
+        tenant_id: tenant,
+        workspace_id: workspace,
+    };
+    let delivered =
+        KubernetesSecretDelivery::new(rig.delivery.clone(), settings.namespace_prefix.clone())
+            .deliver(&target, "reference", b"{}")
+            .await;
+    let namespace_reads = Api::<Secret>::namespaced(rig.namespace.clone(), &namespace)
+        .get(&secret_name(workspace))
+        .await;
+    let delivery_edits_walls = Api::<NetworkPolicy>::namespaced(rig.delivery.clone(), &namespace)
+        .delete(
+            &manifests::tenant_policy_name(tenant),
+            &DeleteParams::default(),
+        )
+        .await;
+
+    delete_namespace(&rig.admin, &namespace).await;
+    teardown(&rig).await;
+    separated.expect("two separate identities are accepted");
+    assert_eq!(
+        username.expect("username"),
+        format!("system:serviceaccount:default:{}", rig.delivery_account)
+    );
+    set_up.expect("the namespace identity sets the tenant up and binds the delivery account");
+    delivered.expect("the delivery identity writes the Secret");
+    assert!(
+        forbidden(namespace_reads),
+        "the namespace identity must not read the Secret"
+    );
+    assert!(
+        forbidden(delivery_edits_walls),
+        "the delivery identity must not change the rules"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster"]
+async fn one_identity_doing_both_jobs_is_refused() {
+    let rig = rig().await;
+
+    let result = check_separation(&rig.admin, &rig.admin).await;
+
+    teardown(&rig).await;
+    let error = result
+        .expect_err("one identity for both jobs must be refused")
+        .to_string();
+    assert!(error.contains("separate identities"), "{error}");
+}
+
+#[tokio::test]
+#[ignore = "needs a Kubernetes cluster"]
+async fn a_delivery_identity_that_administers_namespaces_is_refused() {
+    let rig = rig().await;
+
+    let result = check_separation(&rig.namespace, &rig.namespace).await;
+
+    teardown(&rig).await;
+    let error = result
+        .expect_err("a delivery identity with namespace rights must be refused")
+        .to_string();
+    assert!(error.contains("namespace administration"), "{error}");
 }

@@ -9,6 +9,7 @@
 //! In hosted mode the Manager also proves, at startup, that the cluster really
 //! enforces these rules ([`probe`]) and refuses to start when it does not.
 
+pub mod identity;
 pub mod manifests;
 mod probe;
 
@@ -19,6 +20,7 @@ use async_trait::async_trait;
 use k8s_openapi::api::authorization::v1::SubjectAccessReview;
 use k8s_openapi::api::core::v1::{LimitRange, Namespace, ResourceQuota, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 use serde::de::DeserializeOwned;
@@ -26,6 +28,7 @@ use serde::Serialize;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+pub use identity::{check_separation, delivery_client, DELIVERY_KUBECONFIG_ENV};
 pub use probe::run as run_probe;
 
 const FIELD_MANAGER: &str = "openflows-manager";
@@ -33,8 +36,12 @@ const FIELD_MANAGER: &str = "openflows-manager";
 /// Connect with the in-cluster or kubeconfig identity. The build holds two TLS crypto
 /// providers and rustls will not choose between them, so this installs `ring` first.
 pub async fn cluster_client() -> Result<Client, kube::Error> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
     Client::try_default().await
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Namespace of the platform services (Manager, Coder, Redis) pods may reach.
@@ -49,6 +56,9 @@ pub const PROVISIONER_SELECTOR_ENV: &str = "OPENFLOWS_K8S_PROVISIONER_SELECTOR";
 pub const API_CIDRS_ENV: &str = "OPENFLOWS_K8S_API_EGRESS_CIDRS";
 /// `namespace/name` of the Coder provisioner's service account; it must not be able to read Secrets.
 pub const PROVISIONER_ACCOUNT_ENV: &str = "OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT";
+/// `namespace/name` of the Secret-delivery identity's service account. The namespace identity
+/// binds it to Secret write access in each organization namespace.
+pub const DELIVERY_ACCOUNT_ENV: &str = "OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT";
 /// Image with `nc` and `sh` used by the readiness probe.
 pub const PROBE_IMAGE_ENV: &str = "OPENFLOWS_K8S_PROBE_IMAGE";
 /// Address of the node-local DNS cache, such as `169.254.20.10`, on clusters that run NodeLocal DNSCache.
@@ -93,6 +103,8 @@ pub struct IsolationSettings {
     pub api_cidrs: Vec<String>,
     /// Namespace and name of the provisioner's service account.
     pub provisioner_account: Option<(String, String)>,
+    /// Namespace and name of the Secret-delivery identity's service account.
+    pub delivery_account: Option<(String, String)>,
     pub probe_image: String,
     /// Node-local DNS cache address; pods query it instead of CoreDNS when it runs.
     pub node_local_dns: Option<String>,
@@ -114,6 +126,7 @@ impl Default for IsolationSettings {
             provisioner_selector: None,
             api_cidrs: Vec::new(),
             provisioner_account: None,
+            delivery_account: None,
             probe_image: DEFAULT_PROBE_IMAGE.to_string(),
             node_local_dns: None,
             pod_security_version: DEFAULT_POD_SECURITY_VERSION.to_string(),
@@ -152,7 +165,10 @@ impl IsolationSettings {
             settings.provisioner_selector = Some(parse_selector(&selector)?);
         }
         if let Some(account) = get(PROVISIONER_ACCOUNT_ENV) {
-            settings.provisioner_account = Some(parse_account(&account)?);
+            settings.provisioner_account = Some(parse_account(PROVISIONER_ACCOUNT_ENV, &account)?);
+        }
+        if let Some(account) = get(DELIVERY_ACCOUNT_ENV) {
+            settings.delivery_account = Some(parse_account(DELIVERY_ACCOUNT_ENV, &account)?);
         }
         if let Some(version) = get(POD_SECURITY_VERSION_ENV) {
             settings.pod_security_version = parse_pod_security_version(&version)?;
@@ -235,7 +251,7 @@ fn parse_cidrs(var: &str, value: &str) -> Result<Vec<String>, ManagerError> {
         .collect()
 }
 
-fn parse_account(value: &str) -> Result<(String, String), ManagerError> {
+fn parse_account(var: &str, value: &str) -> Result<(String, String), ManagerError> {
     let allowed = |s: &str| {
         !s.is_empty()
             && s.chars()
@@ -246,7 +262,7 @@ fn parse_account(value: &str) -> Result<(String, String), ManagerError> {
             Ok((namespace.into(), name.into()))
         }
         _ => Err(ManagerError::Config(format!(
-            "{PROVISIONER_ACCOUNT_ENV} must look like openflows/coder-provisioner"
+            "{var} must look like openflows/service-account-name"
         ))),
     }
 }
@@ -358,6 +374,26 @@ impl KubernetesIsolation {
         Self { client, settings }
     }
 
+    /// Whether a service account may use `verb` on Secrets in `namespace`, asked of the API server.
+    async fn account_may(
+        &self,
+        namespace: &str,
+        account_namespace: &str,
+        account: &str,
+        verb: &str,
+    ) -> Result<bool, ManagerError> {
+        let review = manifests::secret_access_review(namespace, account_namespace, account, verb)?;
+        let answer = Api::<SubjectAccessReview>::all(self.client.clone())
+            .create(&PostParams::default(), &review)
+            .await
+            .map_err(|e| {
+                ManagerError::Config(format!(
+                    "cannot check access of {account_namespace}/{account}: {e}"
+                ))
+            })?;
+        Ok(answer.status.is_some_and(|status| status.allowed))
+    }
+
     /// Fail when the provisioner's service account can read Secrets in the namespace, since
     /// the tenants' runtime credentials live there.
     async fn provisioner_cannot_read_secrets(
@@ -366,20 +402,52 @@ impl KubernetesIsolation {
         account_namespace: &str,
         account: &str,
     ) -> Result<(), ManagerError> {
-        let reviews = Api::<SubjectAccessReview>::all(self.client.clone());
         for verb in manifests::SECRET_READ_VERBS {
-            let review =
-                manifests::secret_access_review(namespace, account_namespace, account, verb)?;
-            let answer = reviews
-                .create(&PostParams::default(), &review)
-                .await
-                .map_err(|e| {
-                    ManagerError::Config(format!("cannot check provisioner access: {e}"))
-                })?;
-            if answer.status.is_some_and(|status| status.allowed) {
+            if self
+                .account_may(namespace, account_namespace, account, verb)
+                .await?
+            {
                 return Err(ManagerError::Config(format!(
                     "the provisioner service account {account_namespace}/{account} can {verb} Secrets \
                      in namespace {namespace}; remove that permission so it cannot read tenant credentials"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind the Secret-delivery service account to Secret write access in this namespace and
+    /// fail unless it can use it. The binding takes a moment to reach the authorizer.
+    async fn grant_secret_delivery(
+        &self,
+        namespace: &str,
+        account_namespace: &str,
+        account: &str,
+    ) -> Result<(), ManagerError> {
+        apply(
+            &Api::<RoleBinding>::namespaced(self.client.clone(), namespace),
+            manifests::SECRET_DELIVERY_BINDING,
+            &manifests::secret_delivery_binding(namespace, account_namespace, account)?,
+        )
+        .await?;
+        for verb in manifests::SECRET_WRITE_VERBS {
+            let mut allowed = false;
+            for _ in 0..20 {
+                if self
+                    .account_may(namespace, account_namespace, account, verb)
+                    .await?
+                {
+                    allowed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if !allowed {
+                return Err(ManagerError::Config(format!(
+                    "the Secret delivery service account {account_namespace}/{account} cannot {verb} \
+                     Secrets in namespace {namespace}; check that the ClusterRole {} exists and that \
+                     the namespace identity may bind it",
+                    manifests::SECRET_WRITER_ROLE
                 )));
             }
         }
@@ -434,6 +502,10 @@ impl TenantIsolation for KubernetesIsolation {
             &manifests::default_service_account(&name)?,
         )
         .await?;
+        if let Some((account_namespace, account)) = &settings.delivery_account {
+            self.grant_secret_delivery(&name, account_namespace, account)
+                .await?;
+        }
         let policies = Api::<NetworkPolicy>::namespaced(self.client.clone(), &name);
         let mut wanted = manifests::base_policies(settings, &name)?;
         wanted.push(manifests::tenant_policy(&name, tenant_id)?);
@@ -472,6 +544,36 @@ impl TenantIsolation for KubernetesIsolation {
     }
 }
 
+/// Hosted mode needs a Secret-delivery identity apart from the namespace identity. Check that
+/// one is configured, that it authenticates as the service account the Manager grants Secret
+/// access to, and that neither identity can do the other's job.
+async fn require_separate_delivery(
+    namespace_client: &Client,
+    settings: &IsolationSettings,
+) -> Result<(), ManagerError> {
+    if identity::delivery_kubeconfig().is_none() {
+        return Err(ManagerError::Config(format!(
+            "hosted mode on kubernetes needs a Secret delivery identity apart from the namespace \
+             identity: set {DELIVERY_KUBECONFIG_ENV} to a kubeconfig for it"
+        )));
+    }
+    let Some((account_namespace, account)) = &settings.delivery_account else {
+        return Err(ManagerError::Config(format!(
+            "hosted mode on kubernetes needs {DELIVERY_ACCOUNT_ENV}, the service account of the \
+             delivery identity, so each organization namespace can grant it Secret access"
+        )));
+    };
+    let delivery = identity::delivery_client().await?;
+    let expected = format!("system:serviceaccount:{account_namespace}:{account}");
+    let actual = identity::username(&delivery).await?;
+    if actual != expected {
+        return Err(ManagerError::Config(format!(
+            "the delivery kubeconfig authenticates as {actual}, not as {DELIVERY_ACCOUNT_ENV} ({expected})"
+        )));
+    }
+    identity::check_separation(namespace_client, &delivery).await
+}
+
 /// Pick the isolation for the workspace backend. On Kubernetes in hosted mode the
 /// cluster must pass the enforcement probe, or the Manager does not start.
 pub async fn resolve(config: &ManagerConfig) -> Result<Arc<dyn TenantIsolation>, ManagerError> {
@@ -489,6 +591,7 @@ pub async fn resolve(config: &ManagerConfig) -> Result<Arc<dyn TenantIsolation>,
         .await
         .map_err(|e| ManagerError::Config(format!("tenant isolation needs cluster access: {e}")))?;
     if config.mode == Mode::Hosted {
+        require_separate_delivery(&client, &settings).await?;
         probe::run(&client, &settings).await?;
     }
     Ok(Arc::new(KubernetesIsolation::new(client, settings)))
@@ -524,6 +627,7 @@ mod tests {
             (PLATFORM_CIDRS_ENV, "10.1.2.3/32,10.9.0.0/16"),
             (PROVISIONER_SELECTOR_ENV, "app=coder-provisioner"),
             (PROVISIONER_ACCOUNT_ENV, "platform/provisioner"),
+            (DELIVERY_ACCOUNT_ENV, "platform/delivery"),
             (NODE_LOCAL_DNS_ENV, "169.254.20.10"),
             (POD_SECURITY_VERSION_ENV, "v1.35"),
             (PROBE_NAMESPACE_ENV, "openflows-probe"),
@@ -539,6 +643,10 @@ mod tests {
             Some(("app".into(), "coder-provisioner".into()))
         );
         assert_eq!(settings.quota[0], ("pods".into(), "10".into()));
+        assert_eq!(
+            settings.delivery_account,
+            Some(("platform".into(), "delivery".into()))
+        );
         assert_eq!(settings.node_local_dns.as_deref(), Some("169.254.20.10"));
         assert_eq!(settings.pod_security_version, "v1.35");
         assert_eq!(settings.probe_namespace.as_deref(), Some("openflows-probe"));
@@ -557,6 +665,7 @@ mod tests {
             (API_CIDRS_ENV, "10.1.2.3/40"),
             (PROVISIONER_SELECTOR_ENV, "no-equals-sign"),
             (PROVISIONER_ACCOUNT_ENV, "no-namespace"),
+            (DELIVERY_ACCOUNT_ENV, "no-namespace"),
             (NODE_LOCAL_DNS_ENV, "not-an-ip"),
             (POD_SECURITY_VERSION_ENV, "1.33"),
             (POD_SECURITY_VERSION_ENV, "v1"),

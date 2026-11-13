@@ -10,6 +10,7 @@ use crate::id::{OrganizationId, TenantId};
 use k8s_openapi::api::authorization::v1::SubjectAccessReview;
 use k8s_openapi::api::core::v1::{LimitRange, Namespace, ResourceQuota, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::RoleBinding;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
@@ -36,6 +37,11 @@ pub const ALLOW_PUBLIC: &str = "openflows-allow-public-egress";
 pub const PROVISIONER_POLICY: &str = "openflows-provisioner";
 pub const QUOTA_NAME: &str = "openflows-quota";
 pub const LIMIT_RANGE_NAME: &str = "openflows-defaults";
+/// ClusterRole, created by the operator, that lets an identity write Secrets and nothing else.
+pub const SECRET_WRITER_ROLE: &str = "openflows-secret-writer";
+pub const SECRET_DELIVERY_BINDING: &str = "openflows-secret-delivery";
+/// Verbs the Secret-delivery identity needs on Secrets.
+pub const SECRET_WRITE_VERBS: [&str; 3] = ["create", "patch", "delete"];
 /// Verbs the Coder provisioner must not hold on Secrets.
 pub const SECRET_READ_VERBS: [&str; 3] = ["get", "list", "watch"];
 
@@ -128,6 +134,22 @@ pub fn default_service_account(namespace: &str) -> Result<ServiceAccount, Manage
         "apiVersion": "v1", "kind": "ServiceAccount",
         "metadata": meta("default", Some(namespace), None),
         "automountServiceAccountToken": false,
+    }))
+}
+
+/// Gives the Secret-delivery service account write access to Secrets in this namespace only.
+pub fn secret_delivery_binding(
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+) -> Result<RoleBinding, ManagerError> {
+    typed(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+        "metadata": meta(SECRET_DELIVERY_BINDING, Some(namespace), None),
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": SECRET_WRITER_ROLE,
+        },
+        "subjects": [{ "kind": "ServiceAccount", "name": account, "namespace": account_namespace }],
     }))
 }
 
@@ -510,6 +532,19 @@ mod tests {
         assert_eq!(attributes.namespace.as_deref(), Some("org-ns"));
         assert_eq!(attributes.resource.as_deref(), Some("secrets"));
         assert_eq!(attributes.verb.as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn the_delivery_account_gets_secret_write_access_in_one_namespace_only() {
+        let binding = secret_delivery_binding("org-ns", "platform", "delivery").expect("binding");
+
+        assert_eq!(binding.metadata.namespace.as_deref(), Some("org-ns"));
+        assert_eq!(binding.role_ref.kind, "ClusterRole");
+        assert_eq!(binding.role_ref.name, SECRET_WRITER_ROLE);
+        let subject = &binding.subjects.expect("subjects")[0];
+        assert_eq!(subject.kind, "ServiceAccount");
+        assert_eq!(subject.name, "delivery");
+        assert_eq!(subject.namespace.as_deref(), Some("platform"));
     }
 
     #[test]
