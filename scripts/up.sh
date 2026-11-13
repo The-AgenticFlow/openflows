@@ -99,6 +99,9 @@ if ! grep -q "^OPENFLOWS_HOOK_URL=http://manager:3002/" "$ENV_FILE" \
     printf 'Pointed the Coder hook and runtime URLs at the Compose Manager (backup: .env.openflows.bak).\n'
 fi
 
+# A Console started separately by ./scripts/console.sh holds port 3000; Compose runs its own.
+docker rm -f openflows-console >/dev/null 2>&1 || true
+
 [ "$PULL" = 0 ] || "${COMPOSE[@]}" pull console
 "${COMPOSE[@]}" up -d --build
 
@@ -110,6 +113,10 @@ done
 printf '\n'
 curl -fs -m 3 http://127.0.0.1:3002/ready >/dev/null 2>&1 \
     || die "The Manager did not become ready." "Check: ${COMPOSE[*]} logs manager"
+for _ in $(seq 1 30); do
+    curl -fs -m 3 -o /dev/null http://127.0.0.1:3000/login >/dev/null 2>&1 && break
+    sleep 1
+done
 curl -fs -m 5 -o /dev/null http://127.0.0.1:3000/login \
     || die "The Console did not answer." "Check: ${COMPOSE[*]} logs console"
 
