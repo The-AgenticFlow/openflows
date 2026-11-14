@@ -532,7 +532,7 @@ mod tests {
             serde_json::from_str(include_str!("../../../orchestration/agent/registry.json"))
                 .unwrap();
         assert_eq!(reg.forge_slots(), vec!["forge-1", "forge-2"]);
-        assert!(reg.get("lore").is_none());
+        assert!(reg.get("lore").is_some());
     }
 
     #[test]
