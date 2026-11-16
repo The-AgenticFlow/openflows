@@ -65,7 +65,7 @@ Use the real repository name: setup checks it against the repositories you selec
 Setup asks for, in order: your Coder sign-in and an API token, the GitHub App install and device code in the console at <http://127.0.0.1:3002>, then the LLM provider and key. It ends with "All set".
 
 - [ ] Setup finishes and `./scripts/prod.sh doctor` passes.
-- [ ] Clean up: `docker compose down -v` in the kit folder, then remove `~/.config/openflows`.
+- [ ] Clean up: `docker compose down -v --remove-orphans` in the kit folder, then remove `~/.config/openflows`.
 
 ## Rollback
 
