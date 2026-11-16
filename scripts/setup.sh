@@ -477,8 +477,8 @@ stage_docker() {
     [ "$MODE" = source ] && args+=(--build)
     # Compose prefers shell variables over .env; pass the image from .env so a leftover
     # export (e.g. from an earlier upgrade) cannot copy a different version.
-    local image_env=()
-    [ "$MODE" = compose ] && image_env=(
+    local image_env=("OPENFLOWS_WORKSPACE_IMAGE=$(env_get OPENFLOWS_WORKSPACE_IMAGE)")
+    [ "$MODE" = compose ] && image_env+=(
         "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
         "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
@@ -774,8 +774,8 @@ templates_ready() {
     # Programs from an image or a release (IMAGE, RELEASE markers) must be rebuilt from this checkout.
     elif [ -f "${BIN_DIR}/IMAGE" ] || [ -f "${BIN_DIR}/RELEASE" ]; then
         return 1
-    # Rebuild when any source or template is newer than the built binary.
-    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+    # Rebuild when any source, template or runtime script is newer than the built binary.
+    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/runtime" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
         return 1
     fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
@@ -915,7 +915,7 @@ stage_bootstrap() {
             ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
             return
         fi
-        run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+        push_release_templates
         env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
         mark_pending_restart
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
@@ -1062,11 +1062,11 @@ main() {
 
     stage_preflight
     stage_env
-    env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
-    env_set OPENFLOWS_SETUP_MODE "$MODE"
+    env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"; env_set OPENFLOWS_SETUP_MODE "$MODE"
     [ "$MODE" = compose ] && stage_image
     [ "$MODE" = binary ] && stage_release
     stage_github_app
+    resolve_workspace_image
     stage_docker
     stage_connected_local_authorization
     stage_coder_token

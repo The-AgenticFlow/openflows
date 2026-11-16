@@ -69,8 +69,12 @@ immutable release name on the next setup run. Keep `.env` private.
 
 Both release modes require a version with the shared App Manager image (newer
 than 1.8.1). `--compose` pins the program and Manager images by digest and
-copies workspace binaries into `.dev-binaries/`. `--binary` verifies release
-archive checksums and uses the same Manager image. A source checkout can use
+copies the programs this machine runs into `.dev-binaries/`. `--binary` verifies
+release archive checksums and uses the same Manager image. From the release after
+1.8.2, both modes also pin the version's workspace image
+(`ghcr.io/the-agenticflow/openflows-workspace`) as `OPENFLOWS_WORKSPACE_IMAGE`;
+workspaces run the programs in it and mount nothing from `.dev-binaries/` unless
+`TF_VAR_dev_binary_host_path` is set. A source checkout can use
 `--source` to build and run its Manager from current code.
 
 For release installation, setup records the selected version and image

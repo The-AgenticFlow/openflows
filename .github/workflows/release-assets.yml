@@ -212,6 +212,7 @@ jobs:
       contents: write
     with:
       version: ${{ inputs.version }}
+      wait_for_images: ${{ inputs.wait_for_images }}
 
   attach:
     name: Attach assets and publish
@@ -308,7 +309,7 @@ jobs:
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
               "https://ghcr.io/v2/${1}/manifests/${VERSION}")" = 200 ]
           }
-          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager" "${GITHUB_REPOSITORY,,}-workspace"; do
             until image_exists "${image}"; do
               if [ "${SECONDS}" -ge "${IMAGE_WAIT_SECONDS}" ]; then
                 echo "::error::ghcr.io/${image}:${VERSION} did not appear; ${TAG} stays a draft."
@@ -323,7 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG_TREE="$(git rev-parse 'HEAD^{tree}')"
-          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager" "${GITHUB_REPOSITORY,,}-workspace"; do
             bash verifier/scripts/verify-release.sh image "ghcr.io/${image}" "${VERSION}" "${TAG_TREE}"
           done
 

@@ -20,8 +20,14 @@ check (`openflows-doctor`), and stores its configuration in `.env`.
 The workspace templates are built into the `openflows` program
 (`crates/coder-client/build.rs` packs them; bootstrap embeds them), so in every
 mode the templates pushed to Coder come from the same build as the programs.
-Workspaces read the programs from `.dev-binaries/`, so the workspace startup is
-identical across modes. Setup saves the
+Workspaces start from the OpenFlows workspace image
+(`ghcr.io/the-agenticflow/openflows-workspace:<version>`, built from `runtime/`),
+which holds the programs and the shared startup steps, so the workspace startup
+is identical across modes. Compose and binary installs pin it by digest as
+`OPENFLOWS_WORKSPACE_IMAGE`; a source install builds it from the checkout
+(`openflows-workspace:dev`) and also mounts `.dev-binaries/`, whose programs and
+runtime scripts replace the image's. Releases up to 1.8.2 publish no workspace
+image; their workspaces read the programs from `.dev-binaries/`. Setup saves the
 mode as `OPENFLOWS_SETUP_MODE` and reuses it when run without a flag; the first
 run without a flag uses `--source` and prints a hint about `--compose`.
 
@@ -32,7 +38,7 @@ operating system:
 
 | Where | Runs | Source | Compose | Binary |
 | --- | --- | --- | --- | --- |
-| Workspaces (`linux/amd64` containers) | `openflows`, `openflows-harness` | `dev-sync.sh` cross-compiles | From the image | `x86_64-unknown-linux-gnu` archive |
+| Workspaces (`linux/amd64` containers) | `openflows`, `openflows-harness` | `dev-sync.sh` cross-compiles; mounted over the image's | The workspace image | The workspace image |
 | The host, during setup | `openflows bootstrap`, `tenant add`, `doctor` | Native `cargo build` | The image's copy on x86-64 Linux with glibc 2.34+; otherwise the release's native archive | The same archive on x86-64 Linux with glibc; otherwise the release's native archive |
 
 Native copies live in `.dev-binaries/host/`. Docker emulates `linux/amd64` on ARM64.
