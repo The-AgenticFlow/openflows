@@ -200,6 +200,21 @@ pub fn secret_name(workspace_id: WorkspaceId) -> String {
     format!("openflows-runtime-{workspace_id}")
 }
 
+/// The namespace the Manager delivers an organization's runtime Secrets to, and
+/// the one its workspaces must run in. Templates receive it as a parameter so a
+/// pod always lands beside its own Secret.
+pub fn organization_namespace(organization_id: OrganizationId) -> String {
+    format!("{}{organization_id}", configured_namespace_prefix())
+}
+
+fn configured_namespace_prefix() -> String {
+    std::env::var(NAMESPACE_PREFIX_ENV)
+        .ok()
+        .map(|prefix| prefix.trim().to_string())
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or_else(|| DEFAULT_NAMESPACE_PREFIX.to_string())
+}
+
 /// Pure so the name, labels and key are unit-tested without a cluster.
 pub fn build_secret(target: &DeliveryTarget, bundle: &[u8]) -> Secret {
     let labels: BTreeMap<String, String> = [
@@ -280,8 +295,7 @@ pub async fn resolve_delivery(
     match (backend, dir) {
         ("kubernetes", _) => {
             kubernetes_opt_in(std::env::var(K8S_DELIVERY_ENV).ok().as_deref())?;
-            let prefix = std::env::var(NAMESPACE_PREFIX_ENV)
-                .unwrap_or_else(|_| DEFAULT_NAMESPACE_PREFIX.to_string());
+            let prefix = configured_namespace_prefix();
             Ok(std::sync::Arc::new(
                 KubernetesSecretDelivery::connect(prefix).await?,
             ))

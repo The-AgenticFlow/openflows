@@ -199,7 +199,13 @@ impl ReleaseProvider {
         let image_repository = non_empty_env("OPENFLOWS_WORKSPACE_IMAGE_REPO");
         let workspace_runtime_release = non_empty_env("OPENFLOWS_WORKSPACE_RUNTIME_RELEASE");
 
-        let has_kubernetes = self.source_dir.join("kubernetes").is_dir();
+        // The Kubernetes variants land role by role (issue #500). A manifest is
+        // only valid when every backend it lists provides all required roles, so
+        // the backend appears once all five sources exist; until then a source
+        // install keeps producing a Docker-only manifest.
+        let has_kubernetes = Role::ALL.iter().all(|role| {
+            role_source_dir(&self.source_dir, ProvisionerBackend::Kubernetes, *role).is_some()
+        });
         let is_v2 = has_kubernetes
             || image_repository.is_some()
             || workspace_runtime_release.is_some()
@@ -320,4 +326,65 @@ fn default_source_dir() -> PathBuf {
     // Best-effort: relative to the workspace root. Callers can override with
     // OPENFLOWS_TEMPLATE_SOURCE_DIR.
     PathBuf::from("crates/coder-client/templates")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source tree with every role's Docker template, plus the Kubernetes
+    /// roles named in `kubernetes_roles`.
+    fn source_tree(kubernetes_roles: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for role in ["forge", "sentinel", "nexus", "vessel", "lore"] {
+            let docker = dir.path().join(format!("openflows-{role}"));
+            std::fs::create_dir_all(&docker).unwrap();
+            std::fs::write(docker.join("main.tf"), "terraform {}\n").unwrap();
+        }
+        for role in kubernetes_roles {
+            let kubernetes = dir
+                .path()
+                .join("kubernetes")
+                .join(format!("openflows-{role}"));
+            std::fs::create_dir_all(&kubernetes).unwrap();
+            std::fs::write(kubernetes.join("main.tf"), "terraform {}\n").unwrap();
+        }
+        dir
+    }
+
+    fn provider(dir: &tempfile::TempDir) -> ReleaseProvider {
+        ReleaseProvider::new(dir.path().to_path_buf(), None, None, "test".into())
+    }
+
+    #[test]
+    fn a_partial_kubernetes_set_leaves_the_source_manifest_docker_only() {
+        // A manifest that lists a backend must carry every required role for it,
+        // so one Kubernetes template must not introduce the backend yet.
+        let dir = source_tree(&["nexus"]);
+        let artifacts = provider(&dir).load().unwrap();
+        assert_eq!(
+            artifacts.manifest.backends(),
+            vec![ProvisionerBackend::Docker]
+        );
+    }
+
+    #[test]
+    fn a_complete_kubernetes_set_publishes_kubernetes_variants() {
+        let dir = source_tree(&["forge", "sentinel", "nexus", "vessel", "lore"]);
+        let artifacts = provider(&dir).load().unwrap();
+        assert_eq!(
+            artifacts.manifest.backends(),
+            vec![ProvisionerBackend::Docker, ProvisionerBackend::Kubernetes]
+        );
+        for role in Role::ALL {
+            let entry = artifacts
+                .manifest
+                .variant(ProvisionerBackend::Kubernetes, role)
+                .expect("every role has a Kubernetes variant");
+            assert_eq!(
+                entry.archive,
+                role.archive_name_for_backend(ProvisionerBackend::Kubernetes)
+            );
+        }
+    }
 }

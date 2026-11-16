@@ -667,6 +667,14 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
             ManagerError::Service(anyhow::anyhow!("failed to compute relative path: {e}"))
         })?;
         let ft = entry.file_type().map_err(ManagerError::from)?;
+        // Terraform's local working directory holds downloaded provider binaries
+        // and must never be packaged into a template archive.
+        if ft.is_dir() && entry.file_name() == ".terraform" {
+            continue;
+        }
+        if ft.is_file() && entry.file_name() == ".terraform.lock.hcl" {
+            continue;
+        }
         if ft.is_dir() {
             collect_files(root, &path, out)?;
         } else if ft.is_file() {

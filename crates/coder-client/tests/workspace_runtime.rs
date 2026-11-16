@@ -8,6 +8,7 @@
 //! stub Manager over HTTP.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -364,7 +365,7 @@ fn controller_bootstrap_keeps_its_session_and_seeds_workers_only_locally() {
     assert_eq!(
         steps,
         [
-            "of_prepare --own-artifacts",
+            "of_prepare",
             "of_install_programs openflows openflows-harness",
             "of_load_runtime_credentials HOOK=hook_key",
             "of_register_runtime",
@@ -434,6 +435,96 @@ fn hosted_workspaces_give_up_sudo_before_the_role_runs() {
     assert!(!stuck.status.success());
     assert!(stderr(&stuck).contains("FATAL: sudo is still available"));
     assert!(!stdout(&stuck).contains("continued"));
+}
+
+/// Run SCRIPT with a sudo that always fails, as inside a Kubernetes pod that
+/// forbids privilege escalation and adds no capabilities. Any attempt is logged.
+fn run_without_privilege(dir: &Path, script: &str) -> Output {
+    Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                r#"set -e
+. "$RUNTIME"
+sudo() {{ printf '%s\n' "$*" >> "$SUDO_LOG"; return 1; }}
+{script}"#
+            ),
+            "runtime-test",
+        ])
+        .arg(dir)
+        .env("RUNTIME", runtime())
+        .env("SUDO_LOG", dir.join("sudo.log"))
+        .env("HOME", dir)
+        .env_remove("GIT_DIR")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn startup_needs_no_privilege_when_the_backend_mounts_the_paths_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        &format!(
+            r#"OF_HOME="{}" OF_WORKSPACE="{}" OF_STATE_DIR="{}" of_prepare
+echo prepared"#,
+            home.display(),
+            workspace.display(),
+            dir.path().join("state").display()
+        ),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("prepared"));
+    assert_eq!(
+        sudo_calls(dir.path()),
+        "",
+        "a mount the backend already handed to the workspace user needs no sudo"
+    );
+}
+
+#[test]
+fn a_readable_runtime_secret_is_read_without_privilege() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("runtime.json");
+    std::fs::write(
+        &bundle,
+        r#"{"manager_url":"http://manager.test","bootstrap_token":"boot","redis_url":"redis://redis.test:6379","redis_namespace":"ns","hook_key":"hk","hook_url":"http://hook.test"}"#,
+    )
+    .unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        &format!(
+            r#"OPENFLOWS_RUNTIME_CREDENTIAL_FILE="{}" of_load_runtime_credentials HOOK_KEY=hook_key
+printf '%s %s %s %s\n' "$OF_MANAGER_URL" "$REDIS_URL" "$OPENFLOWS_TENANT" "$HOOK_KEY""#,
+            bundle.display()
+        ),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "http://manager.test redis://redis.test:6379 ns hk"
+    );
+    assert_eq!(sudo_calls(dir.path()), "");
+}
+
+#[test]
+fn a_workspace_without_sudo_has_nothing_to_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        r#"OF_HOSTED=true of_release_privileges
+echo continued"#,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("continued"));
+    assert!(stderr(&output).contains("Released sudo"));
+    assert!(
+        !sudo_calls(dir.path()).is_empty(),
+        "the runtime must still check, not assume"
+    );
 }
 
 #[test]
@@ -526,10 +617,42 @@ fn a_workspace_without_a_persona_ends_startup() {
 
 #[test]
 fn only_the_privileged_preparation_uses_sudo() {
-    let dir = tempfile::tempdir().unwrap();
-    let output = run(dir.path(), &format!("{PATHS}of_prepare --own-artifacts"));
+    // A backend that hands the paths over writable — a Kubernetes PVC mounted
+    // with fsGroup — must not need sudo at all: a pod that forbids privilege
+    // escalation and adds no capabilities cannot use it.
+    let writable = tempfile::tempdir().unwrap();
+    let output = run(
+        writable.path(),
+        &format!("{PATHS}of_prepare"),
+    );
     assert!(output.status.success(), "{}", stderr(&output));
-    let calls = sudo_calls(dir.path());
+    assert_eq!(
+        sudo_calls(writable.path()),
+        "",
+        "a writable mount must prepare without sudo"
+    );
+    assert!(
+        stderr(&output).contains("Workspace runtime"),
+        "startup must log which runtime it loaded"
+    );
+
+    // A root-owned volume — the Docker case — still gets the privileged
+    // preparation, and nothing but it.
+    if running_as_root() {
+        // Every path is writable for root, so the second case cannot arise.
+        return;
+    }
+    let root_owned = tempfile::tempdir().unwrap();
+    let workspace = root_owned.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = run(
+        root_owned.path(),
+        &format!("{PATHS}of_prepare"),
+    );
+    let calls = sudo_calls(root_owned.path());
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
     for call in calls.lines() {
         assert!(
             call.starts_with("mkdir ") || call.starts_with("chown ") || call.starts_with("find "),
@@ -537,12 +660,8 @@ fn only_the_privileged_preparation_uses_sudo() {
         );
     }
     assert!(
-        calls.contains("chown -R coder:coder"),
-        "--own-artifacts must take the artifacts volume"
-    );
-    assert!(
-        stderr(&output).contains("Workspace runtime"),
-        "startup must log which runtime it loaded"
+        calls.contains("find ") && calls.contains("-exec chown "),
+        "a root-owned workspace must be handed to the workspace user"
     );
 }
 
