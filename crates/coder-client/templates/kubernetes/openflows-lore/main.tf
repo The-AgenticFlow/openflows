@@ -226,9 +226,10 @@ resource "coder_agent" "main" {
     # The base role selects the role assets and the Redis keys.
     OF_ROLE="${data.coder_parameter.role.value}"
     OF_REPO_URL="${data.coder_parameter.repo_url.value}"
-    # LORE writes documentation and never pushes: GitHub access is optional and
-    # it needs no author identity.
+    # LORE commits its documentation branch, so it needs an author identity;
+    # GitHub access stays optional because the harness assigns it when it can.
     OF_GITHUB_ACCESS=optional
+    OF_GIT_IDENTITY=optional
     OF_CHECKOUT=default
 
     # Ends with the readiness heartbeat the Manager waits for before assigning work.

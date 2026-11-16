@@ -6,6 +6,11 @@
 //! covered by tests/workspace_runtime.rs; this file guards the infrastructure.
 
 const NEXUS: &str = include_str!("../templates/kubernetes/openflows-nexus/main.tf");
+const NEXUS_DOCKER: &str = include_str!("../templates/openflows-nexus/main.tf");
+const FORGE_DOCKER: &str = include_str!("../templates/openflows-forge/main.tf");
+const SENTINEL_DOCKER: &str = include_str!("../templates/openflows-sentinel/main.tf");
+const VESSEL_DOCKER: &str = include_str!("../templates/openflows-vessel/main.tf");
+const LORE_DOCKER: &str = include_str!("../templates/openflows-lore/main.tf");
 const FORGE: &str = include_str!("../templates/kubernetes/openflows-forge/main.tf");
 const SENTINEL: &str = include_str!("../templates/kubernetes/openflows-sentinel/main.tf");
 const VESSEL: &str = include_str!("../templates/kubernetes/openflows-vessel/main.tf");
@@ -18,6 +23,15 @@ const ALL: [(&str, &str); 5] = [
     ("sentinel", SENTINEL),
     ("vessel", VESSEL),
     ("lore", LORE),
+];
+
+/// Docker template each hosted variant replaces, as (role, docker, kubernetes).
+const PAIRS: [(&str, &str, &str); 5] = [
+    ("nexus", NEXUS_DOCKER, NEXUS),
+    ("forge", FORGE_DOCKER, FORGE),
+    ("sentinel", SENTINEL_DOCKER, SENTINEL),
+    ("vessel", VESSEL_DOCKER, VESSEL),
+    ("lore", LORE_DOCKER, LORE),
 ];
 
 /// The startup script of a template, one trimmed line per entry.
@@ -249,6 +263,38 @@ fn nexus_keeps_the_relay_and_the_controller_bootstrap() {
     assert!(lines
         .iter()
         .any(|line| line.starts_with("nohup openflows run")));
+}
+
+/// Names of the runtime settings a startup script assigns, in order. Only a
+/// line that starts with an `OF_` identifier counts, so shell tests such as
+/// `[ -f ... ] || OF_X=...` are not mistaken for settings.
+fn runtime_settings(template: &'static str) -> Vec<&'static str> {
+    template
+        .lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .map(|(name, _)| name)
+        .filter(|name| {
+            name.starts_with("OF_")
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .collect()
+}
+
+#[test]
+fn the_pod_start_up_keeps_every_runtime_setting_its_container_sets() {
+    // The pod must drive the shared runtime exactly like the container does;
+    // dropping a setting here silently changes how the role starts.
+    for (role, docker, kubernetes) in PAIRS {
+        let hosted_settings = runtime_settings(kubernetes);
+        for name in runtime_settings(docker) {
+            assert!(
+                hosted_settings.contains(&name),
+                "{role} pod start-up drops {name}, which the container sets"
+            );
+        }
+    }
 }
 
 #[test]
