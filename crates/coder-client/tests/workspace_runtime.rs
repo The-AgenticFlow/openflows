@@ -621,10 +621,7 @@ fn only_the_privileged_preparation_uses_sudo() {
     // with fsGroup — must not need sudo at all: a pod that forbids privilege
     // escalation and adds no capabilities cannot use it.
     let writable = tempfile::tempdir().unwrap();
-    let output = run(
-        writable.path(),
-        &format!("{PATHS}of_prepare"),
-    );
+    let output = run(writable.path(), &format!("{PATHS}of_prepare"));
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         sudo_calls(writable.path()),
@@ -646,10 +643,7 @@ fn only_the_privileged_preparation_uses_sudo() {
     let workspace = root_owned.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let output = run(
-        root_owned.path(),
-        &format!("{PATHS}of_prepare"),
-    );
+    let output = run(root_owned.path(), &format!("{PATHS}of_prepare"));
     let calls = sudo_calls(root_owned.path());
     std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(output.status.success(), "{}", stderr(&output));

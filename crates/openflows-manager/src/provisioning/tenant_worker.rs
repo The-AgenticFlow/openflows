@@ -575,7 +575,7 @@ impl TenantProvisionWorker {
                 value: format!("openflows-nexus-{}:3000", row.3),
             },
         ];
-        parameters.extend(kubernetes_placement_parameters(
+        parameters.extend(super::parameters::kubernetes_placement_parameters(
             self.compatibility_target.backend,
             guard.organization_id,
         ));
@@ -993,40 +993,16 @@ impl TenantProvisionWorker {
             .bind(tenant_id.0)
             .fetch_one(&self.pool)
             .await?;
-        let mut parameters = vec![
-            coder_client::types::WorkspaceParameterValue {
-                name: "hosted".into(),
-                value: self.hosted_workspace().to_string(),
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "runtime_secret_ref".into(),
-                value: runtime_secret_ref,
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "workspace_image_digest".into(),
-                value: spec.image_digest.clone(),
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "tenant".into(),
-                value: tenant_id.to_string(),
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "repo_url".into(),
-                value: format!("https://github.com/{repository}.git"),
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "github_repository".into(),
-                value: repository,
-            },
-            coder_client::types::WorkspaceParameterValue {
-                name: "fleet_size".into(),
-                value: fleet_size.to_string(),
-            },
-        ];
-        parameters.extend(kubernetes_placement_parameters(
-            self.compatibility_target.backend,
-            org_id,
-        ));
+        let parameters = super::parameters::nexus_parameters(super::parameters::NexusParameters {
+            hosted: self.hosted_workspace(),
+            runtime_secret_ref: &runtime_secret_ref,
+            workspace_image_digest: &spec.image_digest,
+            tenant_id,
+            repository: &repository,
+            fleet_size,
+            organization_id: org_id,
+            backend: self.compatibility_target.backend,
+        });
         let created = match self
             .adapter
             .create_tenant_workspace_with_parameters(
@@ -1622,28 +1598,6 @@ impl TenantProvisionWorker {
     }
 }
 
-/// Parameters that place a hosted workspace inside its organization's Kubernetes
-/// namespace. The Manager delivers the runtime Secret there, so the pod has to
-/// land beside it; the Docker backend has no namespaces and gets none.
-fn kubernetes_placement_parameters(
-    backend: crate::templates::ProvisionerBackend,
-    organization_id: OrganizationId,
-) -> Vec<coder_client::types::WorkspaceParameterValue> {
-    if backend != crate::templates::ProvisionerBackend::Kubernetes {
-        return Vec::new();
-    }
-    vec![
-        coder_client::types::WorkspaceParameterValue {
-            name: "organization".into(),
-            value: organization_id.to_string(),
-        },
-        coder_client::types::WorkspaceParameterValue {
-            name: "runtime_namespace".into(),
-            value: crate::runtime::delivery::organization_namespace(organization_id),
-        },
-    ]
-}
-
 async fn operation_kind(
     pool: &PgPool,
     id: crate::id::OperationId,
@@ -1663,30 +1617,6 @@ fn worker_workspace_name(role: &str, workspace_id: uuid::Uuid) -> String {
     let prefix = format!("of-{role}-");
     let suffix_len = 32 - prefix.len();
     format!("{prefix}{}", &compact_id[..suffix_len])
-}
-
-#[cfg(test)]
-mod placement_parameter_tests {
-    use super::*;
-    use crate::templates::ProvisionerBackend;
-
-    #[test]
-    fn docker_workspaces_carry_no_kubernetes_placement() {
-        let parameters =
-            kubernetes_placement_parameters(ProvisionerBackend::Docker, OrganizationId::new());
-        assert!(parameters.is_empty());
-    }
-
-    #[test]
-    fn kubernetes_workspaces_land_in_their_organization_namespace() {
-        let organization = OrganizationId::new();
-        let parameters =
-            kubernetes_placement_parameters(ProvisionerBackend::Kubernetes, organization);
-        let names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["organization", "runtime_namespace"]);
-        assert_eq!(parameters[0].value, organization.to_string());
-        assert_eq!(parameters[1].value, format!("openflows-{organization}"));
-    }
 }
 
 #[cfg(test)]
