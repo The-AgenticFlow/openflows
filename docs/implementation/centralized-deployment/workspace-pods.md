@@ -60,12 +60,16 @@ around the pod.
 
 ## Rollout state
 
-Nexus exists today; Forge, Sentinel, Vessel and Lore follow in issue #500. A
-template manifest that lists a backend must carry every required role for it, so
-the Kubernetes variants enter the release manifest only once all five sources
-exist. Until then a source install keeps producing a Docker-only manifest, and a
-Kubernetes tenant is rejected with the existing
+All five variants exist, so a template manifest built from this tree advertises
+both the `docker` and `kubernetes` backends: the backend only appears once every
+required role has a variant, which is now satisfied. What is left in issue #500
+is running the set on a real cluster and proving it there; a Kubernetes tenant
+without the variants fails with the existing
 `release '<name>' has no 'kubernetes' variant for required role '<role>'` error.
+
+Only Nexus declares a Service, because it is the only role other workspaces
+address by name. Every pod still carries the tenant and organization labels the
+per-tenant NetworkPolicy selects.
 
 ## Checking a template
 
