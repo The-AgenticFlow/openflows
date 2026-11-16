@@ -305,6 +305,12 @@ of_install_artifact_bundle() {
             --manager-url "$OF_MANAGER_URL"; then
             of_fatal "cannot install the workspace artifact bundle"
         fi
+    elif command -v openflows-harness >/dev/null 2>&1; then
+        mkdir -p "$ASSETS_DIR"
+        of_log "Installing bundled role assets into $ASSETS_DIR"
+        if ! openflows-harness artifacts install --dir "$ASSETS_DIR"; then
+            of_fatal "cannot install the workspace artifact bundle"
+        fi
     fi
 }
 
@@ -548,21 +554,21 @@ of_install_role_instructions() {
     of_log "Installed hosted instructions for $role"
 }
 
-# of_start_credential_refresh [--api-token] — hosted only: keep the runtime
-# session and the stored GitHub tokens fresh for the workspace's lifetime, and
-# report liveness once of_signal_manager_ready has run.
+# of_start_credential_refresh [--api-token] — runtime secret only: keep the
+# runtime session and the stored GitHub tokens fresh for the workspace's
+# lifetime, and report liveness once of_signal_manager_ready has run.
 of_start_credential_refresh() {
-    of_hosted || return 0
+    of_has_runtime_secret || return 0
     rm -f "$OF_READY_FILE"
     OF_CONNECTED_LOCAL="${OF_CONNECTED_LOCAL:-false}" \
         nohup "$OF_RUNTIME_DIR/bin/openflows-credential-refresh" "$@" >>"$OF_STATE_DIR/git-refresh.log" 2>&1 &
 }
 
-# of_signal_manager_ready — hosted only: tell the Manager this workspace has
-# finished bootstrap. The Manager assigns work only after this heartbeat, so it
-# must be the last bootstrap step before the role's own commands.
+# of_signal_manager_ready — runtime secret only: tell the Manager this workspace
+# has finished bootstrap. The Manager assigns work only after this heartbeat, so
+# it must be the last bootstrap step before the role's own commands.
 of_signal_manager_ready() {
-    of_hosted || return 0
+    of_has_runtime_secret || return 0
     of_curl_auth Bearer "$OF_RUNTIME_ACCESS_TOKEN" -fsS -X POST \
         "${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null ||
         of_fatal "the Manager did not accept the readiness heartbeat"

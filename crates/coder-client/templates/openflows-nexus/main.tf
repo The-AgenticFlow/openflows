@@ -266,11 +266,12 @@ resource "coder_agent" "main" {
       export OPENFLOWS_REDIS_NAMESPACE="${data.coder_parameter.redis_namespace.value}"
       export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
     fi
-    # Fleet size is authoritative only for hosted runtimes, where the Manager
-    # passes it as a workspace parameter. Local tenants supply their fleet
-    # through OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a
-    # parameter that defaults to 1 here would shrink that registry fleet.
-    if of_hosted; then
+    # Fleet size is authoritative only when provisioned by the Manager (hosted or
+    # local Manager with runtime_secret_ref), where the Manager passes it as a
+    # workspace parameter. Legacy local tenants supply their fleet through
+    # OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a parameter that
+    # defaults to 1 here would shrink that registry fleet.
+    if of_has_runtime_secret; then
       export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
     fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"

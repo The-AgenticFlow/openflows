@@ -113,7 +113,6 @@ if [ "$scenario" = workspace-runtime ]; then
     export TF_VAR_dev_binary_host_path="$scratch/dev-bin"
     export TF_VAR_connected_local_manager_url=http://openflows-manager:3002
 else
-    export TF_VAR_dev_binary_host_path="$scratch/bin"
     export TF_VAR_connected_local_manager_url=http://github-fixture:8080
 fi
 printf '%s' ci-broker-key >"$scratch/broker-key"

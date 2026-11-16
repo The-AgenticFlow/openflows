@@ -47,6 +47,13 @@ pub fn release_digest() -> Result<String> {
     Ok(workspace_assets::digest(&archive))
 }
 
+/// Install the artifact bundle compiled into this binary into `dir`.
+pub fn install_bundled(dir: &Path) -> Result<Installed> {
+    let archive = workspace_assets::archive().context("cannot serialize the bundled artifacts")?;
+    let digest = workspace_assets::digest(&archive);
+    install(&archive, &digest, None, dir)
+}
+
 /// Install the bundle of the release this binary was built with.
 ///
 /// This is what a workspace should call at boot: a Manager still serving an

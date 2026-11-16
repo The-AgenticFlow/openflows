@@ -46,8 +46,31 @@ V0_2_0_IMAGES = {
     ),
 }
 
+V0_2_1_IMAGES = {
+    "nexus": (
+        "ghcr.io/the-agenticflow/workspace-runtime-nexus",
+        "sha256:3b4d042fc9ead62e2be88a4eecdb1759f5517b6b6e7a5a1d95ae7ce703c2478c",
+    ),
+    "forge": (
+        "ghcr.io/the-agenticflow/workspace-runtime-forge",
+        "sha256:153892238a0dca7a54c01046aba19b617aac17e647a66730c8b3f2d80f1dbddf",
+    ),
+    "sentinel": (
+        "ghcr.io/the-agenticflow/workspace-runtime-sentinel",
+        "sha256:dc315d45468a2bf825eef4a17880d36ef21271623336de83d5db917a9517d07f",
+    ),
+    "vessel": (
+        "ghcr.io/the-agenticflow/workspace-runtime-vessel",
+        "sha256:47d821cbcfc0f293190572078d6b028ecfefcb384346358f14bad3dea931926e",
+    ),
+    "lore": (
+        "ghcr.io/the-agenticflow/workspace-runtime-lore",
+        "sha256:255ddc151ea6e1233dfec82e8844718658841e7363dd193e13a71ba3d4d9d25e",
+    ),
+}
 
-def build_manifest(runtime_version: str) -> str:
+
+def build_manifest(runtime_version: str, images: dict[str, tuple[str, str]]) -> str:
     return json.dumps(
         {
             "schema_version": 2,
@@ -59,7 +82,7 @@ def build_manifest(runtime_version: str) -> str:
                     "digest": digest,
                     "architectures": ["linux/amd64", "linux/arm64"],
                 }
-                for role, (repo, digest) in V0_2_0_IMAGES.items()
+                for role, (repo, digest) in images.items()
             },
             "roles": ["nexus", "forge", "sentinel", "vessel", "lore"],
             "bootstrap": {
@@ -227,8 +250,25 @@ def stop_manager_container(cid: str, log_name: str):
 
 
 def assert_no_workspaces():
-    res = run(["docker", "ps", "-aq", "--filter", f"network={PROJECT}_default", "--filter", "name=of-"])
-    assert not res.stdout.strip(), f"Unexpected workspace containers exist: {res.stdout}"
+    for prefix in (
+        "openflows-nexus-",
+        "openflows-forge-",
+        "openflows-sentinel-",
+        "openflows-vessel-",
+        "openflows-lore-",
+    ):
+        res = run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"network={PROJECT}_default",
+                "--filter",
+                f"name={prefix}",
+            ]
+        )
+        assert not res.stdout.strip(), f"Unexpected workspace containers exist ({prefix}): {res.stdout}"
 
 
 def main():
@@ -244,9 +284,9 @@ def main():
     (secrets_dir / "github-broker-key").chmod(0o600)
 
     manifest_v020 = secrets_dir / "v0.2.0-manifest.json"
-    manifest_v020.write_text(build_manifest("0.2.0"))
+    manifest_v020.write_text(build_manifest("0.2.0", V0_2_0_IMAGES))
     manifest_v021 = secrets_dir / "v0.2.1-manifest.json"
-    manifest_v021.write_text(build_manifest("0.2.1"))
+    manifest_v021.write_text(build_manifest("0.2.1", V0_2_1_IMAGES))
 
     # 0. Wait for Coder HTTP server to be ready.
     wait("Coder HTTP server ready", lambda: _coder_ready(), seconds=120)
@@ -462,7 +502,7 @@ def main():
         print("6. Verified Nexus workspace-runtime v0.2.0 assertions.", flush=True)
 
         # 8. Spawn Forge via Manager runtime API using Nexus's registered runtime token & verify Forge + relay.
-        _spawn_forge_from_nexus(nexus_cid, "T-1", "forge/T-1")
+        _spawn_workspace_from_nexus(nexus_cid, "forge", 1, "T-1", "forge/T-1", "forge-spawn-1")
         wait("Forge container started", lambda: len(_find_containers("openflows-forge-")) == 1, seconds=180)
         forge_cid = _find_container("openflows-forge-")
         wait("Forge workspace initialized", lambda: _forge_ready(forge_cid), seconds=180)
@@ -498,7 +538,10 @@ def main():
             seconds=600,
         )
         assert _org_current_release(org_id) == rel_v021
-        print(f"8. Explicit upgrade promoted {rel_v021}; rolling back to {rel_v020}.", flush=True)
+        _assert_release_images(rel_v021, V0_2_1_IMAGES)
+        _assert_container_pinned_image(nexus_cid, V0_2_0_IMAGES["nexus"])
+        _assert_container_pinned_image(forge_cid, V0_2_0_IMAGES["forge"])
+        print(f"8. Explicit upgrade promoted {rel_v021} (v0.2.1 digests) and preserved v0.2.0 workspace pins; rolling back to {rel_v020}.", flush=True)
 
         stop_manager_container(mgr_cid, "manager-v021.log")
         mgr_cid = None
@@ -517,14 +560,18 @@ def main():
             seconds=600,
         )
         assert _org_current_release(org_id) == rel_v020
-        print("9. Rollback to v0.2.0 release verified.", flush=True)
+        _assert_release_images(rel_v020, V0_2_0_IMAGES)
+        _assert_container_pinned_image(nexus_cid, V0_2_0_IMAGES["nexus"])
+        _assert_container_pinned_image(forge_cid, V0_2_0_IMAGES["forge"])
+        print("9. Rollback to v0.2.0 release verified (v0.2.0 digests restored, existing workspace pins preserved).", flush=True)
     finally:
         coder_logs = run(["docker", "logs", f"{PROJECT}-coder-1"], check=False)
         (ARTIFACTS / "coder.log").write_text(coder_logs.stdout + coder_logs.stderr)
-        for cid in _find_containers("openflows-nexus-") + _find_containers("openflows-forge-"):
-            cname = run(["docker", "inspect", "--format", "{{.Name}}", cid], check=False).stdout.strip().lstrip("/") or cid
-            wlogs = run(["docker", "logs", cid], check=False)
-            (ARTIFACTS / f"{cname}.log").write_text(wlogs.stdout + wlogs.stderr)
+        for prefix in ("openflows-nexus-", "openflows-forge-", "openflows-sentinel-", "openflows-lore-"):
+            for cid in _find_containers(prefix):
+                cname = run(["docker", "inspect", "--format", "{{.Name}}", cid], check=False).stdout.strip().lstrip("/") or cid
+                wlogs = run(["docker", "logs", cid], check=False)
+                (ARTIFACTS / f"{cname}.log").write_text(wlogs.stdout + wlogs.stderr)
         if mgr_cid:
             stop_manager_container(mgr_cid, "manager-final.log")
 
@@ -631,6 +678,21 @@ def _org_current_release(org_id: str) -> str:
     return res.stdout.strip()
 
 
+def _assert_release_images(release_id: str, expected_images: dict[str, tuple[str, str]]):
+    res = run([
+        "docker", "exec", f"{PROJECT}-openflows-db-1",
+        "psql", "-U", "openflows", "-d", "openflows_control_plane", "-tAc",
+        f"SELECT role, image_repository, image_digest FROM template_release_roles WHERE release_id = '{release_id}' AND backend = 'docker' ORDER BY role",
+    ])
+    actual = {}
+    for line in res.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        role, repo, digest = line.split("|", 2)
+        actual[role] = (repo, digest)
+    assert actual == expected_images, f"Release {release_id} docker images {actual} != {expected_images}"
+
+
 _LAST_TENANT_STATUS = None
 
 
@@ -661,7 +723,17 @@ def _find_container(prefix: str) -> str:
     return cids[0]
 
 
-def _spawn_forge_from_nexus(nexus_cid: str, ticket_id: str, branch: str):
+def _spawn_workspace_from_nexus(
+    nexus_cid: str,
+    role: str,
+    slot: int,
+    ticket_id: str,
+    branch: str | None,
+    idempotency_key: str,
+):
+    payload = {"role": role, "slot": slot, "ticket_id": ticket_id}
+    if branch is not None:
+        payload["branch"] = branch
     py = (
         "import glob, json, os, urllib.request\n"
         "token = None\n"
@@ -679,13 +751,13 @@ def _spawn_forge_from_nexus(nexus_cid: str, ticket_id: str, branch: str):
         "assert token, 'OF_RUNTIME_ACCESS_TOKEN not found in Nexus controller process'\n"
         "req = urllib.request.Request(\n"
         "    f'{mgr_url}/api/v1/runtime/workspaces',\n"
-        "    data=json.dumps({'role': 'forge', 'slot': 1, 'ticket_id': %r, 'branch': %r}).encode(),\n"
-        "    headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'Idempotency-Key': 'forge-spawn-1'},\n"
+        "    data=json.dumps(%r).encode(),\n"
+        "    headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'Idempotency-Key': %r},\n"
         "    method='POST',\n"
         ")\n"
         "with urllib.request.urlopen(req, timeout=30) as resp:\n"
         "    print(resp.status, resp.read().decode())\n"
-    ) % (ticket_id, branch)
+    ) % (payload, idempotency_key)
     run(["docker", "exec", "-u", "coder", nexus_cid, "python3", "-c", py])
 
 
@@ -701,12 +773,16 @@ def _forge_ready(forge_cid: str) -> bool:
     return res.returncode == 0
 
 
-def _assert_workspace_runtime(cid: str, role: str, expected_image: tuple[str, str]):
+def _assert_container_pinned_image(cid: str, expected_image: tuple[str, str]):
     repo, digest = expected_image
     expected_ref = f"{repo}@{digest}"
     image_id = run(["docker", "inspect", "--format", "{{.Image}}", cid]).stdout.strip()
     repo_digests = json.loads(run(["docker", "inspect", "--format", "{{json .RepoDigests}}", image_id]).stdout)
-    assert expected_ref in repo_digests, f"{role} image {repo_digests} missing pinned {expected_ref}"
+    assert expected_ref in repo_digests, f"Container {cid} image {repo_digests} missing pinned {expected_ref}"
+
+
+def _assert_workspace_runtime(cid: str, role: str, expected_image: tuple[str, str]):
+    _assert_container_pinned_image(cid, expected_image)
 
     check_cmd = (
         f"set -eu; "

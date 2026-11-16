@@ -37,6 +37,15 @@ impl WorkspaceRuntimeImage {
     pub fn image_reference(&self) -> String {
         format!("{}@{}", self.repository, self.digest)
     }
+
+    /// Returns true if this image supports the given canonical architecture (e.g. `amd64`).
+    pub fn supports_architecture(&self, arch: &str) -> bool {
+        let Ok(canonical) = validate_architecture(arch) else {
+            return false;
+        };
+        let linux_platform = format!("linux/{canonical}");
+        self.architectures.iter().any(|a| a == &linux_platform)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +256,7 @@ impl WorkspaceRuntimeManifest {
 
         for role in Role::ALL {
             let img = self.image_for(role)?;
-            if !img.architectures.iter().any(|a| a == &linux_platform) {
+            if !img.supports_architecture(&canonical_arch) {
                 return Err(ManagerError::InvalidInput(format!(
                     "workspace-runtime '{}' role '{}' does not support target platform '{}'",
                     self.runtime_version,
@@ -333,23 +342,53 @@ impl WorkspaceRuntimeManifest {
     }
 
     /// Populate per-role image repository, digest, and runtime release version on
-    /// a [`TemplateManifest`].
+    /// a [`TemplateManifest`], verifying each entry's schema version and architecture.
     pub fn apply_to_template_manifest(
         &self,
         manifest: &mut TemplateManifest,
     ) -> Result<(), ManagerError> {
-        for (role, entry) in manifest.roles.iter_mut() {
-            let img = self.image_for(*role)?;
-            entry.image_repository = Some(img.repository.clone());
-            entry.image_digest = Some(img.digest.clone());
-            entry.workspace_runtime_release = Some(self.runtime_version.clone());
+        for (&role, entry) in manifest.roles.iter_mut() {
+            self.apply_entry(role, entry)?;
         }
         for ((_, role), entry) in manifest.variants.iter_mut() {
-            let img = self.image_for(*role)?;
-            entry.image_repository = Some(img.repository.clone());
-            entry.image_digest = Some(img.digest.clone());
-            entry.workspace_runtime_release = Some(self.runtime_version.clone());
+            self.apply_entry(*role, entry)?;
         }
+        Ok(())
+    }
+
+    fn apply_entry(
+        &self,
+        role: Role,
+        entry: &mut crate::templates::packaging::RoleManifestEntry,
+    ) -> Result<(), ManagerError> {
+        let supported_schemas = &self
+            .compatibility
+            .openflows_template_parameter_schema_versions;
+        if !supported_schemas.is_empty()
+            && !supported_schemas.contains(&entry.parameter_schema_version)
+        {
+            return Err(ManagerError::InvalidInput(format!(
+                "workspace-runtime '{}' schema versions {:?} do not support {} role '{}' parameter_schema_version {}",
+                self.runtime_version,
+                supported_schemas,
+                entry.backend,
+                role.as_str(),
+                entry.parameter_schema_version
+            )));
+        }
+        let img = self.image_for(role)?;
+        if !img.supports_architecture(&entry.architecture) {
+            return Err(ManagerError::InvalidInput(format!(
+                "workspace-runtime '{}' {} role '{}' image does not support entry architecture '{}'",
+                self.runtime_version,
+                entry.backend,
+                role.as_str(),
+                entry.architecture
+            )));
+        }
+        entry.image_repository = Some(img.repository.clone());
+        entry.image_digest = Some(img.digest.clone());
+        entry.workspace_runtime_release = Some(self.runtime_version.clone());
         Ok(())
     }
 }
@@ -372,7 +411,10 @@ fn is_valid_oci_repository(repo: &str) -> bool {
         return false;
     }
     let segments: Vec<&str> = repo.split('/').collect();
-    if segments.iter().any(|s| s.is_empty()) {
+    if segments
+        .iter()
+        .any(|s| s.is_empty() || *s == "." || *s == ".." || s.starts_with('.') || s.ends_with('.'))
+    {
         return false;
     }
     // Registry host (first segment) may contain a port (e.g. localhost:5000);
@@ -576,5 +618,81 @@ mod tests {
             Some("sha256:660f6f401a13103e2012997f03ab7d864f8853ce06b280b0371fb07d05a752f0")
         );
         assert_eq!(forge.workspace_runtime_release.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn apply_rejects_schema_version_and_architecture_mismatches() {
+        let mut manifest = WorkspaceRuntimeManifest::parse_str(V0_2_0_MANIFEST).unwrap();
+        manifest.status = WorkspaceRuntimeStatus::Compatible;
+        manifest
+            .compatibility
+            .openflows_template_parameter_schema_versions = vec![2];
+        manifest.images.get_mut(&Role::Forge).unwrap().architectures =
+            vec!["linux/amd64".to_string()];
+
+        let mut roles = BTreeMap::new();
+        for role in Role::ALL {
+            roles.insert(
+                role,
+                crate::templates::packaging::RoleManifestEntry::docker(
+                    role,
+                    role.archive_name(),
+                    "a".repeat(64),
+                    1,
+                    None,
+                ),
+            );
+        }
+        let mut schema_mismatch =
+            TemplateManifest::from_v1_roles("2026.11.0", Role::ALL.to_vec(), roles);
+        let err = manifest
+            .apply_to_template_manifest(&mut schema_mismatch)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("parameter_schema_version 1"),
+            "{err}"
+        );
+
+        let mut roles = BTreeMap::new();
+        for role in Role::ALL {
+            let mut entry = crate::templates::packaging::RoleManifestEntry::docker(
+                role,
+                role.archive_name(),
+                "a".repeat(64),
+                2,
+                None,
+            );
+            if role == Role::Forge {
+                entry.architecture = "arm64".to_string();
+            }
+            roles.insert(role, entry);
+        }
+        let mut arch_mismatch =
+            TemplateManifest::from_v1_roles("2026.11.0", Role::ALL.to_vec(), roles);
+        let err = manifest
+            .apply_to_template_manifest(&mut arch_mismatch)
+            .unwrap_err();
+        assert!(err.to_string().contains("architecture 'arm64'"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_oci_repository_segments() {
+        for bad in [
+            "ghcr.io/../workspace-runtime-nexus",
+            "ghcr.io/./workspace-runtime-nexus",
+            "ghcr.io//workspace-runtime-nexus",
+            "../workspace-runtime-nexus",
+            "ghcr.io/.hidden/workspace-runtime-nexus",
+            "ghcr.io/org./workspace-runtime-nexus",
+        ] {
+            assert!(
+                !is_valid_oci_repository(bad),
+                "expected rejection for {bad}"
+            );
+        }
+        assert!(is_valid_oci_repository(
+            "ghcr.io/the-agenticflow/workspace-runtime-nexus"
+        ));
+        assert!(is_valid_oci_repository("localhost:5000/org/repo_v1.0"));
     }
 }

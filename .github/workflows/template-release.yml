@@ -50,41 +50,33 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=openflows-$VERSION" >> "$GITHUB_OUTPUT"
 
-      # The manifest pins the workspace image docker-publish.yml builds for this
-      # version: its repository, digest, platform and runtime release. Hosted
-      # workspaces run exactly that image.
-      - name: Resolve the workspace image
+      # The manifest pins the workspace-runtime release images for this version:
+      # per-role repositories, digests, platform and runtime release. Hosted
+      # workspaces run exactly those images.
+      - name: Resolve the workspace-runtime manifest
         if: inputs.wait_for_images
         env:
-          VERSION: ${{ steps.release.outputs.version }}
-          IMAGE_WAIT_SECONDS: 7200
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}-workspace"
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPOSITORY="ghcr.io/${OWNER,,}/workspace-runtime"
           # Hosted workspaces run "<workspace_image_repository>@<digest>", where the
           # repository is the templates' default and only the digest comes from the
           # Manager. A digest of another repository cannot be pulled, so the
-          # repository pinned here must be the one the templates name.
+          # repository pinned here must match the templates' per-role defaults.
           bash scripts/check-template-image-repository.sh crates/coder-client/templates "${REPOSITORY}"
-          until DIGEST="$(docker buildx imagetools inspect "${REPOSITORY}:${VERSION}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
-              && [ -n "${DIGEST}" ]; do
-            if [ "${SECONDS}" -ge "${IMAGE_WAIT_SECONDS}" ]; then
-              echo "::error::${REPOSITORY}:${VERSION} did not appear; the templates cannot pin a workspace image."
-              exit 1
-            fi
-            sleep 60
-          done
-          if ! printf '%s' "${DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
-            echo "::error::Could not resolve an immutable digest for ${REPOSITORY}:${VERSION}: '${DIGEST}'"
-            exit 1
-          fi
+          RUNTIME_REPO="${OWNER}/workspace-runtime"
+          MANIFEST_PATH="${RUNNER_TEMP}/workspace-runtime-release-manifest.json"
+          gh release download --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          MANIFEST_SHA256="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
           {
-            echo "OPENFLOWS_WORKSPACE_IMAGE_REPO=${REPOSITORY}"
-            echo "OPENFLOWS_WORKSPACE_IMAGE_DIGEST=${DIGEST}"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST=${MANIFEST_PATH}"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST_SHA256=${MANIFEST_SHA256}"
             echo "OPENFLOWS_WORKSPACE_ARCH=amd64"
             echo "OPENFLOWS_WORKSPACE_RUNTIME_RELEASE=$(cat runtime/VERSION)"
           } >> "$GITHUB_ENV"
-          echo "Pinned ${REPOSITORY}@${DIGEST} (linux/amd64, runtime $(cat runtime/VERSION))"
+          echo "Pinned workspace-runtime manifest ${MANIFEST_SHA256} from ${RUNTIME_REPO} (linux/amd64, runtime $(cat runtime/VERSION))"
 
       - name: Build deterministic template release
         run: |

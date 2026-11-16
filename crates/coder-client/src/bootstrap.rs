@@ -555,15 +555,14 @@ impl CoderBootstrapper {
 }
 
 /// Fingerprint both the archive and the variables stored by server-side Terraform.
-fn template_hash(name: &str, data: &[u8]) -> String {
+fn template_hash(name: &str, data: &[u8]) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let variables =
-        serde_json::to_vec(&crate::template_variable_values_for(name).unwrap_or_default())
-            .expect("template variable strings are JSON serializable");
+    let variables = serde_json::to_vec(&crate::template_variable_values_for(name)?)
+        .expect("template variable strings are JSON serializable");
     hasher.update(variables);
-    hex_encode(&hasher.finalize())
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 /// Minimal hex encoder (avoids pulling in another crate just for this).
@@ -612,7 +611,13 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 /// if the push attempt failed. Callers use `None` to determine whether bootstrap
 /// should fail due to a template management error.
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
-    let current_hash = template_hash(name, data);
+    let current_hash = match template_hash(name, data) {
+        Ok(hash) => hash,
+        Err(err) => {
+            tracing::error!(template = name, error = %err, "Failed to prepare template variable values");
+            return None;
+        }
+    };
 
     let before_templates = client.list_templates_in_default_org().await.ok();
     let before_template = before_templates
