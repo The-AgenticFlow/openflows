@@ -72,6 +72,7 @@ cleanup() {
         done < <(sort -u "$scratch/volumes")
     fi
     remove_resource image "$project-workspace:ci" || result=1
+    remove_resource image "$project-runtime:ci" || result=1
     [ "$scenario" != upgrade ] || remove_resource image "$project-workspace:ci-upgrade" || result=1
     remove_resource image "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" || result=1
     rm -rf "$scratch"
@@ -84,7 +85,11 @@ cargo build --locked -p openflows --bin openflows --bin openflows-doctor -p open
 mkdir -p "$scratch/bin" "$scratch/home"
 cp target/debug/openflows target/debug/openflows-doctor target/debug/openflows-harness "$scratch/bin/"
 docker build -t "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" tests/e2e/system 2>&1 | tee "$artifacts/fixtures-image.log"
-docker build -t "$project-workspace:ci" -f tests/e2e/system/workspace.Dockerfile tests/e2e/system 2>&1 | tee "$artifacts/workspace-image.log"
+# The workspace image is the OpenFlows runtime image built from this checkout with the
+# candidate programs, so workspaces run them without a development mount.
+runtime/build-image.sh "$project-runtime:ci" "$scratch/bin" 2>&1 | tee "$artifacts/runtime-image.log"
+docker build --build-arg RUNTIME_IMAGE="$project-runtime:ci" -t "$project-workspace:ci" \
+    -f tests/e2e/system/workspace.Dockerfile tests/e2e/system 2>&1 | tee "$artifacts/workspace-image.log"
 "${compose[@]}" up -d --wait --wait-timeout 120
 coder_id=$("${compose[@]}" ps -q coder)
 docker cp "$coder_id:/opt/coder" "$scratch/bin/coder"
@@ -102,7 +107,6 @@ export REDIS_URL="redis://$("${compose[@]}" port redis 6379)"
 export CODER_CHAT_HOOK_SECRET=disposable-ci-hook-secret-at-least-32-bytes
 export CODER_CHAT_HOOK_URL=http://openflows-nexus:3001/experimental/hooks/chat
 export GITHUB_GIT_BASE=git://github-fixture:9418
-export TF_VAR_dev_binary_host_path="$scratch/bin"
 export TF_VAR_docker_network="${project}_default"
 export TF_VAR_workspace_image="$project-workspace:ci"
 export TF_VAR_github_api_base=http://github-fixture:8080

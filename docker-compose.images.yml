@@ -1,8 +1,10 @@
 # Apply after docker-compose.yml for installs from the published images:
 #   docker compose -f docker-compose.yml -f docker-compose.images.yml up -d
 # `setup.sh --compose` does this. It copies the released OpenFlows programs out
-# of the image into ./.dev-binaries, the folder Coder workspaces read them from,
-# before Coder starts. Create ./.dev-binaries first so it stays owned by your user.
+# of the image into ./.dev-binaries before Coder starts, for setup to run on this
+# machine. Workspaces run the programs in the pinned workspace image instead
+# (releases up to 1.8.2: from ./.dev-binaries). Create ./.dev-binaries first so it
+# stays owned by your user.
 services:
   openflows-binaries:
     image: ${OPENFLOWS_IMAGE_REPO:-ghcr.io/the-agenticflow/openflows}:${OPENFLOWS_VERSION:-latest}${OPENFLOWS_IMAGE_DIGEST:+@${OPENFLOWS_IMAGE_DIGEST}}

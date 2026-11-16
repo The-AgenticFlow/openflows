@@ -150,6 +150,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p test_connected_local_helper.py -v
       - name: Run line-limit checker tests
         run: bash tests/ci/check-line-limits-test.sh
+      - name: Run runtime version and image repository checker tests
+        run: bash tests/ci/check-runtime-version-test.sh
 
   typos:
     name: Spelling
@@ -182,6 +184,11 @@ jobs:
             exit 0
           fi
           python3 scripts/check_line_limits.py
+      - name: Require a new runtime/VERSION for workspace runtime changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: bash scripts/check-runtime-version.sh
 
   redis-lifecycle:
     name: Redis lifecycle integration

@@ -199,9 +199,22 @@ case "$CMD" in
             echo "  → Skipping (--skip-build): using the programs already in .dev-binaries"
         elif [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
             "${SCRIPT_DIR}/dev-sync.sh"
+            # Workspaces start from the workspace image; build it from this checkout
+            # unless an image was given (TF_VAR_workspace_image).
+            if [ -z "${TF_VAR_workspace_image:-}" ]; then
+                echo "  → Building the workspace image from this checkout..."
+                "${PROJECT_ROOT}/runtime/build-image.sh" openflows-workspace:dev "${PROJECT_ROOT}/.dev-binaries"
+                export TF_VAR_workspace_image=openflows-workspace:dev
+            fi
         else
             echo "⚠ dev-sync.sh not found, skipping..."
         fi
+        # Templates have no default workspace image: use the one setup pinned in .env
+        # unless one was given or built above.
+        if [ -z "${TF_VAR_workspace_image:-}" ] && [ -n "${OPENFLOWS_WORKSPACE_IMAGE:-}" ]; then
+            export TF_VAR_workspace_image="${OPENFLOWS_WORKSPACE_IMAGE}"
+        fi
+        echo "  → Workspace image: ${TF_VAR_workspace_image:-none given; local workspaces will not start until one is set}"
         echo ""
         echo "Step 2: Running Coder bootstrap..."
         echo ""

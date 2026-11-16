@@ -774,8 +774,8 @@ templates_ready() {
     # Programs from an image or a release (IMAGE, RELEASE markers) must be rebuilt from this checkout.
     elif [ -f "${BIN_DIR}/IMAGE" ] || [ -f "${BIN_DIR}/RELEASE" ]; then
         return 1
-    # Rebuild when any source or template is newer than the built binary.
-    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+    # Rebuild when any source, template or runtime script is newer than the built binary.
+    elif [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/runtime" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
         return 1
     fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
@@ -915,7 +915,7 @@ stage_bootstrap() {
             ok "5 templates already pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"
             return
         fi
-        run_quiet "Pushing templates" "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+        push_release_templates
         env_set OPENFLOWS_SETUP_TEMPLATES_IMAGE "$(installed_ref)"
         mark_pending_restart
         ok "5 templates pushed for OpenFlows $(env_get OPENFLOWS_VERSION)"

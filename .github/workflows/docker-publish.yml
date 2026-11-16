@@ -21,6 +21,11 @@ name: Docker Publish
 # assembles the multi-platform manifest with `docker buildx imagetools create`.
 # This avoids QEMU-emulated Rust compilation, which previously took ~1 hour.
 #
+# A third job then publishes the workspace image role workspaces start from:
+#   ghcr.io/the-agenticflow/openflows-workspace:1.3.1 (and the same floating tags)
+# built from runtime/Dockerfile, linux/amd64 only (the platform the role templates
+# run), with the programs copied from the openflows image above by digest.
+#
 # Manual dispatch requires the `version` input (e.g. 1.3.1).
 on:
   push:
@@ -42,6 +47,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: the-agenticflow/openflows
+  WORKSPACE_IMAGE_NAME: the-agenticflow/openflows-workspace
 
 jobs:
   # Resolves the version to build. Kept as its own job so that a not-applicable
@@ -225,11 +231,94 @@ jobs:
             echo "\`${IMAGE}@${DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Shares its concurrency group with docker-publish-manager.yml so the two
-  # workflows never edit the same release notes at once.
-  record-digest:
-    name: Record digest in release notes
+  # The role workspace image: the shared startup runtime (runtime/) plus the
+  # programs of the openflows image merged above, taken by digest so both images
+  # hold the same programs. Templates pin it by digest through the release manifest.
+  workspace:
+    name: Workspace image (linux/amd64)
     needs: [resolve, merge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: refs/tags/openflows-${{ needs.resolve.outputs.version }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${WORKSPACE_IMAGE_NAME}"
+          MAJOR="$(printf '%s' "${VERSION}" | cut -d. -f1)"
+          MINOR="$(printf '%s' "${VERSION}" | cut -d. -f2)"
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${VERSION}"
+            echo "${IMAGE}:${MAJOR}.${MINOR}"
+            echo "${IMAGE}:${MAJOR}"
+            echo "${IMAGE}:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6
+        with:
+          context: runtime
+          file: runtime/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            PROGRAMS_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.merge.outputs.digest }}
+            OPENFLOWS_VERSION=${{ needs.resolve.outputs.version }}
+          provenance: false
+
+      - name: Record the reference
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::The workspace image build returned no digest: '${DIGEST}'"
+            exit 1
+          fi
+          IMAGE="${REGISTRY}/${WORKSPACE_IMAGE_NAME}"
+          {
+            echo "### Published workspace image (linux/amd64)"
+            echo "\`${IMAGE}:${VERSION}\`"
+            echo "\`${IMAGE}@${DIGEST}\`"
+            echo "Runtime $(cat runtime/VERSION)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Shares its concurrency group with docker-publish-manager.yml so the two
+  # workflows never edit the same release notes at once. One job records both
+  # images: a second job in the group could displace this one while it waits.
+  # It runs whenever the openflows image was published, so a failed workspace
+  # image build never hides that digest; the workspace digest is recorded only
+  # when that build succeeded, and the job then fails to flag the missing image.
+  record-digest:
+    name: Record digests in release notes
+    needs: [resolve, merge, workspace]
+    if: ${{ !cancelled() && needs.merge.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -244,9 +333,18 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Record the image digest
+      - name: Record the image digests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           DIGEST: ${{ needs.merge.outputs.digest }}
-        run: scripts/record-image-digest.sh "${VERSION}" "${REGISTRY}/${IMAGE_NAME}" "${DIGEST}"
+          WORKSPACE_DIGEST: ${{ needs.workspace.outputs.digest }}
+          WORKSPACE_RESULT: ${{ needs.workspace.result }}
+        run: |
+          set -euo pipefail
+          scripts/record-image-digest.sh "${VERSION}" "${REGISTRY}/${IMAGE_NAME}" "${DIGEST}"
+          if [ "${WORKSPACE_RESULT}" != success ]; then
+            echo "::error::The workspace image was not published (${WORKSPACE_RESULT}); only the openflows digest was recorded."
+            exit 1
+          fi
+          scripts/record-image-digest.sh "${VERSION}" "${REGISTRY}/${WORKSPACE_IMAGE_NAME}" "${WORKSPACE_DIGEST}"
