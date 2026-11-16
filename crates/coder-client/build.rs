@@ -24,6 +24,11 @@ fn main() {
     let tar = std::env::var("OPENFLOWS_TAR").unwrap_or_else(|_| "tar".to_string());
     println!("cargo:rerun-if-env-changed=OPENFLOWS_TAR");
 
+    // Watch the template tree itself, not only the sources that exist today:
+    // a commit that adds a variant (or a whole backend) must repackage it
+    // without a clean rebuild. Cargo scans a watched directory recursively.
+    println!("cargo:rerun-if-changed={}", templates_dir.display());
+
     let mut any_rebuilt = false;
     for (source, archive) in VARIANTS {
         for role in roles {
@@ -45,16 +50,16 @@ fn main() {
 /// error: a Kubernetes variant lands role by role, and partial checkouts exist.
 fn pack(templates_dir: &Path, source: &str, archive_name: &str, tar: &str) -> bool {
     let src_dir = templates_dir.join(source);
-    if !src_dir.is_dir() {
-        return false;
-    }
-    let archive = templates_dir.join(archive_name);
-
-    // Re-run when the template source changes.
+    // Watch a source that does not exist yet as well, so pulling the commit that
+    // adds it triggers the repack instead of leaving the archive missing.
     println!(
         "cargo:rerun-if-changed={}",
         src_dir.join("main.tf").display()
     );
+    if !src_dir.is_dir() {
+        return false;
+    }
+    let archive = templates_dir.join(archive_name);
 
     // Repack to a temp archive and byte-compare; rewrite only when content differs.
     let mut tmp = archive.clone();
