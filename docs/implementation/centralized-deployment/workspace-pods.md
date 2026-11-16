@@ -49,12 +49,14 @@ templates satisfy it directly:
 - `seccompProfile: RuntimeDefault`;
 - `automountServiceAccountToken: false`.
 
-`fsGroup` also makes the start-up work without privilege: the PVC arrives
-writable, so `of_prepare` and `of_load_runtime_credentials` skip their `sudo`
-steps, and `of_release_privileges` treats an unavailable `sudo` as already
-released. Under `allowPrivilegeEscalation: false` that `sudo` could not work
-anyway. See [tenant isolation](tenant-isolation.md) for the policies the Manager
-applies around the pod.
+`fsGroup` also makes the start-up work without privilege: `of_prepare` probes
+for `sudo` once and, finding none, only creates the paths the PVC already handed
+over writable; `of_load_runtime_credentials` reads the `0440` Secret file
+directly and falls back to `sudo` only for a root-owned Docker file; and
+`of_release_privileges` treats an unavailable `sudo` as already released. Under
+`allowPrivilegeEscalation: false` that `sudo` could not work anyway. See
+[tenant isolation](tenant-isolation.md) for the policies the Manager applies
+around the pod.
 
 ## Rollout state
 
