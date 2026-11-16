@@ -137,7 +137,7 @@ chmod +x "$DEV_BINARIES_DIR/openflows-harness"
 # instead of the copies in their image, so runtime edits apply on the next start.
 rm -rf "$DEV_BINARIES_DIR/runtime"
 mkdir -p "$DEV_BINARIES_DIR/runtime"
-cp -R "${PROJECT_ROOT}/runtime/lib" "${PROJECT_ROOT}/runtime/bin" "$DEV_BINARIES_DIR/runtime/"
+cp -R "${PROJECT_ROOT}/runtime/lib" "${PROJECT_ROOT}/runtime/bin" "${PROJECT_ROOT}/runtime/VERSION" "$DEV_BINARIES_DIR/runtime/"
 echo "✓ Binaries synced"
 echo "  openflows:        $DEV_BINARIES_DIR/openflows"
 echo "  openflows-harness: $DEV_BINARIES_DIR/openflows-harness"

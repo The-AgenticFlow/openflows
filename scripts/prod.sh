@@ -34,8 +34,22 @@ case "${OPENFLOWS_SETUP_MODE:-}" in
         if [ -z "${OPENFLOWS_BIN:-}" ]; then
             OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/openflows"
             [ -x "${PROJECT_ROOT}/.dev-binaries/host/openflows" ] && OPENFLOWS_BIN="${PROJECT_ROOT}/.dev-binaries/host/openflows"
+        fi
+        # Workspaces of a release with a workspace image run its programs and runtime. Every
+        # template push (bootstrap, and the one `tenant` runs) must leave .dev-binaries
+        # unmounted, so an explicit empty value stops the automatic development mount.
+        if [ -n "${TF_VAR_workspace_image:-${OPENFLOWS_WORKSPACE_IMAGE:-}}" ]; then
+            export TF_VAR_dev_binary_host_path="${TF_VAR_dev_binary_host_path:-}"
         fi ;;
 esac
+
+# use_pinned_workspace_image — templates have no default workspace image: use the one
+# setup pinned in .env unless one was given (or built by bootstrap).
+use_pinned_workspace_image() {
+    if [ -z "${TF_VAR_workspace_image:-}" ] && [ -n "${OPENFLOWS_WORKSPACE_IMAGE:-}" ]; then
+        export TF_VAR_workspace_image="${OPENFLOWS_WORKSPACE_IMAGE}"
+    fi
+}
 
 # Track whether the caller explicitly pinned a binary (env var or --bin flag).
 # When explicit, we respect it as-is and never touch it. Otherwise we always
@@ -209,11 +223,7 @@ case "$CMD" in
         else
             echo "⚠ dev-sync.sh not found, skipping..."
         fi
-        # Templates have no default workspace image: use the one setup pinned in .env
-        # unless one was given or built above.
-        if [ -z "${TF_VAR_workspace_image:-}" ] && [ -n "${OPENFLOWS_WORKSPACE_IMAGE:-}" ]; then
-            export TF_VAR_workspace_image="${OPENFLOWS_WORKSPACE_IMAGE}"
-        fi
+        use_pinned_workspace_image
         echo "  → Workspace image: ${TF_VAR_workspace_image:-none given; local workspaces will not start until one is set}"
         echo ""
         echo "Step 2: Running Coder bootstrap..."
@@ -284,6 +294,8 @@ case "$CMD" in
         echo "  Tenant Name: $NAME"
         echo "  Fleet: $FLEET (FORGE-SENTINEL pair(s))"
         echo ""
+        # `tenant add` bootstraps first, which pushes the templates again.
+        use_pinned_workspace_image
         if [ "${#REST[@]}" -gt 0 ]; then
             run_openflows tenant add "$OWNER_REPO" --name "$NAME" --fleet "$FLEET" "${REST[@]}"
         else

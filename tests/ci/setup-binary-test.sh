@@ -305,6 +305,25 @@ expect_eq "binary, same machine" "$(prod_bin binary no)" workspace
 expect_eq "binary, macOS or ARM64" "$(prod_bin binary yes)" host
 expect_eq "compose, macOS or ARM64" "$(prod_bin compose yes)" host
 
+echo "prod.sh tenant pushes templates as setup did"
+# tenant_env PINNED_IMAGE — the Terraform settings `prod.sh tenant` hands the programs, whose
+# bootstrap pushes the templates again; .dev-binaries exists, as in every release install.
+tenant_env() {
+    (
+        P="${WORK}/tenant-$RANDOM"; mkdir -p "${P}/scripts" "${P}/.dev-binaries"
+        cp "${ROOT}/scripts/prod.sh" "${P}/scripts/"
+        printf 'OPENFLOWS_SETUP_MODE=binary\nOPENFLOWS_WORKSPACE_IMAGE=%s\n' "$1" >"${P}/.env"
+        printf '#!/bin/sh\necho "image=${TF_VAR_workspace_image-unset} dev=${TF_VAR_dev_binary_host_path-unset}"\n' \
+            >"${P}/.dev-binaries/openflows"
+        chmod +x "${P}/.dev-binaries/openflows"
+        env -u OPENFLOWS_BIN -u TF_VAR_workspace_image -u TF_VAR_dev_binary_host_path \
+            bash "${P}/scripts/prod.sh" tenant o/r --name t --fleet 1 2>&1 | grep '^image='
+    )
+}
+expect_eq "a release with the image keeps it and mounts nothing" "$(tenant_env "${WORKSPACE_IMAGE}:1.9.0@sha256:abc")" \
+    "image=${WORKSPACE_IMAGE}:1.9.0@sha256:abc dev="
+expect_eq "a release without the image keeps its old wiring" "$(tenant_env "")" "image=unset dev=unset"
+
 echo
 if [ "$failures" -gt 0 ]; then
     echo "$failures test(s) failed"

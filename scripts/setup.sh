@@ -484,6 +484,7 @@ stage_docker() {
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
         "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
     [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
+    image_env+=("OPENFLOWS_WORKSPACE_IMAGE=$(env_get OPENFLOWS_WORKSPACE_IMAGE)")
     if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
@@ -1067,6 +1068,7 @@ main() {
     [ "$MODE" = compose ] && stage_image
     [ "$MODE" = binary ] && stage_release
     stage_github_app
+    resolve_workspace_image
     stage_docker
     stage_connected_local_authorization
     stage_coder_token

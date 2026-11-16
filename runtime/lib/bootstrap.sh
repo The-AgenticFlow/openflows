@@ -370,10 +370,10 @@ of_clear_workspace() {
 # not per workspace) and refreshed; when there is no seed or the copy fails, the
 # repository is cloned directly. Network steps are time-boxed; failures are
 # logged loudly and the caller's of_require_repository decides whether startup
-# can continue. --checkout-default leaves a new checkout on the remote's
-# default head.
+# can continue. --checkout-default leaves a new seed copy on the remote's
+# default head; a direct clone keeps its default branch.
 of_acquire_repository() {
-    local repo_url="$1" checkout_default="${2:-}" fresh=""
+    local repo_url="$1" checkout_default="${2:-}" fresh="" seeded=""
     if [ -d "$OF_WORKSPACE/.git" ]; then
         cd "$OF_WORKSPACE"
         # A checkout left on the detached default head has nothing to pull into.
@@ -386,7 +386,7 @@ of_acquire_repository() {
     if [ -d "$OF_GOLDEN_REPO/.git" ]; then
         if cp -a "$OF_GOLDEN_REPO/." "$OF_WORKSPACE/" 2>"$OF_STATE_DIR/golden-copy.log"; then
             of_log "Copied golden repo seed into $OF_WORKSPACE"
-            fresh=1
+            fresh=1 seeded=1
         else
             of_log "WARNING: copying the golden repo seed failed — $(tail -5 "$OF_STATE_DIR/golden-copy.log" 2>/dev/null); falling back to a direct clone"
             of_clear_workspace
@@ -410,7 +410,9 @@ of_acquire_repository() {
     # Refresh before checkout (copy -> refresh -> checkout -> work).
     cd "$OF_WORKSPACE"
     timeout -k 5s 45s git fetch --all --prune 2>/dev/null || of_log "WARNING: repository fetch failed or timed out; using seed refs"
-    if [ "$checkout_default" = --checkout-default ]; then
+    # Only a seed copy needs moving to the default head. A direct clone is already
+    # on the default branch and stays on it, so a restart pulls upstream changes.
+    if [ "$checkout_default" = --checkout-default ] && [ -n "$seeded" ]; then
         git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     fi
 }

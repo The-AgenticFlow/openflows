@@ -636,6 +636,45 @@ fn a_failed_golden_copy_falls_back_to_a_direct_clone() {
 }
 
 #[test]
+fn a_direct_clone_stays_on_its_branch_and_pulls_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture_repositories(dir.path());
+    std::fs::remove_dir_all(dir.path().join("golden")).unwrap();
+    let script = format!(
+        "{PATHS}of_acquire_repository \"$1/origin.git\" --checkout-default\nof_require_repository"
+    );
+    let first = run(dir.path(), &script);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stderr(&first).contains("Cloned repository"));
+    let ws = dir.path().join("ws");
+    assert_eq!(
+        git(dir.path(), &ws, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main",
+        "a direct clone must keep its tracking branch"
+    );
+
+    // An upstream change must reach the checkout on the next start.
+    let source = dir.path().join("source");
+    std::fs::write(source.join("upstream.txt"), "new\n").unwrap();
+    git(dir.path(), &source, &["add", "."]);
+    git(dir.path(), &source, &["commit", "-qm", "upstream"]);
+    git(
+        dir.path(),
+        &source,
+        &[
+            "push",
+            "-q",
+            dir.path().join("origin.git").to_str().unwrap(),
+            "main",
+        ],
+    );
+
+    let restart = run(dir.path(), &script);
+    assert!(restart.status.success(), "{}", stderr(&restart));
+    assert!(ws.join("upstream.txt").is_file(), "{}", stderr(&restart));
+}
+
+#[test]
 fn rework_resumes_the_pr_branch_or_flags_a_missing_one() {
     let dir = tempfile::tempdir().unwrap();
     fixture_repositories(dir.path());

@@ -166,13 +166,24 @@ pin_workspace_image() {
     env_set OPENFLOWS_WORKSPACE_IMAGE "${repo}:${version}@${digest}"
 }
 
+# resolve_workspace_image — save the workspace image in .env before the local Manager starts:
+# it reads OPENFLOWS_WORKSPACE_IMAGE once, at start, and publishes templates with it. A source
+# install names the image its bootstrap builds; a release pins its published image.
+resolve_workspace_image() {
+    if [ "$MODE" = source ]; then
+        env_set OPENFLOWS_WORKSPACE_IMAGE openflows-workspace:dev
+    else
+        pin_workspace_image
+    fi
+}
+
 # push_release_templates — push the templates of a --compose or --binary install. Workspaces run
 # the programs in the pinned workspace image; .dev-binaries holds the programs for this machine
 # and is mounted into workspaces only when TF_VAR_dev_binary_host_path asks for it. Releases
 # without the image keep their old wiring.
 push_release_templates() {
     local template_env=()
-    pin_workspace_image
+    pin_workspace_image   # a no-op once resolve_workspace_image has pinned it
     if has_workspace_image "$(env_get OPENFLOWS_VERSION)"; then
         template_env=("TF_VAR_workspace_image=${TF_VAR_workspace_image:-$(env_get OPENFLOWS_WORKSPACE_IMAGE)}"
             "TF_VAR_dev_binary_host_path=${TF_VAR_dev_binary_host_path:-}")
