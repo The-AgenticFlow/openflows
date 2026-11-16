@@ -477,14 +477,13 @@ stage_docker() {
     [ "$MODE" = source ] && args+=(--build)
     # Compose prefers shell variables over .env; pass the image from .env so a leftover
     # export (e.g. from an earlier upgrade) cannot copy a different version.
-    local image_env=()
-    [ "$MODE" = compose ] && image_env=(
+    local image_env=("OPENFLOWS_WORKSPACE_IMAGE=$(env_get OPENFLOWS_WORKSPACE_IMAGE)")
+    [ "$MODE" = compose ] && image_env+=(
         "OPENFLOWS_VERSION=$(env_get OPENFLOWS_VERSION)"
         "OPENFLOWS_IMAGE_DIGEST=$(env_get OPENFLOWS_IMAGE_DIGEST)"
         "OPENFLOWS_HOST_UID=$(env_get OPENFLOWS_HOST_UID)"
         "OPENFLOWS_HOST_GID=$(env_get OPENFLOWS_HOST_GID)")
     [ "$MODE" = source ] || image_env+=("OPENFLOWS_MANAGER_IMAGE=$(env_get OPENFLOWS_MANAGER_IMAGE)")
-    image_env+=("OPENFLOWS_WORKSPACE_IMAGE=$(env_get OPENFLOWS_WORKSPACE_IMAGE)")
     if ! out="$(cd "$ROOT" && env ${image_env[@]+"${image_env[@]}"} docker compose "${args[@]}" 2>&1)"; then
         printf '%s\n' "$out" | tail -8 | sed 's/^/    /' >&2
         die "docker compose up failed (see above)."
@@ -1063,8 +1062,7 @@ main() {
 
     stage_preflight
     stage_env
-    env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"
-    env_set OPENFLOWS_SETUP_MODE "$MODE"
+    env_set OPENFLOWS_SETUP_REPO "$REPO"; env_set OPENFLOWS_SETUP_NAME "$NAME"; env_set OPENFLOWS_SETUP_FLEET "$FLEET"; env_set OPENFLOWS_SETUP_MODE "$MODE"
     [ "$MODE" = compose ] && stage_image
     [ "$MODE" = binary ] && stage_release
     stage_github_app
