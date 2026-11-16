@@ -24,10 +24,14 @@ fn main() {
     let tar = std::env::var("OPENFLOWS_TAR").unwrap_or_else(|_| "tar".to_string());
     println!("cargo:rerun-if-env-changed=OPENFLOWS_TAR");
 
-    // Watch the template tree itself, not only the sources that exist today:
-    // a commit that adds a variant (or a whole backend) must repackage it
-    // without a clean rebuild. Cargo scans a watched directory recursively.
-    println!("cargo:rerun-if-changed={}", templates_dir.display());
+    // Watch the Kubernetes variant tree, not only the sources that exist today: a
+    // commit that adds a role variant must repackage it without a clean rebuild.
+    // The packed archives are written beside this directory, not into it, so the
+    // watch cannot see the script's own output and stay dirty for ever.
+    println!(
+        "cargo:rerun-if-changed={}",
+        templates_dir.join("kubernetes").display()
+    );
 
     let mut any_rebuilt = false;
     for (source, archive) in VARIANTS {
@@ -50,15 +54,16 @@ fn main() {
 /// error: a Kubernetes variant lands role by role, and partial checkouts exist.
 fn pack(templates_dir: &Path, source: &str, archive_name: &str, tar: &str) -> bool {
     let src_dir = templates_dir.join(source);
-    // Watch a source that does not exist yet as well, so pulling the commit that
-    // adds it triggers the repack instead of leaving the archive missing.
+    // A source that does not exist yet is covered by the tree watch above. Watching
+    // its `main.tf` here would mark the script dirty on every build until it
+    // appears, so the per-source watch only starts once the directory exists.
+    if !src_dir.is_dir() {
+        return false;
+    }
     println!(
         "cargo:rerun-if-changed={}",
         src_dir.join("main.tf").display()
     );
-    if !src_dir.is_dir() {
-        return false;
-    }
     let archive = templates_dir.join(archive_name);
 
     // Repack to a temp archive and byte-compare; rewrite only when content differs.
