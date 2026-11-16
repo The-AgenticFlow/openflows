@@ -42,9 +42,30 @@ While the draft is open:
 
 After publishing:
 
-- [ ] On a clean machine, `./scripts/setup.sh owner/repo --binary` installs the release and `openflows-doctor` passes.
+- [ ] On a clean machine, `--binary` installs the release and `openflows-doctor` passes (see [Test a release install](#test-a-release-install)).
 - [ ] `--compose` does the same with the published image.
 - [ ] If the Manager runs with `OPENFLOWS_MANAGER_METRICS=true`, error rates on `/api/v1/local/github-credential` stay at their usual level (see [Metrics](#metrics)).
+
+## Test a release install
+
+On a clean Linux x86_64 machine, once for `--binary` and once for `--compose`. Replace `1.8.2` with the version under test; versions below 1.8.2 are refused.
+
+You need Docker with Compose, the `coder` CLI, a test repository you can install the App on, and an LLM API key.
+
+```bash
+mkdir -p ~/of-test && cd ~/of-test
+gh release download openflows-1.8.2 --repo The-AgenticFlow/openflows --pattern '*-setup.tar.gz'
+tar xzf openflows-1.8.2-setup.tar.gz && cd openflows-1.8.2
+cp .env.example .env    # set OPENFLOWS_VERSION=1.8.2: the kit and this value must match
+./scripts/setup.sh your-user/your-test-repo --binary    # or --compose
+```
+
+Use the real repository name: setup checks it against the repositories you selected in the console.
+
+Setup asks for, in order: your Coder sign-in and an API token, the GitHub App install and device code in the console at <http://127.0.0.1:3002>, then the LLM provider and key. It ends with "All set".
+
+- [ ] Setup finishes and `./scripts/prod.sh doctor` passes.
+- [ ] Clean up: `docker compose down -v` in the kit folder, then remove `~/.config/openflows`.
 
 ## Rollback
 
