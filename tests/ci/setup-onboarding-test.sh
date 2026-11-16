@@ -13,6 +13,8 @@ printf 'CODER_SESSION_TOKEN=\n' >"$ENV_FILE"
 [ "$(compose_files | tr '\n' ' ')" = '-f docker-compose.yml -f docker-compose.connected-local.yml ' ]
 [ "$(MODE=binary; compose_files | tr '\n' ' ')" = '-f docker-compose.yml -f docker-compose.connected-local.yml -f docker-compose.manager-image.yml ' ]
 [ "$(MODE=compose; compose_files | tr '\n' ' ')" = '-f docker-compose.yml -f docker-compose.connected-local.yml -f docker-compose.manager-image.yml -f docker-compose.images.yml ' ]
+duplicates="$(awk '/^  [a-z]/{s=$1} /^      [A-Za-z_]+:/{k=s $1; if(seen[k]++) print k}' "$REPO_ROOT/docker-compose.connected-local.yml")"
+[ -z "$duplicates" ] || { echo "docker-compose.connected-local.yml repeats keys: $duplicates" >&2; exit 1; }
 ! grep -q '^CODER_EXTERNAL_AUTH_0_' "$REPO_ROOT/.env.example"
 ! grep -q '^OPENFLOWS_GITHUB_AUTH_MODE=' "$REPO_ROOT/.env.example"
 bash -c 'set -euo pipefail; set -a; source "$1"' _ "$REPO_ROOT/.env.example"
