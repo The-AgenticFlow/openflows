@@ -282,6 +282,11 @@ resource "kubernetes_persistent_volume_claim_v1" "workspace" {
     labels    = local.labels
   }
 
+  # A StorageClass with WaitForFirstConsumer only binds once a pod arrives, and
+  # that pod is this workspace's Deployment. Waiting for the claim would deadlock
+  # the first build, so Terraform returns while it is still pending.
+  wait_until_bound = false
+
   spec {
     access_modes = ["ReadWriteOnce"]
 

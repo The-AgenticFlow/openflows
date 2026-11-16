@@ -365,7 +365,7 @@ fn controller_bootstrap_keeps_its_session_and_seeds_workers_only_locally() {
     assert_eq!(
         steps,
         [
-            "of_prepare",
+            "of_prepare --own-artifacts",
             "of_install_programs openflows openflows-harness",
             "of_load_runtime_credentials HOOK=hook_key",
             "of_register_runtime",
@@ -480,8 +480,8 @@ echo prepared"#,
     assert!(stdout(&output).contains("prepared"));
     assert_eq!(
         sudo_calls(dir.path()),
-        "",
-        "a mount the backend already handed to the workspace user needs no sudo"
+        "-n true\n",
+        "a pod that forbids escalation may only probe for sudo, never use it"
     );
 }
 
@@ -617,37 +617,14 @@ fn a_workspace_without_a_persona_ends_startup() {
 
 #[test]
 fn only_the_privileged_preparation_uses_sudo() {
-    // A backend that hands the paths over writable — a Kubernetes PVC mounted
-    // with fsGroup — must not need sudo at all: a pod that forbids privilege
-    // escalation and adds no capabilities cannot use it.
-    let writable = tempfile::tempdir().unwrap();
-    let output = run(writable.path(), &format!("{PATHS}of_prepare"));
+    // Where sudo works (Docker), startup repairs ownership exactly as before:
+    // the workspace paths for every role, and the artifacts mount recursively
+    // only for the controller, because a worker mounts it read-only.
+    let worker = tempfile::tempdir().unwrap();
+    let output = run(worker.path(), &format!("{PATHS}of_prepare"));
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        sudo_calls(writable.path()),
-        "",
-        "a writable mount must prepare without sudo"
-    );
-    assert!(
-        stderr(&output).contains("Workspace runtime"),
-        "startup must log which runtime it loaded"
-    );
-
-    // A root-owned volume — the Docker case — still gets the privileged
-    // preparation, and nothing but it.
-    if running_as_root() {
-        // Every path is writable for root, so the second case cannot arise.
-        return;
-    }
-    let root_owned = tempfile::tempdir().unwrap();
-    let workspace = root_owned.path().join("ws");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let output = run(root_owned.path(), &format!("{PATHS}of_prepare"));
-    let calls = sudo_calls(root_owned.path());
-    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    for call in calls.lines() {
+    let calls = sudo_calls(worker.path());
+    for call in calls.lines().filter(|call| *call != "-n true") {
         assert!(
             call.starts_with("mkdir ") || call.starts_with("chown ") || call.starts_with("find "),
             "of_prepare ran an unexpected privileged command: {call}"
@@ -655,7 +632,31 @@ fn only_the_privileged_preparation_uses_sudo() {
     }
     assert!(
         calls.contains("find ") && calls.contains("-exec chown "),
-        "a root-owned workspace must be handed to the workspace user"
+        "every role takes its workspace paths"
+    );
+    assert!(
+        !calls.contains("chown -R"),
+        "a worker must not recurse into its read-only artifacts mount"
+    );
+    assert!(
+        stderr(&output).contains("Workspace runtime"),
+        "startup must log which runtime it loaded"
+    );
+
+    if running_as_root() {
+        // Root can write every path, so the ownership repair is still exercised
+        // through the recorded calls above.
+        return;
+    }
+    let controller = tempfile::tempdir().unwrap();
+    let output = run(
+        controller.path(),
+        &format!("{PATHS}of_prepare --own-artifacts"),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        sudo_calls(controller.path()).contains("chown -R"),
+        "the controller takes the artifacts volume it seeds"
     );
 }
 

@@ -73,22 +73,23 @@ of_curl_auth() {
     curl -H @<(printf 'Authorization: %s %s\n' "$scheme" "$token") "$@"
 }
 
-# of_prepare — create the state directory and give the workspace paths to the
-# coder user. A Docker volume arrives root-owned, and the artifacts volume Nexus
-# seeds mounts under ~/.openflows as root; a Kubernetes PVC arrives writable
-# through its fsGroup, so only the first needs sudo.
+# of_prepare [--own-artifacts] — create the state directory and give the
+# workspace paths to the coder user. A mounted volume arrives root-owned and a
+# previous root run can leave root-owned files behind, so a backend that can
+# escalate repairs them; a Kubernetes pod that forbids privilege escalation and
+# adds no capabilities cannot, and receives the paths writable through its
+# fsGroup instead. --own-artifacts (Nexus) also takes the tenant artifacts
+# volume it seeds, which only that role mounts read-write.
 of_prepare() {
-    if ! mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows" 2>/dev/null; then
+    if sudo -n true 2>/dev/null; then
         sudo mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows"
-    fi
-    if [ ! -w "$OF_WORKSPACE" ]; then
+        sudo chown coder:coder "$OF_HOME/.openflows"
         sudo find "$OF_WORKSPACE" -xdev \! -user coder -exec chown -h coder:coder {} +
-    fi
-    # The recursive fix covers the artifacts volume Nexus seeds, which mounts
-    # under this directory. A directory the backend already made writable is in
-    # the workspace user's hands.
-    if [ ! -w "$OF_HOME/.openflows" ]; then
-        sudo chown -R coder:coder "$OF_HOME/.openflows"
+        if [ "${1:-}" = --own-artifacts ]; then
+            sudo chown -R coder:coder "$OF_HOME/.openflows"
+        fi
+    else
+        mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows"
     fi
     mkdir -p "$OF_STATE_DIR"
     of_log "Workspace runtime $OF_RUNTIME_VERSION (API $OF_RUNTIME_API) from $OF_RUNTIME_DIR"
@@ -626,7 +627,7 @@ of_bootstrap_worker() {
 # session (it calls the Manager itself) and reports its own readiness after
 # opening its tenant store.
 of_bootstrap_controller() {
-    of_prepare
+    of_prepare --own-artifacts
     of_install_programs openflows openflows-harness
     if of_hosted; then
         of_load_runtime_credentials "$@"

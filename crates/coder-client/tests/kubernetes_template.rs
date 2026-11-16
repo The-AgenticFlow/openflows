@@ -68,6 +68,12 @@ fn the_workspace_home_survives_stop_and_start() {
         "the workspace PVC must outlive a stop, not follow start_count"
     );
     assert!(claim.contains(r#"access_modes = ["ReadWriteOnce"]"#));
+    // A WaitForFirstConsumer class only binds once the pod exists, and the pod is
+    // created after this claim: waiting here would deadlock the first build.
+    assert!(
+        claim.contains("wait_until_bound = false"),
+        "the claim must not wait for a consumer that cannot exist yet"
+    );
 }
 
 #[test]
