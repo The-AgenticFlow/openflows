@@ -36,22 +36,9 @@ variable "connected_local_helper_host_path" {
 }
 
 variable "workspace_image" {
-  description = "Workspace image for local workspaces: the OpenFlows workspace image of the templates' release. Setup pins it by digest (OPENFLOWS_WORKSPACE_IMAGE); a source install builds openflows-workspace:dev. There is no floating default, so local workspaces never run a runtime of another release."
+  description = "STANDALONE TEMPLATE USE ONLY. A mutable release tag used when no workspace_image_digest parameter is set. Manager-provisioned workspaces never use it: Manager always passes workspace_image_repository plus a sha256 workspace_image_digest from the validated workspace-runtime release."
   type        = string
-  default     = ""
-}
-
-variable "workspace_image_repository" {
-  description = "Repository of the hosted workspace image. The template release pins its digest (workspace_image_digest)."
-  type        = string
-  default     = "ghcr.io/the-agenticflow/openflows-workspace"
-}
-
-locals {
-  # Without an explicit image, local workspaces get a reference that cannot be
-  # pulled and whose tag names the setting to fix, instead of a floating tag
-  # whose runtime may belong to another release.
-  local_workspace_image = var.workspace_image != "" ? var.workspace_image : "${var.workspace_image_repository}:unset-set-TF_VAR_workspace_image-or-OPENFLOWS_WORKSPACE_IMAGE"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-nexus:v0.2.0"
 }
 
 variable "github_api_base" {
@@ -211,6 +198,14 @@ data "coder_parameter" "runtime_secret_ref" {
   mutable     = false
 }
 
+data "coder_parameter" "workspace_image_repository" {
+  name        = "workspace_image_repository"
+  description = "Release-pinned container repository for the Nexus workspace image"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-nexus"
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "workspace_image_digest" {
   name        = "workspace_image_digest"
   description = "Release-pinned sha256 digest for the hosted workspace image"
@@ -237,13 +232,14 @@ resource "coder_agent" "main" {
     [ "$${OF_RUNTIME_API:-}" = 1 ] || { echo "FATAL: $OF_RUNTIME_LIB provides workspace runtime API '$${OF_RUNTIME_API:-none}' but this template needs 1; use the workspace image of the templates' release" >&2; exit 1; }
     OF_HOSTED="${data.coder_parameter.hosted.value}"
     OF_CONNECTED_LOCAL="${var.connected_local}"
+    OF_RUNTIME_SECRET_REF="${data.coder_parameter.runtime_secret_ref.value}"
     OF_REPO_URL="${data.coder_parameter.repo_url.value}"
 
     # Nexus owns the tenant artifacts volume (local mode) and seeds the golden
     # checkout workers copy. Hosted Nexus also receives the tenant's lifecycle
     # hook key and URL from the runtime secret.
     of_bootstrap_controller CODER_CHAT_HOOK_SECRET=hook_key CODER_CHAT_HOOK_URL=hook_url
-    if of_hosted; then
+    if of_has_runtime_secret; then
       # The controller uses this Manager runtime session for hosted
       # control-plane calls; Coder user credentials never reach the workspace.
       export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
@@ -260,7 +256,7 @@ resource "coder_agent" "main" {
     # deployment-wide hook signing secret, and keeps the tenant-scoped Redis
     # endpoint it loaded from the runtime secret: parameters are visible to
     # Coder and are not the secret delivery channel.
-    if ! of_hosted; then
+    if ! of_has_runtime_secret; then
       export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
       export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
       export OPENFLOWS_DOCS_GATE_SECRET="${data.coder_parameter.docs_gate_secret.value}"
@@ -300,20 +296,18 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Tenant artifacts volume, local mode only. Nexus seeds the golden repository
-# clone here and publishes the instruction bundle; local workers mount it
-# read-only. A hosted workspace installs the bundle from the Manager and clones
+# Tenant golden repository volume, local mode only. A hosted workspace clones
 # from the remote with its own brokered credential, so hosted mode creates no
 # shared volume and requires no read-write-many storage.
-resource "docker_volume" "artifacts" {
+resource "docker_volume" "golden" {
   count = data.coder_parameter.hosted.value != "true" ? 1 : 0
-  name  = "openflows-artifacts-${data.coder_parameter.tenant.value}"
+  name  = "openflows-golden-${data.coder_parameter.tenant.value}"
 }
 
 resource "docker_container" "workspace" {
   count = data.coder_workspace.me.start_count
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
-  image = data.coder_parameter.hosted.value == "true" ? "${var.workspace_image_repository}@${data.coder_parameter.workspace_image_digest.value}" : local.local_workspace_image
+  image = data.coder_parameter.workspace_image_digest.value != "" ? "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
   # The workspace image is published for linux/amd64 only; Docker emulates
   # it on Apple Silicon and other ARM64 hosts.
   platform = "linux/amd64"
@@ -331,14 +325,14 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel).
-  # Local mode only: a hosted Nexus keeps the tree in its own workspace and
-  # publishes nothing that another workspace has to mount.
+  # Tenant golden repository volume, local mode only. Nexus seeds it; local
+  # workers mount it read-only. Mounted at a path distinct from the role assets
+  # (`$HOME/.openflows/artifacts`, installed from the pinned image).
   dynamic "volumes" {
     for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
     content {
-      container_path = "/home/coder/.openflows/artifacts"
-      volume_name    = docker_volume.artifacts[0].name
+      container_path = "/home/coder/.openflows/golden"
+      volume_name    = docker_volume.golden[0].name
     }
   }
 
@@ -353,7 +347,7 @@ resource "docker_container" "workspace" {
   }
 
   dynamic "volumes" {
-    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    for_each = data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
     content {
       container_path = "/run/openflows/runtime.json"
       host_path      = data.coder_parameter.runtime_secret_ref.value
@@ -392,6 +386,7 @@ resource "docker_container" "workspace" {
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
+    "OPENFLOWS_ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
     # reach it over the shared docker network (issue #143). Workspaces address

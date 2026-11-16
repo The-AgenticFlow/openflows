@@ -13,8 +13,13 @@ pub mod backend;
 pub mod packaging;
 pub mod repository;
 pub mod service;
+pub mod workspace_runtime;
 
 pub use backend::{ProvisionerBackend, ReleaseCompatibilityTarget};
 pub use packaging::{build_deterministic_archive, Role, RoleManifestEntry, TemplateManifest};
 pub use repository::ReleaseRepository;
 pub use service::ReleaseService;
+pub use workspace_runtime::{
+    WorkspaceRuntimeCompatibilityOptions, WorkspaceRuntimeImage, WorkspaceRuntimeManifest,
+    WorkspaceRuntimeStatus,
+};

@@ -18,6 +18,8 @@ case "$scenario" in
             *) printf 'Usage: %s install source|compose|binary\n' "$0" >&2; exit 2 ;;
         esac
         category="clean-install-$OPENFLOWS_E2E_MODE"; driver=clean_install.py; model=bootstrap-model.json ;;
+    workspace-runtime)
+        category=workspace-runtime; driver=workspace_runtime_e2e.py; model=bootstrap-model.json ;;
     *) printf 'Unknown E2E scenario: %s\n' "$scenario" >&2; exit 2 ;;
 esac
 project="openflows-${scenario}-$(date +%s)-$$"
@@ -28,6 +30,7 @@ export OPENFLOWS_SYSTEM_FIXTURE_IMAGE="$project-fixtures:ci"
 export OPENFLOWS_E2E_MODEL_SCENARIO="/opt/fixtures/$model"
 compose=(docker compose --env-file /dev/null -p "$project" -f "$PWD/tests/e2e/compose.yml" -f "$PWD/tests/e2e/system/bootstrap.compose.yml")
 [ "$scenario" != upgrade ] || compose+=(-f "$PWD/tests/e2e/system/upgrade.compose.yml")
+[ "$scenario" != workspace-runtime ] || compose+=(-f "$PWD/tests/e2e/system/manager.compose.yml")
 remove_resource() {
     local kind="$1" name="$2" filter remaining
     if [ "$kind" = image ]; then
@@ -71,8 +74,10 @@ cleanup() {
             remove_resource volume "$volume" || result=1
         done < <(sort -u "$scratch/volumes")
     fi
-    remove_resource image "$project-workspace:ci" || result=1
-    remove_resource image "$project-runtime:ci" || result=1
+    if [ "$scenario" != workspace-runtime ]; then
+        remove_resource image "$project-workspace:ci" || result=1
+        remove_resource image "$project-runtime:ci" || result=1
+    fi
     [ "$scenario" != upgrade ] || remove_resource image "$project-workspace:ci-upgrade" || result=1
     remove_resource image "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" || result=1
     rm -rf "$scratch"
@@ -81,15 +86,41 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cargo build --locked -p openflows --bin openflows --bin openflows-doctor -p openflows-harness --bin openflows-harness 2>&1 | tee "$artifacts/build.log"
-mkdir -p "$scratch/bin" "$scratch/home"
-cp target/debug/openflows target/debug/openflows-doctor target/debug/openflows-harness "$scratch/bin/"
+if [ "$scenario" = workspace-runtime ]; then
+    cargo build --locked -p openflows --bin openflows -p openflows-manager --bin openflows-manager 2>&1 | tee "$artifacts/build.log"
+    mkdir -p "$scratch/bin" "$scratch/dev-bin" "$scratch/home"
+    cp target/debug/openflows-manager "$scratch/bin/"
+    cp target/debug/openflows "$scratch/dev-bin/"
+    mkdir -p "$scratch/dev-bin/runtime"
+    cp -r runtime/lib runtime/bin runtime/VERSION "$scratch/dev-bin/runtime/"
+else
+    cargo build --locked -p openflows --bin openflows --bin openflows-doctor -p openflows-harness --bin openflows-harness 2>&1 | tee "$artifacts/build.log"
+    mkdir -p "$scratch/bin" "$scratch/home"
+    cp target/debug/openflows target/debug/openflows-doctor target/debug/openflows-harness "$scratch/bin/"
+fi
 docker build -t "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" tests/e2e/system 2>&1 | tee "$artifacts/fixtures-image.log"
-# The workspace image is the OpenFlows runtime image built from this checkout with the
-# candidate programs, so workspaces run them without a development mount.
-runtime/build-image.sh "$project-runtime:ci" "$scratch/bin" 2>&1 | tee "$artifacts/runtime-image.log"
-docker build --build-arg RUNTIME_IMAGE="$project-runtime:ci" -t "$project-workspace:ci" \
-    -f tests/e2e/system/workspace.Dockerfile tests/e2e/system 2>&1 | tee "$artifacts/workspace-image.log"
+if [ "$scenario" != workspace-runtime ]; then
+    # The workspace image is the OpenFlows runtime image built from this checkout with the
+    # candidate programs, so workspaces run them without a development mount.
+    runtime/build-image.sh "$project-runtime:ci" "$scratch/bin" 2>&1 | tee "$artifacts/runtime-image.log"
+    docker build --build-arg RUNTIME_IMAGE="$project-runtime:ci" -t "$project-workspace:ci" \
+        -f tests/e2e/system/workspace.Dockerfile tests/e2e/system 2>&1 | tee "$artifacts/workspace-image.log"
+fi
+export TF_VAR_docker_network="${project}_default"
+export TF_VAR_github_api_base=http://github-fixture:8080
+export TF_VAR_github_git_base="git://github-fixture:9418"
+if [ "$scenario" = workspace-runtime ]; then
+    export TF_VAR_dev_binary_host_path="$scratch/dev-bin"
+    export TF_VAR_connected_local_manager_url=http://openflows-manager:3002
+else
+    export TF_VAR_dev_binary_host_path="$scratch/bin"
+    export TF_VAR_connected_local_manager_url=http://github-fixture:8080
+fi
+printf '%s' ci-broker-key >"$scratch/broker-key"
+chmod 600 "$scratch/broker-key"
+export TF_VAR_connected_local=true
+export TF_VAR_connected_local_broker_secret_host_path="$scratch/broker-key"
+export TF_VAR_connected_local_helper_host_path="$PWD/scripts/connected-local-github.py"
 "${compose[@]}" up -d --wait --wait-timeout 120
 coder_id=$("${compose[@]}" ps -q coder)
 docker cp "$coder_id:/opt/coder" "$scratch/bin/coder"
@@ -107,16 +138,10 @@ export REDIS_URL="redis://$("${compose[@]}" port redis 6379)"
 export CODER_CHAT_HOOK_SECRET=disposable-ci-hook-secret-at-least-32-bytes
 export CODER_CHAT_HOOK_URL=http://openflows-nexus:3001/experimental/hooks/chat
 export GITHUB_GIT_BASE=git://github-fixture:9418
-export TF_VAR_docker_network="${project}_default"
 export TF_VAR_workspace_image="$project-workspace:ci"
-export TF_VAR_github_api_base=http://github-fixture:8080
-export TF_VAR_github_git_base="$GITHUB_GIT_BASE"
-printf '%s' ci-broker-key >"$scratch/broker-key"
-chmod 600 "$scratch/broker-key"
-export TF_VAR_connected_local=true
-export TF_VAR_connected_local_broker_secret_host_path="$scratch/broker-key"
-export TF_VAR_connected_local_helper_host_path="$PWD/scripts/connected-local-github.py"
-export TF_VAR_connected_local_manager_url=http://github-fixture:8080
+if [ "$scenario" = workspace-runtime ]; then
+    export OPENFLOWS_E2E_MANAGER_DB_URL="postgres://openflows:openflows@$("${compose[@]}" port openflows-db 5432)/openflows_control_plane"
+fi
 export OPENFLOWS_E2E_OAUTH_URL="http://$("${compose[@]}" port oauth 8080)"
 export OPENFLOWS_E2E_ARTIFACTS="$artifacts"
 export OPENFLOWS_E2E_GITHUB_URL="http://$("${compose[@]}" port github-fixture 8080)"

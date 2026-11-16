@@ -120,18 +120,24 @@ pub fn to_http_response(error: &ManagerError) -> (u16, serde_json::Value) {
         ),
         ManagerError::Conflict(msg) => (409, "CONFLICT".to_string(), msg.clone(), false),
         ManagerError::InvalidInput(msg) => (422, "INVALID_INPUT".to_string(), msg.clone(), false),
-        ManagerError::Config(_) | ManagerError::Io(_) | ManagerError::Migration(_) => (
-            503,
-            "INTERNAL".to_string(),
-            "internal service error".to_string(),
-            false,
-        ),
-        ManagerError::Service(_) | ManagerError::Database(_) => (
-            503,
-            "INTERNAL".to_string(),
-            "internal service error".to_string(),
-            false,
-        ),
+        ManagerError::Config(_) | ManagerError::Io(_) | ManagerError::Migration(_) => {
+            tracing::warn!(error = %error, "internal service error");
+            (
+                503,
+                "INTERNAL".to_string(),
+                "internal service error".to_string(),
+                false,
+            )
+        }
+        ManagerError::Service(_) | ManagerError::Database(_) => {
+            tracing::warn!(error = %error, "internal service error");
+            (
+                503,
+                "INTERNAL".to_string(),
+                "internal service error".to_string(),
+                false,
+            )
+        }
     };
 
     let body = serde_json::json!({

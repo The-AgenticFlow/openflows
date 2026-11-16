@@ -44,7 +44,7 @@ OF_STATE_DIR=/home/coder/.local/state/openflows
 OF_READY_FILE=/tmp/openflows-manager-ready
 OF_API_TOKEN_FILE=/home/coder/.config/openflows/github-api-token
 OF_GIT_CREDENTIALS=/home/coder/.git-credentials
-OF_GOLDEN_REPO=/home/coder/.openflows/artifacts/repo
+OF_GOLDEN_REPO=/home/coder/.openflows/golden/repo
 OF_BIN_DIR=/usr/local/bin
 OF_DEV_DIR=/opt/openflows-dev
 OF_SUDOERS_FILE=/etc/sudoers.d/coder
@@ -59,6 +59,7 @@ of_fatal() {
 }
 of_hosted() { [ "${OF_HOSTED:-false}" = true ]; }
 of_connected_local() { [ "${OF_CONNECTED_LOCAL:-false}" = true ]; }
+of_has_runtime_secret() { of_hosted || [ -n "${OF_RUNTIME_SECRET_REF:-}" ]; }
 
 # of_json_field FIELD — print FIELD of the JSON document on stdin.
 of_json_field() {
@@ -231,6 +232,9 @@ of_store_git_credentials() {
         of_write_git_credentials "$OF_GIT_CREDENTIALS" "$GIT_TOKEN"
         of_log "Configured git credentials for GitHub"
     fi
+    if [ -n "${GITHUB_GIT_BASE:-}" ] && [ "${GITHUB_GIT_BASE}" != "https://github.com" ]; then
+        git config --global "url.${GITHUB_GIT_BASE%/}/.insteadOf" "https://github.com/"
+    fi
 }
 
 # of_store_api_token — write API_TOKEN to the file the harness reads for pull
@@ -285,7 +289,13 @@ of_configure_git_identity() {
 # reads the tenant artifacts volume the Nexus workspace seeds.
 of_install_artifact_bundle() {
     ASSETS_DIR="$OF_HOME/.openflows/artifacts"
-    if of_hosted; then
+    if command -v openflows-runtime >/dev/null 2>&1; then
+        mkdir -p "$ASSETS_DIR"
+        of_log "Installing role assets for ${OF_ROLE:-unknown} via openflows-runtime install"
+        if ! OPENFLOWS_ROLE="${OF_ROLE:-}" openflows-runtime install; then
+            of_fatal "cannot install the workspace artifact bundle"
+        fi
+    elif of_hosted; then
         ASSETS_DIR="$OF_HOME/.openflows/bundle"
         mkdir -p "$ASSETS_DIR"
         of_log "Installing the workspace artifact bundle from the Manager"
@@ -507,16 +517,25 @@ of_install_role_instructions() {
     persona="$root/agent/agents/$role.agent.md"
     manifest="$root/agent/roles/$role.skills"
     [ -f "$persona" ] || of_fatal "hosted instruction bundle is missing $persona"
-    [ -f "$manifest" ] || of_fatal "hosted skill manifest is missing $manifest"
     cp "$persona" "$OF_WORKSPACE/AGENTS.md"
     cp "$persona" "$OF_WORKSPACE/$role.agent.md"
     mkdir -p "$OF_WORKSPACE/.agents/skills" "$OF_WORKSPACE/.agents/commands"
-    while IFS= read -r skill; do
-        [ -z "$skill" ] && continue
-        mkdir -p "$OF_WORKSPACE/.agents/skills/$skill"
-        cp "$root/plugin/skills/$skill/SKILL.md" "$OF_WORKSPACE/.agents/skills/$skill/SKILL.md"
-    done < "$manifest"
-    cp -R "$root/plugin/commands/." "$OF_WORKSPACE/.agents/commands/"
+    if [ -f "$manifest" ]; then
+        while IFS= read -r skill; do
+            [ -z "$skill" ] && continue
+            mkdir -p "$OF_WORKSPACE/.agents/skills/$skill"
+            cp "$root/plugin/skills/$skill/SKILL.md" "$OF_WORKSPACE/.agents/skills/$skill/SKILL.md"
+        done < "$manifest"
+    elif [ -d "$ASSETS_DIR/plugin/skills" ]; then
+        cp -a "$ASSETS_DIR/plugin/skills/." "$OF_WORKSPACE/.agents/skills/"
+    else
+        of_fatal "hosted skill manifest is missing $manifest"
+    fi
+    if [ -d "$root/plugin/commands" ]; then
+        cp -R "$root/plugin/commands/." "$OF_WORKSPACE/.agents/commands/"
+    elif [ -d "$ASSETS_DIR/plugin/commands" ]; then
+        cp -a "$ASSETS_DIR/plugin/commands/." "$OF_WORKSPACE/.agents/commands/"
+    fi
     for standard in CODING.md SECURITY.md REVIEW.md; do
         [ ! -f "$root/agent/standards/$standard" ] || cp "$root/agent/standards/$standard" "$OF_WORKSPACE/"
     done
@@ -595,7 +614,7 @@ of_bootstrap_worker() {
     [ "${OF_GITHUB_API_TOKEN:-false}" != true ] || api=--api
     of_prepare
     of_install_programs openflows-harness
-    if of_hosted; then
+    if of_has_runtime_secret; then
         of_load_runtime_credentials
         of_register_runtime
     fi
@@ -629,9 +648,12 @@ of_bootstrap_worker() {
 of_bootstrap_controller() {
     of_prepare --own-artifacts
     of_install_programs openflows openflows-harness
-    if of_hosted; then
+    if of_has_runtime_secret; then
         of_load_runtime_credentials "$@"
         of_register_runtime
+    fi
+    if command -v openflows-runtime >/dev/null 2>&1; then
+        OF_ROLE="${OF_ROLE:-nexus}" of_install_artifact_bundle
     fi
     of_resolve_github_tokens
     of_store_git_credentials required

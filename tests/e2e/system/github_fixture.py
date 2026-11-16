@@ -7,7 +7,7 @@ from git_repository import Repository, git
 
 TOKENS = {'ci-forge-token': 'forge', 'ci-sentinel-token': 'sentinel',
     'ci-vessel-token': 'vessel', 'ci-runner-token': 'ci', 'ci-operator-token': 'operator',
-    'ci-reviewer-token': 'reviewer'}
+    'ci-reviewer-token': 'reviewer', 'local-github-access-token': 'operator'}
 
 
 class GitHub:
@@ -48,6 +48,39 @@ class GitHub:
         parts = parsed.path.strip('/').split('/')
         if method == 'GET' and parts == ['user']:
             return 200, {'login': role, 'id': list(TOKENS.values()).index(role) + 1}
+        if method == 'GET' and parts == ['user', 'installations']:
+            return 200, {
+                'total_count': 1,
+                'installations': [{
+                    'id': 1001,
+                    'app_id': 1,
+                    'app_slug': 'openflows-local',
+                    'account': {'login': 'test', 'id': 1, 'type': 'Organization'},
+                }],
+            }
+        if method == 'GET' and parts == ['user', 'installations', '1001', 'repositories']:
+            return 200, {
+                'total_count': 1,
+                'repositories': [{
+                    'id': 1,
+                    'full_name': 'test/repo',
+                    'name': 'repo',
+                    'private': False,
+                    'default_branch': 'main',
+                    'permissions': {'push': True, 'pull': True},
+                    'owner': {'login': 'test'},
+                }],
+            }
+        if method == 'GET' and parts == ['user', 'repos']:
+            return 200, [{
+                'id': 1,
+                'full_name': 'test/repo',
+                'name': 'repo',
+                'private': False,
+                'default_branch': 'main',
+                'permissions': {'push': True, 'pull': True},
+                'owner': {'login': 'test'},
+            }]
         if parts[:3] != ['repos', 'test', 'repo']:
             self.fail(404, 'Unsupported fixture repository or endpoint')
         route = parts[3:]

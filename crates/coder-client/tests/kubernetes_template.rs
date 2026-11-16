@@ -47,7 +47,7 @@ fn the_pod_follows_coder_start_count_and_the_amd64_image() {
     assert!(deployment.contains("count = data.coder_workspace.me.start_count"));
     assert!(deployment.contains(r#""kubernetes.io/arch" = "amd64""#));
     assert!(
-        NEXUS.contains(r#"image = "${var.workspace_image_repository}@${data.coder_parameter.workspace_image_digest.value}""#),
+        NEXUS.contains(r#"image = "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}""#),
         "the pod must run the release-pinned image digest"
     );
 }

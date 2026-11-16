@@ -123,6 +123,15 @@ struct RepositoryList {
 }
 
 impl LocalGithubAuth {
+    pub fn with_oauth_base(mut self, base: &str) -> Self {
+        let trimmed = base.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            self.device_url = format!("{trimmed}/login/device/code");
+            self.token_url = format!("{trimmed}/login/oauth/access_token");
+        }
+        self
+    }
+
     pub fn new(client_id: String) -> Result<Self, ManagerError> {
         if client_id.trim().is_empty() {
             return Err(ManagerError::Config(
