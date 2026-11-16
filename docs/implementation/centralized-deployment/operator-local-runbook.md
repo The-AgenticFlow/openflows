@@ -124,8 +124,17 @@ to start the Manager or check its API. Then start everything (Coder, databases,
 Redis, relay, the Manager, and the Console) with one command:
 
 ```sh
-docker compose --env-file .env.openflows -f deployment.compose.yml up -d
+./scripts/up.sh
 ```
+
+It detects the user and Docker group ids the Manager container needs, creates
+the provisioner credential directory, points `OPENFLOWS_HOOK_URL` and
+`OPENFLOWS_RUNTIME_MANAGER_URL` at the Compose Manager (keeping a
+`.env.openflows.bak`), starts the stack, waits until the Manager and Console
+answer, and prints their URLs. Add `--pull` to fetch a newer Console image. It is
+safe to re-run, and it stops without changing anything if the install was saved
+for a host Manager (see below). The equivalent plain command is
+`docker compose --env-file .env.openflows -f deployment.compose.yml up -d`.
 
 The Manager image is built from this checkout the first time (a few minutes).
 The Console is pulled from GHCR and served on `http://127.0.0.1:3000`; it
