@@ -77,8 +77,8 @@ On provision, the Coder template's **startup script** runs a fixed sequence (§5
 1. **Install Harness A (the `openflows` binary)** — mandatory; startup fails if it is missing or not on `PATH`. It is **pulled from a GitHub Release at provision time**, not baked into a base image (except the local dev override). See §3.1 for the full release/install model.
 2. **Install the Agent Harness (B)** — pulled/provisioned as a first-class, versioned artifact and unpacked into the workspace (today the Controller's `Provisioner` copies its files in via `~/.openflows/`; the target is a packaged install with a pinned version). Under the target plugin-FS contract (see §7) this yields a self-describing `~/.openflows/` tree the Coder agent calls explicitly. See §3.1a for the release/install model.
 3. **Wire environment** — set the ticket/role/tenant/Redis/A2A variables above, then register to obtain a runtime session.
-4. **Install the role asset bundle** — a hosted workspace runs `openflows-harness artifacts fetch` and installs the persona, skills, commands, standards and hooks from the bundle the Manager serves for this release. The archive is verified against its sha256 before anything is written, so a corrupt or unexpected release fails startup instead of producing a half-configured agent. Local mode reads the tenant artifacts volume instead. See §3.3.
-5. **Acquire the repository** — the worker copies the repo from a shared **golden mount clone** (rather than a per-spawn network clone) and checks out the pair branch (FORGE) or the target for review (SENTINEL). See §3.2.
+4. **Install the role asset bundle** — a hosted workspace runs `openflows-harness artifacts fetch` and installs the persona, skills, commands, standards and hooks from the bundle the Manager serves for this release. The archive is verified against its sha256 before anything is written and pinned to the bundle the harness was built with, so a corrupt archive or a Manager serving a different bundle fails startup instead of producing a half-configured agent. Local mode reads the tenant artifacts volume instead. See §3.3.
+5. **Acquire the repository** — local mode copies the repo from a shared **golden mount clone** instead of a per-spawn network clone; hosted mode has no shared volume and clones with the credential the Manager brokered at registration. Either way the worker checks out the pair branch (FORGE) or the target for review (SENTINEL). See §3.2.
 6. **Start the heartbeat** daemon (writes a Redis key every 30s with a 120s TTL — see §6).
 7. **Verify the Agent Harness (B) surface** — skills, MCP, standards, and persona are installed and discoverable (see §4).
 8. **FORGE only: start the A2A executor daemon** — Harness A `openflows worker verify serve` (see §5.4).
@@ -87,23 +87,22 @@ Under the hood, file materialization is performed by the **Provisioner** (`crate
 
 ### 3.1 The Harness A release & install model
 
-The worker installs **Harness A** (the `openflows` binary, whose `worker` command surface is the coordination CLI) by runtime download at boot (`crates/coder-client/templates/openflows-forge/main.tf:85-123`, mirrored in the sentinel/vessel/lore templates):
+The worker gets **Harness A** (the `openflows` and `openflows-harness` programs) from the OpenFlows workspace image it starts from, `ghcr.io/the-agenticflow/openflows-workspace:<version>`, built from `runtime/Dockerfile`. The image also holds the shared startup steps (`runtime/lib/bootstrap.sh`) that every role template sources; each template keeps only its role's settings and commands.
 
-1. **Local dev override** — if `/opt/openflows-dev/openflows` is bind-mounted (local testing), copy it and skip the download.
-2. **Download** — `curl -fsSL --retry 3` from `…/releases/download/{harness_version}/openflows-{harness_version}-x86_64-unknown-linux-musl.tar.gz` (the single `openflows` release tarball), where `harness_version` defaults to `harness-edge` (latest main-branch build) or a pinned tag/version.
-3. **Extract + install** — untar to `/tmp`, locate the `openflows-*` dir, `sudo mv` the `openflows` binary to `/usr/local/bin/openflows`, `chmod +x`.
-4. **Fail loudly** — retry 3x; if still not executable, log `FATAL` and `exit 1` so the workspace never comes up uncoordinated.
+1. **From the image** — the release builds the workspace image with the programs of the `openflows` image of the same version and pins it by digest: hosted workspaces through the template release manifest (`image_repository`, `image_digest`, `architecture`, `workspace_runtime_release`), local installs through `OPENFLOWS_WORKSPACE_IMAGE` set by setup. Nothing is downloaded at boot.
+2. **Optional local dev override** — when `.dev-binaries` is mounted at `/opt/openflows-dev` (`TF_VAR_dev_binary_host_path`, a source install), its Linux x86-64 programs and runtime scripts replace the image's. A program built for another system is ignored with a warning.
+3. **Fail loudly** — if a required program is missing, startup logs `FATAL` and exits 1, so the workspace never comes up uncoordinated.
+
+Because the image and the template bundle come from the same release, the programs a workspace runs always match the Manager's release; no separate harness version has to be kept in line.
 
 **Release concept — one binary everywhere.** There is **one** `openflows` binary that contains both the Controller (`openflows run`) and the Worker surface (`openflows worker …`); the four roles (FORGE, SENTINEL, VESSEL, LORE) are not separate binaries — they are the same worker command surface driven by different `OPENFLOWS_ROLE`/`OPENFLOWS_TICKET` env plus the role-scoped Agent Harness (B) content (hooks/skills/persona). The release therefore publishes two independently releasable pieces:
 
 | Artifact | Contains | Deployed to |
 |----------|----------|-------------|
-| `openflows-<ver>-<target>.tar.gz` | The single binary (`openflows`, `openflows-doctor`) | Control plane (`openflows run`) **and** every worker workspace (`openflows worker …`), **installed** at boot (§3.1) |
+| `openflows-<ver>-<target>.tar.gz` | The single binary (`openflows`, `openflows-doctor`) | Control plane (`openflows run`) on the host; every workspace gets the same programs from the workspace image (§3.1) |
 | `agent-harness-<ver>-<target>.tar.gz` | **Harness B** — hooks · commands · skills · mcp · personas · standards (the §7 plugin tree) | Every worker workspace, **installed** at boot via `openflows install` (§3.1a) |
 
 Both the Controller and Harness A share **one version number and one binary** (no divergent versions, no separate artifact to reconcile). The asset name is exact and versioned (`openflows-<ver>-<target>.tar.gz`) so unattended startup scripts can `curl` a stable, predictable URL and (with the shipped `.sha256`) verify integrity before installing. The Agent Harness (B) is its **own independently versioned, installed artifact** (see §3.1a) — which is exactly why the two "harness" names stay distinct even though Harness A is no longer a separate executable.
-
-> **Alignment note:** the templates reference the worker asset as `openflows-{harness_version}-x86_64-unknown-linux-musl.tar.gz`, matching the single `openflows` release tarball produced by `release-assets.yml`, so the worker and the controller now resolve the same artifact name.
 
 ### 3.1a The Agent Harness (B) release & install model
 
@@ -112,7 +111,7 @@ The Agent Harness (Harness B) is **installed and provisioned just like Harness A
 1. **Controller-side provisioning (today).** The `Provisioner` (`crates/provisioner/src/provision.rs:27`) copies the Agent Harness files *into* the workspace over `WorkspaceTransport` — skills → `.agents/skills/`, `.mcp.json`, standards, personas/`AGENTS.md`. Because workspaces share no filesystem, the Controller copies rather than mounts (see the transport note at the end of §3).
 2. **Workspace-side package install (target).** The Agent Harness ships as a **versioned, independently released artifact** (its own project), pulled at boot and unpacked to `~/.openflows/` by `openflows install` (§7) — the plugin-tree analogue of Harness A's download-and-install. This gives B the same properties A has: a pinned/`-edge` version, a predictably named asset with integrity verification, and a **fail-loud** rule (the workspace never boots with a partially installed Agent Harness).
 
-**Versioning.** Harness A and the Controller share one version number and one binary; the Agent Harness (B) is **versioned independently** because it is its own project. The workspace pins/validates whichever `agent-harness` revision it resolved, mirroring how Harness A validates its `harness_version` — so a worker is never held to an outdated or partial Agent Harness.
+**Versioning.** Harness A and the Controller share one version number and one binary; the Agent Harness (B) is **versioned independently** because it is its own project. The workspace pins/validates whichever `agent-harness` revision it resolved, as Harness A is pinned by the workspace image digest — so a worker is never held to an outdated or partial Agent Harness.
 
 > This is the part that previously read as "materialize content": the Agent Harness is **not** loose files to be sprinkled in — it is a release artifact to be installed, exactly like the `openflows` binary. The docs, the release pipeline, and the boot must treat B as a first-class installed component.
 
@@ -120,7 +119,14 @@ The Agent Harness (Harness B) is **installed and provisioned just like Harness A
 
 Every FORGE (or SENTINEL) spawn currently runs its own `git clone`/`pull` into its private docker volume (`openflows-forge/main.tf:213-225`). A full clone on every ephemeral spawn is slow and wasteful. The target design removes the network clone from the per-workspace path by reusing the existing tenant-shared read-only volume:
 
-**Topology (one network fetch, many local copies).**
+**Hosted mode does not take this path.** A hosted workspace has no shared volume
+to seed: it installs the artifact bundle from the Manager and clones the
+repository with a short-lived credential the Manager brokers for it. The golden
+clone stays a local-mode optimisation, which is what keeps read-write-many
+storage optional and keeps no copy of a customer repository outside the tenant's
+own workspaces.
+
+**Topology (one network fetch, many local copies, local mode).**
 
 ```
                 NEXUS (control plane, has creds + network)  [per tenant]
@@ -147,13 +153,13 @@ Every FORGE (or SENTINEL) spawn currently runs its own `git clone`/`pull` into i
 - **Per-tenant scoping.** The golden clone, its shared volume, and all copies are scoped per tenant: the volume is `openflows-artifacts-<tenant>` and lives under NEXUS's tenant workspace, so one tenant's repo snapshot is never visible to another tenant's workspaces. This composes with the `ns:{tenant}:` Redis keyspace for full tenant isolation.
 - **Read-only source.** The shared volume is mounted `read_only = true` (`openflows-forge/main.tf:296-301`), so a worker can never mutate the golden tree; NEXUS is the sole writer.
 - **Independent physical copies.** Each worker still gets its **own** tree on its **own** docker volume, so FORGE and SENTINEL never share a writable filesystem — the review-integrity property (SENTINEL cannot touch FORGE's tree) is intact. Golden-copying is purely a *seed*; it is not a live shared mount for writes.
-- **No credentials in workers.** The copy is offline; the only git/network dependency stays in NEXUS.
+- **No credentials in workers, local mode.** The copy is offline; the only git/network dependency stays in NEXUS. Hosted workers do hold a short-lived brokered credential, because they clone directly.
 
 **Freshness before work (no stale versions):**
 
 - **The golden tree is refreshed before any copy** — NEXUS runs `git fetch --prune` + `reset --hard origin/<target>` on the golden clone before a worker takes its snapshot, so the snapshot reflects the current target, not a stale one.
 - **The workspace refreshes to the latest before checking out** — after `cp -a`, the worker runs a small `git fetch` on its local copy **first**, then checks out the current target/pair branch from the fetched head. The copy is the cheap seed; the **refresh always precedes the checkout** so the worker plans and builds against the up-to-date tree, never a stale checkout. (Ordering in the workspace: copy → refresh → checkout → begin work.)
-- The same freshness principle applies to the Harness A binary (§3.1): a workspace pulling a pinned `harness_version` verifies it resolves to the expected version (and `harness-edge` always tracks the latest), so the worker isn't held to an outdated binary.
+- The same freshness principle applies to the Harness A binary (§3.1): it comes from the workspace image pinned by digest for the release, so the worker isn't held to an outdated binary.
 
 **Caveats to design around:**
 

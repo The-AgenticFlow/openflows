@@ -110,7 +110,7 @@ jobs:
           git-cliff --tag "openflows-${VERSION}" --output CHANGELOG.md
 
           # Insert a Contributors section into the latest version block by
-          # collecting all unique `by @username` mentions from that block and
+          # collecting all unique `(@username)` attributions from that block and
           # listing them in a deduplicated, alphabetically sorted section.
           # Bots (github-actions[bot], AgentFlow, etc.) are excluded.
           # VERSION is passed via env because this is a quoted heredoc (the
@@ -132,14 +132,14 @@ jobs:
               raise SystemExit(f"Version section [{VERSION}] not found in CHANGELOG.md")
           block = match.group(1)
 
-          # Collect all `by @username` mentions.
+          # Collect all `(@username)` attributions.
           contributors = sorted({
-              m for m in re.findall(r"by @([\w-]+)", block)
+              m for m in re.findall(r"\(@([\w-]+)\)", block)
               if m not in BOTS
           })
 
           # Contributor attribution is optional: a release with no non-bot
-          # `by @username` mentions simply omits the Contributors subsection.
+          # `(@username)` attributions simply omits the Contributors subsection.
           if contributors:
               # Build the Contributors section.
               contrib_lines = "\n".join(f"- @{c}" for c in contributors)

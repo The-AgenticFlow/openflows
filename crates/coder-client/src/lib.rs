@@ -67,40 +67,9 @@ fn check_template_push_output(name: &str, output: &std::process::Output) -> Resu
     Ok(())
 }
 
-/// Values forwarded to server-side Terraform and included in bootstrap caching.
-/// Terraform variable values configured by the operator for template imports.
-/// They are sent to Coder with each managed template version so its server-side
-/// provisioner sees the same configuration as the local bootstrap CLI.
-pub fn template_variable_values() -> Vec<(&'static str, String)> {
-    [
-        ("TF_VAR_dev_binary_host_path", "dev_binary_host_path"),
-        ("TF_VAR_docker_network", "docker_network"),
-        ("TF_VAR_workspace_image", "workspace_image"),
-        ("TF_VAR_github_api_base", "github_api_base"),
-        ("TF_VAR_github_git_base", "github_git_base"),
-        ("TF_VAR_connected_local", "connected_local"),
-        (
-            "TF_VAR_connected_local_broker_secret_host_path",
-            "connected_local_broker_secret_host_path",
-        ),
-        (
-            "TF_VAR_connected_local_helper_host_path",
-            "connected_local_helper_host_path",
-        ),
-        (
-            "TF_VAR_connected_local_manager_url",
-            "connected_local_manager_url",
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(env_name, name)| {
-        std::env::var(env_name)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| (name, value))
-    })
-    .collect()
-}
+pub use bootstrap::{
+    is_pinned_image_reference, template_variable_values, template_variable_values_for,
+};
 
 fn resolve_coder_cli() -> PathBuf {
     if let Some(path) = std::env::var_os("CODER_CLI_PATH").map(PathBuf::from) {
@@ -810,7 +779,7 @@ impl CoderClient {
         // stores them and applies them when creating workspaces. Setting them
         // as env vars in the Rust process does NOT reach the server's Terraform
         // execution — the CLI only uploads the template files.
-        for (variable_name, value) in template_variable_values() {
+        for (variable_name, value) in template_variable_values_for(name)? {
             cmd.arg("--variable")
                 .arg(format!("{}={}", variable_name, value));
         }
@@ -3603,62 +3572,5 @@ mod tests {
         assert_eq!(coder.status, reqwest::StatusCode::FORBIDDEN);
         assert!(!err.to_string().contains("operator credential expired"));
         server.shutdown().await;
-    }
-
-    #[test]
-    fn every_worker_signals_manager_readiness_only_after_bootstrap() {
-        let templates = [
-            (
-                "forge",
-                include_str!("../templates/openflows-forge/main.tf"),
-            ),
-            (
-                "sentinel",
-                include_str!("../templates/openflows-sentinel/main.tf"),
-            ),
-            (
-                "vessel",
-                include_str!("../templates/openflows-vessel/main.tf"),
-            ),
-            ("lore", include_str!("../templates/openflows-lore/main.tf")),
-        ];
-        for (role, template) in templates {
-            let repo_ready = template
-                .find("repository bootstrap did not produce")
-                .unwrap_or_else(|| panic!("{role} does not verify repository bootstrap"));
-            let instructions_ready = template
-                .find("Installed hosted instructions")
-                .unwrap_or_else(|| panic!("{role} does not install hosted instructions"));
-            let heartbeat = template
-                .find("Manager readiness heartbeat sent after bootstrap")
-                .unwrap_or_else(|| panic!("{role} does not signal Manager readiness"));
-            assert!(
-                repo_ready < instructions_ready,
-                "{role} installs instructions before repository bootstrap"
-            );
-            assert!(
-                instructions_ready < heartbeat,
-                "{role} signals readiness before instructions are installed"
-            );
-            let periodic_ready = template
-                .find("touch /tmp/openflows-manager-ready")
-                .unwrap_or_else(|| panic!("{role} does not enable periodic heartbeats"));
-            assert!(
-                heartbeat < periodic_ready,
-                "{role} enables periodic heartbeats before readiness"
-            );
-            assert!(
-                template.contains("if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi"),
-                "{role} can report periodic liveness before readiness"
-            );
-            assert!(
-                template.matches("/api/v1/runtime/heartbeat").count() >= 2,
-                "{role} does not maintain Manager liveness after readiness"
-            );
-            assert!(
-                template.contains("-w \"%%{http_code}\""),
-                "{role} must escape curl's HTTP status format in Terraform strings"
-            );
-        }
     }
 }

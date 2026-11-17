@@ -1,0 +1,709 @@
+//! Kubernetes objects that wall one organization namespace and its tenants.
+//!
+//! Every builder is pure so names, labels and rules are unit-tested without a
+//! cluster. The rules deny all traffic by default and then allow only DNS, the
+//! platform services, the public internet and traffic inside one tenant.
+
+use super::IsolationSettings;
+use crate::error::ManagerError;
+use crate::id::{OrganizationId, TenantId};
+use k8s_openapi::api::admissionregistration::v1::{
+    ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
+};
+use k8s_openapi::api::authorization::v1::SubjectAccessReview;
+use k8s_openapi::api::core::v1::{LimitRange, Namespace, ResourceQuota, ServiceAccount};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::RoleBinding;
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+
+/// Pods that belong to one tenant carry this label; the tenant policy selects on it.
+pub const TENANT_LABEL: &str = "openflows.io/tenant";
+/// Organization the namespace and its objects belong to.
+pub const ORGANIZATION_LABEL: &str = "openflows.io/organization";
+const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+const MANAGER: &str = "openflows-manager";
+/// Private, link-local and carrier-grade NAT ranges. Pod, node and cloud metadata
+/// addresses live here, so none of them is reachable through the public rule.
+pub const NON_PUBLIC_CIDRS: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+];
+
+pub const DEFAULT_DENY: &str = "openflows-default-deny";
+pub const ALLOW_DNS: &str = "openflows-allow-dns";
+pub const ALLOW_PLATFORM: &str = "openflows-allow-platform";
+pub const ALLOW_PUBLIC: &str = "openflows-allow-public-egress";
+pub const PROVISIONER_POLICY: &str = "openflows-provisioner";
+pub const QUOTA_NAME: &str = "openflows-quota";
+pub const LIMIT_RANGE_NAME: &str = "openflows-defaults";
+/// ClusterRole, created by the operator, that lets an identity write Secrets and nothing else.
+pub const SECRET_WRITER_ROLE: &str = "openflows-secret-writer";
+pub const SECRET_DELIVERY_BINDING: &str = "openflows-secret-delivery";
+/// Name of the admission policy, and its binding, that limit who may be bound to the Secret writer.
+pub const BINDING_RULE_NAME: &str = "openflows-secret-writer-bindings";
+/// Verbs the Secret-delivery identity needs on Secrets.
+pub const SECRET_WRITE_VERBS: [&str; 3] = ["create", "patch", "delete"];
+/// Verbs the Coder provisioner must not hold on Secrets.
+pub const SECRET_READ_VERBS: [&str; 3] = ["get", "list", "watch"];
+
+/// Name of an organization's namespace.
+pub fn namespace_name(prefix: &str, organization_id: OrganizationId) -> String {
+    format!("{prefix}{organization_id}")
+}
+
+/// Name of the policy that lets one tenant's pods talk to each other.
+pub fn tenant_policy_name(tenant_id: TenantId) -> String {
+    format!("openflows-tenant-{tenant_id}")
+}
+
+fn typed<T: DeserializeOwned>(value: Value) -> Result<T, ManagerError> {
+    serde_json::from_value(value)
+        .map_err(|e| ManagerError::Config(format!("invalid tenant isolation object: {e}")))
+}
+
+fn meta(name: &str, namespace: Option<&str>, organization: Option<OrganizationId>) -> Value {
+    let mut labels = json!({ MANAGED_BY_LABEL: MANAGER });
+    if let Some(org) = organization {
+        labels[ORGANIZATION_LABEL] = json!(org.to_string());
+    }
+    let mut meta = json!({ "name": name, "labels": labels });
+    if let Some(ns) = namespace {
+        meta["namespace"] = json!(ns);
+    }
+    meta
+}
+
+/// The organization namespace, enforcing the `restricted` Pod Security Standard.
+pub fn namespace(
+    settings: &IsolationSettings,
+    organization_id: OrganizationId,
+) -> Result<Namespace, ManagerError> {
+    let name = namespace_name(&settings.namespace_prefix, organization_id);
+    let mut metadata = meta(&name, None, Some(organization_id));
+    if let Some(labels) = pod_security_labels(settings).as_object() {
+        for (key, value) in labels {
+            metadata["labels"][key] = value.clone();
+        }
+    }
+    typed(json!({ "apiVersion": "v1", "kind": "Namespace", "metadata": metadata }))
+}
+
+/// Pod Security labels. `enforce` is pinned, so a cluster upgrade cannot start rejecting pods
+/// that were admitted the day before. `audit` and `warn` follow the latest standard, so an
+/// upgrade shows up as warnings first.
+pub fn pod_security_labels(settings: &IsolationSettings) -> Value {
+    json!({
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": settings.pod_security_version,
+        "pod-security.kubernetes.io/audit": "restricted",
+        "pod-security.kubernetes.io/audit-version": "latest",
+        "pod-security.kubernetes.io/warn": "restricted",
+        "pod-security.kubernetes.io/warn-version": "latest",
+    })
+}
+
+/// Ceiling on what the organization's namespace may consume.
+pub fn quota(settings: &IsolationSettings, namespace: &str) -> Result<ResourceQuota, ManagerError> {
+    let hard: serde_json::Map<String, Value> = settings
+        .quota
+        .iter()
+        .map(|(resource, amount)| (resource.clone(), json!(amount)))
+        .collect();
+    typed(json!({
+        "apiVersion": "v1", "kind": "ResourceQuota",
+        "metadata": meta(QUOTA_NAME, Some(namespace), None),
+        "spec": { "hard": hard },
+    }))
+}
+
+/// Container defaults, so pods without explicit limits still fit the quota.
+pub fn limit_range(namespace: &str) -> Result<LimitRange, ManagerError> {
+    typed(json!({
+        "apiVersion": "v1", "kind": "LimitRange",
+        "metadata": meta(LIMIT_RANGE_NAME, Some(namespace), None),
+        "spec": { "limits": [{
+            "type": "Container",
+            "default": { "cpu": "1", "memory": "2Gi" },
+            "defaultRequest": { "cpu": "100m", "memory": "256Mi" },
+        }]},
+    }))
+}
+
+/// The namespace's default service account, so pods that name none get no API token.
+pub fn default_service_account(namespace: &str) -> Result<ServiceAccount, ManagerError> {
+    typed(json!({
+        "apiVersion": "v1", "kind": "ServiceAccount",
+        "metadata": meta("default", Some(namespace), None),
+        "automountServiceAccountToken": false,
+    }))
+}
+
+/// Gives the Secret-delivery service account write access to Secrets in this namespace only.
+pub fn secret_delivery_binding(
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+) -> Result<RoleBinding, ManagerError> {
+    secret_writer_binding(
+        SECRET_DELIVERY_BINDING,
+        namespace,
+        account_namespace,
+        account,
+    )
+}
+
+/// A RoleBinding of the Secret-writer role under any name, for any service account. The
+/// admission rule accepts exactly one of these; the startup check builds the others.
+pub fn secret_writer_binding(
+    name: &str,
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+) -> Result<RoleBinding, ManagerError> {
+    typed(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+        "metadata": meta(name, Some(namespace), None),
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": SECRET_WRITER_ROLE,
+        },
+        "subjects": [{ "kind": "ServiceAccount", "name": account, "namespace": account_namespace }],
+    }))
+}
+
+/// CEL expressions of the admission rule. The operator manifest in `tenant-isolation.md` carries
+/// the same text, and a test keeps the two equal.
+pub const RULE_APPLIES_TO: &str =
+    "object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'openflows-secret-writer'";
+pub const RULE_NAME: &str = "object.metadata.name == 'openflows-secret-delivery'";
+pub const RULE_NAMESPACE: &str = "has(namespaceObject.metadata.labels) && 'openflows.io/organization' in namespaceObject.metadata.labels";
+
+pub fn rule_subject(account_namespace: &str, account: &str) -> String {
+    format!(
+        "has(object.subjects) && size(object.subjects) == 1 && object.subjects[0].kind == \
+         'ServiceAccount' && object.subjects[0].namespace == '{account_namespace}' && \
+         object.subjects[0].name == '{account}'"
+    )
+}
+
+/// The admission rule that stops the namespace identity binding the Secret-writer role to
+/// itself. A binding of the role must have the fixed name, sit in a namespace labelled as an
+/// organization's, and bind only the delivery account. The operator installs it, not the
+/// Manager, since an identity that could install it could remove it.
+pub fn secret_writer_rule(
+    account_namespace: &str,
+    account: &str,
+) -> Result<(ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding), ManagerError> {
+    let policy = typed(json!({
+        "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy",
+        "metadata": { "name": BINDING_RULE_NAME },
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": { "resourceRules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"], "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"], "resources": ["rolebindings"],
+            }]},
+            "matchConditions": [{ "name": "binds-the-secret-writer-role", "expression": RULE_APPLIES_TO }],
+            "validations": [
+                { "expression": RULE_NAME,
+                  "message": "a binding of openflows-secret-writer must be named openflows-secret-delivery" },
+                { "expression": RULE_NAMESPACE,
+                  "message": "openflows-secret-writer may only be bound in a namespace labelled openflows.io/organization" },
+                { "expression": rule_subject(account_namespace, account),
+                  "message": format!("openflows-secret-writer may only be bound to the delivery service account {account_namespace}/{account}") },
+            ],
+        },
+    }))?;
+    let binding = typed(json!({
+        "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": { "name": BINDING_RULE_NAME },
+        "spec": { "policyName": BINDING_RULE_NAME, "validationActions": ["Deny"] },
+    }))?;
+    Ok((policy, binding))
+}
+
+/// Asks the API server whether a service account may use `verb` on Secrets in `namespace`.
+pub fn secret_access_review(
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+    verb: &str,
+) -> Result<SubjectAccessReview, ManagerError> {
+    account_review(namespace, account_namespace, account, ("", "secrets", verb))
+}
+
+/// Asks the API server whether a service account may do `(api group, resource, verb)` in `namespace`.
+pub fn account_review(
+    namespace: &str,
+    account_namespace: &str,
+    account: &str,
+    right: (&str, &str, &str),
+) -> Result<SubjectAccessReview, ManagerError> {
+    let (group, resource, verb) = right;
+    typed(json!({
+        "apiVersion": "authorization.k8s.io/v1", "kind": "SubjectAccessReview",
+        "spec": {
+            "user": format!("system:serviceaccount:{account_namespace}:{account}"),
+            // The API server adds these groups to a real service account, and a
+            // binding to any of them grants the account access too.
+            "groups": [
+                "system:serviceaccounts",
+                format!("system:serviceaccounts:{account_namespace}"),
+                "system:authenticated",
+            ],
+            "resourceAttributes": {
+                "namespace": namespace, "group": group, "resource": resource, "verb": verb,
+            },
+        },
+    }))
+}
+
+fn policy(name: &str, namespace: &str, spec: Value) -> Result<NetworkPolicy, ManagerError> {
+    typed(json!({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": meta(name, Some(namespace), None),
+        "spec": spec,
+    }))
+}
+
+fn tcp_ports(ports: &[u16]) -> Vec<Value> {
+    ports
+        .iter()
+        .map(|port| json!({ "protocol": "TCP", "port": port }))
+        .collect()
+}
+
+/// Egress peers for DNS: CoreDNS, and the node-local resolver where NodeLocal DNSCache runs.
+/// That cache answers on a link-local address, which the public egress rule excludes.
+fn dns_peers(settings: &IsolationSettings) -> Vec<Value> {
+    let mut peers = vec![json!({
+        "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } },
+        "podSelector": { "matchLabels": { "k8s-app": "kube-dns" } },
+    })];
+    if let Some(address) = &settings.node_local_dns {
+        let bits = if address.contains(':') { 128 } else { 32 };
+        peers.push(json!({ "ipBlock": { "cidr": format!("{address}/{bits}") } }));
+    }
+    peers
+}
+
+/// Egress peers for the platform services: their namespace plus any external CIDRs.
+fn platform_peers(settings: &IsolationSettings) -> Vec<Value> {
+    let mut peers = vec![json!({ "namespaceSelector": { "matchLabels": {
+        "kubernetes.io/metadata.name": settings.platform_namespace } } })];
+    peers.extend(
+        settings
+            .platform_cidrs
+            .iter()
+            .map(|cidr| json!({ "ipBlock": { "cidr": cidr } })),
+    );
+    peers
+}
+
+/// Policies every organization namespace gets, whichever tenants it holds.
+pub fn base_policies(
+    settings: &IsolationSettings,
+    namespace: &str,
+) -> Result<Vec<NetworkPolicy>, ManagerError> {
+    let all_pods = json!({});
+    // Only pods that carry the tenant label may reach the platform services.
+    let tenant_pods =
+        json!({ "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }] });
+    let mut policies = vec![
+        policy(
+            DEFAULT_DENY,
+            namespace,
+            json!({ "podSelector": all_pods, "policyTypes": ["Ingress", "Egress"] }),
+        )?,
+        policy(
+            ALLOW_DNS,
+            namespace,
+            json!({ "podSelector": all_pods, "policyTypes": ["Egress"], "egress": [{
+                "to": dns_peers(settings),
+                "ports": [{ "protocol": "UDP", "port": 53 }, { "protocol": "TCP", "port": 53 }],
+            }]}),
+        )?,
+        policy(
+            ALLOW_PLATFORM,
+            namespace,
+            json!({ "podSelector": tenant_pods, "policyTypes": ["Egress"], "egress": [{
+                "to": platform_peers(settings),
+                "ports": tcp_ports(&settings.platform_ports),
+            }]}),
+        )?,
+        policy(
+            ALLOW_PUBLIC,
+            namespace,
+            json!({ "podSelector": all_pods, "policyTypes": ["Egress"], "egress": [{
+                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0", "except": NON_PUBLIC_CIDRS } }],
+            }]}),
+        )?,
+    ];
+    if let Some((key, value)) = &settings.provisioner_selector {
+        policies.push(provisioner_policy(settings, namespace, key, value)?);
+    }
+    Ok(policies)
+}
+
+/// The provisioner is not tenant workload. It also needs the Kubernetes API,
+/// so it gets its own egress policy instead of the workspace rules.
+fn provisioner_policy(
+    settings: &IsolationSettings,
+    namespace: &str,
+    key: &str,
+    value: &str,
+) -> Result<NetworkPolicy, ManagerError> {
+    let mut peers = platform_peers(settings);
+    peers.extend(
+        settings
+            .api_cidrs
+            .iter()
+            .map(|cidr| json!({ "ipBlock": { "cidr": cidr } })),
+    );
+    policy(
+        PROVISIONER_POLICY,
+        namespace,
+        json!({
+            "podSelector": { "matchLabels": { key: value } },
+            "policyTypes": ["Egress"],
+            "egress": [{ "to": peers }],
+        }),
+    )
+}
+
+/// Lets the pods of one tenant, and only those, reach each other.
+pub fn tenant_policy(namespace: &str, tenant_id: TenantId) -> Result<NetworkPolicy, ManagerError> {
+    let same_tenant = json!({ "matchLabels": { TENANT_LABEL: tenant_id.to_string() } });
+    policy(
+        &tenant_policy_name(tenant_id),
+        namespace,
+        json!({
+            "podSelector": same_tenant,
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{ "from": [{ "podSelector": same_tenant }] }],
+            "egress": [{ "to": [{ "podSelector": same_tenant }] }],
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn org() -> OrganizationId {
+        OrganizationId::from_uuid(uuid::Uuid::from_u128(1))
+    }
+
+    fn tenant(n: u128) -> TenantId {
+        TenantId::from_uuid(uuid::Uuid::from_u128(n))
+    }
+
+    fn spec(policy: &NetworkPolicy) -> Value {
+        serde_json::to_value(policy.spec.as_ref().expect("policy has a spec")).expect("serialize")
+    }
+
+    #[test]
+    fn namespace_enforces_the_restricted_pod_standard() {
+        let ns = namespace(&IsolationSettings::default(), org()).expect("namespace");
+        let labels = ns.metadata.labels.expect("labels");
+
+        assert_eq!(
+            ns.metadata.name.as_deref(),
+            Some("openflows-00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(labels["pod-security.kubernetes.io/enforce"], "restricted");
+        assert_eq!(labels[ORGANIZATION_LABEL], org().to_string());
+    }
+
+    #[test]
+    fn enforce_is_pinned_while_audit_and_warn_follow_the_latest_standard() {
+        let ns = namespace(&IsolationSettings::default(), org()).expect("namespace");
+        let labels = ns.metadata.labels.expect("labels");
+
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce-version"],
+            "v1.33"
+        );
+        assert_eq!(labels["pod-security.kubernetes.io/audit-version"], "latest");
+        assert_eq!(labels["pod-security.kubernetes.io/warn-version"], "latest");
+    }
+
+    #[test]
+    fn the_pinned_version_follows_the_setting() {
+        let settings = IsolationSettings {
+            pod_security_version: "v1.35".into(),
+            ..IsolationSettings::default()
+        };
+        let labels = namespace(&settings, org())
+            .expect("namespace")
+            .metadata
+            .labels
+            .expect("labels");
+
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce-version"],
+            "v1.35"
+        );
+    }
+
+    #[test]
+    fn platform_access_is_limited_to_tenant_labelled_pods() {
+        let policies = base_policies(&IsolationSettings::default(), "ns").expect("policies");
+        let selector_of = |name: &str| {
+            let policy = policies
+                .iter()
+                .find(|p| p.metadata.name.as_deref() == Some(name))
+                .expect("policy");
+            spec(policy)["podSelector"].clone()
+        };
+
+        assert_eq!(
+            selector_of(ALLOW_PLATFORM),
+            json!({ "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }] })
+        );
+        assert_eq!(selector_of(ALLOW_DNS), json!({}));
+        assert_eq!(selector_of(ALLOW_PUBLIC), json!({}));
+    }
+
+    #[test]
+    fn default_deny_selects_every_pod_and_both_directions() {
+        let policies = base_policies(&IsolationSettings::default(), "ns").expect("policies");
+        let deny = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(DEFAULT_DENY))
+            .expect("default deny");
+        let spec = spec(deny);
+
+        assert_eq!(spec["podSelector"], json!({}));
+        assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
+        assert!(spec.get("ingress").is_none() && spec.get("egress").is_none());
+    }
+
+    #[test]
+    fn public_egress_excludes_private_pod_node_and_metadata_ranges() {
+        let policies = base_policies(&IsolationSettings::default(), "ns").expect("policies");
+        let public = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(ALLOW_PUBLIC))
+            .expect("public egress");
+        let spec = spec(public);
+        let block = &spec["egress"][0]["to"][0]["ipBlock"];
+
+        assert_eq!(block["cidr"], "0.0.0.0/0");
+        for cidr in ["10.0.0.0/8", "192.168.0.0/16", "169.254.0.0/16"] {
+            assert!(block["except"]
+                .as_array()
+                .expect("except list")
+                .contains(&json!(cidr)));
+        }
+    }
+
+    #[test]
+    fn tenant_policy_only_admits_the_same_tenant() {
+        let policy = tenant_policy("ns", tenant(7)).expect("policy");
+        let spec = spec(&policy);
+        let label = json!({ "matchLabels": { TENANT_LABEL: tenant(7).to_string() } });
+
+        assert_eq!(spec["podSelector"], label);
+        assert_eq!(spec["ingress"][0]["from"][0]["podSelector"], label);
+        assert_eq!(spec["egress"][0]["to"][0]["podSelector"], label);
+    }
+
+    fn dns_peers_of(settings: &IsolationSettings) -> Vec<Value> {
+        let policies = base_policies(settings, "ns").expect("policies");
+        let dns = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(ALLOW_DNS))
+            .expect("dns policy");
+        spec(dns)["egress"][0]["to"]
+            .as_array()
+            .expect("peers")
+            .clone()
+    }
+
+    #[test]
+    fn dns_reaches_only_coredns_by_default() {
+        let peers = dns_peers_of(&IsolationSettings::default());
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0]["podSelector"]["matchLabels"]["k8s-app"],
+            "kube-dns"
+        );
+    }
+
+    #[test]
+    fn dns_also_reaches_the_node_local_resolver_when_configured() {
+        let settings = IsolationSettings {
+            node_local_dns: Some("169.254.20.10".into()),
+            ..IsolationSettings::default()
+        };
+
+        let peers = dns_peers_of(&settings);
+
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&json!({ "ipBlock": { "cidr": "169.254.20.10/32" } })));
+    }
+
+    #[test]
+    fn an_ipv6_node_local_resolver_gets_a_host_prefix() {
+        let settings = IsolationSettings {
+            node_local_dns: Some("fd00::10".into()),
+            ..IsolationSettings::default()
+        };
+
+        assert!(dns_peers_of(&settings).contains(&json!({ "ipBlock": { "cidr": "fd00::10/128" } })));
+    }
+
+    #[test]
+    fn two_tenants_get_different_policy_names() {
+        assert_ne!(tenant_policy_name(tenant(1)), tenant_policy_name(tenant(2)));
+    }
+
+    #[test]
+    fn provisioner_policy_exists_only_when_a_selector_is_configured() {
+        let mut settings = IsolationSettings::default();
+        let without = base_policies(&settings, "ns").expect("policies").len();
+        settings.provisioner_selector = Some(("app".into(), "provisioner".into()));
+        settings.api_cidrs = vec!["172.20.0.1/32".into()];
+
+        let with = base_policies(&settings, "ns").expect("policies");
+
+        assert_eq!(with.len(), without + 1);
+        let provisioner = with.last().expect("provisioner policy");
+        assert_eq!(
+            provisioner.metadata.name.as_deref(),
+            Some(PROVISIONER_POLICY)
+        );
+        assert!(spec(provisioner)["egress"][0]["to"]
+            .as_array()
+            .expect("peers")
+            .contains(&json!({ "ipBlock": { "cidr": "172.20.0.1/32" } })));
+    }
+
+    #[test]
+    fn default_service_account_hands_out_no_api_token() {
+        let account = default_service_account("ns").expect("account");
+
+        assert_eq!(account.metadata.name.as_deref(), Some("default"));
+        assert_eq!(account.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn access_review_names_the_service_account_and_the_secrets_resource() {
+        let review =
+            secret_access_review("org-ns", "platform", "provisioner", "get").expect("review");
+        let spec = review.spec;
+
+        assert_eq!(
+            spec.user.as_deref(),
+            Some("system:serviceaccount:platform:provisioner")
+        );
+        let groups = spec.groups.expect("groups");
+        for group in [
+            "system:serviceaccounts",
+            "system:serviceaccounts:platform",
+            "system:authenticated",
+        ] {
+            assert!(
+                groups.iter().any(|g| g == group),
+                "missing {group}: {groups:?}"
+            );
+        }
+        let attributes = spec.resource_attributes.expect("attributes");
+        assert_eq!(attributes.namespace.as_deref(), Some("org-ns"));
+        assert_eq!(attributes.resource.as_deref(), Some("secrets"));
+        assert_eq!(attributes.verb.as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn the_delivery_account_gets_secret_write_access_in_one_namespace_only() {
+        let binding = secret_delivery_binding("org-ns", "platform", "delivery").expect("binding");
+
+        assert_eq!(binding.metadata.namespace.as_deref(), Some("org-ns"));
+        assert_eq!(binding.role_ref.kind, "ClusterRole");
+        assert_eq!(binding.role_ref.name, SECRET_WRITER_ROLE);
+        let subject = &binding.subjects.expect("subjects")[0];
+        assert_eq!(subject.kind, "ServiceAccount");
+        assert_eq!(subject.name, "delivery");
+        assert_eq!(subject.namespace.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn the_rule_applies_only_to_bindings_of_the_secret_writer_role() {
+        let (policy, binding) = secret_writer_rule("openflows", "secret-delivery").expect("rule");
+        let spec = serde_json::to_value(policy.spec.expect("spec")).expect("serialize");
+
+        assert_eq!(spec["matchConditions"][0]["expression"], RULE_APPLIES_TO);
+        assert_eq!(
+            spec["matchConstraints"]["resourceRules"][0]["resources"][0],
+            "rolebindings"
+        );
+        assert_eq!(spec["failurePolicy"], "Fail");
+        assert_eq!(
+            serde_json::to_value(binding.spec.expect("binding spec")).expect("serialize")
+                ["validationActions"][0],
+            "Deny"
+        );
+    }
+
+    #[test]
+    fn the_rule_checks_the_name_the_namespace_and_the_subject() {
+        let (policy, _) = secret_writer_rule("openflows", "secret-delivery").expect("rule");
+        let validations =
+            serde_json::to_value(policy.spec.expect("spec").validations).expect("serialize");
+        let expressions: Vec<String> = validations
+            .as_array()
+            .expect("validations")
+            .iter()
+            .map(|v| v["expression"].as_str().expect("expression").to_string())
+            .collect();
+
+        assert_eq!(
+            expressions,
+            [
+                RULE_NAME.to_string(),
+                RULE_NAMESPACE.to_string(),
+                rule_subject("openflows", "secret-delivery"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_operator_manifest_in_the_doc_carries_the_same_rule() {
+        let doc = include_str!(
+            "../../../../../docs/implementation/centralized-deployment/tenant-isolation.md"
+        );
+
+        for expression in [
+            RULE_APPLIES_TO.to_string(),
+            RULE_NAME.to_string(),
+            RULE_NAMESPACE.to_string(),
+            rule_subject("openflows", "secret-delivery"),
+        ] {
+            assert!(doc.contains(&expression), "the doc lacks: {expression}");
+        }
+    }
+
+    #[test]
+    fn a_binding_can_carry_any_name_and_subject() {
+        let binding = secret_writer_binding("other", "ns", "default", "someone").expect("binding");
+
+        assert_eq!(binding.metadata.name.as_deref(), Some("other"));
+        assert_eq!(binding.role_ref.name, SECRET_WRITER_ROLE);
+        assert_eq!(binding.subjects.expect("subjects")[0].name, "someone");
+    }
+
+    #[test]
+    fn quota_carries_every_configured_limit() {
+        let settings = IsolationSettings::default();
+        let quota = quota(&settings, "ns").expect("quota");
+        let hard = quota.spec.expect("spec").hard.expect("hard limits");
+
+        assert_eq!(hard.len(), settings.quota.len());
+        assert!(hard.contains_key("pods"));
+    }
+}

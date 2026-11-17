@@ -17,56 +17,61 @@ All notable changes to this project will be documented in this file.
 # template for the changelog body
 # https://keats.github.io/tera/docs/#introduction
 body = """
-{%- if not version %}
+{%- if not version -%}
 ## [unreleased]
 {% else -%}
 ## [{{ version | replace(from="openflows-", to="") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% endif -%}
 
-{% macro commit(commit) -%}
-- *({{ commit.scope | default(value = "uncategorized") | lower }})* {{ commit.message | upper_first | trim }}\
-  {{ self::mention(commit=commit) }}\
-{%- if commit.breaking %} [**breaking**]{% endif %}
-{% endmacro -%}
+{% macro area(scope) -%}
+{%- if scope == "api" -%}API
+{%- elif scope == "a2a" -%}A2A
+{%- elif scope == "a2a-protocol" -%}A2A
+{%- elif scope == "e2e" -%}E2E
+{%- elif scope == "tui" -%}TUI
+{%- elif scope == "ui" -%}UI
+{%- elif scope == "mcp" -%}MCP
+{%- elif scope == "github" -%}GitHub
+{%- elif scope == "agent-forge" -%}Agent Forge
+{%- elif scope == "agent-sentinel" -%}Agent Sentinel
+{%- elif scope == "coder-client" -%}Coder Client
+{%- elif scope == "pair-harness" -%}Pair Harness
+{%- elif scope == "docker-compose" -%}Docker Compose
+{%- elif scope == "lifecycle-hooks" -%}Lifecycle Hooks
+{%- elif scope == "state-machine" -%}State Machine
+{%- elif scope == "model-discovery" -%}Model Discovery
+{%- elif scope == "resolve-version" -%}Resolve Version
+{%- elif scope == "quick-start" -%}Quick Start
+{%- elif scope == "external-auth" -%}External Auth
+{%- else -%}{{ scope | replace(from=", ", to=",") | replace(from=",", to=", ") | replace(from="-", to=" ") | upper_first }}
+{%- endif -%}
+{% endmacro area -%}
 
 {% macro mention(commit) -%}
 {%- if commit.author -%}
 {%- set acct = commit.author -%}
-{%- set email_ok = acct.email is string -%}
-{# `acct.email` can be a non-string (Null) for some commits under release-plz's#}
-{# embedded git-cliff-core (e.g. commits without a resolvable author). Calling #}
-{# `ending_with` on a non-string makes Tera throw "Tester ending_with was      #}
-{# called on a variable that isn't a string", which aborts the whole release-  #}
-{# pr changelog generation. Guard on `email_ok` so the test only runs on a     #}
-{# real string and the templating never crashes.                              #}
-{%- if email_ok and acct.email is ending_with("users.noreply.github.com") -%}
-{# GitHub noreply emails are `NNNNNNN+<login>@users.noreply.github.com`, so the#}
-{# `<login>` is an exact GitHub username that makes a valid mention.          #}
-  by @{{ acct.email | split(pat="+") | last | split(pat="@") | first }}
-{%- elif email_ok and not acct.email is ending_with("users.noreply.github.com") -%}
-{# Non-noreply (e.g. personal) emails have no reliable login: fall back to the#}
-{# commit author's display name, which equals the GitHub login for releases   #}
-{# by name=login authors (NkwaTambe, Ngha-Boris, ...).                         #}
-  by @{{ acct.name }}
+{%- set email = acct.email -%}
+{%- set email_ok = email is string -%}
+{%- if email_ok and email is ending_with("@users.noreply.github.com") -%}
+(@{{ email | split(pat="+") | last | split(pat="@") | first }})
 {%- elif acct.name -%}
-{# No usable email (non-string/Null from git-cliff-core): still credit the    #}
-{# author by display name rather than silently dropping the attribution.      #}
-  by @{{ acct.name }}
+(@{{ acct.name }})
 {%- endif -%}
 {%- endif -%}
-{% endmacro -%}
+{% endmacro mention -%}
+
+{% macro commit(commit) -%}
+-{% if commit.scope %} {{ self::area(scope=commit.scope) }}:{% endif %} {{ commit.message | upper_first | trim }}{% if commit.id %} ({{ commit.id | truncate(length=7, end="") }}){% endif %} {{ self::mention(commit=commit) }}{% if commit.breaking %} [**breaking**]{% endif %}
+{%- endmacro commit -%}
 
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim | upper_first }}
-{% for commit in commits | filter(attribute="scope") | sort(attribute="scope") %}
-{{ self::commit(commit=commit) }}
-{%- endfor -%}
-{% for commit in commits %}
-{%- if not commit.scope %}
-{{ self::commit(commit=commit) }}
-{%- endif -%}
-{%- endfor -%}
-{%- endfor %}
+
+{% for commit in commits | filter(attribute="scope") | sort(attribute="scope") %}{{ self::commit(commit=commit) }}
+{% endfor %}{% for commit in commits %}{% if not commit.scope %}{{ self::commit(commit=commit) }}
+{% endif %}{% endfor %}
+
+{% endfor %}
 
 {% if version %}
 {% if previous.version %}
@@ -93,6 +98,7 @@ trim = false
 # postprocessors for the changelog body
 postprocessors = [
   { pattern = ' +\n', replace = "\n" },
+  { pattern = '\n{3,}', replace = "\n\n" },
 ]
 
 [git]
@@ -122,12 +128,11 @@ commit_parsers = [
   { message = "^[a-zA-Z]+\\(release\\):", skip = true },
   { message = "^[a-zA-Z]+\\(ci\\):",      skip = true },
   { message = "^feat", group = "<!-- 00 -->Features" },
-  { message = "^[fF]ix", group = "<!-- 01 -->Bug Fixes" },
-  { message = "^refactor", group = "<!-- 02 -->Refactor" },
-  { message = "^docs", group = "<!-- 03 -->Documentation" },
-  { message = "^perf", group = "<!-- 04 -->Performance" },
-  { message = "^style", group = "<!-- 05 -->Styling" },
-  { message = "^test", group = "<!-- 06 -->Testing" },
+  { message = "^[fF]ix", group = "<!-- 01 -->Bug fixes" },
+  { message = "^docs", group = "<!-- 02 -->Documentation" },
+  { message = "^refactor", group = "<!-- 03 -->Code refactoring" },
+  { message = "^perf", group = "<!-- 04 -->Performance improvements" },
+  { message = "^test", group = "<!-- 05 -->Tests" },
   { message = "^chore\\(release\\): prepare for", skip = true },
   { message = "^chore: release", skip = true },
   { message = "^chore\\(openflows\\): release", skip = true },
@@ -135,14 +140,19 @@ commit_parsers = [
   { message = "^chore\\(pull\\)", skip = true },
   { message = "^chore\\(deps\\)", skip = true },
   { message = "^chore\\(changelog\\)", skip = true },
-  { message = "^[cC]hore", group = "<!-- 07 -->Miscellaneous Tasks" },
   { message = "^build\\(deps\\)", skip = true },
   { message = "^build\\(release\\)", skip = true },
-  { message = "^build", group = "<!-- 08 -->Build" },
-
-  { body = ".*security", group = "<!-- 09 -->Security" },
-  { message = "^ci", group = "<!-- 10 -->Continuous Integration" },
-  { message = "^revert", group = "<!-- 11 -->Reverted Commits" },
+  { message = "^build", group = "<!-- 06 -->Build" },
+  { message = "^ci", group = "<!-- 07 -->Continuous integration" },
+  { message = "^style", group = "<!-- 08 -->Chores" },
+  { message = "^[cC]hore", group = "<!-- 08 -->Chores" },
+  { message = "^revert", group = "<!-- 09 -->Reverts" },
+  { body = ".*security", group = "<!-- 10 -->Security" },
+  # Fallback: any conventional type not listed above (e.g. legacy `merge:`,
+  # `remove:`, `release:`, `hardening:` commits predating commitlint) is folded
+  # into Chores rather than surfacing as its own one-off heading. Placed last
+  # so the specific parsers above always take precedence.
+  { message = "^[a-zA-Z0-9-]+:", group = "<!-- 08 -->Chores" },
 ]
 
 # protect breaking changes from being skipped due to matching a skipping commit_parser

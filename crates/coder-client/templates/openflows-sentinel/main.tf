@@ -36,9 +36,9 @@ variable "connected_local_helper_host_path" {
 }
 
 variable "workspace_image" {
-  description = "Workspace image containing the tools used by the production bootstrap"
+  description = "STANDALONE TEMPLATE USE ONLY. A mutable release tag used when no workspace_image_digest parameter is set. Manager-provisioned workspaces never use it: Manager always passes workspace_image_repository plus a sha256 workspace_image_digest from the validated workspace-runtime release."
   type        = string
-  default     = "codercom/enterprise-base:ubuntu"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-sentinel:v0.3.1"
 }
 
 variable "github_api_base" {
@@ -88,22 +88,15 @@ variable "coder_url" {
   description = "Coder server URL for API calls"
 }
 
-variable "harness_version" {
-  type        = string
-  default     = "harness-edge"
-  description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
-}
-
 variable "a2a_relay_addr" {
   type        = string
   default     = "openflows-nexus:3000"
   description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Workspaces resolve the nexus container over the shared docker network by its service name."
 }
 
-# TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
-# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
-# The mounted dev harness is used when available (the current fallback when no
-# GitHub Release asset exists); remove when switching to GitHub releases only.
+# Optional development override: a host directory (normally .dev-binaries,
+# filled by `make dev-sync`) whose OpenFlows programs and runtime scripts replace
+# the image's. Releases never set it.
 variable "dev_binary_host_path" {
   description = "Absolute host path to the .dev-binaries directory"
   type        = string
@@ -178,6 +171,14 @@ data "coder_parameter" "runtime_secret_ref" {
   mutable = false
 }
 
+data "coder_parameter" "workspace_image_repository" {
+  name        = "workspace_image_repository"
+  description = "Release-pinned container repository for the Sentinel workspace image"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-sentinel"
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "workspace_image_digest" {
   name        = "workspace_image_digest"
   description = "Release-pinned sha256 digest for the hosted workspace image"
@@ -201,245 +202,32 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
+    # Shared startup from the workspace runtime (runtime/lib/bootstrap.sh in the
+    # workspace image). A development copy mounted by `make dev-sync` replaces
+    # the image's. The template and the runtime must agree on the runtime API.
+    OF_RUNTIME_LIB=/opt/openflows/runtime/lib/bootstrap.sh
+    [ ! -f /opt/openflows-dev/runtime/lib/bootstrap.sh ] || OF_RUNTIME_LIB=/opt/openflows-dev/runtime/lib/bootstrap.sh
+    . "$OF_RUNTIME_LIB" || { echo "FATAL: cannot load the workspace runtime from $OF_RUNTIME_LIB" >&2; exit 1; }
+    [ "$${OF_RUNTIME_API:-}" = 1 ] || { echo "FATAL: $OF_RUNTIME_LIB provides workspace runtime API '$${OF_RUNTIME_API:-none}' but this template needs 1; use the workspace image of the templates' release" >&2; exit 1; }
+    OF_HOSTED="${data.coder_parameter.hosted.value}"
+    OF_CONNECTED_LOCAL="${var.connected_local}"
+    OF_RUNTIME_SECRET_REF="${data.coder_parameter.runtime_secret_ref.value}"
 
-    # Ensure the workspace dir is owned by the coder user so the agent and
-    # the provisioner (skills/standards writes) can create files there.
-    # The volume is initialized root-owned inside codercom/enterprise-base.
-    sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
-    mkdir -p /home/coder/workspace
-    sudo chown -R coder:coder /home/coder/workspace
+    # Role settings: the BASE role selects the role assets and Redis keys.
+    OF_ROLE="sentinel"
+    OF_REPO_URL="${data.coder_parameter.repo_url.value}"
+    # SENTINEL reviews and never pushes: GitHub access is optional and it needs
+    # no author identity.
+    OF_GITHUB_ACCESS=optional
+    OF_CHECKOUT=default
 
-    # Setup git credentials from Coder external auth (the tenant's linked
-    # GitHub App token). PAT flow removed — external auth is the sole source.
-    mkdir -p /home/coder/.local/state/openflows
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      RUNTIME_CREDENTIAL_COPY=$(mktemp)
-      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
-      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
-        rm -f "$RUNTIME_CREDENTIAL_COPY"
-        log "FATAL: runtime secret is not mounted"
-        exit 1
-      fi
-      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
-import json, shlex, sys
-d=json.load(open(sys.argv[1]))
-for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace')]: print('export %s=%s' % (env,shlex.quote(str(d[key]))))
-PY
-)"
-      rm -f "$RUNTIME_CREDENTIAL_COPY"
-      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register")
-      OF_RUNTIME_ACCESS_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["access_token"])' "$SESSION")
-      export OF_RUNTIME_ACCESS_TOKEN
-      OF_RUNTIME_REFRESH_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["refresh_token"])' "$SESSION")
-      export OF_RUNTIME_REFRESH_TOKEN
-      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials")
-      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
-    else
-      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
-      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
-    fi
-    if [ -n "$GIT_TOKEN" ]; then
-      # System-level helper so git works for BOTH the agent user (pushes) and
-      # the sudo'd root clone below (their $HOME differ).
-      sudo git config --system credential.helper store
-      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
-      chmod 600 /home/coder/.git-credentials
-      sudo mkdir -p /root
-      sudo cp /home/coder/.git-credentials /root/.git-credentials
-      sudo chmod 600 /root/.git-credentials
-      log "Configured git credentials for GitHub push auth"
-    else
-      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
-    fi
+    # Ends with the readiness heartbeat the Manager waits for before creating a reviewer Chat.
+    of_bootstrap_worker
 
-    if [ "${var.connected_local}" = "true" ]; then
-      git config --global --unset-all credential.helper 2>/dev/null || true
-      sudo git config --system --unset-all credential.helper 2>/dev/null || true
-      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
-      rm -f /home/coder/.git-credentials
-      sudo rm -f /root/.git-credentials
-    fi
-
-    # Acquire the repository. Prefer the golden offline seed from the shared
-    # artifacts volume (docs §3.2): copy -> refresh -> checkout -> work.
-    # Fall back to a direct network clone when no golden seed exists, and fail
-    # LOUDLY (WARNING) rather than silently leaving an empty workspace.
-    GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
-    # The fresh workspace volume is root-owned initially, so any copy/clone
-    # into /home/coder/workspace must run via sudo (then be chowned back).
-    if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull 2>/dev/null || true
-    elif [ -d "$GOLDEN_REPO/.git" ]; then
-      sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/dev/null || true
-      sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
-      log "Copied golden repo seed into /home/coder/workspace"
-      # Refresh to latest before checkout (design: copy -> refresh -> checkout).
-      cd /home/coder/workspace
-      git fetch --all --prune 2>/dev/null || true
-      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
-    elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
-      log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
-      if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/sentinel_clone_err.log; then
-        sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
-        log "Cloned repository into /home/coder/workspace"
-      else
-        log "WARNING: git clone failed — $(tail -5 /tmp/sentinel_clone_err.log 2>/dev/null)"
-      fi
-    else
-      log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
-    fi
-
-    # Download and install openflows-harness from GitHub releases.
-    # The harness is REQUIRED for session coordination (dispatch/status/heartbeat,
-    # A2A verify requests), so a missing harness must fail loudly — a silently
-    # uncoordinated workspace is worse than a startup error.
-    # TEMPORARY: Use mounted dev binaries for local testing when available.
-    HARNESS_BIN="/usr/local/bin/openflows-harness"
-    if [ -f /opt/openflows-dev/openflows-harness ]; then
-      log "Using mounted dev harness binary..."
-      sudo cp /opt/openflows-dev/openflows-harness "$HARNESS_BIN"
-      sudo chmod +x "$HARNESS_BIN"
-    else
-      # Construct download URL based on harness_version:
-      #   harness-edge  → harness-edge pre-release (auto-updated on every main push)
-      #   v1.2.0       → tagged feature release (stable, audited)
-      # Asset naming: both tracks use fixed filename openflows-harness-x86_64-unknown-linux-musl.tar.gz
-      # which GitHub auto-replaces on re-upload with the same name.
-      HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
-      if [ "${var.harness_version}" = "harness-edge" ]; then
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/$${HARNESS_ASSET}"
-        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness (harness-edge/latest build)..." >&2
-      else
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/$${HARNESS_ASSET}"
-        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
-      fi
-      for attempt in 1 2 3; do
-        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness; then
-          tar -xzf /tmp/openflows-harness -C /tmp/ || {
-            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: failed to extract harness tarball" >&2
-            exit 1
-          }
-          HARNESS_DIR=$(find /tmp/ -maxdepth 1 -type d -name "openflows-harness-*" 2>/dev/null | head -1)
-          if [ -n "$HARNESS_DIR" ] && [ -f "$HARNESS_DIR/openflows-harness" ]; then
-            sudo mv "$HARNESS_DIR/openflows-harness" "$HARNESS_BIN"
-            sudo chmod +x "$HARNESS_BIN"
-            rm -rf /tmp/openflows-harness "$HARNESS_DIR"
-          else
-            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: could not find harness binary in extracted tarball" >&2
-            exit 1
-          fi
-          break
-        fi
-        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Harness download attempt $attempt failed; retrying in 5s..." >&2
-        sleep 5
-      done
-    fi
-    if [ ! -x "$HARNESS_BIN" ]; then
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: openflows-harness could not be installed — agent will not be able to coordinate; failing startup" >&2
-      exit 1
-    fi
-    # Immutable role assets: the persona, skills, commands, standards and hooks.
-    # A hosted workspace fetches the bundle of this release from the Manager and
-    # verifies its digest before installing anything, so it never depends on
-    # another workspace having published them. Local mode reads the tenant
-    # artifacts volume that the Nexus workspace seeds.
-    ASSETS_DIR="/home/coder/.openflows/artifacts"
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      ASSETS_DIR="/home/coder/.openflows/bundle"
-      sudo mkdir -p "$ASSETS_DIR"
-      sudo chown coder:coder "$ASSETS_DIR"
-      log "Installing the workspace artifact bundle from the Manager"
-      # The runtime access token comes from OF_RUNTIME_ACCESS_TOKEN, set by the
-      # registration above, so it never appears in a process argument.
-      if ! openflows-harness artifacts fetch --dir "$ASSETS_DIR" \
-        --manager-url "$OF_MANAGER_URL"; then
-        log "FATAL: cannot install the workspace artifact bundle"
-        exit 1
-      fi
-    fi
-
-
-    # Broker-backed git credential refresh. The startup installation token is
-    # short-lived, so a long-running worker's push can outlive it. Refresh the
-    # runtime session and re-fetch a fresh installation token from the Manager
-    # broker, then rewrite the stored git credentials so pushes keep
-    # authenticating mid-task. Runs in the background for the workspace
-    # lifetime; harmless when the Manager is unreachable.
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      rm -f /tmp/openflows-manager-ready
-      nohup bash -c '
-        ACCESS="$${OF_RUNTIME_ACCESS_TOKEN}"
-        REFRESH="$${OF_RUNTIME_REFRESH_TOKEN}"
-        TICKS=0
-        while true; do
-          sleep 30
-          if [ ! -f /tmp/openflows-manager-ready ]; then continue; fi
-          TICKS=$((TICKS + 1))
-          HEARTBEAT_STATUS=$(curl -s -o /dev/null -w "%%{http_code}" -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat")
-          if [ "$${HEARTBEAT_STATUS}" = "401" ]; then
-            RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
-            ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
-            REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
-            curl -fsS -X POST -H "Authorization: Bearer $${ACCESS}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null || true
-          fi
-          if [ "$TICKS" -lt 16 ]; then continue; fi
-          TICKS=0
-          RESP=$(curl -fsS -H "Authorization: Bearer $${REFRESH}" -H "Content-Type: application/json" --data "{\"refresh_token\":\"$${REFRESH}\"}" "$${OF_MANAGER_URL}/api/v1/runtime/refresh" 2>/dev/null) || continue
-          ACCESS=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"access_token\"])")
-          REFRESH=$(printf "%s" "$${RESP}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"refresh_token\"])")
-          GIT=$(curl -fsS -H "Authorization: Bearer $${ACCESS}" -H "Content-Type: application/json" --data "{\"purpose\":\"git\"}" "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials" 2>/dev/null) || continue
-          TOKEN=$(printf "%s" "$${GIT}" | python3 -c "import json,sys;print(json.load(sys.stdin)[\"token\"])")
-          echo "https://x-access-token:$${TOKEN}@github.com" > /home/coder/.git-credentials
-          sudo cp /home/coder/.git-credentials /root/.git-credentials
-          sudo chmod 600 /root/.git-credentials
-        done
-      ' >>/home/coder/.local/state/openflows/git-refresh.log 2>&1 &
-    fi
-
-    if [ ! -d /home/coder/workspace/.git ]; then
-      log "FATAL: repository bootstrap did not produce /home/coder/workspace/.git"
-      exit 1
-    fi
-
-    INSTRUCTION_ROOT="$ASSETS_DIR/orchestration"
-    PERSONA="$INSTRUCTION_ROOT/agent/agents/sentinel.agent.md"
-    if [ ! -f "$PERSONA" ]; then
-      log "FATAL: hosted instruction bundle is missing $PERSONA"
-      exit 1
-    fi
-    sudo cp "$PERSONA" /home/coder/workspace/AGENTS.md
-    sudo cp "$PERSONA" /home/coder/workspace/sentinel.agent.md
-    sudo mkdir -p /home/coder/workspace/.agents/skills /home/coder/workspace/.agents/commands
-    SKILL_MANIFEST="$INSTRUCTION_ROOT/agent/roles/sentinel.skills"
-    if [ ! -f "$SKILL_MANIFEST" ]; then
-      log "FATAL: hosted skill manifest is missing $SKILL_MANIFEST"
-      exit 1
-    fi
-    while IFS= read -r skill; do
-      [ -z "$skill" ] && continue
-      sudo mkdir -p "/home/coder/workspace/.agents/skills/$skill"
-      sudo cp "$INSTRUCTION_ROOT/plugin/skills/$skill/SKILL.md" "/home/coder/workspace/.agents/skills/$skill/SKILL.md"
-    done < "$SKILL_MANIFEST"
-    sudo cp -a "$INSTRUCTION_ROOT/plugin/commands/." /home/coder/workspace/.agents/commands/
-    for standard in CODING.md SECURITY.md REVIEW.md; do
-      [ ! -f "$INSTRUCTION_ROOT/agent/standards/$standard" ] || sudo cp "$INSTRUCTION_ROOT/agent/standards/$standard" /home/coder/workspace/
-    done
-    sudo chown -R coder:coder /home/coder/workspace
-    EXCLUDE=$(git -C /home/coder/workspace rev-parse --absolute-git-dir)/info/exclude
-    sudo mkdir -p "$(dirname "$EXCLUDE")"
-    sudo touch "$EXCLUDE"
-    for pattern in /AGENTS.md /sentinel.agent.md '/.agents/skills/' '/.agents/commands/' /CODING.md /SECURITY.md /REVIEW.md; do
-      sudo grep -qxF -- "$pattern" "$EXCLUDE" || printf '\n%s\n' "$pattern" | sudo tee -a "$EXCLUDE" >/dev/null
-    done
-    log "Installed hosted instructions for sentinel"
-
-    # Start heartbeat only after repository bootstrap completes. Manager uses
-    # this as the readiness boundary before creating a reviewer Chat.
-    # Start heartbeat daemon (the ONLY Redis client in the workspace).
-    # Use the BASE role so the controller can find the heartbeat under the
-    # base-role key (not the worker id — sentinel always matches base role).
-    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+    # Role environment. Hosted mode already loaded the tenant-scoped Redis URL from
+    # the runtime secret; Coder parameters are not a secret channel. The role is
+    # the BASE role: the controller reads heartbeats under the base-role key.
+    if ! of_has_runtime_secret; then
       export REDIS_URL="${data.coder_parameter.redis_url.value}"
     fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
@@ -448,11 +236,8 @@ PY
     export A2A_RELAY_ADDR="${data.coder_parameter.a2a_relay_addr.value}"
     export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      curl -fsS -X POST -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" "$${OF_MANAGER_URL}/api/v1/runtime/heartbeat" >/dev/null
-      log "Manager readiness heartbeat sent after bootstrap"
-      touch /tmp/openflows-manager-ready
-    fi
+
+    # Role command: the heartbeat daemon, the only Redis client in the workspace.
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
 }
@@ -464,8 +249,9 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   count = data.coder_workspace.me.start_count
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
-  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
-  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  image = data.coder_parameter.workspace_image_digest.value != "" ? "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
+  # The workspace image is published for linux/amd64 only; Docker emulates
+  # it on Apple Silicon and other ARM64 hosts.
   platform = "linux/amd64"
 
   # Linux Docker has no built-in host.docker.internal. Map it to the host
@@ -481,18 +267,21 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount the tenant artifacts volume read-only. It carries the repository
-  # seed; hosted workspaces install the role assets from the Manager bundle, so
-  # nothing is written here for sentinel (plans travel through Redis).
-  volumes {
-    container_path = "/home/coder/.openflows/artifacts"
-    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
-    read_only      = true
+  # Local mode only: the tenant golden repository seed that the Nexus workspace
+  # keeps fresh, mounted read-only at a path DISTINCT from the role assets
+  # (`$HOME/.openflows/artifacts`, installed from the pinned image) so the mount
+  # can never shadow them. A hosted workspace mounts no shared storage and clones
+  # with its own brokered credential.
+  dynamic "volumes" {
+    for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
+    content {
+      container_path = "/home/coder/.openflows/golden"
+      volume_name    = "openflows-golden-${data.coder_parameter.tenant.value}"
+      read_only      = true
+    }
   }
 
-  # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases).
-  # The sentinel startup script prefers the mounted /opt/openflows-dev/openflows-harness
-  # when present; this is what keeps the harness available until a hosted release exists.
+  # Optional development override (see variable "dev_binary_host_path").
   dynamic "volumes" {
     for_each = var.dev_binary_host_path != "" ? [1] : []
     content {
@@ -503,7 +292,7 @@ resource "docker_container" "workspace" {
   }
 
   dynamic "volumes" {
-    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    for_each = data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
     content {
       container_path = "/run/openflows/runtime.json"
       host_path = data.coder_parameter.runtime_secret_ref.value

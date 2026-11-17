@@ -77,7 +77,12 @@ impl LocalWorkspaceCleanup {
         self.remove_volume(&volume).await
     }
 
+    /// Remove the tenant-local golden repository volume, plus the legacy
+    /// `openflows-artifacts-<tenant>` volume that earlier releases mounted at
+    /// the role-asset path, so upgraded installs leave nothing behind.
     pub async fn remove_artifacts(&self, tenant_id: Uuid) -> Result<(), ManagerError> {
+        self.remove_volume(&format!("openflows-golden-{tenant_id}"))
+            .await?;
         self.remove_volume(&format!("openflows-artifacts-{tenant_id}"))
             .await
     }
@@ -150,9 +155,44 @@ fn container_is_owned(inspected: &Value, name: &str, volume: &str) -> bool {
             })
 }
 
+/// Coder limits workspace names to 32 lowercase characters. Keep names
+/// deterministic so a retry can adopt the workspace created by an earlier
+/// attempt instead of provisioning a duplicate.
+pub(crate) fn worker_workspace_name(role: &str, workspace_id: Uuid) -> String {
+    let compact_id = workspace_id.simple().to_string();
+    let prefix = format!("of-{role}-");
+    let suffix_len = 32 - prefix.len();
+    format!("{prefix}{}", &compact_id[..suffix_len])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{container_is_owned, workspace_names};
+    use super::{container_is_owned, worker_workspace_name, workspace_names};
+    use crate::server::development_secret_tests::coder_operator_token_for_test;
+
+    #[test]
+    fn strips_line_ending_from_file_backed_token_and_rejects_invalid() {
+        assert_eq!(
+            coder_operator_token_for_test(b"operator-key\r\n".to_vec()).unwrap(),
+            "operator-key"
+        );
+        assert!(coder_operator_token_for_test(b" \n".to_vec()).is_err());
+        assert!(coder_operator_token_for_test(b"first\nsecond".to_vec()).is_err());
+    }
+
+    #[test]
+    fn worker_workspace_names_fit_coder_and_remain_distinct_by_role() {
+        let id = uuid::Uuid::parse_str("ce164533-8eee-4f4a-a9d5-6ab0ee63cf14").unwrap();
+        for role in ["forge", "sentinel", "vessel", "lore"] {
+            let name = worker_workspace_name(role, id);
+            assert!(name.len() <= 32);
+            assert!(name.starts_with(&format!("of-{role}-")));
+            assert!(name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+            assert_eq!(name, worker_workspace_name(role, id));
+        }
+    }
 
     #[test]
     fn cleanup_targets_only_known_role_and_uuid() {
@@ -213,5 +253,34 @@ mod tests {
         assert!(calls.contains(&format!("container rm --force {name}")));
         assert!(calls.contains(&format!("volume rm {name}")));
         assert!(!calls.contains("openflows-forge"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tenant_cleanup_removes_golden_and_legacy_artifact_volumes_only() {
+        use super::LocalWorkspaceCleanup;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("docker-fixture");
+        let log = dir.path().join("calls");
+        let tenant = uuid::Uuid::parse_str("286e59c1-3e82-47d6-b92e-ffd906094407").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n  'volume inspect') printf '[{{\"Name\":\"%s\"}}]' \"$3\" ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cleanup = LocalWorkspaceCleanup {
+            binary: script.to_string_lossy().into_owned(),
+        };
+        cleanup.remove_artifacts(tenant).await.unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains(&format!("volume rm openflows-golden-{tenant}")));
+        assert!(calls.contains(&format!("volume rm openflows-artifacts-{tenant}")));
+        assert_eq!(calls.matches("volume rm").count(), 2, "{calls}");
     }
 }
