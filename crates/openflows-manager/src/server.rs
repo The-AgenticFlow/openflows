@@ -30,25 +30,6 @@ fn coder_operator_token(bytes: Vec<u8>) -> Result<String, ManagerError> {
     Ok(token.to_owned())
 }
 
-#[cfg(test)]
-mod coder_operator_token_tests {
-    use super::coder_operator_token;
-
-    #[test]
-    fn strips_line_ending_from_file_backed_token() {
-        assert_eq!(
-            coder_operator_token(b"operator-key\r\n".to_vec()).unwrap(),
-            "operator-key"
-        );
-    }
-
-    #[test]
-    fn rejects_empty_or_header_unsafe_token() {
-        assert!(coder_operator_token(b" \n".to_vec()).is_err());
-        assert!(coder_operator_token(b"first\nsecond".to_vec()).is_err());
-    }
-}
-
 /// Async dependency probe used by `/ready`.
 ///
 /// The trait keeps the readiness endpoint decoupled from Redis and gives tests
@@ -524,17 +505,23 @@ impl ManagerServices {
         let mut auth_config = config.auth.clone();
         auth_config.master_key = Some(master_key);
 
-        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> = std::sync::Arc::new(
-            crate::auth::github::RealGithubAuth::new(
-                auth_config.client_id.clone(),
-                client_secret,
-                auth_config.github_api_base.clone(),
-            )
-            .with_redirect_uri(format!(
-                "{}/auth/github/callback",
-                auth_config.public_url.trim_end_matches('/')
-            )),
-        );
+        let oauth_base = std::env::var("OPENFLOWS_GITHUB_OAUTH_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut real_github = crate::auth::github::RealGithubAuth::new(
+            auth_config.client_id.clone(),
+            client_secret,
+            auth_config.github_api_base.clone(),
+        )
+        .with_redirect_uri(format!(
+            "{}/auth/github/callback",
+            auth_config.public_url.trim_end_matches('/')
+        ));
+        if let Some(base) = oauth_base {
+            real_github = real_github.with_oauth_base(base);
+        }
+        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> =
+            std::sync::Arc::new(real_github);
 
         // Resolve the App private key (never logged/persisted) and webhook
         // secret through the secret provider. The App JWT is generated fresh and
@@ -687,7 +674,9 @@ impl ManagerServices {
                 }
             });
         }
-        if config.provisioner_backend == "docker" {
+        if config.provisioner_backend == "docker"
+            && std::env::var("OPENFLOWS_CODER_BUILTIN_PROVISIONER").as_deref() != Ok("1")
+        {
             let master =
                 resolve_master_key(provider.as_ref(), &config.crypto_master_key_ref).await?;
             let cipher =
@@ -949,10 +938,15 @@ impl AppState {
             && config.connected_local_enabled
             && !config.auth.client_id.trim().is_empty()
         {
-            let github = Arc::new(
+            let mut local =
                 crate::auth::local_github::LocalGithubAuth::new(config.auth.client_id.clone())?
-                    .with_api_base(config.auth.github_api_base.clone()),
-            );
+                    .with_api_base(config.auth.github_api_base.clone());
+            if let Ok(base) = std::env::var("OPENFLOWS_GITHUB_OAUTH_BASE") {
+                if !base.trim().is_empty() {
+                    local = local.with_oauth_base(&base);
+                }
+            }
+            let github = Arc::new(local);
             let credentials = crate::auth::local_credentials::LocalCredentials::new(
                 crate::auth::local_credentials::credential_path_from_env()?,
                 github,
@@ -1364,8 +1358,12 @@ async fn request_context(
 }
 
 #[cfg(test)]
-mod development_secret_tests {
+pub(crate) mod development_secret_tests {
     use super::*;
+
+    pub(crate) fn coder_operator_token_for_test(bytes: Vec<u8>) -> Result<String, ManagerError> {
+        coder_operator_token(bytes)
+    }
 
     #[tokio::test]
     async fn development_file_populates_oauth_and_master_key_references() {

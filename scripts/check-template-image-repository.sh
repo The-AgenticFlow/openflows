@@ -17,13 +17,15 @@ found=0
 for template in "$templates"/openflows-*/main.tf; do
     [ -f "$template" ] || continue
     found=$((found + 1))
+    dir_name="$(basename "$(dirname "$template")")"
+    role="${dir_name#openflows-}"
     actual="$(awk '
-        /^variable "workspace_image_repository"/ { inside = 1 }
+        /^(variable|data "coder_parameter") "workspace_image_repository"/ { inside = 1 }
         inside && /default[[:space:]]*=/ { sub(/.*default[[:space:]]*=[[:space:]]*"/, ""); sub(/".*/, ""); print; exit }
         inside && /^}/ { exit }
     ' "$template")"
-    if [ "$actual" != "$expected" ]; then
-        echo "::error file=${template}::workspace_image_repository defaults to '${actual:-<none>}', but the release pins the digest of ${expected}" >&2
+    if [ "$actual" != "$expected" ] && [ "$actual" != "${expected}-${role}" ]; then
+        echo "::error file=${template}::workspace_image_repository defaults to '${actual:-<none>}', but the release pins the digest of ${expected} (or ${expected}-${role})" >&2
         failed=1
     fi
 done

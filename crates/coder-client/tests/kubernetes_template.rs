@@ -87,7 +87,7 @@ fn the_pods_follow_coder_start_count_and_the_amd64_image() {
         );
         assert!(
             template.contains(
-                r#"image = "${var.workspace_image_repository}@${data.coder_parameter.workspace_image_digest.value}""#
+                r#"image = "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}""#
             ),
             "{role} must run the release-pinned image digest"
         );

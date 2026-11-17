@@ -41,12 +41,6 @@ variable "coder_service_url" {
   default     = "http://coder.coder.svc.cluster.local:7080"
 }
 
-variable "workspace_image_repository" {
-  description = "Repository of the hosted workspace image. The template release pins its digest (workspace_image_digest)."
-  type        = string
-  default     = "ghcr.io/the-agenticflow/openflows-workspace"
-}
-
 variable "github_api_base" {
   description = "GitHub REST API origin, including any enterprise API path"
   type        = string
@@ -112,6 +106,14 @@ data "coder_parameter" "runtime_secret_ref" {
   name        = "runtime_secret_ref"
   description = "Provisioner-resolved per-workspace secret reference: the Kubernetes Secret name"
   default     = ""
+  type        = "string"
+  mutable     = false
+}
+
+data "coder_parameter" "workspace_image_repository" {
+  name        = "workspace_image_repository"
+  description = "Release-pinned container repository for the Vessel workspace image"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-vessel"
   type        = "string"
   mutable     = false
 }
@@ -196,7 +198,7 @@ locals {
     "app.kubernetes.io/instance" = data.coder_workspace.me.id
   }
 
-  image = "${var.workspace_image_repository}@${data.coder_parameter.workspace_image_digest.value}"
+  image = "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}"
 
   # Empty when the delivery adapter is not the Kubernetes one; the mount is then
   # skipped and the workspace has no bundle to read.
@@ -222,6 +224,7 @@ resource "coder_agent" "main" {
     # or platform-wide credentials.
     OF_HOSTED=true
     OF_CONNECTED_LOCAL=false
+    OF_RUNTIME_SECRET_REF="${data.coder_parameter.runtime_secret_ref.value}"
 
     # The base role selects the role assets and the Redis keys.
     OF_ROLE="${data.coder_parameter.role.value}"

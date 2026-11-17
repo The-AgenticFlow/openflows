@@ -100,6 +100,7 @@ pub struct RealGithubAuth {
     client_id: String,
     client_secret: String,
     api_base: String,
+    oauth_base: String,
     timeout: Duration,
     redirect_uri: Option<String>,
 }
@@ -107,6 +108,14 @@ pub struct RealGithubAuth {
 impl RealGithubAuth {
     pub fn with_redirect_uri(mut self, uri: String) -> Self {
         self.redirect_uri = Some(uri);
+        self
+    }
+
+    pub fn with_oauth_base(mut self, base: String) -> Self {
+        let trimmed = base.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            self.oauth_base = trimmed.to_string();
+        }
         self
     }
 
@@ -121,6 +130,7 @@ impl RealGithubAuth {
             client_id,
             client_secret,
             api_base,
+            oauth_base: "https://github.com".to_string(),
             timeout: Duration::from_secs(10),
             redirect_uri: None,
         }
@@ -132,7 +142,8 @@ impl GithubAuth for RealGithubAuth {
     fn authorize_url(&self, req: &AuthorizeRequest) -> String {
         // PKCE S256 (RFC 7636). GitHub requires S256; `plain` is rejected.
         format!(
-            "{GITHUB_AUTHORIZE_URL}?client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&prompt=select_account",
+            "{}/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&prompt=select_account",
+            self.oauth_base,
             urlencode(&req.client_id),
             urlencode(&req.redirect_uri),
             urlencode(&req.state),
@@ -150,10 +161,11 @@ impl GithubAuth for RealGithubAuth {
         if let Some(uri) = &self.redirect_uri {
             params.push(("redirect_uri", uri.clone()));
         }
+        let token_url = format!("{}/login/oauth/access_token", self.oauth_base);
         let resp = tokio::time::timeout(
             self.timeout,
             self.client
-                .post(GITHUB_TOKEN_URL)
+                .post(&token_url)
                 .header("Accept", "application/json")
                 .form(&params)
                 .send(),
@@ -232,10 +244,11 @@ impl GithubAuth for RealGithubAuth {
             ("code_verifier", verifier.to_string()),
             ("redirect_uri", redirect_uri.to_string()),
         ];
+        let token_url = format!("{}/login/oauth/access_token", self.oauth_base);
         let resp = tokio::time::timeout(
             self.timeout,
             self.client
-                .post(GITHUB_TOKEN_URL)
+                .post(&token_url)
                 .header("Accept", "application/json")
                 .form(&params)
                 .send(),

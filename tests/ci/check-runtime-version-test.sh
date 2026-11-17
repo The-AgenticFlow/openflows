@@ -57,7 +57,10 @@ expect "a fork's repository fails" 1 \
     bash "$ROOT/scripts/check-template-image-repository.sh" "$templates" ghcr.io/fork/openflows-workspace
 expect "the real templates name the published repository" 0 \
     bash "$ROOT/scripts/check-template-image-repository.sh" "$ROOT/crates/coder-client/templates" \
-    ghcr.io/the-agenticflow/openflows-workspace
+    ghcr.io/the-agenticflow/workspace-runtime
+expect "a fork's prefix fails against the real templates" 1 \
+    bash "$ROOT/scripts/check-template-image-repository.sh" "$ROOT/crates/coder-client/templates" \
+    ghcr.io/fork/workspace-runtime
 expect "an empty templates folder fails" 1 \
     bash "$ROOT/scripts/check-template-image-repository.sh" "$PARENT/none" ghcr.io/owner/openflows-workspace
 

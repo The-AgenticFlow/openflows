@@ -22,6 +22,16 @@ on:
         description: 'Publish only once its Docker images exist (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-assets-${{ inputs.version }}
@@ -213,6 +223,8 @@ jobs:
     with:
       version: ${{ inputs.version }}
       wait_for_images: ${{ inputs.wait_for_images }}
+      workspace_runtime_release: ${{ inputs.workspace_runtime_release }}
+      allow_candidate_runtime: ${{ inputs.allow_candidate_runtime }}
 
   attach:
     name: Attach assets and publish

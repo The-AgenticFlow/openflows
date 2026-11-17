@@ -5,13 +5,90 @@
 //! materialize the long-lived Nexus workspace used by the orchestrator.
 //! Safe to call on every restart.
 
+pub use crate::types::TemplateVariableValue;
 use crate::{CoderClient, CreateWorkspaceRequest};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use config::CoderConfig;
 use envconfig::Envconfig;
 use serde_json::json;
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Values forwarded to server-side Terraform and included in bootstrap caching.
+pub fn template_variable_values() -> Vec<(&'static str, String)> {
+    [
+        ("TF_VAR_dev_binary_host_path", "dev_binary_host_path"),
+        ("TF_VAR_docker_network", "docker_network"),
+        ("TF_VAR_workspace_image", "workspace_image"),
+        (
+            "TF_VAR_workspace_image_repository",
+            "workspace_image_repository",
+        ),
+        ("TF_VAR_github_api_base", "github_api_base"),
+        ("TF_VAR_github_git_base", "github_git_base"),
+        ("TF_VAR_connected_local", "connected_local"),
+        (
+            "TF_VAR_connected_local_broker_secret_host_path",
+            "connected_local_broker_secret_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_helper_host_path",
+            "connected_local_helper_host_path",
+        ),
+        (
+            "TF_VAR_connected_local_manager_url",
+            "connected_local_manager_url",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(env_name, name)| {
+        std::env::var(env_name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| (name, value))
+    })
+    .collect()
+}
+
+/// Whether `reference` is an immutable `<repository>@sha256:<64 hex>` image
+/// reference. Tags are mutable and are never accepted as a pin.
+pub fn is_pinned_image_reference(reference: &str) -> bool {
+    let Some((repository, digest)) = reference.split_once('@') else {
+        return false;
+    };
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.contains(char::is_whitespace)
+        && !repository.contains('@')
+        && hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Template variables for one role template (`openflows-<role>`).
+pub fn template_variable_values_for(template_name: &str) -> Result<Vec<(&'static str, String)>> {
+    let mut values = template_variable_values();
+    let Some(role) = template_name.strip_prefix("openflows-") else {
+        return Ok(values);
+    };
+    let env_name = format!("TF_VAR_workspace_image_{role}");
+    let Some(pinned) = std::env::var(&env_name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(values);
+    };
+    if !is_pinned_image_reference(&pinned) {
+        bail!("{env_name} must be '<repository>@sha256:<64 hex digits>', not a mutable tag");
+    }
+    values.retain(|(name, _)| *name != "workspace_image");
+    values.push(("workspace_image", pinned));
+    Ok(values)
+}
 
 /// Bootstrapper for Coder integration.
 pub struct CoderBootstrapper {
@@ -478,14 +555,14 @@ impl CoderBootstrapper {
 }
 
 /// Fingerprint both the archive and the variables stored by server-side Terraform.
-fn template_hash(data: &[u8]) -> String {
+fn template_hash(name: &str, data: &[u8]) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let variables = serde_json::to_vec(&crate::template_variable_values())
+    let variables = serde_json::to_vec(&crate::template_variable_values_for(name)?)
         .expect("template variable strings are JSON serializable");
     hasher.update(variables);
-    hex_encode(&hasher.finalize())
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 /// Minimal hex encoder (avoids pulling in another crate just for this).
@@ -534,7 +611,13 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 /// if the push attempt failed. Callers use `None` to determine whether bootstrap
 /// should fail due to a template management error.
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
-    let current_hash = template_hash(data);
+    let current_hash = match template_hash(name, data) {
+        Ok(hash) => hash,
+        Err(err) => {
+            tracing::error!(template = name, error = %err, "Failed to prepare template variable values");
+            return None;
+        }
+    };
 
     let before_templates = client.list_templates_in_default_org().await.ok();
     let before_template = before_templates

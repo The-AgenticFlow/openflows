@@ -160,9 +160,9 @@ fn every_role_starts_from_the_shared_runtime_in_the_workspace_image() {
         }
         assert!(
             template.contains(
-                r#""${var.workspace_image_repository}@${data.coder_parameter.workspace_image_digest.value}""#
+                r#""${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}""#
             ),
-            "{role} must run the release-pinned OpenFlows workspace image in hosted mode"
+            "{role} must run the release-pinned workspace-runtime image when a digest is set"
         );
         let variable = template
             .split_once("variable \"workspace_image\" {")
@@ -172,16 +172,12 @@ fn every_role_starts_from_the_shared_runtime_in_the_workspace_image() {
             .unwrap()
             .0;
         assert!(
-            variable.contains("default     = \"\""),
-            "{role} must not default local workspaces to a floating image"
+            variable.contains("STANDALONE TEMPLATE USE ONLY"),
+            "{role} must document that the workspace_image tag default is for standalone use"
         );
         assert!(
             !template.contains("openflows-workspace:latest"),
             "{role} still refers to a floating workspace image"
-        );
-        assert!(
-            template.contains(": local.local_workspace_image\n"),
-            "{role} must run local workspaces from the given image or the explanatory reference"
         );
         let dev_mount = template
             .split("dynamic \"volumes\"")
@@ -360,11 +356,236 @@ fn role_hook_settings_keep_other_settings() {
 }
 
 #[test]
-fn hosted_workers_never_read_instructions_from_the_shared_volume() {
+fn hosted_workers_fetch_the_artifact_bundle_instead_of_reading_shared_assets() {
+    assert!(
+        RUNTIME.contains("OPENFLOWS_ROLE=\"${OF_ROLE:-}\" openflows-runtime install"),
+        "shared runtime must install role assets using openflows-runtime install"
+    );
+    assert!(
+        RUNTIME.contains("cannot install the workspace artifact bundle"),
+        "shared runtime must fail startup when the bundle cannot be installed"
+    );
+    assert!(
+        RUNTIME.contains("root=\"$ASSETS_DIR/orchestration\""),
+        "shared runtime must install instructions from the resolved assets directory"
+    );
+    let runtime_install = RUNTIME.find("openflows-runtime install").unwrap();
+    let install = RUNTIME.find("root=\"$ASSETS_DIR/orchestration\"").unwrap();
+    assert!(
+        runtime_install < install,
+        "shared runtime must install role assets before it reads instructions from them"
+    );
     for (role, template) in workers() {
         assert!(
-            !template.contains("/home/coder/.openflows/artifacts/orchestration"),
-            "{role} still reads instructions from the shared artifacts volume"
+            template.contains(&format!("ghcr.io/the-agenticflow/workspace-runtime-{role}")),
+            "{role} must reference the per-role workspace-runtime image"
+        );
+        assert!(
+            !template.contains("codercom/enterprise-base"),
+            "{role} must not reference legacy codercom/enterprise-base"
+        );
+        assert!(
+            !template.contains("openflows-artifacts-"),
+            "{role} must not use the legacy artifacts volume that shadowed role assets"
         );
     }
+}
+
+const GOLDEN_DIR: &str = "/home/coder/.openflows/golden";
+const ASSETS_DIR: &str = "/home/coder/.openflows/artifacts";
+
+fn all_role_templates() -> [(&'static str, &'static str); 5] {
+    [
+        (
+            "nexus",
+            include_str!("../templates/openflows-nexus/main.tf"),
+        ),
+        (
+            "forge",
+            include_str!("../templates/openflows-forge/main.tf"),
+        ),
+        (
+            "sentinel",
+            include_str!("../templates/openflows-sentinel/main.tf"),
+        ),
+        (
+            "vessel",
+            include_str!("../templates/openflows-vessel/main.tf"),
+        ),
+        ("lore", include_str!("../templates/openflows-lore/main.tf")),
+    ]
+}
+
+/// Every `container_path = "..."` declared in a template.
+fn container_paths(template: &str) -> Vec<&str> {
+    template
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("container_path"))
+        .filter_map(|l| l.split('"').nth(1))
+        .collect()
+}
+
+#[test]
+fn no_template_mounts_a_volume_over_the_installed_role_assets() {
+    for (role, template) in all_role_templates() {
+        for path in container_paths(template) {
+            assert!(
+                path != ASSETS_DIR && !path.starts_with(&format!("{ASSETS_DIR}/")),
+                "{role} mounts {path}, which shadows the assets that `openflows-runtime install` writes"
+            );
+        }
+    }
+}
+
+#[test]
+fn local_workers_mount_the_golden_seed_read_only_at_a_distinct_path() {
+    assert!(
+        RUNTIME.contains(&format!("OF_GOLDEN_REPO={GOLDEN_DIR}/repo")),
+        "shared runtime must seed repositories from the golden mount"
+    );
+    assert!(
+        RUNTIME.contains("ASSETS_DIR=\"$OF_HOME/.openflows/artifacts\""),
+        "shared runtime installs assets outside the golden mount"
+    );
+    assert!(
+        RUNTIME.contains("falling back to a direct clone")
+            || RUNTIME.contains("falling back to direct clone"),
+        "shared runtime (hosted) must fall back to a direct clone with no seed"
+    );
+    for (role, template) in all_role_templates()
+        .into_iter()
+        .filter(|(role, _)| *role != "nexus")
+    {
+        let mount = template
+            .find(&format!("container_path = \"{GOLDEN_DIR}\""))
+            .unwrap_or_else(|| panic!("{role} must mount the golden volume"));
+        let block = &template[mount.saturating_sub(120)..mount + 260];
+        assert!(
+            block.contains("hosted.value != \"true\""),
+            "{role}: golden mount must be local mode only: {block}"
+        );
+        assert!(
+            block.contains("openflows-golden-"),
+            "{role}: wrong volume: {block}"
+        );
+        assert!(
+            block.contains("read_only      = true"),
+            "{role}: golden mount must be read-only: {block}"
+        );
+    }
+}
+
+#[test]
+fn nexus_seeds_the_golden_repository_in_local_mode_only() {
+    let template = include_str!("../templates/openflows-nexus/main.tf");
+    assert!(RUNTIME.contains(&format!("OF_GOLDEN_REPO={GOLDEN_DIR}/repo")));
+    assert!(RUNTIME.contains("of_hosted || of_refresh_golden_seed"));
+    assert!(RUNTIME.contains("git clone \"$1\" \"$OF_GOLDEN_REPO\""));
+    assert!(template.contains("resource \"docker_volume\" \"golden\""));
+    let vol = template
+        .find("resource \"docker_volume\" \"golden\"")
+        .unwrap();
+    assert!(
+        template[vol..vol + 200]
+            .contains("count = data.coder_parameter.hosted.value != \"true\" ? 1 : 0"),
+        "hosted mode must create no shared volume"
+    );
+    let mount = template
+        .find(&format!("container_path = \"{GOLDEN_DIR}\""))
+        .expect("nexus mounts the golden volume");
+    let block = &template[mount.saturating_sub(160)..mount + 160];
+    assert!(block.contains("hosted.value != \"true\""), "{block}");
+    assert!(block.contains("docker_volume.golden[0].name"), "{block}");
+    assert!(
+        !block.contains("read_only"),
+        "nexus must be able to write the golden seed: {block}"
+    );
+    // The controller's ARTIFACTS_DIR is the installed asset tree, not the volume.
+    assert!(template.contains(&format!("\"ARTIFACTS_DIR={ASSETS_DIR}\"")));
+    assert!(RUNTIME.contains("OF_ROLE=\"${OF_ROLE:-nexus}\" of_install_artifact_bundle"));
+}
+
+#[test]
+fn workers_keep_the_harness_pinned_in_the_image() {
+    assert!(
+        RUNTIME.contains("of_install_programs openflows-harness"),
+        "shared runtime must verify the image's pinned harness"
+    );
+    assert!(
+        !RUNTIME.contains("HARNESS_ASSET=") && !RUNTIME.contains("HARNESS_URL="),
+        "shared runtime must not fall back to an unpinned harness download"
+    );
+    assert!(
+        RUNTIME.contains("$ASSETS_DIR/plugin/skills"),
+        "shared runtime must support installing skills from $ASSETS_DIR/plugin/skills without a .skills manifest"
+    );
+    for (role, template) in all_role_templates()
+        .into_iter()
+        .filter(|(role, _)| *role != "nexus")
+    {
+        assert!(
+            !template.contains("HARNESS_ASSET=") && !template.contains("HARNESS_URL="),
+            "{role} must not fall back to an unpinned harness download"
+        );
+    }
+}
+
+#[test]
+fn standalone_image_tag_default_is_documented_as_standalone_only() {
+    for (role, template) in all_role_templates() {
+        assert!(
+            template.contains("STANDALONE TEMPLATE USE ONLY"),
+            "{role} must document that the tag default is for standalone use"
+        );
+        // Manager-provisioned workspaces use repository@digest.
+        assert!(
+            template.contains(
+                "\"${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}\""
+            ),
+            "{role} must pin repository@digest when a digest is provided"
+        );
+    }
+}
+
+#[test]
+fn runtime_install_is_fatal_and_runs_as_the_unprivileged_user_under_set_e() {
+    assert!(
+        RUNTIME.contains("if ! OPENFLOWS_ROLE=\"${OF_ROLE:-}\" openflows-runtime install; then")
+    );
+    assert!(!RUNTIME.contains("sudo openflows-runtime"));
+    for (role, template) in all_role_templates()
+        .into_iter()
+        .filter(|(role, _)| *role != "nexus")
+    {
+        assert!(template.contains("set -e"), "{role}");
+        assert!(!template.contains("sudo openflows-runtime"), "{role}");
+    }
+}
+
+#[test]
+fn nexus_network_aliases_cover_hosted_manager_local_and_legacy_modes() {
+    let template = include_str!("../templates/openflows-nexus/main.tf");
+    let block = template
+        .split_once("networks_advanced {")
+        .expect("nexus defines networks_advanced")
+        .1
+        .split_once("\n  }")
+        .expect("networks_advanced block closes")
+        .0;
+    let aliases_line = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("aliases = "))
+        .expect("networks_advanced defines aliases");
+    assert!(
+        aliases_line.contains(
+            "data.coder_parameter.hosted.value == \"true\" ? [\"openflows-nexus-${data.coder_parameter.tenant.value}\"]"
+        ),
+        "hosted mode must advertise the tenant-scoped alias: {aliases_line}"
+    );
+    assert!(
+        aliases_line.contains(
+            "data.coder_parameter.runtime_secret_ref.value != \"\" ? [\"openflows-nexus\", \"openflows-nexus-${data.coder_parameter.tenant.value}\"] : [\"openflows-nexus\"]"
+        ),
+        "local mode must add the tenant-scoped alias when runtime_secret_ref is set and preserve openflows-nexus for legacy mode: {aliases_line}"
+    );
 }

@@ -46,6 +46,12 @@ enum ArtifactAction {
         #[arg(long)]
         any_release: bool,
     },
+    /// Install the workspace artifact bundle compiled into this binary
+    Install {
+        /// Directory to install the artifacts tree into
+        #[arg(long)]
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -337,6 +343,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Commands::Artifacts { action } = cli.command {
+        return handle_artifacts(action).await;
+    }
     if let Commands::Verify {
         action: VerifyAction::Request {
             argv, command_argv, ..
@@ -526,47 +535,7 @@ async fn main() -> Result<()> {
         } => {
             store.gate_status(&ticket, &phase).await?;
         }
-        Commands::Artifacts { action } => match action {
-            ArtifactAction::Fetch {
-                dir,
-                manager_url,
-                token,
-                digest,
-                any_release,
-            } => {
-                let manager_url = manager_url
-                    .or_else(|| std::env::var("OF_MANAGER_URL").ok())
-                    .context("--manager-url or OF_MANAGER_URL is required")?;
-                let token = token
-                    .or_else(|| std::env::var("OF_RUNTIME_ACCESS_TOKEN").ok())
-                    .context("--token or OF_RUNTIME_ACCESS_TOKEN is required")?;
-                let installed = match (digest, any_release) {
-                    (Some(digest), _) => {
-                        openflows_harness::artifacts::fetch(
-                            &manager_url,
-                            &token,
-                            Some(&digest),
-                            &dir,
-                        )
-                        .await?
-                    }
-                    (None, true) => {
-                        openflows_harness::artifacts::fetch(&manager_url, &token, None, &dir)
-                            .await?
-                    }
-                    (None, false) => {
-                        openflows_harness::artifacts::fetch_own_release(&manager_url, &token, &dir)
-                            .await?
-                    }
-                };
-                println!(
-                    "installed {} artifacts ({}) into {}",
-                    installed.files,
-                    installed.digest,
-                    dir.display()
-                );
-            }
-        },
+        Commands::Artifacts { .. } => unreachable!("artifacts command handled before Redis setup"),
         Commands::Verify {
             action:
                 VerifyAction::Request {
@@ -613,6 +582,54 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn handle_artifacts(action: ArtifactAction) -> Result<()> {
+    match action {
+        ArtifactAction::Fetch {
+            dir,
+            manager_url,
+            token,
+            digest,
+            any_release,
+        } => {
+            let manager_url = manager_url
+                .or_else(|| std::env::var("OF_MANAGER_URL").ok())
+                .context("--manager-url or OF_MANAGER_URL is required")?;
+            let token = token
+                .or_else(|| std::env::var("OF_RUNTIME_ACCESS_TOKEN").ok())
+                .context("--token or OF_RUNTIME_ACCESS_TOKEN is required")?;
+            let installed = match (digest, any_release) {
+                (Some(digest), _) => {
+                    openflows_harness::artifacts::fetch(&manager_url, &token, Some(&digest), &dir)
+                        .await?
+                }
+                (None, true) => {
+                    openflows_harness::artifacts::fetch(&manager_url, &token, None, &dir).await?
+                }
+                (None, false) => {
+                    openflows_harness::artifacts::fetch_own_release(&manager_url, &token, &dir)
+                        .await?
+                }
+            };
+            println!(
+                "installed {} artifacts ({}) into {}",
+                installed.files,
+                installed.digest,
+                dir.display()
+            );
+        }
+        ArtifactAction::Install { dir } => {
+            let installed = openflows_harness::artifacts::install_bundled(&dir)?;
+            println!(
+                "installed {} artifacts ({}) into {}",
+                installed.files,
+                installed.digest,
+                dir.display()
+            );
+        }
+    }
     Ok(())
 }
 

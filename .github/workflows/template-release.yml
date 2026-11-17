@@ -13,6 +13,16 @@ on:
         description: 'Pin the workspace image published for this version (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Optional workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       version:
@@ -22,6 +32,16 @@ on:
         description: 'Pin the workspace image published for this version (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Optional workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -50,41 +70,58 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=openflows-$VERSION" >> "$GITHUB_OUTPUT"
 
-      # The manifest pins the workspace image docker-publish.yml builds for this
-      # version: its repository, digest, platform and runtime release. Hosted
-      # workspaces run exactly that image.
-      - name: Resolve the workspace image
+      # The manifest pins the workspace-runtime release images for this version:
+      # per-role repositories, digests, platform and runtime release. Hosted
+      # workspaces run exactly those images.
+      - name: Resolve the workspace-runtime manifest
         if: inputs.wait_for_images
         env:
-          VERSION: ${{ steps.release.outputs.version }}
-          IMAGE_WAIT_SECONDS: 7200
+          GH_TOKEN: ${{ github.token }}
+          WORKSPACE_RUNTIME_RELEASE: ${{ inputs.workspace_runtime_release }}
+          ALLOW_CANDIDATE_RUNTIME: ${{ inputs.allow_candidate_runtime }}
         run: |
           set -euo pipefail
-          REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}-workspace"
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPOSITORY="ghcr.io/${OWNER,,}/workspace-runtime"
           # Hosted workspaces run "<workspace_image_repository>@<digest>", where the
           # repository is the templates' default and only the digest comes from the
           # Manager. A digest of another repository cannot be pulled, so the
-          # repository pinned here must be the one the templates name.
+          # repository pinned here must match the templates' per-role defaults.
           bash scripts/check-template-image-repository.sh crates/coder-client/templates "${REPOSITORY}"
-          until DIGEST="$(docker buildx imagetools inspect "${REPOSITORY}:${VERSION}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')" \
-              && [ -n "${DIGEST}" ]; do
-            if [ "${SECONDS}" -ge "${IMAGE_WAIT_SECONDS}" ]; then
-              echo "::error::${REPOSITORY}:${VERSION} did not appear; the templates cannot pin a workspace image."
-              exit 1
-            fi
-            sleep 60
-          done
-          if ! printf '%s' "${DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
-            echo "::error::Could not resolve an immutable digest for ${REPOSITORY}:${VERSION}: '${DIGEST}'"
+          RUNTIME_REPO="${OWNER}/workspace-runtime"
+          MANIFEST_PATH="${RUNNER_TEMP}/workspace-runtime-release-manifest.json"
+          if [ -n "${WORKSPACE_RUNTIME_RELEASE}" ]; then
+            gh release download "${WORKSPACE_RUNTIME_RELEASE}" --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          else
+            gh release download --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          fi
+          RUNTIME_VERSION="$(jq -er '.runtime_version' "${MANIFEST_PATH}")"
+          RUNTIME_STATUS="$(jq -er '.status' "${MANIFEST_PATH}")"
+          if [ "${RUNTIME_STATUS}" = "candidate" ] && [ "${ALLOW_CANDIDATE_RUNTIME}" != "true" ]; then
+            echo "::error::workspace-runtime ${RUNTIME_VERSION} has status 'candidate'; pass allow_candidate_runtime=true or pin a compatible workspace_runtime_release"
             exit 1
           fi
+          MANIFEST_SHA256="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
           {
-            echo "OPENFLOWS_WORKSPACE_IMAGE_REPO=${REPOSITORY}"
-            echo "OPENFLOWS_WORKSPACE_IMAGE_DIGEST=${DIGEST}"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST=${MANIFEST_PATH}"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST_SHA256=${MANIFEST_SHA256}"
             echo "OPENFLOWS_WORKSPACE_ARCH=amd64"
-            echo "OPENFLOWS_WORKSPACE_RUNTIME_RELEASE=$(cat runtime/VERSION)"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_RELEASE=${RUNTIME_VERSION}"
+            if [ "${ALLOW_CANDIDATE_RUNTIME}" = "true" ]; then
+              echo "OPENFLOWS_WORKSPACE_RUNTIME_ALLOW_CANDIDATE=true"
+            fi
           } >> "$GITHUB_ENV"
-          echo "Pinned ${REPOSITORY}@${DIGEST} (linux/amd64, runtime $(cat runtime/VERSION))"
+          echo "Pinned workspace-runtime manifest ${MANIFEST_SHA256} from ${RUNTIME_REPO} (linux/amd64, runtime ${RUNTIME_VERSION}, status ${RUNTIME_STATUS})"
+
+      - name: Set fork-testing workspace image pins
+        if: ${{ !inputs.wait_for_images }}
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          {
+            echo "OPENFLOWS_WORKSPACE_IMAGE_REPO=ghcr.io/${OWNER,,}/workspace-runtime"
+            echo "OPENFLOWS_WORKSPACE_IMAGE_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          } >> "$GITHUB_ENV"
 
       - name: Build deterministic template release
         run: |

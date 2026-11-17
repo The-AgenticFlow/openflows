@@ -147,8 +147,13 @@ fn local_github(
             "The OpenFlows GitHub App is not configured for this local installation",
         )
     })?;
-    let github = LocalGithubAuth::new(client_id.to_owned())?
+    let mut github = LocalGithubAuth::new(client_id.to_owned())?
         .with_api_base(state.github_api_base().to_owned());
+    if let Ok(base) = std::env::var("OPENFLOWS_GITHUB_OAUTH_BASE") {
+        if !base.trim().is_empty() {
+            github = github.with_oauth_base(&base);
+        }
+    }
     Ok((credentials, github))
 }
 
