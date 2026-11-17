@@ -74,16 +74,22 @@ of_curl_auth() {
 }
 
 # of_prepare [--own-artifacts] — create the state directory and give the
-# workspace paths to the coder user: the workspace volume (new volumes are
-# root-owned; files a previous release wrote as root are handed back) and
-# ~/.openflows, which Docker creates as root to hold the artifacts mount.
-# --own-artifacts (Nexus) also takes the tenant artifacts volume it seeds.
+# workspace paths to the coder user. A mounted volume arrives root-owned and a
+# previous root run can leave root-owned files behind, so a backend that can
+# escalate repairs them; a Kubernetes pod that forbids privilege escalation and
+# adds no capabilities cannot, and receives the paths writable through its
+# fsGroup instead. --own-artifacts (Nexus) also takes the tenant artifacts
+# volume it seeds, which only that role mounts read-write.
 of_prepare() {
-    sudo mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows"
-    sudo chown coder:coder "$OF_HOME/.openflows"
-    sudo find "$OF_WORKSPACE" -xdev \! -user coder -exec chown -h coder:coder {} +
-    if [ "${1:-}" = --own-artifacts ]; then
-        sudo chown -R coder:coder "$OF_HOME/.openflows"
+    if sudo -n true 2>/dev/null; then
+        sudo mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows"
+        sudo chown coder:coder "$OF_HOME/.openflows"
+        sudo find "$OF_WORKSPACE" -xdev \! -user coder -exec chown -h coder:coder {} +
+        if [ "${1:-}" = --own-artifacts ]; then
+            sudo chown -R coder:coder "$OF_HOME/.openflows"
+        fi
+    else
+        mkdir -p "$OF_WORKSPACE" "$OF_HOME/.openflows"
     fi
     mkdir -p "$OF_STATE_DIR"
     of_log "Workspace runtime $OF_RUNTIME_VERSION (API $OF_RUNTIME_API) from $OF_RUNTIME_DIR"
@@ -118,8 +124,9 @@ of_install_programs() {
 }
 
 # of_load_runtime_credentials [ENV=key ...] — export the values of the mounted
-# runtime secret. The mount is root-owned, so it is read through sudo into a
-# private copy that is removed straight after parsing. Every role exports the
+# runtime secret. A Docker host file is root-owned and read through sudo; a
+# Kubernetes Secret volume is readable by the workspace's group. Both end up in
+# a private copy that is removed straight after parsing. Every role exports the
 # Manager URL, bootstrap token, Redis URL and tenant namespace; extra ENV=key
 # pairs export more fields of the secret.
 of_load_runtime_credentials() {
@@ -127,7 +134,8 @@ of_load_runtime_credentials() {
     [ -n "${OPENFLOWS_RUNTIME_CREDENTIAL_FILE:-}" ] || of_fatal "OPENFLOWS_RUNTIME_CREDENTIAL_FILE is not set"
     RUNTIME_CREDENTIAL_COPY=$(mktemp)
     chmod 600 "$RUNTIME_CREDENTIAL_COPY"
-    if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
+    if ! cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY" 2>/dev/null &&
+        ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY" 2>/dev/null; then
         rm -f "$RUNTIME_CREDENTIAL_COPY"
         of_fatal "runtime secret is not mounted"
     fi
@@ -548,9 +556,15 @@ of_signal_manager_ready() {
 # workspace then run without root, so they cannot read the root-owned runtime
 # secret or tamper with the image. The image restores the rule on the next
 # start, where startup needs it again. Local workspaces keep sudo so agents can
-# install tools on the operator's own machine.
+# install tools on the operator's own machine. A backend that never grants
+# privilege (a Kubernetes pod with no_new_privs and no added capabilities) has
+# nothing to give up, and startup continues.
 of_release_privileges() {
     of_hosted || return 0
+    if ! sudo -n true 2>/dev/null; then
+        of_log "Released sudo: the role's commands run without root"
+        return 0
+    fi
     sudo rm -f "$OF_SUDOERS_FILE"
     if sudo -n true 2>/dev/null; then
         of_fatal "sudo is still available after removing $OF_SUDOERS_FILE; refusing to hand a root-capable workspace to an agent"

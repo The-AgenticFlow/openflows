@@ -8,6 +8,7 @@
 //! links, special files) are rejected. The old agent `registry.json` is never
 //! shipped or passed as a template parameter here.
 
+pub mod archive;
 pub mod backend;
 pub mod packaging;
 pub mod repository;
