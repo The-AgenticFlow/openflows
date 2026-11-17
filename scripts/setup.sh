@@ -414,14 +414,14 @@ PY
 }
 
 stage_manager_coder_oauth() {
-    local secret_dir="$(env_get OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR)" token_file="$secret_dir/coder-bootstrap-token" id line args=()
+    local secret_dir="$(env_get OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR)" id line args=()
     # The Manager creates its own Coder OAuth client using the already signed-in
     # local Coder account. The token file is private and mounted only locally.
-    (umask 077; printf '%s' "$(env_get CODER_SESSION_TOKEN)" >"$token_file")
+    (umask 077; printf '%s' "$(env_get CODER_SESSION_TOKEN)" >"$secret_dir/coder-bootstrap-token")
     while IFS= read -r line; do args+=("$line"); done < <(compose_files)
-    if ! (cd "$ROOT" && docker compose "${args[@]}" exec -T \
+    if ! (cd "$ROOT" && docker compose "${args[@]}" run --rm --no-deps -T \
         -e OPENFLOWS_CODER_BOOTSTRAP_TOKEN_FILE=/run/openflows-local/coder-bootstrap-token \
-        openflows-local-manager openflows-manager setup >"$LOG_FILE" 2>&1); then
+        openflows-local-manager setup >"$LOG_FILE" 2>&1); then
         tail -n 15 "$LOG_FILE" | sed 's/^/    /' >&2
         die "Could not register the local Coder OAuth application" "Full log: $LOG_FILE"
     fi
@@ -1068,9 +1068,9 @@ main() {
     stage_github_app
     resolve_workspace_image
     stage_docker
-    stage_connected_local_authorization
     stage_coder_token
     stage_manager_coder_oauth
+    stage_connected_local_authorization
     stage_llm
     stage_bootstrap
     stage_tenant
