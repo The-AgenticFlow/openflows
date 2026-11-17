@@ -1,4 +1,4 @@
-"""Real Docker E2E for workspace-runtime v0.2.0 + Manager release pinning (#514/#515)."""
+"""Real Docker E2E for published workspace-runtime v0.3.1 + Manager release pinning (#514/#515)."""
 
 import hashlib
 import http.cookiejar
@@ -23,26 +23,26 @@ REDIS_URL = os.environ["REDIS_URL"]
 DB_URL = os.environ["OPENFLOWS_E2E_MANAGER_DB_URL"]
 TENANT = os.environ["OPENFLOWS_E2E_TENANT"]
 
-V0_2_0_IMAGES = {
+V0_3_1_IMAGES = {
     "nexus": (
         "ghcr.io/the-agenticflow/workspace-runtime-nexus",
-        "sha256:76db4d6953b4ed5ba64cfd47e155fdb7aca38cd79ee89b600f9f46457cbe12cd",
+        "sha256:8a116ddf018d1317d4a282818e04c44f4bcb2c9ac45ad3bbfd5412c4e0743373",
     ),
     "forge": (
         "ghcr.io/the-agenticflow/workspace-runtime-forge",
-        "sha256:660f6f401a13103e2012997f03ab7d864f8853ce06b280b0371fb07d05a752f0",
+        "sha256:5e86abc601910eaa50ba840532a818406ee6fb3652793d365afbaa1f25088356",
     ),
     "sentinel": (
         "ghcr.io/the-agenticflow/workspace-runtime-sentinel",
-        "sha256:b824305d32ad15f087cf00f17880d36ef21271623336de83d5db917a9517d07f",
+        "sha256:87fbfb936ee950985ea83dfb8b624efd77655b2f01ba3768c9b4419b6d06e936",
     ),
     "vessel": (
         "ghcr.io/the-agenticflow/workspace-runtime-vessel",
-        "sha256:59bff0379fa95382725b74196be274a9cbaac0e85e3183ffa6e5e48766342e3e",
+        "sha256:383fe3b55b8ef34771fbdedcbb9881c0b52f2bca86c9cd09bd9830ea2b65b830",
     ),
     "lore": (
         "ghcr.io/the-agenticflow/workspace-runtime-lore",
-        "sha256:5f42f72b37c9c8ec687599f9f905554ccf71e452d5a13e8b2133475c6fe068fb",
+        "sha256:15a2d4259ce21c455253feab1236bae4caeac1f7a7be54f9851ce9a16559d1a7",
     ),
 }
 
@@ -70,12 +70,18 @@ V0_2_1_IMAGES = {
 }
 
 
-def build_manifest(runtime_version: str, images: dict[str, tuple[str, str]]) -> str:
+def build_manifest(
+    runtime_version: str,
+    images: dict[str, tuple[str, str]],
+    *,
+    status: str = "candidate",
+    schema_versions: list[int] | None = None,
+) -> str:
     return json.dumps(
         {
             "schema_version": 2,
             "runtime_version": runtime_version,
-            "status": "candidate",
+            "status": status,
             "images": {
                 role: {
                     "repository": repo,
@@ -97,7 +103,7 @@ def build_manifest(runtime_version: str, images: dict[str, tuple[str, str]]) -> 
                 "openflows_release": "openflows-1.8.2",
             },
             "compatibility": {
-                "openflows_template_parameter_schema_versions": [],
+                "openflows_template_parameter_schema_versions": schema_versions or [],
                 "minimum_manager_version": None,
             },
         },
@@ -283,8 +289,10 @@ def main():
     (secrets_dir / "github-broker-key").write_text(broker_key)
     (secrets_dir / "github-broker-key").chmod(0o600)
 
-    manifest_v020 = secrets_dir / "v0.2.0-manifest.json"
-    manifest_v020.write_text(build_manifest("0.2.0", V0_2_0_IMAGES))
+    manifest_v031 = secrets_dir / "v0.3.1-manifest.json"
+    manifest_v031.write_text(
+        build_manifest("0.3.1", V0_3_1_IMAGES, status="compatible", schema_versions=[2])
+    )
     manifest_v021 = secrets_dir / "v0.2.1-manifest.json"
     manifest_v021.write_text(build_manifest("0.2.1", V0_2_1_IMAGES))
 
@@ -319,9 +327,9 @@ def main():
 
     # 2. #514 negative checks: candidate without opt-in & bad sha256 rejected BEFORE any workspace.
     for label, mpath, allow, sha in [
-        ("candidate-rejected", "/run/openflows-local/v0.2.0-manifest.json", False, None),
-        ("bad-sha256", "/run/openflows-local/v0.2.0-manifest.json", True, "0" * 64),
-        ("missing-manifest", "/run/openflows-local/does-not-exist.json", True, None),
+        ("candidate-rejected", "/run/openflows-local/v0.2.1-manifest.json", False, None),
+        ("bad-sha256", "/run/openflows-local/v0.3.1-manifest.json", False, "0" * 64),
+        ("missing-manifest", "/run/openflows-local/does-not-exist.json", False, None),
     ]:
         env = manager_env(secrets_dir, Path(mpath), allow, "2026.11.0-bad", "http://127.0.0.1:3002", sha)
         cmd = [
@@ -347,18 +355,18 @@ def main():
     ]).stdout)
     oauth_client_id = deployment_json["oauth_id"]
 
-    # 3. Start Manager with v0.2.0 manifest.
+    # 3. Start Manager with v0.3.1 manifest (strict compatibility: allow_candidate=False).
     mgr_name = f"{PROJECT}-manager"
-    env_v020 = manager_env(
+    env_v031 = manager_env(
         secrets_dir,
-        Path("/run/openflows-local/v0.2.0-manifest.json"),
-        True,
-        "2026.11.0-runtime-0.2.0",
+        Path("/run/openflows-local/v0.3.1-manifest.json"),
+        False,
+        "2026.11.0-runtime-0.3.1",
         "http://127.0.0.1:3002",
         oauth_client_id=oauth_client_id,
     )
     mgr_cid = None
-    mgr_cid, mgr_url = start_manager_container(mgr_name, secrets_dir, env_v020)
+    mgr_cid, mgr_url = start_manager_container(mgr_name, secrets_dir, env_v031)
     try:
         # 4. Authenticate in connected-local mode via /api/v1/local/github/device -> /poll (sets of_session cookie).
         jar = http.cookiejar.CookieJar()
@@ -460,7 +468,7 @@ def main():
         assert st in (200, 302, 303)
         print("3. Authenticated Manager user + linked local GitHub + linked Coder identity.", flush=True)
 
-        # 5. Create organization, bind Coder OSS default org, and wait for provisioning + v0.2.0 pinning.
+        # 5. Create organization, bind Coder OSS default org, and wait for provisioning + v0.3.1 pinning.
         default_coder_org_id = _coder_default_org_id()
         _, org_res, _ = http_json(
             f"{mgr_url}/api/v1/organizations",
@@ -476,9 +484,9 @@ def main():
             lambda: _op_succeeded(mgr_url, bearer, org_id, org_op_id),
             seconds=600,
         )
-        rel_v020 = _org_current_release(org_id)
-        assert rel_v020, "Organization must be pinned to v0.2.0 release after provisioning"
-        print(f"4. Organization {org_id} provisioned and pinned to v0.2.0 release {rel_v020}.", flush=True)
+        rel_v031 = _org_current_release(org_id)
+        assert rel_v031, "Organization must be pinned to v0.3.1 release after provisioning"
+        print(f"4. Organization {org_id} provisioned and pinned to v0.3.1 release {rel_v031}.", flush=True)
 
         # 6. Create tenant and wait for Nexus running + healthy runtime heartbeat.
         bearer = _issue_cli_bearer(mgr_url, opener, csrf_token)
@@ -498,20 +506,20 @@ def main():
 
         # 7. Find Nexus container & verify runtime assertions inside Nexus.
         nexus_cid = _find_container("openflows-nexus-")
-        _assert_workspace_runtime(nexus_cid, "nexus", V0_2_0_IMAGES["nexus"])
-        print("6. Verified Nexus workspace-runtime v0.2.0 assertions.", flush=True)
+        _assert_workspace_runtime(nexus_cid, "nexus", V0_3_1_IMAGES["nexus"])
+        print("6. Verified Nexus workspace-runtime v0.3.1 assertions (no dev mount).", flush=True)
 
         # 8. Spawn Forge via Manager runtime API using Nexus's registered runtime token & verify Forge + relay.
         _spawn_workspace_from_nexus(nexus_cid, "forge", 1, "T-1", "forge/T-1", "forge-spawn-1")
         wait("Forge container started", lambda: len(_find_containers("openflows-forge-")) == 1, seconds=180)
         forge_cid = _find_container("openflows-forge-")
         wait("Forge workspace initialized", lambda: _forge_ready(forge_cid), seconds=180)
-        _assert_workspace_runtime(forge_cid, "forge", V0_2_0_IMAGES["forge"])
+        _assert_workspace_runtime(forge_cid, "forge", V0_3_1_IMAGES["forge"])
         _assert_nexus_forge_relay(nexus_cid, forge_cid)
-        print("7. Verified Forge workspace-runtime v0.2.0, golden repo seed, and Nexus<->Forge relay.", flush=True)
+        print("7. Verified Forge workspace-runtime v0.3.1 (no dev mount), golden repo seed, and Nexus<->Forge relay.", flush=True)
 
-        # 9. #514 Upgrade & rollback: restart Manager with v0.2.1, verify existing org/tenant stays pinned until promoted.
-        stop_manager_container(mgr_cid, "manager-v020.log")
+        # 9. #514 Upgrade & rollback: restart Manager with v0.2.1 (candidate), verify existing org/tenant stays pinned until promoted.
+        stop_manager_container(mgr_cid, "manager-v031.log")
         env_v021 = manager_env(
             secrets_dir,
             Path("/run/openflows-local/v0.2.1-manifest.json"),
@@ -522,7 +530,7 @@ def main():
         )
         mgr_cid, mgr_url = start_manager_container(mgr_name, secrets_dir, env_v021)
         bearer = _issue_cli_bearer(mgr_url, opener, csrf_token)
-        assert _org_current_release(org_id) == rel_v020, "Existing org must stay pinned before promotion"
+        assert _org_current_release(org_id) == rel_v031, "Existing org must stay pinned before promotion"
 
         _, promo2, _ = http_json(
             f"{mgr_url}/api/v1/platform/organizations/{org_id}/template-release/promote-configured",
@@ -531,7 +539,7 @@ def main():
             headers=bearer,
         )
         rel_v021 = promo2["release_id"]
-        assert rel_v021 != rel_v020
+        assert rel_v021 != rel_v031
         wait(
             "Promotion to v0.2.1",
             lambda: _op_succeeded(mgr_url, bearer, org_id, promo2["operation_id"]),
@@ -539,13 +547,13 @@ def main():
         )
         assert _org_current_release(org_id) == rel_v021
         _assert_release_images(rel_v021, V0_2_1_IMAGES)
-        _assert_container_pinned_image(nexus_cid, V0_2_0_IMAGES["nexus"])
-        _assert_container_pinned_image(forge_cid, V0_2_0_IMAGES["forge"])
-        print(f"8. Explicit upgrade promoted {rel_v021} (v0.2.1 digests) and preserved v0.2.0 workspace pins; rolling back to {rel_v020}.", flush=True)
+        _assert_container_pinned_image(nexus_cid, V0_3_1_IMAGES["nexus"])
+        _assert_container_pinned_image(forge_cid, V0_3_1_IMAGES["forge"])
+        print(f"8. Explicit upgrade promoted {rel_v021} (v0.2.1 digests) and preserved v0.3.1 workspace pins; rolling back to {rel_v031}.", flush=True)
 
         stop_manager_container(mgr_cid, "manager-v021.log")
         mgr_cid = None
-        mgr_cid, mgr_url = start_manager_container(mgr_name, secrets_dir, env_v020)
+        mgr_cid, mgr_url = start_manager_container(mgr_name, secrets_dir, env_v031)
         bearer = _issue_cli_bearer(mgr_url, opener, csrf_token)
         _, promo_rb, _ = http_json(
             f"{mgr_url}/api/v1/platform/organizations/{org_id}/template-release/promote-configured",
@@ -553,17 +561,17 @@ def main():
             body={},
             headers=bearer,
         )
-        assert promo_rb["release_id"] == rel_v020
+        assert promo_rb["release_id"] == rel_v031
         wait(
-            "Rollback to v0.2.0",
+            "Rollback to v0.3.1",
             lambda: _op_succeeded(mgr_url, bearer, org_id, promo_rb["operation_id"]),
             seconds=600,
         )
-        assert _org_current_release(org_id) == rel_v020
-        _assert_release_images(rel_v020, V0_2_0_IMAGES)
-        _assert_container_pinned_image(nexus_cid, V0_2_0_IMAGES["nexus"])
-        _assert_container_pinned_image(forge_cid, V0_2_0_IMAGES["forge"])
-        print("9. Rollback to v0.2.0 release verified (v0.2.0 digests restored, existing workspace pins preserved).", flush=True)
+        assert _org_current_release(org_id) == rel_v031
+        _assert_release_images(rel_v031, V0_3_1_IMAGES)
+        _assert_container_pinned_image(nexus_cid, V0_3_1_IMAGES["nexus"])
+        _assert_container_pinned_image(forge_cid, V0_3_1_IMAGES["forge"])
+        print("9. Rollback to v0.3.1 release verified (v0.3.1 digests restored, existing workspace pins preserved).", flush=True)
     finally:
         coder_logs = run(["docker", "logs", f"{PROJECT}-coder-1"], check=False)
         (ARTIFACTS / "coder.log").write_text(coder_logs.stdout + coder_logs.stderr)
@@ -786,6 +794,11 @@ def _assert_workspace_runtime(cid: str, role: str, expected_image: tuple[str, st
 
     check_cmd = (
         f"set -eu; "
+        f"test ! -d /opt/openflows-dev; "
+        f"test -x /usr/local/bin/openflows; "
+        f"test -f /opt/openflows/runtime/lib/bootstrap.sh; "
+        f"test -x /opt/openflows/runtime/bin/openflows-credential-refresh; "
+        f"test -f /opt/openflows/runtime/VERSION; "
         f"OPENFLOWS_ROLE={role} openflows-runtime check; "
         f"test -x /usr/local/bin/openflows-harness; "
         f"test -f /home/coder/.openflows/artifacts/orchestration/agent/agents/{role}.agent.md; "

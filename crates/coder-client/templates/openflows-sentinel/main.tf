@@ -38,7 +38,7 @@ variable "connected_local_helper_host_path" {
 variable "workspace_image" {
   description = "STANDALONE TEMPLATE USE ONLY. A mutable release tag used when no workspace_image_digest parameter is set. Manager-provisioned workspaces never use it: Manager always passes workspace_image_repository plus a sha256 workspace_image_digest from the validated workspace-runtime release."
   type        = string
-  default     = "ghcr.io/the-agenticflow/workspace-runtime-sentinel:v0.2.0"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-sentinel:v0.3.1"
 }
 
 variable "github_api_base" {

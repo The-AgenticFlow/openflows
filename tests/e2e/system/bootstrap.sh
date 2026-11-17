@@ -87,12 +87,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if [ "$scenario" = workspace-runtime ]; then
-    cargo build --locked -p openflows --bin openflows -p openflows-manager --bin openflows-manager 2>&1 | tee "$artifacts/build.log"
-    mkdir -p "$scratch/bin" "$scratch/dev-bin" "$scratch/home"
+    cargo build --locked -p openflows-manager --bin openflows-manager 2>&1 | tee "$artifacts/build.log"
+    mkdir -p "$scratch/bin" "$scratch/home"
     cp target/debug/openflows-manager "$scratch/bin/"
-    cp target/debug/openflows "$scratch/dev-bin/"
-    mkdir -p "$scratch/dev-bin/runtime"
-    cp -r runtime/lib runtime/bin runtime/VERSION "$scratch/dev-bin/runtime/"
 else
     cargo build --locked -p openflows --bin openflows --bin openflows-doctor -p openflows-harness --bin openflows-harness 2>&1 | tee "$artifacts/build.log"
     mkdir -p "$scratch/bin" "$scratch/home"
@@ -110,7 +107,7 @@ export TF_VAR_docker_network="${project}_default"
 export TF_VAR_github_api_base=http://github-fixture:8080
 export TF_VAR_github_git_base="git://github-fixture:9418"
 if [ "$scenario" = workspace-runtime ]; then
-    export TF_VAR_dev_binary_host_path="$scratch/dev-bin"
+    unset TF_VAR_dev_binary_host_path
     export TF_VAR_connected_local_manager_url=http://openflows-manager:3002
 else
     export TF_VAR_connected_local_manager_url=http://github-fixture:8080
