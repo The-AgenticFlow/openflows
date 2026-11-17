@@ -72,12 +72,42 @@ pub struct WorkspaceRuntimeCompatibility {
     pub minimum_manager_version: Option<String>,
 }
 
+pub const DEFAULT_ALLOWED_REPO_PREFIXES: &[&str] = &["ghcr.io/the-agenticflow/"];
+pub const WORKSPACE_RUNTIME_ALLOWED_REPO_PREFIXES_ENV: &str =
+    "OPENFLOWS_WORKSPACE_RUNTIME_ALLOWED_REPO_PREFIXES";
+
+/// Resolve the allowed OCI repository prefixes from
+/// `OPENFLOWS_WORKSPACE_RUNTIME_ALLOWED_REPO_PREFIXES` (comma-separated),
+/// defaulting to [`DEFAULT_ALLOWED_REPO_PREFIXES`].
+pub fn allowed_repo_prefixes_from_env() -> Vec<String> {
+    let custom: Vec<String> = std::env::var(WORKSPACE_RUNTIME_ALLOWED_REPO_PREFIXES_ENV)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if custom.is_empty() {
+        DEFAULT_ALLOWED_REPO_PREFIXES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        custom
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRuntimeCompatibilityOptions {
     /// When true, requires `status == "compatible"` and at least one compatible
     /// entry in `openflows_template_parameter_schema_versions`.
     pub strict_compatibility: bool,
     pub manager_version: String,
+    /// Allowed OCI repository prefixes (e.g. `["ghcr.io/the-agenticflow/"]`).
+    pub allowed_repository_prefixes: Vec<String>,
 }
 
 impl Default for WorkspaceRuntimeCompatibilityOptions {
@@ -85,6 +115,10 @@ impl Default for WorkspaceRuntimeCompatibilityOptions {
         Self {
             strict_compatibility: true,
             manager_version: env!("CARGO_PKG_VERSION").to_string(),
+            allowed_repository_prefixes: DEFAULT_ALLOWED_REPO_PREFIXES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         }
     }
 }
@@ -256,6 +290,20 @@ impl WorkspaceRuntimeManifest {
 
         for role in Role::ALL {
             let img = self.image_for(role)?;
+            if !options.allowed_repository_prefixes.is_empty()
+                && !options
+                    .allowed_repository_prefixes
+                    .iter()
+                    .any(|prefix| img.repository.starts_with(prefix))
+            {
+                return Err(ManagerError::InvalidInput(format!(
+                    "workspace-runtime '{}' role '{}' repository '{}' is not under an allowed prefix ({})",
+                    self.runtime_version,
+                    role.as_str(),
+                    img.repository,
+                    options.allowed_repository_prefixes.join(", ")
+                )));
+            }
             if !img.supports_architecture(&canonical_arch) {
                 return Err(ManagerError::InvalidInput(format!(
                     "workspace-runtime '{}' role '{}' does not support target platform '{}'",
@@ -694,5 +742,27 @@ mod tests {
             "ghcr.io/the-agenticflow/workspace-runtime-nexus"
         ));
         assert!(is_valid_oci_repository("localhost:5000/org/repo_v1.0"));
+    }
+
+    #[test]
+    fn rejects_disallowed_repository_prefix_and_allows_explicit_override() {
+        let evil_json = V0_2_0_MANIFEST.replace(
+            "ghcr.io/the-agenticflow/workspace-runtime-nexus",
+            "evil.example/attacker/workspace-runtime-nexus",
+        );
+        let manifest = WorkspaceRuntimeManifest::parse_str(&evil_json).unwrap();
+        let target = ReleaseCompatibilityTarget::docker_default();
+        let mut opts = WorkspaceRuntimeCompatibilityOptions::allow_candidate();
+        let err = manifest.validate_compatibility(&target, &opts).unwrap_err();
+        assert!(
+            err.to_string().contains("not under an allowed prefix"),
+            "{err}"
+        );
+
+        opts.allowed_repository_prefixes = vec![
+            "ghcr.io/the-agenticflow/".to_string(),
+            "evil.example/attacker/".to_string(),
+        ];
+        manifest.validate_compatibility(&target, &opts).unwrap();
     }
 }

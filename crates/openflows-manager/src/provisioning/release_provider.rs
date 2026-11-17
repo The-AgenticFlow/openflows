@@ -60,6 +60,7 @@ pub struct ReleaseProvider {
     workspace_runtime_manifest_path: Option<PathBuf>,
     workspace_runtime_manifest_sha256: Option<String>,
     allow_candidate_runtime: bool,
+    mode_override: Option<crate::config::Mode>,
 }
 
 impl ReleaseProvider {
@@ -85,6 +86,7 @@ impl ReleaseProvider {
             workspace_runtime_manifest_path,
             workspace_runtime_manifest_sha256,
             allow_candidate_runtime,
+            mode_override: None,
         })
     }
 
@@ -103,7 +105,14 @@ impl ReleaseProvider {
             workspace_runtime_manifest_path: None,
             workspace_runtime_manifest_sha256: None,
             allow_candidate_runtime: false,
+            mode_override: None,
         }
+    }
+
+    /// Override the deployment mode used for runtime manifest integrity checks.
+    pub fn with_mode(mut self, mode: crate::config::Mode) -> Self {
+        self.mode_override = Some(mode);
+        self
     }
 
     /// Attach a `workspace-runtime` `release-manifest.json` path to resolve
@@ -238,6 +247,22 @@ impl ReleaseProvider {
         }
 
         if let Some(runtime_path) = &self.workspace_runtime_manifest_path {
+            let backend = crate::provisioning::selection::resolve_backend_env()
+                .map_err(ReleaseProviderError)?;
+            let mode = match self.mode_override {
+                Some(m) => m,
+                None => {
+                    let mode_raw = std::env::var(crate::config::MODE_ENV).ok();
+                    crate::config::Mode::parse(mode_raw.as_deref()).map_err(ReleaseProviderError)?
+                }
+            };
+            if mode == crate::config::Mode::Hosted
+                && self.workspace_runtime_manifest_sha256.is_none()
+            {
+                return Err(ReleaseProviderError(format!(
+                    "{WORKSPACE_RUNTIME_MANIFEST_SHA256_ENV} is required in hosted mode when {WORKSPACE_RUNTIME_MANIFEST_ENV} is set"
+                )));
+            }
             let runtime_bytes = std::fs::read(runtime_path).map_err(|e| {
                 ReleaseProviderError(format!(
                     "cannot read workspace-runtime manifest '{}': {e}",
@@ -255,15 +280,12 @@ impl ReleaseProvider {
             }
             let runtime_manifest = WorkspaceRuntimeManifest::parse(&runtime_bytes)
                 .map_err(|e| ReleaseProviderError(e.to_string()))?;
-            let backend = crate::provisioning::selection::resolve_backend_env()
-                .map_err(ReleaseProviderError)?;
-            let mode_raw = std::env::var(crate::config::MODE_ENV).ok();
-            let mode =
-                crate::config::Mode::parse(mode_raw.as_deref()).map_err(ReleaseProviderError)?;
             let target = crate::provisioning::selection::release_target(&backend, mode)
                 .map_err(|e| ReleaseProviderError(e.to_string()))?;
             let options = WorkspaceRuntimeCompatibilityOptions {
                 strict_compatibility: !self.allow_candidate_runtime,
+                allowed_repository_prefixes:
+                    crate::templates::workspace_runtime::allowed_repo_prefixes_from_env(),
                 ..WorkspaceRuntimeCompatibilityOptions::default()
             };
             runtime_manifest
@@ -507,7 +529,7 @@ mod tests {
             .enumerate()
             .map(|(i, role)| {
                 format!(
-                    r#""{role}": {{"repository": "ghcr.io/example/workspace-runtime-{role}", "digest": "sha256:{}", "architectures": ["linux/amd64", "linux/arm64"]}}"#,
+                    r#""{role}": {{"repository": "ghcr.io/the-agenticflow/workspace-runtime-{role}", "digest": "sha256:{}", "architectures": ["linux/amd64", "linux/arm64"]}}"#,
                     format!("{:x}", i + 1).repeat(64)
                 )
             })
@@ -565,7 +587,7 @@ mod tests {
             .expect("forge role");
         assert_eq!(
             forge.image_repository.as_deref(),
-            Some("ghcr.io/example/workspace-runtime-forge")
+            Some("ghcr.io/the-agenticflow/workspace-runtime-forge")
         );
         assert!(forge
             .image_digest
@@ -678,5 +700,22 @@ mod tests {
         let reparsed =
             TemplateManifest::parse(&artifacts.manifest.to_canonical_json().unwrap()).unwrap();
         assert_eq!((reparsed.schema_version, reparsed.variants.len()), (2, 10));
+    }
+
+    #[test]
+    fn hosted_mode_requires_workspace_runtime_manifest_sha256() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release-manifest.json");
+        std::fs::write(&path, runtime_manifest("candidate", None)).unwrap();
+
+        let err = provider(Some(&path), true)
+            .with_mode(crate::config::Mode::Hosted)
+            .load()
+            .expect_err("hosted mode must require runtime manifest sha256");
+        assert!(
+            err.to_string()
+                .contains(WORKSPACE_RUNTIME_MANIFEST_SHA256_ENV),
+            "{err}"
+        );
     }
 }
