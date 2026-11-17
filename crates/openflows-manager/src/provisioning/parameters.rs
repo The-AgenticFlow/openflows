@@ -12,6 +12,7 @@ use coder_client::types::WorkspaceParameterValue;
 pub struct NexusParameters<'a> {
     pub hosted: bool,
     pub runtime_secret_ref: &'a str,
+    pub workspace_image_repository: Option<&'a str>,
     pub workspace_image_digest: &'a str,
     pub tenant_id: TenantId,
     pub repository: &'a str,
@@ -25,6 +26,7 @@ pub fn nexus_parameters(params: NexusParameters<'_>) -> Vec<WorkspaceParameterVa
     let NexusParameters {
         hosted,
         runtime_secret_ref,
+        workspace_image_repository,
         workspace_image_digest,
         tenant_id,
         repository,
@@ -41,6 +43,9 @@ pub fn nexus_parameters(params: NexusParameters<'_>) -> Vec<WorkspaceParameterVa
         value("github_repository", repository),
         value("fleet_size", fleet_size.to_string()),
     ];
+    if let Some(repo) = workspace_image_repository {
+        parameters.push(value("workspace_image_repository", repo));
+    }
     parameters.extend(kubernetes_placement_parameters(backend, organization_id));
     parameters
 }
@@ -95,6 +100,7 @@ mod tests {
         let parameters = nexus_parameters(NexusParameters {
             hosted: true,
             runtime_secret_ref: "openflows-runtime-1",
+            workspace_image_repository: Some("ghcr.io/example/workspace-runtime-nexus"),
             workspace_image_digest: "sha256:abc",
             tenant_id: TenantId::new(),
             repository: "acme/widgets",
@@ -111,6 +117,11 @@ mod tests {
                 .clone()
         };
         assert_eq!(get("hosted"), "true");
+        assert_eq!(
+            get("workspace_image_repository"),
+            "ghcr.io/example/workspace-runtime-nexus"
+        );
+        assert_eq!(get("workspace_image_digest"), "sha256:abc");
         assert_eq!(get("repo_url"), "https://github.com/acme/widgets.git");
         assert_eq!(get("github_repository"), "acme/widgets");
         assert_eq!(get("fleet_size"), "2");

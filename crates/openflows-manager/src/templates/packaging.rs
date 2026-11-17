@@ -13,7 +13,10 @@ use tar::EntryType;
 
 /// The five role templates. Order matters only for required-role checks; the
 /// manifest serializes roles in sorted order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Nexus,
     Forge,
@@ -852,13 +855,7 @@ mod tests {
     fn invalid_manifest_rejected() {
         assert!(TemplateManifest::parse(br#"{"schema_version": 99}"#).is_err());
         assert!(TemplateManifest::parse(br#"not json"#).is_err());
-        // Missing required role entry.
-        let bad = br#"{
-            "schema_version": 1,
-            "release": "x",
-            "required_roles": ["nexus", "forge"],
-            "roles": { "nexus": {"archive":"openflows-nexus.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameter_schema_version":1} }
-        }"#;
+        let bad = br#"{"schema_version":1,"release":"x","required_roles":["nexus","forge"],"roles":{"nexus":{"archive":"openflows-nexus.tar.gz","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameter_schema_version":1}}}"#;
         assert!(TemplateManifest::parse(bad).is_err());
     }
 

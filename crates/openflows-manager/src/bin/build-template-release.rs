@@ -19,8 +19,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: build-template-release <source-dir> <release> <output-dir>".into());
     }
 
-    let artifacts =
-        ReleaseProvider::new(source, None, None, release.to_string_lossy().into()).load()?;
+    // A release must name the workspace images it pins. Refuse to publish one
+    // that does not, instead of shipping a release Manager would have to reject.
+    let provider = ReleaseProvider::new(source, None, None, release.to_string_lossy().into())
+        .with_workspace_runtime_from_env();
+    if !provider.has_workspace_runtime_manifest()
+        && env::var("OPENFLOWS_WORKSPACE_IMAGE_REPO")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err(format!(
+            "no workspace image is pinned: set {} to a workspace-runtime release-manifest.json",
+            openflows_manager::provisioning::release_provider::WORKSPACE_RUNTIME_MANIFEST_ENV
+        )
+        .into());
+    }
+    let artifacts = provider.load()?;
     fs::create_dir_all(&output)?;
     let manifest = artifacts.manifest.to_canonical_json()?;
     fs::write(output.join("manifest.json"), &manifest)?;

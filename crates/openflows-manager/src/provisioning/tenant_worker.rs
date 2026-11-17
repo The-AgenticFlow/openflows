@@ -579,6 +579,12 @@ impl TenantProvisionWorker {
             self.compatibility_target.backend,
             guard.organization_id,
         ));
+        if let Some(repo) = &spec.image_repository {
+            parameters.push(coder_client::types::WorkspaceParameterValue {
+                name: "workspace_image_repository".into(),
+                value: repo.clone(),
+            });
+        }
         if let Some(ticket_id) = ticket_id {
             parameters.push(coder_client::types::WorkspaceParameterValue {
                 name: "ticket_id".into(),
@@ -996,6 +1002,7 @@ impl TenantProvisionWorker {
         let parameters = super::parameters::nexus_parameters(super::parameters::NexusParameters {
             hosted: self.hosted_workspace(),
             runtime_secret_ref: &runtime_secret_ref,
+            workspace_image_repository: spec.image_repository.as_deref(),
             workspace_image_digest: &spec.image_digest,
             tenant_id,
             repository: &repository,
@@ -1598,6 +1605,8 @@ impl TenantProvisionWorker {
     }
 }
 
+use super::local_workspace_cleanup::worker_workspace_name;
+
 async fn operation_kind(
     pool: &PgPool,
     id: crate::id::OperationId,
@@ -1607,33 +1616,4 @@ async fn operation_kind(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.0))
-}
-
-/// Coder limits workspace names to 32 lowercase characters. Keep names
-/// deterministic so a retry can adopt the workspace created by an earlier
-/// attempt instead of provisioning a duplicate.
-fn worker_workspace_name(role: &str, workspace_id: uuid::Uuid) -> String {
-    let compact_id = workspace_id.simple().to_string();
-    let prefix = format!("of-{role}-");
-    let suffix_len = 32 - prefix.len();
-    format!("{prefix}{}", &compact_id[..suffix_len])
-}
-
-#[cfg(test)]
-mod workspace_name_tests {
-    use super::worker_workspace_name;
-
-    #[test]
-    fn worker_workspace_names_fit_coder_and_remain_distinct_by_role() {
-        let id = uuid::Uuid::parse_str("ce164533-8eee-4f4a-a9d5-6ab0ee63cf14").unwrap();
-        for role in ["forge", "sentinel", "vessel", "lore"] {
-            let name = worker_workspace_name(role, id);
-            assert!(name.len() <= 32);
-            assert!(name.starts_with(&format!("of-{role}-")));
-            assert!(name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
-            assert_eq!(name, worker_workspace_name(role, id));
-        }
-    }
 }

@@ -26,9 +26,11 @@ pub struct WorkspaceReleaseSpec {
     pub template_id: coder_client::CoderTemplateId,
     pub version_id: coder_client::CoderTemplateVersionId,
     pub release_id: ReleaseId,
+    pub role: Role,
     pub backend: ProvisionerBackend,
     pub image_digest: String,
     pub image_repository: Option<String>,
+    pub image_reference: Option<String>,
     pub architecture: String,
     pub workspace_runtime_release: Option<String>,
     pub parameter_schema_version: u32,
@@ -241,6 +243,37 @@ pub fn resolve_variant_image_digest(
     Ok(digest)
 }
 
+/// Resolve the container repository a variant pins its workspace image to.
+///
+/// For schema v2+ releases, the repository is never guessed or defaulted: a
+/// release that does not name the image it pins is rejected before any
+/// workspace is created. Legacy v1 releases (`parameter_schema_version <= 1`)
+/// are permitted without `image_repository` for backwards compatibility with
+/// existing pinned workspaces.
+pub fn resolve_variant_image_repository(
+    entry: &RoleManifestEntry,
+    role: Role,
+    target: &ReleaseCompatibilityTarget,
+) -> Result<Option<String>, ManagerError> {
+    let repo = entry
+        .image_repository
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if repo.is_some() || entry.parameter_schema_version <= 1 {
+        return Ok(repo);
+    }
+    Err(ManagerError::api(
+        err::RELEASE_NOT_RESOLVED,
+        format!(
+            "role '{}' ({}) is missing required image_repository",
+            role.as_str(),
+            target.backend
+        ),
+    ))
+}
+
 async fn build_workspace_spec(
     release_repo: &ReleaseRepository,
     org_id: OrganizationId,
@@ -262,6 +295,10 @@ async fn build_workspace_spec(
         )
     })?;
     let image_digest = resolve_variant_image_digest(entry, target)?;
+    let image_repo = resolve_variant_image_repository(entry, role, target)?;
+    let image_reference = image_repo
+        .as_deref()
+        .map(|repo| format!("{repo}@{image_digest}"));
 
     let version_row = release_repo
         .get_org_template_version_for_backend(org_id, release_id, target.backend, role)
@@ -281,9 +318,11 @@ async fn build_workspace_spec(
         template_id: coder_client::CoderTemplateId::new(template_id),
         version_id: coder_client::CoderTemplateVersionId::new(version_id),
         release_id,
+        role,
         backend: target.backend,
         image_digest,
-        image_repository: entry.image_repository.clone(),
+        image_repository: image_repo,
+        image_reference,
         architecture: entry.architecture.clone(),
         workspace_runtime_release: entry.workspace_runtime_release.clone(),
         parameter_schema_version: entry.parameter_schema_version,
@@ -378,6 +417,46 @@ mod tests {
             image_digest: digest,
             workspace_runtime_release: Some("2026.11.0".to_string()),
         }
+    }
+
+    #[test]
+    fn missing_or_blank_image_repository_is_rejected_for_v2_and_allowed_for_v1() {
+        for backend in [ProvisionerBackend::Docker, ProvisionerBackend::Kubernetes] {
+            let target = match backend {
+                ProvisionerBackend::Docker => ReleaseCompatibilityTarget::docker_default(),
+                ProvisionerBackend::Kubernetes => {
+                    ReleaseCompatibilityTarget::kubernetes_default("amd64")
+                }
+            };
+            for repo in [None, Some(String::new()), Some("   ".to_string())] {
+                let mut e = entry(backend, Some(format!("sha256:{}", "a".repeat(64))));
+                e.image_repository = repo.clone();
+                let err = resolve_variant_image_repository(&e, Role::Forge, &target)
+                    .expect_err("a v2 release without an image repository must be rejected");
+                let msg = err.to_string();
+                assert!(msg.contains("missing required image_repository"), "{msg}");
+                assert!(!msg.contains("ghcr.io"), "no guessed repository: {msg}");
+
+                e.parameter_schema_version = 1;
+                assert_eq!(
+                    resolve_variant_image_repository(&e, Role::Forge, &target).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_image_repository_is_used_verbatim() {
+        let target = ReleaseCompatibilityTarget::docker_default();
+        let mut e = entry(ProvisionerBackend::Docker, None);
+        e.image_repository = Some(" ghcr.io/the-agenticflow/workspace-runtime-forge ".into());
+        assert_eq!(
+            resolve_variant_image_repository(&e, Role::Forge, &target)
+                .unwrap()
+                .as_deref(),
+            Some("ghcr.io/the-agenticflow/workspace-runtime-forge")
+        );
     }
 
     #[test]
