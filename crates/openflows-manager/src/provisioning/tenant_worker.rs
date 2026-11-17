@@ -575,6 +575,10 @@ impl TenantProvisionWorker {
                 value: format!("openflows-nexus-{}:3000", row.3),
             },
         ];
+        parameters.extend(super::parameters::kubernetes_placement_parameters(
+            self.compatibility_target.backend,
+            guard.organization_id,
+        ));
         if let Some(ticket_id) = ticket_id {
             parameters.push(coder_client::types::WorkspaceParameterValue {
                 name: "ticket_id".into(),
@@ -989,6 +993,16 @@ impl TenantProvisionWorker {
             .bind(tenant_id.0)
             .fetch_one(&self.pool)
             .await?;
+        let parameters = super::parameters::nexus_parameters(super::parameters::NexusParameters {
+            hosted: self.hosted_workspace(),
+            runtime_secret_ref: &runtime_secret_ref,
+            workspace_image_digest: &spec.image_digest,
+            tenant_id,
+            repository: &repository,
+            fleet_size,
+            organization_id: org_id,
+            backend: self.compatibility_target.backend,
+        });
         let created = match self
             .adapter
             .create_tenant_workspace_with_parameters(
@@ -997,36 +1011,7 @@ impl TenantProvisionWorker {
                 &spec.template_id,
                 &spec.version_id,
                 &workspace_name,
-                &[
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "hosted".into(),
-                        value: self.hosted_workspace().to_string(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "runtime_secret_ref".into(),
-                        value: runtime_secret_ref,
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "workspace_image_digest".into(),
-                        value: spec.image_digest.clone(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "tenant".into(),
-                        value: tenant_id.to_string(),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "repo_url".into(),
-                        value: format!("https://github.com/{repository}.git"),
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "github_repository".into(),
-                        value: repository,
-                    },
-                    coder_client::types::WorkspaceParameterValue {
-                        name: "fleet_size".into(),
-                        value: fleet_size.to_string(),
-                    },
-                ],
+                &parameters,
             )
             .await
         {

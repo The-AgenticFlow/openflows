@@ -112,10 +112,15 @@ fn every_template_mounts_the_runtime_bundle_where_the_harness_reads_it() {
         );
     }
     assert!(
+        RUNTIME
+            .contains(r#"cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY""#),
+        "the runtime must read the bundle into its private copy"
+    );
+    assert!(
         RUNTIME.contains(
             r#"sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY""#
         ),
-        "the runtime must read the root-owned mount through its privileged copy step"
+        "the runtime must fall back to its privileged copy step for a root-owned mount"
     );
 }
 

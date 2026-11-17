@@ -25,7 +25,7 @@ pub fn run_with(dir: &Path, script: &str, env: &[(&str, &str)]) -> Output {
 . "$RUNTIME"
 sudo() {
     printf '%s\n' "$*" >> "$SUDO_LOG"
-    case "$1" in chown|find) return 0 ;; -H) shift; "$@" ;; *) "$@" ;; esac
+    case "$1" in chown|find) return 0 ;; -n|-H) shift; "$@" ;; *) "$@" ;; esac
 }
 "#;
     let mut command = Command::new("bash");

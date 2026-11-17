@@ -436,6 +436,96 @@ fn hosted_workspaces_give_up_sudo_before_the_role_runs() {
     assert!(!stdout(&stuck).contains("continued"));
 }
 
+/// Run SCRIPT with a sudo that always fails, as inside a Kubernetes pod that
+/// forbids privilege escalation and adds no capabilities. Any attempt is logged.
+fn run_without_privilege(dir: &Path, script: &str) -> Output {
+    Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                r#"set -e
+. "$RUNTIME"
+sudo() {{ printf '%s\n' "$*" >> "$SUDO_LOG"; return 1; }}
+{script}"#
+            ),
+            "runtime-test",
+        ])
+        .arg(dir)
+        .env("RUNTIME", runtime())
+        .env("SUDO_LOG", dir.join("sudo.log"))
+        .env("HOME", dir)
+        .env_remove("GIT_DIR")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn startup_needs_no_privilege_when_the_backend_mounts_the_paths_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        &format!(
+            r#"OF_HOME="{}" OF_WORKSPACE="{}" OF_STATE_DIR="{}" of_prepare
+echo prepared"#,
+            home.display(),
+            workspace.display(),
+            dir.path().join("state").display()
+        ),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("prepared"));
+    assert_eq!(
+        sudo_calls(dir.path()),
+        "-n true\n",
+        "a pod that forbids escalation may only probe for sudo, never use it"
+    );
+}
+
+#[test]
+fn a_readable_runtime_secret_is_read_without_privilege() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("runtime.json");
+    std::fs::write(
+        &bundle,
+        r#"{"manager_url":"http://manager.test","bootstrap_token":"boot","redis_url":"redis://redis.test:6379","redis_namespace":"ns","hook_key":"hk","hook_url":"http://hook.test"}"#,
+    )
+    .unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        &format!(
+            r#"OPENFLOWS_RUNTIME_CREDENTIAL_FILE="{}" of_load_runtime_credentials HOOK_KEY=hook_key
+printf '%s %s %s %s\n' "$OF_MANAGER_URL" "$REDIS_URL" "$OPENFLOWS_TENANT" "$HOOK_KEY""#,
+            bundle.display()
+        ),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "http://manager.test redis://redis.test:6379 ns hk"
+    );
+    assert_eq!(sudo_calls(dir.path()), "");
+}
+
+#[test]
+fn a_workspace_without_sudo_has_nothing_to_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_without_privilege(
+        dir.path(),
+        r#"OF_HOSTED=true of_release_privileges
+echo continued"#,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("continued"));
+    assert!(stderr(&output).contains("Released sudo"));
+    assert!(
+        !sudo_calls(dir.path()).is_empty(),
+        "the runtime must still check, not assume"
+    );
+}
+
 #[test]
 fn role_instructions_install_once_and_stay_out_of_commits_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
@@ -526,23 +616,46 @@ fn a_workspace_without_a_persona_ends_startup() {
 
 #[test]
 fn only_the_privileged_preparation_uses_sudo() {
-    let dir = tempfile::tempdir().unwrap();
-    let output = run(dir.path(), &format!("{PATHS}of_prepare --own-artifacts"));
+    // Where sudo works (Docker), startup repairs ownership exactly as before:
+    // the workspace paths for every role, and the artifacts mount recursively
+    // only for the controller, because a worker mounts it read-only.
+    let worker = tempfile::tempdir().unwrap();
+    let output = run(worker.path(), &format!("{PATHS}of_prepare"));
     assert!(output.status.success(), "{}", stderr(&output));
-    let calls = sudo_calls(dir.path());
-    for call in calls.lines() {
+    let calls = sudo_calls(worker.path());
+    for call in calls.lines().filter(|call| *call != "-n true") {
         assert!(
             call.starts_with("mkdir ") || call.starts_with("chown ") || call.starts_with("find "),
             "of_prepare ran an unexpected privileged command: {call}"
         );
     }
     assert!(
-        calls.contains("chown -R coder:coder"),
-        "--own-artifacts must take the artifacts volume"
+        calls.contains("find ") && calls.contains("-exec chown "),
+        "every role takes its workspace paths"
+    );
+    assert!(
+        !calls.contains("chown -R"),
+        "a worker must not recurse into its read-only artifacts mount"
     );
     assert!(
         stderr(&output).contains("Workspace runtime"),
         "startup must log which runtime it loaded"
+    );
+
+    if running_as_root() {
+        // Root can write every path, so the ownership repair is still exercised
+        // through the recorded calls above.
+        return;
+    }
+    let controller = tempfile::tempdir().unwrap();
+    let output = run(
+        controller.path(),
+        &format!("{PATHS}of_prepare --own-artifacts"),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        sudo_calls(controller.path()).contains("chown -R"),
+        "the controller takes the artifacts volume it seeds"
     );
 }
 
