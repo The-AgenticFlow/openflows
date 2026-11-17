@@ -95,6 +95,23 @@ fn the_pods_follow_coder_start_count_and_the_amd64_image() {
 }
 
 #[test]
+fn a_pod_is_replaced_only_after_the_previous_one_stopped() {
+    // One pod owns the ReadWriteOnce home. The default rolling update starts the
+    // replacement first, which either blocks on the volume on another node or
+    // lets both pods write the same checkout on the same node.
+    for (role, template) in ALL {
+        let deployment = template
+            .split_once(r#"resource "kubernetes_deployment_v1" "workspace""#)
+            .unwrap_or_else(|| panic!("{role} has no Deployment"))
+            .1;
+        assert!(
+            deployment.contains(r#"type = "Recreate""#),
+            "{role} must replace its pod only after the previous one stopped"
+        );
+    }
+}
+
+#[test]
 fn the_workspace_home_survives_stop_and_start() {
     for (role, template) in ALL {
         // A stopped workspace runs Terraform with start_count = 0. The home
