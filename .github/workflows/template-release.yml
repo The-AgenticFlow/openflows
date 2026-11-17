@@ -113,6 +113,16 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Pinned workspace-runtime manifest ${MANIFEST_SHA256} from ${RUNTIME_REPO} (linux/amd64, runtime ${RUNTIME_VERSION}, status ${RUNTIME_STATUS})"
 
+      - name: Set fork-testing workspace image pins
+        if: ${{ !inputs.wait_for_images }}
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          {
+            echo "OPENFLOWS_WORKSPACE_IMAGE_REPO=ghcr.io/${OWNER,,}/workspace-runtime"
+            echo "OPENFLOWS_WORKSPACE_IMAGE_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          } >> "$GITHUB_ENV"
+
       - name: Build deterministic template release
         run: |
           cargo run -p openflows-manager --bin build-template-release -- \
