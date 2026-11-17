@@ -245,6 +245,7 @@ resource "coder_agent" "main" {
     # or platform-wide credentials.
     OF_HOSTED=true
     OF_CONNECTED_LOCAL=false
+    OF_RUNTIME_SECRET_REF="${data.coder_parameter.runtime_secret_ref.value}"
     OF_REPO_URL="${data.coder_parameter.repo_url.value}"
 
     # Nexus owns the tenant's seed checkout inside its own PVC and delivers what
@@ -341,6 +342,14 @@ resource "kubernetes_deployment_v1" "workspace" {
 
   spec {
     replicas = "1"
+
+    # One pod owns the ReadWriteOnce home, so a replacement must never overlap the
+    # pod it replaces: the default rolling update starts the new one first, which
+    # either blocks on the volume (another node) or writes the same checkout (same
+    # node). stop-then-start is the only safe order here.
+    strategy {
+      type = "Recreate"
+    }
 
     selector {
       match_labels = local.selector_labels

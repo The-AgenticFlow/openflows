@@ -503,6 +503,36 @@ mod tests {
     }
 
     #[test]
+    fn the_checked_in_templates_publish_both_backends() {
+        // The tree ships every role for both backends; a source install must
+        // advertise both, or a Kubernetes tenant could never resolve a release.
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../coder-client/templates");
+        let provider = ReleaseProvider::new(source, None, None, "test".into());
+        let artifacts = provider.load().unwrap();
+        assert_eq!(
+            artifacts.manifest.backends(),
+            vec![ProvisionerBackend::Docker, ProvisionerBackend::Kubernetes]
+        );
+        for role in Role::ALL {
+            assert!(
+                artifacts
+                    .manifest
+                    .variant(ProvisionerBackend::Kubernetes, role)
+                    .is_some(),
+                "{} is missing its Kubernetes variant",
+                role.as_str()
+            );
+            assert!(
+                artifacts
+                    .archive_for(ProvisionerBackend::Kubernetes, role)
+                    .is_some(),
+                "{} Kubernetes archive was not packaged",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn a_complete_kubernetes_set_publishes_kubernetes_variants() {
         let dir = source_tree(&["forge", "sentinel", "nexus", "vessel", "lore"]);
         let artifacts = source_provider(&dir).load().unwrap();
