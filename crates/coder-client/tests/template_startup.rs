@@ -561,3 +561,31 @@ fn runtime_install_is_fatal_and_runs_as_the_unprivileged_user_under_set_e() {
         assert!(!template.contains("sudo openflows-runtime"), "{role}");
     }
 }
+
+#[test]
+fn nexus_network_aliases_cover_hosted_manager_local_and_legacy_modes() {
+    let template = include_str!("../templates/openflows-nexus/main.tf");
+    let block = template
+        .split_once("networks_advanced {")
+        .expect("nexus defines networks_advanced")
+        .1
+        .split_once("\n  }")
+        .expect("networks_advanced block closes")
+        .0;
+    let aliases_line = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("aliases = "))
+        .expect("networks_advanced defines aliases");
+    assert!(
+        aliases_line.contains(
+            "data.coder_parameter.hosted.value == \"true\" ? [\"openflows-nexus-${data.coder_parameter.tenant.value}\"]"
+        ),
+        "hosted mode must advertise the tenant-scoped alias: {aliases_line}"
+    );
+    assert!(
+        aliases_line.contains(
+            "data.coder_parameter.runtime_secret_ref.value != \"\" ? [\"openflows-nexus\", \"openflows-nexus-${data.coder_parameter.tenant.value}\"] : [\"openflows-nexus\"]"
+        ),
+        "local mode must add the tenant-scoped alias when runtime_secret_ref is set and preserve openflows-nexus for legacy mode: {aliases_line}"
+    );
+}

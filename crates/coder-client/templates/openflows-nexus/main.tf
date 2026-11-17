@@ -414,7 +414,9 @@ resource "docker_container" "workspace" {
     name = var.docker_network
     # Stable service name so forge/sentinel templates can default
     # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
-    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"]
+    # Manager-provisioned workers (hosted and local with runtime_secret_ref)
+    # address the tenant-scoped alias openflows-nexus-<tenant>:3000.
+    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : (data.coder_parameter.runtime_secret_ref.value != "" ? ["openflows-nexus", "openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"])
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

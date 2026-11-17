@@ -13,6 +13,16 @@ on:
         description: 'Pin the workspace image published for this version (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Optional workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       version:
@@ -22,6 +32,16 @@ on:
         description: 'Pin the workspace image published for this version (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Optional workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -57,6 +77,8 @@ jobs:
         if: inputs.wait_for_images
         env:
           GH_TOKEN: ${{ github.token }}
+          WORKSPACE_RUNTIME_RELEASE: ${{ inputs.workspace_runtime_release }}
+          ALLOW_CANDIDATE_RUNTIME: ${{ inputs.allow_candidate_runtime }}
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%/*}"
@@ -68,15 +90,28 @@ jobs:
           bash scripts/check-template-image-repository.sh crates/coder-client/templates "${REPOSITORY}"
           RUNTIME_REPO="${OWNER}/workspace-runtime"
           MANIFEST_PATH="${RUNNER_TEMP}/workspace-runtime-release-manifest.json"
-          gh release download --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          if [ -n "${WORKSPACE_RUNTIME_RELEASE}" ]; then
+            gh release download "${WORKSPACE_RUNTIME_RELEASE}" --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          else
+            gh release download --repo "${RUNTIME_REPO}" --pattern release-manifest.json --output "${MANIFEST_PATH}"
+          fi
+          RUNTIME_VERSION="$(jq -er '.runtime_version' "${MANIFEST_PATH}")"
+          RUNTIME_STATUS="$(jq -er '.status' "${MANIFEST_PATH}")"
+          if [ "${RUNTIME_STATUS}" = "candidate" ] && [ "${ALLOW_CANDIDATE_RUNTIME}" != "true" ]; then
+            echo "::error::workspace-runtime ${RUNTIME_VERSION} has status 'candidate'; pass allow_candidate_runtime=true or pin a compatible workspace_runtime_release"
+            exit 1
+          fi
           MANIFEST_SHA256="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
           {
             echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST=${MANIFEST_PATH}"
             echo "OPENFLOWS_WORKSPACE_RUNTIME_MANIFEST_SHA256=${MANIFEST_SHA256}"
             echo "OPENFLOWS_WORKSPACE_ARCH=amd64"
-            echo "OPENFLOWS_WORKSPACE_RUNTIME_RELEASE=$(cat runtime/VERSION)"
+            echo "OPENFLOWS_WORKSPACE_RUNTIME_RELEASE=${RUNTIME_VERSION}"
+            if [ "${ALLOW_CANDIDATE_RUNTIME}" = "true" ]; then
+              echo "OPENFLOWS_WORKSPACE_RUNTIME_ALLOW_CANDIDATE=true"
+            fi
           } >> "$GITHUB_ENV"
-          echo "Pinned workspace-runtime manifest ${MANIFEST_SHA256} from ${RUNTIME_REPO} (linux/amd64, runtime $(cat runtime/VERSION))"
+          echo "Pinned workspace-runtime manifest ${MANIFEST_SHA256} from ${RUNTIME_REPO} (linux/amd64, runtime ${RUNTIME_VERSION}, status ${RUNTIME_STATUS})"
 
       - name: Build deterministic template release
         run: |
