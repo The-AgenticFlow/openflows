@@ -309,6 +309,9 @@ resource "kubernetes_persistent_volume_claim_v1" "workspace" {
 # `openflows-nexus-<tenant>:3000` from the Manager, so the name must match even
 # while the Nexus pod is restarting; the selector simply has no endpoints then.
 resource "kubernetes_service_v1" "relay" {
+  # A template import plans with no tenant, and "openflows-nexus-" is not a valid name.
+  count = data.coder_parameter.tenant.value != "" ? 1 : 0
+
   metadata {
     name      = local.service_name
     namespace = local.namespace

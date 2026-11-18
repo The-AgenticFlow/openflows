@@ -272,6 +272,8 @@ fn nexus_keeps_the_relay_and_the_controller_bootstrap() {
         .0;
     assert!(service.contains("port        = 3000"));
     assert!(service.contains("selector = local.selector_labels"));
+    // A template import has no tenant yet, and an empty name is an invalid Service.
+    assert!(service.contains(r#"count = data.coder_parameter.tenant.value != "" ? 1 : 0"#));
 
     let lines = startup(NEXUS);
     assert!(lines.iter().any(|line| line.starts_with(
