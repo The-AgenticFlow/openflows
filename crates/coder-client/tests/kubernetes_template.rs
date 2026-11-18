@@ -165,6 +165,115 @@ fn the_pods_mount_the_delivered_secret_where_the_harness_reads_it() {
     }
 }
 
+/// The init container block of a hosted template.
+fn init_container(role: &str, template: &'static str) -> &'static str {
+    template
+        .split_once("init_container {")
+        .unwrap_or_else(|| panic!("{role} prepares the workspace directory first"))
+        .1
+        .split_once("\n        container {")
+        .unwrap_or_else(|| panic!("{role} declares its container after the init container"))
+        .0
+}
+
+/// The shell script the init container runs, with its directory pointed at `dir`.
+fn init_script(role: &str, template: &'static str, dir: &str) -> String {
+    let command = init_container(role, template)
+        .split_once(r#"command     = ["sh", "-c", ""#)
+        .unwrap_or_else(|| panic!("{role} runs a script"))
+        .1
+        .split_once(r#""]"#)
+        .unwrap()
+        .0;
+    command
+        .replace(r#"\""#, "\"")
+        .replace("/home/coder/workspace", dir)
+}
+
+#[test]
+fn a_kept_claim_replaces_an_empty_workspace_directory_and_never_one_with_files() {
+    // The home claim survives stop and start, so it may already hold the directory the earlier bug
+    // left behind. A directory without write access stands in for a root-owned one; root bypasses
+    // permissions, so the check cannot say anything there.
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &std::path::Path, bits| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+    };
+    let run = |script: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .status()
+            .unwrap()
+            .success()
+    };
+    for (role, template) in ALL {
+        let base = std::env::temp_dir().join(format!("of-wd-{}-{role}", std::process::id()));
+        let dir = base.join("workspace");
+        let script = init_script(role, template, dir.to_str().unwrap());
+
+        // Empty and not writable: replaced by a directory the workspace user can write.
+        std::fs::create_dir_all(&dir).unwrap();
+        mode(&dir, 0o555);
+        assert!(run(&script), "{role}: an empty directory is replaced");
+        std::fs::create_dir(dir.join("probe")).unwrap_or_else(|_| panic!("{role}: not writable"));
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            1,
+            "{role}: nothing is left aside"
+        );
+
+        // Writable and populated: left alone, and the rerun succeeds.
+        assert!(run(&script), "{role}: a writable directory is a no-op");
+        assert!(
+            dir.join("probe").exists(),
+            "{role}: contents survive a rerun"
+        );
+
+        // Not writable and holding files: the pod must stop, with the files untouched.
+        mode(&dir, 0o555);
+        assert!(
+            !run(&script),
+            "{role}: a populated directory must fail the init"
+        );
+        assert!(
+            dir.join("probe").exists(),
+            "{role}: the files are not moved or deleted"
+        );
+
+        mode(&dir, 0o755);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[test]
+fn the_workspace_directory_is_created_by_the_workspace_user_before_the_role_starts() {
+    // The image WORKDIR is /home/coder/workspace, which the home PVC hides. Left to the
+    // container runtime it is created root-owned and the repository clone is denied.
+    for (role, template) in ALL {
+        let init = init_container(role, template);
+        assert!(
+            init.contains("mkdir -p $d"),
+            "{role}: creates the directory"
+        );
+        assert!(
+            init.contains(r#"working_dir = "/tmp""#),
+            "{role}: a neutral workdir"
+        );
+        assert!(
+            init.contains("run_as_user                = 1000"),
+            "{role}: as the user"
+        );
+        assert!(
+            init.contains(r#"mount_path = "/home/coder""#),
+            "{role}: on the home volume"
+        );
+    }
+}
+
 #[test]
 fn the_namespace_comes_from_the_manager_when_it_passes_one() {
     // The Manager delivers the Secret into the organization's namespace, so the
