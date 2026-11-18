@@ -394,6 +394,42 @@ resource "kubernetes_deployment_v1" "workspace" {
           "kubernetes.io/arch" = "amd64"
         }
 
+        # The image WORKDIR is /home/coder/workspace, and the home PVC hides the image copy.
+        # Create it as uid 1000 first, or the runtime makes it root-owned and the clone fails.
+        init_container {
+          name        = "prepare-workspace"
+          image       = local.image
+          working_dir = "/tmp"
+          command     = ["mkdir", "-p", "/home/coder/workspace"]
+
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            run_as_user                = 1000
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          resources {
+            requests = {
+              cpu    = "10m"
+              memory = "16Mi"
+            }
+
+            limits = {
+              cpu    = "100m"
+              memory = "64Mi"
+            }
+          }
+
+          volume_mount {
+            name       = "home"
+            mount_path = "/home/coder"
+          }
+        }
+
         container {
           name  = "forge"
           image = local.image

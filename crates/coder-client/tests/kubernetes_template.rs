@@ -166,6 +166,34 @@ fn the_pods_mount_the_delivered_secret_where_the_harness_reads_it() {
 }
 
 #[test]
+fn the_workspace_directory_is_created_by_the_workspace_user_before_the_role_starts() {
+    // The image WORKDIR is /home/coder/workspace, which the home PVC hides. Left to the
+    // container runtime it is created root-owned and the repository clone is denied.
+    for (role, template) in ALL {
+        let init = template
+            .split_once("init_container {")
+            .unwrap_or_else(|| panic!("{role} prepares the workspace directory first"))
+            .1
+            .split_once("\n        container {")
+            .unwrap_or_else(|| panic!("{role} declares its container after the init container"))
+            .0;
+        assert!(init.contains(r#"command     = ["mkdir", "-p", "/home/coder/workspace"]"#));
+        assert!(
+            init.contains(r#"working_dir = "/tmp""#),
+            "{role}: a neutral workdir"
+        );
+        assert!(
+            init.contains("run_as_user                = 1000"),
+            "{role}: as the user"
+        );
+        assert!(
+            init.contains(r#"mount_path = "/home/coder""#),
+            "{role}: on the home volume"
+        );
+    }
+}
+
+#[test]
 fn the_namespace_comes_from_the_manager_when_it_passes_one() {
     // The Manager delivers the Secret into the organization's namespace, so the
     // pod has to land beside it; the template variable is the operator default.
