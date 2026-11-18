@@ -335,13 +335,13 @@ resource "kubernetes_deployment_v1" "workspace" {
           "kubernetes.io/arch" = "amd64"
         }
 
-        # The image WORKDIR is /home/coder/workspace, and the home PVC hides the image copy.
-        # Create it as uid 1000 first, or the runtime makes it root-owned and the clone fails.
+        # The image WORKDIR is /home/coder/workspace and the home PVC hides the image copy, so the
+        # runtime makes it root-owned. Create it as uid 1000; on a kept claim, move a root-owned one aside.
         init_container {
           name        = "prepare-workspace"
           image       = local.image
           working_dir = "/tmp"
-          command     = ["mkdir", "-p", "/home/coder/workspace"]
+          command     = ["sh", "-c", "d=/home/coder/workspace; if [ -d $d ] && [ ! -w $d ]; then mv $d $d.root-owned.$(date +%s); fi; mkdir -p $d && [ -w $d ]"]
 
           security_context {
             allow_privilege_escalation = false

@@ -165,19 +165,90 @@ fn the_pods_mount_the_delivered_secret_where_the_harness_reads_it() {
     }
 }
 
+/// The init container block of a hosted template.
+fn init_container(role: &str, template: &'static str) -> &'static str {
+    template
+        .split_once("init_container {")
+        .unwrap_or_else(|| panic!("{role} prepares the workspace directory first"))
+        .1
+        .split_once("\n        container {")
+        .unwrap_or_else(|| panic!("{role} declares its container after the init container"))
+        .0
+}
+
+/// The shell script the init container runs, with its directory pointed at `dir`.
+fn init_script(role: &str, template: &'static str, dir: &str) -> String {
+    let command = init_container(role, template)
+        .split_once(r#"command     = ["sh", "-c", ""#)
+        .unwrap_or_else(|| panic!("{role} runs a script"))
+        .1
+        .split_once(r#""]"#)
+        .unwrap()
+        .0;
+    command.replace("/home/coder/workspace", dir)
+}
+
+#[test]
+fn a_root_owned_workspace_directory_on_a_kept_claim_is_replaced_not_reused() {
+    // The home claim survives stop and start, so a claim the earlier bug already filled holds a
+    // directory the workspace user cannot write. A directory without write access stands in for
+    // it; root bypasses permissions, so the check cannot say anything there.
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let run = |script: &str| {
+        let status = std::process::Command::new("sh")
+            .args(["-c", script])
+            .status();
+        assert!(status.unwrap().success(), "init script failed: {script}");
+    };
+    for (role, template) in ALL {
+        let base = std::env::temp_dir().join(format!("of-wd-{}-{role}", std::process::id()));
+        let dir = base.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let script = init_script(role, template, dir.to_str().unwrap());
+
+        run(&script);
+        let probe = dir.join("probe");
+        std::fs::create_dir(&probe).unwrap_or_else(|_| panic!("{role}: directory not writable"));
+        let moved = |base: &std::path::Path| {
+            std::fs::read_dir(base)
+                .unwrap()
+                .filter(|entry| {
+                    let name = entry.as_ref().unwrap().file_name();
+                    name.to_string_lossy().starts_with("workspace.root-owned.")
+                })
+                .count()
+        };
+        assert_eq!(moved(&base), 1, "{role}: the old directory is kept aside");
+
+        run(&script);
+        assert_eq!(
+            moved(&base),
+            1,
+            "{role}: a writable directory is left alone"
+        );
+        for entry in std::fs::read_dir(&base).unwrap() {
+            let path = entry.unwrap().path();
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
 #[test]
 fn the_workspace_directory_is_created_by_the_workspace_user_before_the_role_starts() {
     // The image WORKDIR is /home/coder/workspace, which the home PVC hides. Left to the
     // container runtime it is created root-owned and the repository clone is denied.
     for (role, template) in ALL {
-        let init = template
-            .split_once("init_container {")
-            .unwrap_or_else(|| panic!("{role} prepares the workspace directory first"))
-            .1
-            .split_once("\n        container {")
-            .unwrap_or_else(|| panic!("{role} declares its container after the init container"))
-            .0;
-        assert!(init.contains(r#"command     = ["mkdir", "-p", "/home/coder/workspace"]"#));
+        let init = init_container(role, template);
+        assert!(
+            init.contains("mkdir -p $d"),
+            "{role}: creates the directory"
+        );
         assert!(
             init.contains(r#"working_dir = "/tmp""#),
             "{role}: a neutral workdir"
