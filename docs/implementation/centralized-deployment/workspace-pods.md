@@ -133,7 +133,7 @@ Do these once per cluster, in order.
 3. **Promote the configured release** into the organization
    (`POST /api/v1/platform/organizations/{org}/template-release/promote-configured`).
    Promotion never upgrades existing pins, so a tenant created earlier keeps its
-   templates; create the tenant again to pick up a new release. Changed templates
+   templates until it is [recreated](#recreating-a-tenant). Changed templates
    also need a new `OPENFLOWS_RELEASE_NAME`, as the
    [production runbook](operator-production-runbook.md) says.
 4. **Add a chat model in each tenant's Coder organization.** Coder Agents
@@ -141,11 +141,28 @@ Do these once per cluster, in order.
    organization has none (see the
    [Coder models documentation](https://coder.com/docs/ai-coder/agents/models)).
    Without one, `/api/v1/runtime/chats` returns 503 with
-   `No chat model is available in this organization`.
+   `CODER_CHAT_UNAVAILABLE` (`Coder could not create the worker Chat`). The
+   cause, `No chat model is available in this organization`, is in the Manager
+   log.
 5. **Keep the Manager's secrets directory on a persistent volume** when it uses
    the filesystem secret provider (`OPENFLOWS_SECRET_PROVIDER=filesystem`).
    Per-tenant hook keys and Redis credentials live there. Losing the directory
    makes a start fail with `cannot resolve hook key`.
+
+## Recreating a tenant
+
+Deleting a tenant removes its Coder workspaces, and with them the home volumes
+(`openflows-<role>-<workspace id>` claims are removed only when Coder deletes the
+workspace). Anything not pushed to the repository, and the agents' saved state,
+is lost.
+
+> [!WARNING]
+> Recreate a tenant only when it holds nothing worth keeping. Before deleting
+> one that does, push or copy its work out of `/home/coder/workspace` first.
+
+On a disposable validation tenant, delete it and create it again. On a tenant
+with data, avoid recreating it, and back up the Manager's secrets directory,
+because a start fails without it.
 
 ## Troubleshooting
 
@@ -153,8 +170,8 @@ Do these once per cluster, in order.
 | --- | --- | --- |
 | Workspace stays at `connecting`; the startup log cannot download the agent | The platform egress ports omit the port Coder listens on | Step 1 |
 | Promote returns 403 | The user is not a platform operator | Step 2 |
-| A new tenant still runs the old templates | Promotion does not upgrade existing pins | Create the tenant again |
-| `/api/v1/runtime/chats` returns 503, `No chat model is available in this organization` | The tenant's Coder organization has no model | Step 4 |
-| A start fails with `cannot resolve hook key` | The Manager's secrets directory was lost | Create the tenant again; see step 5 |
+| A new tenant still runs the old templates | Promotion does not upgrade existing pins | [Recreate the tenant](#recreating-a-tenant) |
+| `/api/v1/runtime/chats` returns 503 `CODER_CHAT_UNAVAILABLE`, and the Manager log says `No chat model is available in this organization` | The tenant's Coder organization has no model | Step 4 |
+| A start fails with `cannot resolve hook key` | The Manager's secrets directory was lost | [Recreate the tenant](#recreating-a-tenant); see step 5 |
 | `FATAL: Manager runtime registration failed` after restarting a workspace in Coder | The bootstrap credential is single use ([`bootstrap.sh`](../../../runtime/lib/bootstrap.sh)) | Stop, then start the tenant through OpenFlows |
 | The `prepare-workspace` init container fails with `is not writable and holds files` | A populated workspace directory the user cannot write | Keep the files, fix the ownership, restart |
