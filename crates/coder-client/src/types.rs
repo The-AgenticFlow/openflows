@@ -706,9 +706,12 @@ impl Default for AgentLifecycleState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
+    Connecting,
     Connected,
     Disconnected,
     Timeout,
+    // Coder adds statuses over time; an unseen one must not fail a readiness poll.
+    #[serde(untagged)]
     Unknown(String),
 }
 
