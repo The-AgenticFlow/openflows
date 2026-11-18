@@ -11,7 +11,6 @@
 //!
 //! File I/O in workspaces uses the `exec` API (run `cat`/`tee`/`mkdir` commands).
 
-mod agent_status;
 pub mod bootstrap;
 pub mod types;
 

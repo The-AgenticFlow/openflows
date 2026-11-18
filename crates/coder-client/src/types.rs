@@ -702,7 +702,8 @@ impl Default for AgentLifecycleState {
     }
 }
 
-pub use crate::agent_status::AgentStatus;
+mod agent_status;
+pub use agent_status::AgentStatus;
 
 /// A Coder API key (token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
