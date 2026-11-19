@@ -2,8 +2,10 @@
 
 ## Configuration
 
-Copy `.env.prod.example` to `.env.prod` and replace its values. The manager
-loads `.env.prod` automatically when launched from the repository root. Shell
+For this legacy local Manager test workflow, copy
+`docs/examples/manager-local.env.example` to `.env.prod` and replace its
+values. New deployments use `.env.openflows.example`. The Manager loads
+`.env.prod` automatically when launched from the repository root. Shell
 variables that are already exported take precedence over values in the file.
 
 Hosted deployments require the existing OAuth and envelope-key configuration,
