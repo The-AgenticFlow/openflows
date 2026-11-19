@@ -76,7 +76,7 @@ The current profiles are deliberately different:
 
 | Agent | Git access | API access | Intended responsibility |
 |---|---|---|---|
-| NEXUS | Contents: read | Contents: read; issues and pull requests: write | Discover and coordinate work without implementing repository changes |
+| NEXUS | Contents: read | Contents: read; issues and pull requests: write; checks, statuses, and actions: read | Discover and coordinate work, and read CI for the Vessel node it hosts, without implementing repository changes |
 | FORGE | Contents and workflows: write | Contents and pull requests: write | Implement, push the assigned branch, and create or update its pull request |
 | SENTINEL | Contents: read | Contents and checks: read; pull requests: write | Inspect code and CI, then submit independent review feedback |
 | VESSEL | Contents: write | Contents and pull requests: write; checks, statuses, and actions: read | Perform approved merge and delivery operations using current CI evidence |
