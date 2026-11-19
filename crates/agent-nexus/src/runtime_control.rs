@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Installation tokens last an hour, so rotate well inside that window.
+const GITHUB_TOKEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+/// Wait before retrying when the broker could not issue a token.
+const GITHUB_TOKEN_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct RuntimeControlClient {
     base_url: String,
@@ -230,6 +235,28 @@ impl RuntimeControlClient {
             bail!("GitHub credential broker returned an empty token");
         }
         Ok(credential.token)
+    }
+
+    /// Fetch a brokered `api` token and store it in `token`, for clients that
+    /// outlive one installation token. A failure leaves the current token in place.
+    pub async fn refresh_github_token(&self, token: &github::SharedToken) -> Result<()> {
+        token.set(self.github_api_token().await?);
+        Ok(())
+    }
+
+    /// Keep `token` current for as long as the controller runs. Uses the same
+    /// runtime session as every other call, so it never rotates the session itself.
+    pub async fn keep_github_token_fresh(self, token: github::SharedToken) {
+        loop {
+            let wait = match self.refresh_github_token(&token).await {
+                Ok(()) => GITHUB_TOKEN_REFRESH,
+                Err(error) => {
+                    tracing::warn!(%error, "GitHub token refresh failed; retrying");
+                    GITHUB_TOKEN_RETRY
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
     }
 
     pub async fn request_worker(
@@ -456,6 +483,49 @@ mod tests {
             "installation-token"
         );
         exchange.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_the_shared_token_and_a_failure_keeps_it() {
+        let mut server = Server::new_async().await;
+        let issued = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"token":"fresh"}"#)
+            .create_async()
+            .await;
+        let client = RuntimeControlClient::for_test(server.url());
+        let seen = github::GithubRestClient::with_api_base("stale", server.url());
+        let shared = seen.token_handle();
+        let user = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer fresh")
+            .with_body(r#"{"login":"app"}"#)
+            .create_async()
+            .await;
+
+        client.refresh_github_token(&shared).await.unwrap();
+        seen.get_authenticated_user_login().await.unwrap();
+        issued.assert_async().await;
+        user.assert_async().await;
+
+        issued.remove_async().await;
+        let refused = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_status(500)
+            .create_async()
+            .await;
+        assert!(client.refresh_github_token(&shared).await.is_err());
+        refused.assert_async().await;
+        let still = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer fresh")
+            .with_body(r#"{"login":"app"}"#)
+            .create_async()
+            .await;
+        seen.get_authenticated_user_login().await.unwrap();
+        still.assert_async().await;
     }
 
     #[tokio::test]

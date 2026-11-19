@@ -431,9 +431,9 @@ async fn run_controller(reset_store: bool) -> Result<()> {
             openflows::nodes::VesselConfig::from_env()
         }),
     ));
-    // LORE is not a flow node: NEXUS drives it as a Coder workspace chat for
-    // merged tickets (see `agent-nexus/src/lore.rs`), gated by the operator
-    // through `openflows gate docs`. The flow never blocks on docs.
+    let vessel_token = vessel.github_token();
+    // LORE is not a flow node: NEXUS drives it as a Coder workspace chat for merged tickets
+    // (see `agent-nexus/src/lore.rs`), gated by `openflows gate docs`. The flow never blocks on docs.
     if registry.get("lore").is_some_and(|entry| entry.enabled) {
         match config::docs_lifecycle::DocsGateKeys::from_env() {
             Ok(Some(keys)) => {
@@ -515,9 +515,8 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // within ~40 steps instead of burning all 1000.
     let flow = flow.max_steps(1000).max_visits_per_node(20);
 
-    // Report readiness only after controller initialization has succeeded.
-    // Keep the task scoped to this function so exiting the controller also
-    // stops heartbeats, including when initialization or the loop fails.
+    // Report readiness only after initialization succeeds. These tasks end with the
+    // controller, including when initialization or the loop fails.
     let mut runtime_heartbeats = tokio::task::JoinSet::new();
     if let Some(runtime) = runtime_control.clone() {
         let mut retry_delay = std::time::Duration::from_secs(1);
@@ -535,6 +534,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 }
             }
         }
+        runtime_heartbeats.spawn(runtime.clone().keep_github_token_fresh(vessel_token));
         runtime_heartbeats.spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;

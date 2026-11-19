@@ -141,6 +141,17 @@ supplied by a caller. `metadata` is implicit.
 | vessel | contents: write | contents: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | lore | contents: write | contents: write, pull_requests: write |
 
+### Vessel in the controller
+
+In a hosted tenant the Vessel merge manager runs inside the Nexus controller, so
+its GitHub client authenticates with the `nexus` `api` profile above. The
+controller fetches that token from the broker through its own runtime session at
+startup and every eight minutes after, and updates the client in place
+([`runtime_control.rs`](../../crates/agent-nexus/src/runtime_control.rs)). The
+session itself stays with the runtime client, so this refresh never rotates it.
+When a refresh fails, the previous token stays in use and the next attempt
+follows in 30 seconds.
+
 ## Concurrency and revocation
 
 - Generations are captured before the external exchange and rechecked after it,
