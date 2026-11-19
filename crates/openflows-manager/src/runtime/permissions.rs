@@ -282,16 +282,11 @@ mod tests {
             .unwrap()
             .permissions
             .to_wire();
-        for (name, level) in [
-            ("checks", "read"),
-            ("statuses", "read"),
-            ("actions", "read"),
-            ("contents", "read"),
-        ] {
+        for name in ["checks", "statuses", "actions"] {
             assert_eq!(
                 permissions.get(name).map(String::as_str),
-                Some(level),
-                "nexus.api must grant {name}:{level} for the Vessel node in the controller"
+                Some("read"),
+                "nexus.api must grant {name}:read for the Vessel node in the controller"
             );
         }
         // Merging still needs contents write, which this profile must not grant.

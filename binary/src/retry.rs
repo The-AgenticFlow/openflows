@@ -1,8 +1,8 @@
 //! Startup retries for steps the controller cannot run without.
 //!
 //! A hosted controller talks to the Manager before it can do anything useful.
-//! These helpers keep the process alive with exponential backoff while that
-//! dependency recovers, instead of exiting and waiting for a restart.
+//! This keeps the process alive with exponential backoff while that dependency
+//! recovers.
 
 use std::time::Duration;
 
