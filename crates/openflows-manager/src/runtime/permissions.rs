@@ -147,7 +147,17 @@ pub fn resolve_profile(
         ("forge", Git) => map(&[(Contents, Write), (Workflows, Write)]),
         ("vessel", Git) | ("lore", Git) => map(&[(Contents, Write)]),
         // API: Nexus coordinates issues/PRs; Forge/Sentinel review; Vessel CI.
-        ("nexus", Api) => map(&[(Contents, Read), (Issues, Write), (PullRequests, Write)]),
+        // The controller also reads CI for the Vessel node it hosts, so the
+        // Nexus profile carries the same read scopes. Merging stays out until
+        // the merge credential is decided (#592).
+        ("nexus", Api) => map(&[
+            (Contents, Read),
+            (Issues, Write),
+            (PullRequests, Write),
+            (Checks, Read),
+            (Statuses, Read),
+            (Actions, Read),
+        ]),
         ("forge", Api) => map(&[(Contents, Write), (PullRequests, Write)]),
         ("sentinel", Api) => map(&[(Contents, Read), (PullRequests, Write), (Checks, Read)]),
         ("vessel", Api) => map(&[
@@ -264,6 +274,26 @@ mod tests {
                 purpose.as_str()
             );
         }
+    }
+
+    #[test]
+    fn nexus_api_covers_the_ci_reads_the_hosted_vessel_makes() {
+        let permissions = resolve_profile("nexus", RuntimePurpose::Api)
+            .unwrap()
+            .permissions
+            .to_wire();
+        for name in ["checks", "statuses", "actions"] {
+            assert_eq!(
+                permissions.get(name).map(String::as_str),
+                Some("read"),
+                "nexus.api must grant {name}:read for the Vessel node in the controller"
+            );
+        }
+        // Merging still needs contents write, which this profile must not grant.
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("read")
+        );
     }
 
     #[test]

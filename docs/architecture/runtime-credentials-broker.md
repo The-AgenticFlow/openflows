@@ -135,11 +135,26 @@ supplied by a caller. `metadata` is implicit.
 
 | Role | `git` | `api` |
 |---|---|---|
-| nexus | contents: read | contents: read, issues: write, pull_requests: write |
+| nexus | contents: read | contents: read, issues: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | forge | contents: write | contents: write, pull_requests: write |
 | sentinel | contents: read | contents: read, pull_requests: write, checks: read |
 | vessel | contents: write | contents: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | lore | contents: write | contents: write, pull_requests: write |
+
+### Vessel in the controller
+
+In a hosted tenant the Vessel merge manager runs inside the Nexus controller, so
+its GitHub client authenticates with the `nexus` `api` profile above. The
+controller fetches that token from the broker through its own runtime session at
+startup and every eight minutes after, and updates the client in place
+([`runtime_control.rs`](../../crates/agent-nexus/src/runtime_control.rs)). The
+refresher shares the runtime client's session instead of keeping a second one,
+so it consumes no extra refresh token. When a refresh fails, the previous token
+stays in use and the next attempt follows in 30 seconds.
+
+That profile covers the CI reads the Vessel node makes (`check-suites`, commit
+statuses, actions), so a hosted CI gate can observe a pull request. Merging
+still needs `contents: write`; which credential merges is decided on #592.
 
 ## Concurrency and revocation
 

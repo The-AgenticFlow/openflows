@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Installation tokens last an hour, so rotate well inside that window.
+const GITHUB_TOKEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+/// Wait before retrying when the broker could not issue a token.
+const GITHUB_TOKEN_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on one exchange, response body included. A Manager that accepts the
+/// request and stops writing must not stall rotation, or the token runs out.
+const GITHUB_TOKEN_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct RuntimeControlClient {
     base_url: String,
@@ -129,32 +137,19 @@ impl RuntimeControlClient {
     }
 
     async fn refresh_if_needed(&self, rejected_access: &str) -> Result<()> {
-        // Keep the lock during refresh so a heartbeat and a broker request do
-        // not consume the same single-use refresh token concurrently.
-        let mut tokens = self.tokens.lock().await;
-        if tokens.access != rejected_access {
-            return Ok(());
-        }
-        let response = self
-            .http
-            .post(format!("{}/api/v1/runtime/refresh", self.base_url))
-            .bearer_auth(&tokens.refresh)
-            .send()
-            .await
-            .context("failed to refresh runtime credential")?;
-        if !response.status().is_success() {
-            bail!(
-                "runtime credential refresh failed with {}",
-                response.status()
-            );
-        }
-        let refreshed: RefreshResponse = response
-            .json()
-            .await
-            .context("invalid runtime refresh response")?;
-        tokens.access = refreshed.access_token;
-        tokens.refresh = refreshed.refresh_token;
-        Ok(())
+        // A rotation spends a single-use refresh token, so once the request is
+        // in flight the replacement pair must be stored even if the caller's
+        // deadline cancels this future. Run the exchange in its own task and
+        // only wait for it here.
+        let tokens = self.tokens.clone();
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let rejected = rejected_access.to_owned();
+        tokio::spawn(
+            async move { rotate_runtime_tokens(&tokens, &http, &base_url, &rejected).await },
+        )
+        .await
+        .context("runtime credential rotation task failed")?
     }
 
     async fn send_retrying_refresh(
@@ -211,6 +206,18 @@ impl RuntimeControlClient {
     /// Manager derives the installation, repository, and permissions from the
     /// authenticated workspace; the controller supplies only the purpose.
     pub async fn github_api_token(&self) -> Result<String> {
+        self.github_api_token_within(GITHUB_TOKEN_EXCHANGE).await
+    }
+
+    /// The exchange bounded by `budget`, so a stalled broker cannot hold the
+    /// caller (or the rotation loop) forever. Tests pass a short budget.
+    async fn github_api_token_within(&self, budget: std::time::Duration) -> Result<String> {
+        tokio::time::timeout(budget, self.exchange_github_api_token())
+            .await
+            .with_context(|| format!("GitHub credential broker did not answer within {budget:?}"))?
+    }
+
+    async fn exchange_github_api_token(&self) -> Result<String> {
         let response = self
             .send_retrying_refresh(
                 reqwest::Method::POST,
@@ -230,6 +237,28 @@ impl RuntimeControlClient {
             bail!("GitHub credential broker returned an empty token");
         }
         Ok(credential.token)
+    }
+
+    /// Fetch a brokered `api` token and store it in `token`, for clients that
+    /// outlive one installation token. A failure leaves the current token in place.
+    pub async fn refresh_github_token(&self, token: &github::SharedToken) -> Result<()> {
+        token.set(self.github_api_token().await?);
+        Ok(())
+    }
+
+    /// Keep `token` current for as long as the controller runs. Uses the
+    /// controller's own runtime session rather than keeping a second one.
+    pub async fn keep_github_token_fresh(self, token: github::SharedToken) {
+        loop {
+            let wait = match self.refresh_github_token(&token).await {
+                Ok(()) => GITHUB_TOKEN_REFRESH,
+                Err(error) => {
+                    tracing::warn!(%error, "GitHub token refresh failed; retrying");
+                    GITHUB_TOKEN_RETRY
+                }
+            };
+            tokio::time::sleep(wait).await;
+        }
     }
 
     pub async fn request_worker(
@@ -364,6 +393,41 @@ impl RuntimeControlClient {
     }
 }
 
+/// Exchange the single-use runtime refresh token for a new pair and store it.
+/// Split out so the rotation outlives a caller cancelled by its own deadline.
+async fn rotate_runtime_tokens(
+    tokens: &Mutex<RuntimeTokens>,
+    http: &reqwest::Client,
+    base_url: &str,
+    rejected_access: &str,
+) -> Result<()> {
+    // Hold the lock across the exchange so a heartbeat and a broker request do
+    // not consume the same single-use refresh token concurrently.
+    let mut tokens = tokens.lock().await;
+    if tokens.access != rejected_access {
+        return Ok(());
+    }
+    let response = http
+        .post(format!("{base_url}/api/v1/runtime/refresh"))
+        .bearer_auth(&tokens.refresh)
+        .send()
+        .await
+        .context("failed to refresh runtime credential")?;
+    if !response.status().is_success() {
+        bail!(
+            "runtime credential refresh failed with {}",
+            response.status()
+        );
+    }
+    let refreshed: RefreshResponse = response
+        .json()
+        .await
+        .context("invalid runtime refresh response")?;
+    tokens.access = refreshed.access_token;
+    tokens.refresh = refreshed.refresh_token;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +523,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_replaces_the_shared_token_and_a_failure_keeps_it() {
+        let mut server = Server::new_async().await;
+        let issued = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"token":"fresh"}"#)
+            .create_async()
+            .await;
+        let client = RuntimeControlClient::for_test(server.url());
+        let seen = github::GithubRestClient::with_api_base("stale", server.url());
+        let shared = seen.token_handle();
+        let user = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer fresh")
+            .with_body(r#"{"login":"app"}"#)
+            .create_async()
+            .await;
+
+        client.refresh_github_token(&shared).await.unwrap();
+        seen.get_authenticated_user_login().await.unwrap();
+        issued.assert_async().await;
+        user.assert_async().await;
+
+        issued.remove_async().await;
+        let refused = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_status(500)
+            .create_async()
+            .await;
+        assert!(client.refresh_github_token(&shared).await.is_err());
+        refused.assert_async().await;
+        let still = server
+            .mock("GET", "/user")
+            .match_header("authorization", "Bearer fresh")
+            .with_body(r#"{"login":"app"}"#)
+            .create_async()
+            .await;
+        seen.get_authenticated_user_login().await.unwrap();
+        still.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_stops_writing_cannot_stall_the_exchange() {
+        // Accept the credential request and never answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let stalled = RuntimeControlClient::for_test(format!("http://{address}"));
+
+        let started = std::time::Instant::now();
+        let error = stalled
+            .github_api_token_within(std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // The retry against a healthy broker still issues a token.
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_body(r#"{"token":"fresh"}"#)
+            .create_async()
+            .await;
+        let healthy = RuntimeControlClient::for_test(server.url());
+        assert_eq!(healthy.github_api_token().await.unwrap(), "fresh");
+    }
+
+    #[tokio::test]
     async fn managed_worker_delete_uses_runtime_route_and_idempotency_key() {
         let mut server = Server::new_async().await;
         let request = server
@@ -482,6 +619,75 @@ mod tests {
             .await
             .unwrap();
         request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_exchange_still_stores_the_rotated_session() {
+        let mut server = Server::new_async().await;
+        let rejected = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .match_header("authorization", "Bearer test-access")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        // The rotation commits, but its body arrives after the caller's deadline.
+        let rotation = server
+            .mock("POST", "/api/v1/runtime/refresh")
+            .match_header("authorization", "Bearer test-refresh")
+            .with_header("content-type", "application/json")
+            .with_chunked_body(|writer| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                writer.write_all(
+                    br#"{"access_token":"rotated-access","refresh_token":"rotated-refresh"}"#,
+                )
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let heartbeat = server
+            .mock("POST", "/api/v1/runtime/heartbeat")
+            .match_header("authorization", "Bearer rotated-access")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let exchanged = server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .match_header("authorization", "Bearer rotated-access")
+            .match_body(Matcher::JsonString(r#"{"purpose":"api"}"#.into()))
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"token":"installation-token"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = RuntimeControlClient::for_test(server.url());
+        let error = client
+            .github_api_token_within(std::time::Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+
+        // The rotation finished in its own task, so the same client works again.
+        let mut healed = false;
+        for _ in 0..40 {
+            if client.heartbeat().await.is_ok() {
+                healed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(healed, "the rotated session never became usable");
+        assert_eq!(
+            client.github_api_token().await.unwrap(),
+            "installation-token"
+        );
+
+        rejected.assert_async().await;
+        rotation.assert_async().await;
+        heartbeat.assert_async().await;
+        exchanged.assert_async().await;
     }
 
     #[tokio::test]
