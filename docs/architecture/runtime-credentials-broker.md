@@ -135,7 +135,7 @@ supplied by a caller. `metadata` is implicit.
 
 | Role | `git` | `api` |
 |---|---|---|
-| nexus | contents: read | contents: read, issues: write, pull_requests: write |
+| nexus | contents: read | contents: read, issues: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | forge | contents: write | contents: write, pull_requests: write |
 | sentinel | contents: read | contents: read, pull_requests: write, checks: read |
 | vessel | contents: write | contents: write, pull_requests: write, checks: read, statuses: read, actions: read |
@@ -151,6 +151,11 @@ startup and every eight minutes after, and updates the client in place
 refresher shares the runtime client's session instead of keeping a second one,
 so it consumes no extra refresh token. When a refresh fails, the previous token
 stays in use and the next attempt follows in 30 seconds.
+
+That profile covers the CI reads the Vessel node makes (`check-suites`,
+commit statuses, actions), so a hosted CI gate can observe a pull
+request. Merging still needs `contents: write`; which credential merges is
+decided on #592.
 
 ## Concurrency and revocation
 
