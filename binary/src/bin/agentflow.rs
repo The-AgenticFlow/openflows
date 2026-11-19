@@ -520,6 +520,19 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let mut runtime_heartbeats = tokio::task::JoinSet::new();
     if let Some(runtime) = runtime_control.clone() {
         openflows::retry::until_ready("Manager runtime heartbeat", || runtime.heartbeat()).await;
+        // Heartbeats keep running while the credential exchange below is retried,
+        // so the Manager never sees this workspace go stale.
+        runtime_heartbeats.spawn({
+            let runtime = runtime.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    if let Err(error) = runtime.heartbeat().await {
+                        tracing::warn!(%error, "Manager runtime heartbeat failed");
+                    }
+                }
+            }
+        });
         // The controller pod has no token file, so the in-process Vessel needs a
         // brokered token before the first flow pass can reach it.
         openflows::retry::until_ready("Vessel GitHub token", || {
@@ -527,14 +540,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         })
         .await;
         runtime_heartbeats.spawn(runtime.clone().keep_github_token_fresh(vessel_token));
-        runtime_heartbeats.spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if let Err(error) = runtime.heartbeat().await {
-                    tracing::warn!(%error, "Manager runtime heartbeat failed");
-                }
-            }
-        });
     }
 
     // ── Run controller poll loop ────────────────────────────────────────
