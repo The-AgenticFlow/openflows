@@ -5,7 +5,7 @@
 //! workspace's stored agent role and the requested runtime purpose. A caller
 //! can never supply or override an organization, installation, repository, or
 //! permission set: the broker resolves the profile itself and the only
-//! caller-controlled input is the coarse `purpose` (`git` or `api`).
+//! caller-controlled input is the coarse `purpose` (`git`, `api` or `merge`).
 //!
 //! Profiles are explicit allowlists grounded in the actual runtime needs from
 //! the centralized-deployment specification (02-github-app.md §2). They are
@@ -68,6 +68,9 @@ pub enum RuntimePurpose {
     Git,
     /// A credential for REST API operations (issues, PRs, checks, CI).
     Api,
+    /// A credential for merging pull requests, issued only to the controller
+    /// that runs the Vessel merge manager.
+    Merge,
 }
 
 impl RuntimePurpose {
@@ -75,9 +78,10 @@ impl RuntimePurpose {
         match raw {
             "git" => Ok(RuntimePurpose::Git),
             "api" => Ok(RuntimePurpose::Api),
+            "merge" => Ok(RuntimePurpose::Merge),
             other => Err(ManagerError::api(
                 "INVALID_INPUT",
-                format!("invalid runtime purpose '{other}': expected 'git' or 'api'"),
+                format!("invalid runtime purpose '{other}': expected 'git', 'api' or 'merge'"),
             )),
         }
     }
@@ -86,6 +90,7 @@ impl RuntimePurpose {
         match self {
             RuntimePurpose::Git => "git",
             RuntimePurpose::Api => "api",
+            RuntimePurpose::Merge => "merge",
         }
     }
 }
@@ -152,6 +157,16 @@ pub fn resolve_profile(
         // the merge credential is decided (#592).
         ("nexus", Api) => map(&[
             (Contents, Read),
+            (Issues, Write),
+            (PullRequests, Write),
+            (Checks, Read),
+            (Statuses, Read),
+            (Actions, Read),
+        ]),
+        // Merge: what the controller's Vessel does (read PRs, reviews and CI, close
+        // the issue, merge). It is the `nexus` API grants with contents raised to write.
+        ("nexus", Merge) => map(&[
+            (Contents, Write),
             (Issues, Write),
             (PullRequests, Write),
             (Checks, Read),
@@ -263,6 +278,7 @@ mod tests {
             ("vessel", RuntimePurpose::Git),
             ("lore", RuntimePurpose::Git),
             ("forge", RuntimePurpose::Api),
+            ("nexus", RuntimePurpose::Merge),
         ] {
             let permissions = resolve_profile(role, purpose)
                 .unwrap()
@@ -294,6 +310,37 @@ mod tests {
             permissions.get("contents").map(String::as_str),
             Some("read")
         );
+    }
+
+    #[test]
+    fn merge_is_the_nexus_api_grants_with_contents_raised_to_write() {
+        let api = resolve_profile("nexus", RuntimePurpose::Api).unwrap();
+        let merge = resolve_profile("nexus", RuntimePurpose::Merge).unwrap();
+        let mut expected = api.permissions.to_wire();
+        expected.insert("contents".into(), "write".into());
+        assert_eq!(merge.permissions.to_wire(), expected);
+        assert_ne!(merge.profile_hash, api.profile_hash);
+        assert_eq!(merge.name, "nexus.merge");
+    }
+
+    #[test]
+    fn only_nexus_can_request_the_merge_purpose() {
+        for role in ["forge", "sentinel", "vessel", "lore", "unknown", ""] {
+            assert!(
+                resolve_profile(role, RuntimePurpose::Merge).is_err(),
+                "{role} must not receive a merge credential"
+            );
+        }
+    }
+
+    #[test]
+    fn the_merge_purpose_parses_and_unknown_purposes_still_fail() {
+        assert_eq!(
+            RuntimePurpose::parse("merge").unwrap(),
+            RuntimePurpose::Merge
+        );
+        assert_eq!(RuntimePurpose::Merge.as_str(), "merge");
+        assert!(RuntimePurpose::parse("admin").is_err());
     }
 
     #[test]

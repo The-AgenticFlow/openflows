@@ -536,10 +536,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         // The controller pod has no token file, so the in-process Vessel needs a
         // brokered token before the first flow pass can reach it.
         openflows::retry::until_ready("Vessel GitHub token", || {
-            runtime.refresh_github_token(&vessel_token)
+            runtime.refresh_vessel_token(&vessel_token)
         })
         .await;
-        runtime_heartbeats.spawn(runtime.clone().keep_github_token_fresh(vessel_token));
+        runtime_heartbeats.spawn(runtime.clone().keep_vessel_token_fresh(vessel_token));
     }
 
     // ── Run controller poll loop ────────────────────────────────────────
