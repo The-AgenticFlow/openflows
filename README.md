@@ -1,25 +1,31 @@
-# OpenFlows
+<h1 align="center">OpenFlows</h1>
 
-Turn GitHub issues into reviewed pull requests with a self-hosted AI development team.
+<h2 align="center">A self-hosted AI development team for GitHub</h2>
+
+<p align="center"><strong>Turn GitHub issues into reviewed pull requests on your own infrastructure.</strong></p>
+
+<hr>
 
 <p align="center">
+  <strong>Run with</strong> <a href="#deployment"><img src="./assets/cloud-platforms/docker.svg" alt="Docker" width="44"></a> <strong>on</strong>&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/aws.svg" alt="AWS" width="48"></a>&nbsp;&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/azure.svg" alt="Azure" width="48"></a>&nbsp;&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/google-cloud.svg" alt="Google Cloud" width="48"></a>
+</p>
+<p align="center"><a href="#deployment"><img src="./assets/cloud-platforms/kubernetes.svg" alt="Kubernetes" width="24"></a> <sub>Hosted Kubernetes deployment in progress</sub></p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> · <a href="#deployment">Deployment</a> · <a href="#how-it-works">How it works</a> · <a href="#contribute">Contribute</a> · <a href="#documentation">Docs</a> · <a href="https://openflows.dev">Website</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/The-AgenticFlow/openflows/releases/latest"><img src="https://img.shields.io/github/v/release/The-AgenticFlow/openflows?style=flat-square" alt="Latest release"></a>
   <a href="https://github.com/The-AgenticFlow/openflows/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/The-AgenticFlow/openflows/ci.yml?branch=develop&amp;label=checks&amp;style=flat-square" alt="CI checks"></a>
   <a href="https://github.com/The-AgenticFlow/openflows/stargazers"><img src="https://img.shields.io/github/stars/The-AgenticFlow/openflows?style=flat-square" alt="GitHub stars"></a>
   <a href="https://github.com/The-AgenticFlow/openflows/graphs/contributors"><img src="https://img.shields.io/github/contributors/The-AgenticFlow/openflows?style=flat-square" alt="Contributors"></a>
+  <a href="https://github.com/The-AgenticFlow/openflows/issues"><img src="https://img.shields.io/github/issues/The-AgenticFlow/openflows?style=flat-square" alt="Open issues"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/The-AgenticFlow/openflows?style=flat-square" alt="MIT license"></a>
 </p>
-
-[Quickstart](#quickstart) · [Deployment](#deployment) · [How it works](#how-it-works) · [Contribute](#contribute) · [Documentation](#documentation) · [Website](https://openflows.dev)
-
-<p align="center">
-  <a href="#deployment"><img src="./assets/cloud-platforms/aws.svg" alt="AWS" width="52"></a>&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="#deployment"><img src="./assets/cloud-platforms/azure.svg" alt="Azure" width="52"></a>&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="#deployment"><img src="./assets/cloud-platforms/google-cloud.svg" alt="Google Cloud" width="52"></a>&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="#deployment"><img src="./assets/cloud-platforms/kubernetes.svg" alt="Kubernetes" width="52"></a>
-</p>
-<p align="center"><sub>Docker on cloud VMs today · Hosted Kubernetes deployment in progress</sub></p>
-
-<img src="./assets/home.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
 OpenFlows coordinates AI agents inside [Coder](https://coder.com) workspaces. A controller assigns work, checks plans before coding begins, sends changes through review and CI, and recovers interrupted runs. Coder provides the workspaces and model access; OpenFlows manages the delivery workflow.
 
@@ -27,6 +33,8 @@ OpenFlows coordinates AI agents inside [Coder](https://coder.com) workspaces. A 
 - **Review before code:** the reviewer approves the implementation plan before the builder starts.
 - **Run on your infrastructure:** Coder hosts the workspaces, while OpenFlows keeps coordination and audit records in its shared store.
 - **Serve multiple repositories:** each tenant has its own repository binding, controller workspace, and Redis namespace.
+
+<img src="./assets/home.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
 ## Quickstart
 
