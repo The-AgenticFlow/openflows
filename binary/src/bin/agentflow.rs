@@ -519,30 +519,13 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // controller, including when initialization or the loop fails.
     let mut runtime_heartbeats = tokio::task::JoinSet::new();
     if let Some(runtime) = runtime_control.clone() {
-        let mut retry_delay = std::time::Duration::from_secs(1);
-        loop {
-            match runtime.heartbeat().await {
-                Ok(()) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        retry_delay_secs = retry_delay.as_secs(),
-                        "Initial Manager runtime heartbeat failed; retaining session and retrying"
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-                }
-            }
-        }
-        // The controller pod has no token file for the in-process Vessel, so it
-        // needs one before the first flow pass reaches it. A failure is not
-        // fatal: the refresher below retries.
-        if let Err(error) = runtime.refresh_github_token(&vessel_token).await {
-            tracing::warn!(
-                %error,
-                "Initial Vessel GitHub token exchange failed; the refresher retries"
-            );
-        }
+        openflows::retry::until_ready("Manager runtime heartbeat", || runtime.heartbeat()).await;
+        // The controller pod has no token file, so the in-process Vessel needs a
+        // brokered token before the first flow pass can reach it.
+        openflows::retry::until_ready("Vessel GitHub token", || {
+            runtime.refresh_github_token(&vessel_token)
+        })
+        .await;
         runtime_heartbeats.spawn(runtime.clone().keep_github_token_fresh(vessel_token));
         runtime_heartbeats.spawn(async move {
             loop {

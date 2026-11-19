@@ -6,4 +6,5 @@ pub mod debug;
 pub mod doctor;
 pub mod nodes;
 pub mod orchestration;
+pub mod retry;
 pub mod state;

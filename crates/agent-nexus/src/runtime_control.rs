@@ -14,6 +14,9 @@ use tokio::sync::Mutex;
 const GITHUB_TOKEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(8 * 60);
 /// Wait before retrying when the broker could not issue a token.
 const GITHUB_TOKEN_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on one exchange, response body included. A Manager that accepts the
+/// request and stops writing must not stall rotation, or the token runs out.
+const GITHUB_TOKEN_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct RuntimeControlClient {
@@ -216,6 +219,18 @@ impl RuntimeControlClient {
     /// Manager derives the installation, repository, and permissions from the
     /// authenticated workspace; the controller supplies only the purpose.
     pub async fn github_api_token(&self) -> Result<String> {
+        self.github_api_token_within(GITHUB_TOKEN_EXCHANGE).await
+    }
+
+    /// The exchange bounded by `budget`, so a stalled broker cannot hold the
+    /// caller (or the rotation loop) forever. Tests pass a short budget.
+    async fn github_api_token_within(&self, budget: std::time::Duration) -> Result<String> {
+        tokio::time::timeout(budget, self.exchange_github_api_token())
+            .await
+            .with_context(|| format!("GitHub credential broker did not answer within {budget:?}"))?
+    }
+
+    async fn exchange_github_api_token(&self) -> Result<String> {
         let response = self
             .send_retrying_refresh(
                 reqwest::Method::POST,
@@ -244,8 +259,8 @@ impl RuntimeControlClient {
         Ok(())
     }
 
-    /// Keep `token` current for as long as the controller runs. Uses the same
-    /// runtime session as every other call, so it never rotates the session itself.
+    /// Keep `token` current for as long as the controller runs. Uses the
+    /// controller's own runtime session rather than keeping a second one.
     pub async fn keep_github_token_fresh(self, token: github::SharedToken) {
         loop {
             let wait = match self.refresh_github_token(&token).await {
@@ -526,6 +541,36 @@ mod tests {
             .await;
         seen.get_authenticated_user_login().await.unwrap();
         still.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_stops_writing_cannot_stall_the_exchange() {
+        // Accept the credential request and never answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let stalled = RuntimeControlClient::for_test(format!("http://{address}"));
+
+        let started = std::time::Instant::now();
+        let error = stalled
+            .github_api_token_within(std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // The retry against a healthy broker still issues a token.
+        let mut server = Server::new_async().await;
+        server
+            .mock("POST", "/api/v1/runtime/github-credentials")
+            .with_body(r#"{"token":"fresh"}"#)
+            .create_async()
+            .await;
+        let healthy = RuntimeControlClient::for_test(server.url());
+        assert_eq!(healthy.github_api_token().await.unwrap(), "fresh");
     }
 
     #[tokio::test]
