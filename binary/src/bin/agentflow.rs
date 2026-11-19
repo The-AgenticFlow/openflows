@@ -534,6 +534,15 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 }
             }
         }
+        // The controller pod has no token file for the in-process Vessel, so it
+        // needs one before the first flow pass reaches it. A failure is not
+        // fatal: the refresher below retries.
+        if let Err(error) = runtime.refresh_github_token(&vessel_token).await {
+            tracing::warn!(
+                %error,
+                "Initial Vessel GitHub token exchange failed; the refresher retries"
+            );
+        }
         runtime_heartbeats.spawn(runtime.clone().keep_github_token_fresh(vessel_token));
         runtime_heartbeats.spawn(async move {
             loop {
