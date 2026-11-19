@@ -20,7 +20,7 @@ trap 'exit 143' TERM
 OPENFLOWS_FIXTURE_ARTIFACTS="$artifacts/production-client" \
     timeout 600 cargo test --locked -p github --test system_fixture_contract -- --nocapture \
     2>&1 | tee "$artifacts/production-client.log"
-timeout 300 docker build -t "$project:ci" tests/e2e/system \
+timeout 600 docker build -t "$project:ci" tests/e2e/system \
     2>&1 | tee "$artifacts/build.log"
 # No network egress or production mounts. Loopback HTTP/Git remains available.
 timeout 120 docker run --name "$project" --label "openflows.ci.project=$project" \
