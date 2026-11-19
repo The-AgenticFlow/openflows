@@ -8,6 +8,8 @@ vendor/
 dist/
 build/
 out/
+/binary/openflows
+/binary/openflows-harness
 *.pyc
 __pycache__/
 
