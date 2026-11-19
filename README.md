@@ -1,96 +1,106 @@
-# OpenFlows — Autonomous AI Development Team on Coder
+<h1 align="center">OpenFlows</h1>
+
+<h2 align="center">A self-hosted AI development team for GitHub</h2>
+
+<p align="center"><strong>Turn GitHub issues into reviewed pull requests on your own infrastructure.</strong></p>
+
+<hr>
+
+<p align="center">
+  <strong>Run with</strong> <a href="#deployment"><img src="./assets/cloud-platforms/docker.svg" alt="Docker" width="44"></a> <strong>on</strong>&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/aws.svg" alt="AWS" width="48"></a>&nbsp;&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/azure.svg" alt="Azure" width="48"></a>&nbsp;&nbsp;
+  <a href="#deployment"><img src="./assets/cloud-platforms/google-cloud.svg" alt="Google Cloud" width="48"></a>
+</p>
+<p align="center"><a href="#deployment"><img src="./assets/cloud-platforms/kubernetes.svg" alt="Kubernetes" width="24"></a> <sub>Hosted Kubernetes deployment in progress</sub></p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> · <a href="#deployment">Deployment</a> · <a href="#how-it-works">How it works</a> · <a href="#contribute">Contribute</a> · <a href="#documentation">Docs</a> · <a href="https://openflows.dev">Website</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/The-AgenticFlow/openflows/releases/latest"><img src="https://img.shields.io/github/v/release/The-AgenticFlow/openflows?style=flat-square" alt="Latest release"></a>
+  <a href="https://github.com/The-AgenticFlow/openflows/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/The-AgenticFlow/openflows/ci.yml?branch=develop&amp;label=checks&amp;style=flat-square" alt="CI checks"></a>
+  <a href="https://github.com/The-AgenticFlow/openflows/stargazers"><img src="https://img.shields.io/github/stars/The-AgenticFlow/openflows?style=flat-square" alt="GitHub stars"></a>
+  <a href="https://github.com/The-AgenticFlow/openflows/graphs/contributors"><img src="https://img.shields.io/github/contributors/The-AgenticFlow/openflows?style=flat-square" alt="Contributors"></a>
+  <a href="https://github.com/The-AgenticFlow/openflows/issues"><img src="https://img.shields.io/github/issues/The-AgenticFlow/openflows?style=flat-square" alt="Open issues"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/The-AgenticFlow/openflows?style=flat-square" alt="MIT license"></a>
+</p>
+
+OpenFlows coordinates AI agents inside [Coder](https://coder.com) workspaces. A controller assigns work, checks plans before coding begins, sends changes through review and CI, and recovers interrupted runs. Coder provides the workspaces and model access; OpenFlows manages the delivery workflow.
+
+- **From issue to merge:** agents plan, implement, review, and merge changes after the required checks pass.
+- **Review before code:** the reviewer approves the implementation plan before the builder starts.
+- **Run on your infrastructure:** Coder hosts the workspaces, while OpenFlows keeps coordination and audit records in its shared store.
+- **Serve multiple repositories:** each tenant has its own repository binding, controller workspace, and Redis namespace.
+
 <img src="./assets/home.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
-> Official site: [openflows.dev](https://openflows.dev) · Docker: [ghcr.io/the-agenticflow/openflows](https://ghcr.io/the-agenticflow/openflows)
+## Quickstart
 
-**OpenFlows is an autonomous AI software team that turns GitHub issues into reviewed, production-ready pull requests inside your self-hosted Coder environment.** For developers, it handles planning, coding, testing, and adversarial review while keeping them in control of architecture and final decisions. For companies, it brings governed, auditable AI delivery into existing engineering workflows without exposing LLM keys or weakening security boundaries. For stakeholders, it creates a faster, more transparent path from product intent to shipped software.
+You need Docker, `curl`, `python3`, access to a GitHub repository where you can install the OpenFlows App, and an API key for a supported model provider. Building from source also requires Rust.
 
-> **Getting started?** Run `./scripts/setup.sh owner/repo` (add `--binary` or `--compose` to skip compiling) — see [**quick_start.md**](quick_start.md). Manual steps and troubleshooting: [setup-reference](docs/setup-reference.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
-
-## Operator Quick Path
+From a checkout of this repository, run:
 
 ```bash
-./scripts/setup.sh owner/repo --binary    # release binaries, no compiling
-./scripts/setup.sh owner/repo --compose   # published images, no compiling
-./scripts/setup.sh owner/repo --source    # compile from this checkout (default)
+./scripts/setup.sh owner/repo --binary
 ```
 
-One script: creates `.env` and the GitHub App, starts Coder and Redis, configures the LLM, pushes templates and connects your repo. Each tenant's nexus workspace runs its own controller scoped to that repo. Re-run it any time; it skips what is done. Details in [quick_start.md](quick_start.md).
+Use `--compose` for published container images or `--source` to build from this checkout. The setup script starts the local services, opens the Manager at <http://localhost:3002> to connect GitHub, configures your model, and creates the workspace templates and repository tenant. It can be rerun after an interrupted setup.
 
-Lifecycle hooks are wired by the bundled stack. Do not set `CODER_EXPERIMENTS`, `CODER_CHAT_HOOK_URL`, or hook bind addresses unless you are running a custom deployment.
+Then open an issue in the connected repository. OpenFlows will pick it up and work toward a reviewed pull request. Check the local Coder dashboard at <http://localhost:7080> or run `./scripts/prod.sh doctor` to inspect the installation.
 
-## Why architecture-first
+For installation modes, platform requirements, and the complete walkthrough, see the [quick start guide](quick_start.md). For upgrades and troubleshooting, see the [setup reference](docs/setup-reference.md).
 
-AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/architecture/openflows-system-architecture.md`](docs/architecture/openflows-system-architecture.md) for the full design.
+## Deployment
 
-## How It Works
+OpenFlows is designed to run on infrastructure you control. The deployment path depends on the workspace backend and the isolation you need:
 
-OpenFlows runs a team of AI agents that collaborate just like a real engineering team:
+| Environment | Current path |
+| --- | --- |
+| **Local machine or single cloud VM** | Run the Docker-based setup above. It brings up Coder, the Manager, Redis, and workspaces on one host. This is the working development and evaluation path, including on a Docker-capable VM in AWS, Azure, Google Cloud, or another provider. It is not a public multi-tenant production deployment. |
+| **AWS with Kubernetes (EKS)** | The hosted architecture specifies Kubernetes workspaces, separate staging and production environments, workload IAM, and AWS Secrets Manager. The shipped role templates still create Docker workspaces, so this path is not yet validated for production. |
+| **Other Kubernetes providers** | The architecture is intended to support other managed or self-managed clusters. A non-AWS hosted secret-store adapter and Kubernetes workspace templates are still required before that path is supported. |
 
+The [operator deployment guide](docs/implementation/centralized-deployment/operator-deployment.md) explains the deployment profiles. See the [portable workspace runtime design](docs/architecture/portable-workspace-runtime.md) for the Kubernetes architecture and the [AWS runbook](docs/implementation/centralized-deployment/operator-production-runbook.md) for its prerequisites and release gates.
+
+## How it works
+
+```text
+GitHub issue → NEXUS assigns → FORGE plans → SENTINEL approves the plan
+             → FORGE implements → SENTINEL reviews → VESSEL checks CI and merges
 ```
-You create a GitHub issue → NEXUS picks it up → FORGE writes code → SENTINEL reviews adversarially
-→ VESSEL merges green PRs → LORE documents → you get a merged PR
-```
 
-You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously, with NEXUS's `reconcile()` detecting orphans, stale workers, and unmerged PRs and recovering automatically.
+| Agent | Responsibility |
+| --- | --- |
+| **NEXUS** | Coordinates the run and recovers stalled work. |
+| **FORGE** | Implements the approved plan and opens a pull request. |
+| **SENTINEL** | Reviews the plan and code, including security and tests. |
+| **VESSEL** | Watches CI, resolves merge conflicts, and merges approved work. |
+| **LORE** | Maintains documentation and project history when enabled. |
 
-OpenFlows also enforces a **gated planning checkpoint** — FORGE writes a plan and halts until SENTINEL reviews and approves it before any code is written — and provides **secure, sandboxed A2A verification** so SENTINEL can run acceptance tests against FORGE's workspace without arbitrary code execution. The integration is deliberately asymmetrical: **Coder** governs *where* agents run (governed, ephemeral workspaces with zero AI software and zero LLM keys), while **OpenFlows** governs *how* they coordinate (the flow graph, typed state contracts, and the FORGE↔SENTINEL planning cycle).
+OpenFlows asks for human input when a decision needs it. The full design is in the [system architecture](docs/architecture/openflows-system-architecture.md).
 
-## The Team
+## Contribute
 
-| Agent | Role | Plan mode | What it does |
-|-------|------|-----------|--------------|
-| **NEXUS** | Orchestrator | yes | Assigns issues, coordinates the team, owns `reconcile()` failure recovery, notifies you when needed |
-| **FORGE** | Builder | no | Writes code against an agreed `CONTRACT.md`, creates branches, opens PRs |
-| **SENTINEL** | Reviewer | yes | Adversarially reviews code for security, quality, and test coverage against the contract |
-| **VESSEL** | DevOps | no | Monitors CI, handles merge conflicts, squash-merges green PRs, tears down workspaces on merge |
-| **LORE** | Writer | no | Documents decisions, updates changelogs, maintains project history *(disabled by default — enable in the registry)* |
-
-## Multi-Tenancy
-
-One Coder server serves many teams. Each tenant = a real Coder user + a repo binding + an `openflows-nexus` workspace. Tenants are isolated by Coder RBAC and per-tenant Redis keyspace prefixes (`ns:{tenant}:...`).
-
-Configure multiple tenants via environment variables or the control plane API (documented in `docs/`).
-
-## Project Status
-
-OpenFlows is an actively developed, functioning system that already ships merged PRs end-to-end. Current state (v1.2.x):
-
-**Working today:**
-- A full agent team (NEXUS / FORGE / SENTINEL / VESSEL / LORE) running as Coder Agents on ephemeral, governed workspaces.
-- End-to-end flow: GitHub issue → planning gate → FORGE implementation → SENTINEL adversarial review → VESSEL merge → merged PR.
-- Gated planning approval with audit-trailed gate records in Redis.
-- `reconcile()` failure recovery: orphan / stale worker detection, retry with backoff, and unmerged-PR resume.
-- Typed SharedStore contracts and the `openflows worker` CLI as the only Redis client inside workspaces.
-- Multi-tenancy via per-tenant Redis keyspace prefixes and Coder RBAC.
-- Production controller deployment inside a Nexus workspace (auto-start via startup script).
-- A pluggable skill / MCP / model registry.
-
-See [quick_start.md](quick_start.md) to run it, and the planning-gate / architecture docs for the intended end state.
-
-## Plug-and-Play Extension
-
-- **Add a skill**: Drop a directory in `orchestration/plugin/skills/` with a `SKILL.md`, list it in `registry.json` under the role's `skills` array. No code change.
-- **Add an MCP server**: Add it to the role's `mcp` object in `registry.json`, or register it centrally in the Coder dashboard (AI Settings → MCP Servers). Both coexist.
-- **Enable a new model**: Configure it in the Coder dashboard (AI Settings → Coder Agents → Models). Reference it in `registry.json` via the `model` field.
-
-See [`docs/architecture/openflows-system-architecture.md` §10](docs/architecture/openflows-system-architecture.md) for details.
+You can help improve what each agent knows and how it works. The separate [workspace-runtime repository](https://github.com/The-AgenticFlow/workspace-runtime) owns the instructions, skills, commands, hooks, and standards for NEXUS, FORGE, SENTINEL, VESSEL, and LORE. Contribute agent-specific knowledge under [`roles/<role>/`](https://github.com/The-AgenticFlow/workspace-runtime/tree/main/roles), or knowledge shared by every agent under [`shared/`](https://github.com/The-AgenticFlow/workspace-runtime/tree/main/shared). Follow its [contribution guide](https://github.com/The-AgenticFlow/workspace-runtime/blob/main/CONTRIBUTING.md) when opening a pull request.
 
 ## Documentation
 
-| Guide | What it covers |
-|-------|---------------|
-| [quick_start.md](quick_start.md) | One-command setup |
-| [docs/setup-reference.md](docs/setup-reference.md) | Manual setup, hooks, configuration, troubleshooting |
-| [token_guide.md](token_guide.md) | Token acquisition step-by-step |
-| [tests/e2e/README.md](tests/e2e/README.md) | Container CI gate and merge enforcement |
-| [testing_quick_start.md](testing_quick_start.md) | Testing & debugging walkthrough |
-| [docs/architecture/openflows-system-architecture.md](docs/architecture/openflows-system-architecture.md) | Complete system architecture (authoritative) |
-| [docs/architecture/openflows-controller.md](docs/architecture/openflows-controller.md) | Controller deep-dive (Subsystem 01) |
-| [docs/architecture/openflows-worker-workspace.md](docs/architecture/openflows-worker-workspace.md) | Worker workspaces, bootstrap, and executor setup (Subsystem 03) |
-| [docs/architecture/openflows-redis-shared-store.md](docs/architecture/openflows-redis-shared-store.md) | Shared Redis store, tenancy, and namespacing |
-| [docs/architecture/openflows-a2a-relay.md](docs/architecture/openflows-a2a-relay.md) | A2A delegated verification protocol and executor sandbox (Subsystem 04) |
+| Guide | Use it for |
+| --- | --- |
+| [Quick start](quick_start.md) | Prerequisites and first run. |
+| [Setup reference](docs/setup-reference.md) | Configuration, upgrades, and troubleshooting. |
+| [System architecture](docs/architecture/openflows-system-architecture.md) | Components and workflow. |
+| [Controller](docs/architecture/openflows-controller.md) | Orchestration and recovery. |
+| [Worker workspaces](docs/architecture/openflows-worker-workspace.md) | Workspace setup and agent execution. |
+| [Shared store](docs/architecture/openflows-redis-shared-store.md) | State and tenant isolation. |
+| [A2A verification](docs/architecture/openflows-a2a-relay.md) | Delegated acceptance tests. |
+
+## Support and security
+
+[Open an issue](https://github.com/The-AgenticFlow/openflows/issues) for bugs and feature requests. To report a vulnerability, follow the [security policy](SECURITY.md).
 
 ## License
 
-MIT
+[MIT](LICENSE).
