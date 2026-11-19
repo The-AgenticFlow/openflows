@@ -1,4 +1,11 @@
-<h1 align="center">OpenFlows</h1>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/brand/openlogo-light.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/brand/openlogo-dark.png">
+    <img src="./assets/brand/openlogo-dark.png" alt="" width="48">
+  </picture>
+  OpenFlows
+</h1>
 
 <h2 align="center">A self-hosted AI development team for GitHub</h2>
 
@@ -7,12 +14,12 @@
 <hr>
 
 <p align="center">
-  <strong>Run with</strong> <a href="#deployment"><img src="./assets/cloud-platforms/docker.svg" alt="Docker" width="44"></a> <strong>on</strong>&nbsp;
+  <strong>Self-host with</strong> <a href="#deployment"><img src="./assets/cloud-platforms/docker.svg" alt="Docker" width="44"></a> <strong>or</strong>
+  <a href="#deployment"><img src="./assets/cloud-platforms/kubernetes.svg" alt="Kubernetes" width="44"></a> <strong>on</strong>&nbsp;
   <a href="#deployment"><img src="./assets/cloud-platforms/aws.svg" alt="AWS" width="48"></a>&nbsp;&nbsp;
   <a href="#deployment"><img src="./assets/cloud-platforms/azure.svg" alt="Azure" width="48"></a>&nbsp;&nbsp;
   <a href="#deployment"><img src="./assets/cloud-platforms/google-cloud.svg" alt="Google Cloud" width="48"></a>
 </p>
-<p align="center"><a href="#deployment"><img src="./assets/cloud-platforms/kubernetes.svg" alt="Kubernetes" width="24"></a> <sub>Hosted Kubernetes deployment in progress</sub></p>
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> · <a href="#deployment">Deployment</a> · <a href="#how-it-works">How it works</a> · <a href="#contribute">Contribute</a> · <a href="#documentation">Docs</a> · <a href="https://openflows.dev">Website</a>
@@ -56,11 +63,11 @@ For installation modes, platform requirements, and the complete walkthrough, see
 
 OpenFlows is designed to run on infrastructure you control. The deployment path depends on the workspace backend and the isolation you need:
 
-| Environment | Current path |
+| Environment | Deployment path |
 | --- | --- |
 | **Local machine or single cloud VM** | Run the Docker-based setup above. It brings up Coder, the Manager, Redis, and workspaces on one host. This is the working development and evaluation path, including on a Docker-capable VM in AWS, Azure, Google Cloud, or another provider. It is not a public multi-tenant production deployment. |
-| **AWS with Kubernetes (EKS)** | The hosted architecture specifies Kubernetes workspaces, separate staging and production environments, workload IAM, and AWS Secrets Manager. The shipped role templates still create Docker workspaces, so this path is not yet validated for production. |
-| **Other Kubernetes providers** | The architecture is intended to support other managed or self-managed clusters. A non-AWS hosted secret-store adapter and Kubernetes workspace templates are still required before that path is supported. |
+| **AWS with Kubernetes (EKS)** | The Kubernetes backend includes pod-based templates for all five agents, per-workspace Secrets, and tenant isolation controls. A hosted deployment needs separate staging and production environments, workload IAM, AWS Secrets Manager, and the release validation in the AWS runbook before production use. |
+| **Other Kubernetes providers** | The pod templates are provider-neutral, but a non-AWS hosted secret-store adapter and release validation are still required before that path is supported. |
 
 The [operator deployment guide](docs/implementation/centralized-deployment/operator-deployment.md) explains the deployment profiles. See the [portable workspace runtime design](docs/architecture/portable-workspace-runtime.md) for the Kubernetes architecture and the [AWS runbook](docs/implementation/centralized-deployment/operator-production-runbook.md) for its prerequisites and release gates.
 
