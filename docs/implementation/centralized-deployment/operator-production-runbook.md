@@ -2,7 +2,7 @@
 
 The hosted contract, including AWS Secrets Manager as the default and an explicit non-AWS path, is in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md).
 
-> **Current blocker:** Hosted Kubernetes deployment is not yet validated. The role templates still create Docker containers, and hosted mode rejects the Docker backend. Follow the architecture contract and its implementation issues for the target design; do not use an arbitrary backend name to bypass the hosted-mode check. Remove this notice only after the hosted release gates pass.
+> **Production validation:** Kubernetes role templates now exist for all five agents. Before production use, complete the hosted release gates in staging, including workspace startup, tenant isolation, credential delivery, and recovery checks. This repository does not yet provide a turnkey production deployment command.
 
 Deploy **staging**, validate it, then deploy **production** with separate
 resources and credentials. The local Compose stack is not a production
@@ -58,11 +58,10 @@ unless the two identities are separate and the cluster enforces the network
 rules; [tenant isolation](tenant-isolation.md) lists the permissions and
 settings. Tenants of one organization share that
 namespace, so tenant separation relies on those rules, on RBAC and on each
-workspace mounting only the Secret it is given. The shipped templates
-bind-mount a host file, so they cannot use that Secret yet: the Manager refuses
-to start on the `kubernetes` backend unless `OPENFLOWS_K8S_RUNTIME_DELIVERY=1`
-is set, and that should only be set with a template that mounts the Secret's
-`runtime.json` key at `/run/openflows/runtime.json`. On the `docker`
+workspace mounting only the Secret it is given. The Kubernetes templates mount
+the Secret's `runtime.json` key at `/run/openflows/runtime.json`. Set
+`OPENFLOWS_K8S_RUNTIME_DELIVERY=1` when using these templates; the Manager
+refuses to start on the `kubernetes` backend without it. On the `docker`
 backend with a non-filesystem store, set an absolute
 `OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
 Manager refuses to start without it.

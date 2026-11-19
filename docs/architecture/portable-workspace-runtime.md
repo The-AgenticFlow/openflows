@@ -6,7 +6,7 @@ The workspace runtime is released separately from the OpenFlows application. A d
 
 ## Why this change is needed
 
-Manager can select a `kubernetes` provisioner, but all five Coder role templates currently create Docker containers and volumes. They also assume Docker network names and host file mounts. Hosted configuration currently requires AWS Secrets Manager, while the template treats its secret reference as a filesystem path. Those combinations cannot start a hosted workspace. The local Docker path remains valuable and must continue to work.
+Manager can select a `kubernetes` provisioner, and all five Coder roles now have Kubernetes pod templates alongside their Docker variants. The Kubernetes templates mount per-workspace runtime Secrets rather than Docker host files. Hosted configuration currently requires AWS Secrets Manager, while non-AWS hosted secret storage remains planned. The local Docker path continues to serve development and evaluation.
 
 ## Four independent choices
 
