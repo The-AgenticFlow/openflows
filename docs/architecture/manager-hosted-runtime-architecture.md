@@ -35,7 +35,7 @@ flowchart LR
     N -->|runtime access token| RA
     W -->|runtime access token| RA
     N -->|request worker| WC
-    N -->|purpose api or git| GB
+    N -->|purpose api, git or merge| GB
     W -->|purpose api or git| GB
     C -->|globally signed event| HI
     WC --> PG
@@ -188,7 +188,7 @@ The controller sends a Manager heartbeat every 30 seconds; worker runtimes also 
 
 ## Credential broker
 
-A runtime asks only for purpose `git` or `api`, never for arbitrary repository IDs or permissions.
+A runtime asks only for a purpose (`git`, `api`, or `merge` for the Nexus controller), never for arbitrary repository IDs or permissions.
 
 ```mermaid
 sequenceDiagram
