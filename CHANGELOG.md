@@ -7,25 +7,56 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Hosted: Add a merge broker purpose for the controller's Vessel (2c1fd85)
+- Hosted: Add a merge broker purpose for the controller's Vessel (2c1fd85) (@onelrian)
 
 ### Bug fixes
 
-- Hosted: Heartbeat while the Vessel credential is retried (5097205)
-- Hosted: Bound the Vessel token exchange and wait for it before routing (4bb8a97)
-- Hosted: Exchange the Vessel GitHub token before the first flow pass (45d5ed7)
+- Coder Client: Decode the connecting agent status and fall back on unseen ones (5cfb546) (@onelrian)
+- Hosted: Keep runtime rotation out of the broker deadline (96dfd50) (@onelrian)
+- Hosted: Heartbeat while the Vessel credential is retried (5097205) (@onelrian)
+- Hosted: Let the controller's Vessel token read CI (92d1b61) (@onelrian)
+- Hosted: Bound the Vessel token exchange and wait for it before routing (4bb8a97) (@onelrian)
+- Hosted: Exchange the Vessel GitHub token before the first flow pass (45d5ed7) (@onelrian)
+- Hosted: Keep the in-process Vessel's GitHub token current from the broker (94e8b60) (@onelrian)
+- K8s templates: Replace only an empty workspace directory and fail on one with files (ee999fd) (@onelrian)
+- K8s templates: Move a root-owned workspace directory aside on a kept claim (1d6a3eb) (@onelrian)
+- K8s templates: Create the workspace directory as the workspace user before startup (dfe9290) (@onelrian)
+- Nexus template: Create the relay Service only once a tenant is named (19e77a6) (@onelrian)
 
 ### Documentation
 
-- Polish README header (207a604)
-- Refresh project README (ea54149)
+- Hosted: List workflows write on the Forge git profile (165b1d7) (@onelrian)
+- Hosted: Record the CI reads the controller's Vessel node now needs (dbcce0d) (@onelrian)
+- Runtime: Warn that recreating a tenant is destructive and correct the chat error text (e14a0bb) (@onelrian)
+- Runtime: Add the Kubernetes first-run checklist and the workspace directory init container (f47536a) (@onelrian)
+- Show OpenFlows logo and Kubernetes backend (9c52dfb) (@Christiantyemele)
+- Polish README header (207a604) (@Christiantyemele)
+- Refresh project README (ea54149) (@Christiantyemele)
+
+### Code refactoring
+
+- Coder Client: Nest the AgentStatus module under types (bdae32e) (@onelrian)
+- Coder Client: Move AgentStatus into its own module to stay under the line limit (bb4a213) (@onelrian)
+
+### Tests
+
+- Coder Client: Make the readiness check depend on the agent status alone (9bed6ef) (@onelrian)
+
+### Continuous integration
+
+- E2E: Survive a mirror sync race when building the fixture image (d26ba68) (@onelrian)
 
 ### Chores
 
-- Hosted: Tighten the CI-read profile test and broker doc wording (873f4bc)
+- Hosted: Tighten the CI-read profile test and broker doc wording (873f4bc) (@onelrian)
+
+
+### Contributors
+
+- @Christiantyemele
+- @onelrian
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.3...openflows-1.9.0
-
 
 ## [1.8.3] - 2026-11-17
 
@@ -86,14 +117,9 @@ All notable changes to this project will be documented in this file.
 - E2E: Verify published workspace-runtime v0.3.1 without dev mounts (2559ff2) (@NkwaTambe)
 - Runtime: Drop the unused PermissionsExt import (c48199f) (@onelrian)
 
+### Continuous integration
 
-### Contributors
-
-- @NkwaTambe
-- @arielpetit
-- @lele-maxwell
-- @ndefokou
-- @onelrian
+- Ignore changelog commit hashes in spelling check (0cb3ddd) (@Christiantyemele)
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.2...openflows-1.8.3
 
