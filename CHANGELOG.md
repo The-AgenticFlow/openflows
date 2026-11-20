@@ -3,6 +3,30 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.9.0] - 2026-11-20
+
+### Features
+
+- Hosted: Add a merge broker purpose for the controller's Vessel (2c1fd85)
+
+### Bug fixes
+
+- Hosted: Heartbeat while the Vessel credential is retried (5097205)
+- Hosted: Bound the Vessel token exchange and wait for it before routing (4bb8a97)
+- Hosted: Exchange the Vessel GitHub token before the first flow pass (45d5ed7)
+
+### Documentation
+
+- Polish README header (207a604)
+- Refresh project README (ea54149)
+
+### Chores
+
+- Hosted: Tighten the CI-read profile test and broker doc wording (873f4bc)
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.3...openflows-1.9.0
+
+
 ## [1.8.3] - 2026-11-17
 
 ### Features
