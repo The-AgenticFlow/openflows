@@ -1,2 +1,7 @@
 [default.extend-words]
 gitar = "gitar"
+
+[type.changelog]
+extend-glob = ["CHANGELOG.md"]
+# git-cliff renders abbreviated commit IDs in parentheses.
+extend-ignore-re = ['\([0-9a-f]{7}\)']
