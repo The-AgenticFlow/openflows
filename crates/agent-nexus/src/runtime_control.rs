@@ -10,6 +10,26 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// What the Manager's credential broker is asked to issue a token for.
+#[derive(Clone, Copy)]
+enum BrokerPurpose {
+    /// The controller's own REST calls (the `nexus` `api` profile).
+    Api,
+    /// The Vessel merge manager running inside the controller. The Manager
+    /// issues it only to the `nexus` role, and it is the one profile with
+    /// contents write.
+    Merge,
+}
+
+impl BrokerPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Merge => "merge",
+        }
+    }
+}
+
 /// Installation tokens last an hour, so rotate well inside that window.
 const GITHUB_TOKEN_REFRESH: std::time::Duration = std::time::Duration::from_secs(8 * 60);
 /// Wait before retrying when the broker could not issue a token.
@@ -206,23 +226,28 @@ impl RuntimeControlClient {
     /// Manager derives the installation, repository, and permissions from the
     /// authenticated workspace; the controller supplies only the purpose.
     pub async fn github_api_token(&self) -> Result<String> {
-        self.github_api_token_within(GITHUB_TOKEN_EXCHANGE).await
+        self.github_token_within(BrokerPurpose::Api, GITHUB_TOKEN_EXCHANGE)
+            .await
     }
 
     /// The exchange bounded by `budget`, so a stalled broker cannot hold the
     /// caller (or the rotation loop) forever. Tests pass a short budget.
-    async fn github_api_token_within(&self, budget: std::time::Duration) -> Result<String> {
-        tokio::time::timeout(budget, self.exchange_github_api_token())
+    async fn github_token_within(
+        &self,
+        purpose: BrokerPurpose,
+        budget: std::time::Duration,
+    ) -> Result<String> {
+        tokio::time::timeout(budget, self.exchange_github_token(purpose))
             .await
             .with_context(|| format!("GitHub credential broker did not answer within {budget:?}"))?
     }
 
-    async fn exchange_github_api_token(&self) -> Result<String> {
+    async fn exchange_github_token(&self, purpose: BrokerPurpose) -> Result<String> {
         let response = self
             .send_retrying_refresh(
                 reqwest::Method::POST,
                 "/api/v1/runtime/github-credentials",
-                Some(serde_json::json!({ "purpose": "api" })),
+                Some(serde_json::json!({ "purpose": purpose.as_str() })),
                 None,
             )
             .await?;
@@ -239,18 +264,22 @@ impl RuntimeControlClient {
         Ok(credential.token)
     }
 
-    /// Fetch a brokered `api` token and store it in `token`, for clients that
-    /// outlive one installation token. A failure leaves the current token in place.
-    pub async fn refresh_github_token(&self, token: &github::SharedToken) -> Result<()> {
-        token.set(self.github_api_token().await?);
+    /// Fetch a brokered `merge` token and store it in `token`, the Vessel
+    /// client's shared handle, which outlives one installation token. A failure
+    /// leaves the current token in place.
+    pub async fn refresh_vessel_token(&self, token: &github::SharedToken) -> Result<()> {
+        let fresh = self
+            .github_token_within(BrokerPurpose::Merge, GITHUB_TOKEN_EXCHANGE)
+            .await?;
+        token.set(fresh);
         Ok(())
     }
 
     /// Keep `token` current for as long as the controller runs. Uses the
     /// controller's own runtime session rather than keeping a second one.
-    pub async fn keep_github_token_fresh(self, token: github::SharedToken) {
+    pub async fn keep_vessel_token_fresh(self, token: github::SharedToken) {
         loop {
-            let wait = match self.refresh_github_token(&token).await {
+            let wait = match self.refresh_vessel_token(&token).await {
                 Ok(()) => GITHUB_TOKEN_REFRESH,
                 Err(error) => {
                     tracing::warn!(%error, "GitHub token refresh failed; retrying");
@@ -527,6 +556,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let issued = server
             .mock("POST", "/api/v1/runtime/github-credentials")
+            .match_body(Matcher::JsonString(r#"{"purpose":"merge"}"#.into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"token":"fresh"}"#)
@@ -542,7 +572,7 @@ mod tests {
             .create_async()
             .await;
 
-        client.refresh_github_token(&shared).await.unwrap();
+        client.refresh_vessel_token(&shared).await.unwrap();
         seen.get_authenticated_user_login().await.unwrap();
         issued.assert_async().await;
         user.assert_async().await;
@@ -553,7 +583,7 @@ mod tests {
             .with_status(500)
             .create_async()
             .await;
-        assert!(client.refresh_github_token(&shared).await.is_err());
+        assert!(client.refresh_vessel_token(&shared).await.is_err());
         refused.assert_async().await;
         let still = server
             .mock("GET", "/user")
@@ -578,7 +608,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = stalled
-            .github_api_token_within(std::time::Duration::from_millis(100))
+            .github_token_within(BrokerPurpose::Api, std::time::Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("did not answer"), "{error}");
@@ -664,7 +694,7 @@ mod tests {
 
         let client = RuntimeControlClient::for_test(server.url());
         let error = client
-            .github_api_token_within(std::time::Duration::from_millis(500))
+            .github_token_within(BrokerPurpose::Api, std::time::Duration::from_millis(500))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("did not answer"), "{error}");
