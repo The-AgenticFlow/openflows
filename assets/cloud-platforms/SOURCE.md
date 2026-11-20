@@ -1,0 +1,1 @@
+Platform icons are from [Devicon](https://github.com/devicons/devicon/tree/32fe1d3b3f36ad11f90ab94f7db59738139c2bf6) at commit `32fe1d3b3f36ad11f90ab94f7db59738139c2bf6`. See [LICENSE](LICENSE). Product names and logos are trademarks of their respective owners.

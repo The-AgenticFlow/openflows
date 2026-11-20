@@ -335,6 +335,43 @@ resource "kubernetes_deployment_v1" "workspace" {
           "kubernetes.io/arch" = "amd64"
         }
 
+        # The image WORKDIR is /home/coder/workspace and the home PVC hides the image copy, so the
+        # runtime makes it root-owned. Create it as uid 1000. On a kept claim, replace an empty
+        # root-owned one, and fail if it holds files so nothing is moved or lost.
+        init_container {
+          name        = "prepare-workspace"
+          image       = local.image
+          working_dir = "/tmp"
+          command     = ["sh", "-c", "d=/home/coder/workspace; if [ -d $d ] && [ ! -w $d ]; then f=$(ls -A $d) || exit 1; [ -z \"$f\" ] || { echo $d is not writable and holds files: keep them, fix the ownership, then restart >&2; exit 1; }; rmdir $d; fi; mkdir -p $d && [ -w $d ]"]
+
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            run_as_user                = 1000
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          resources {
+            requests = {
+              cpu    = "10m"
+              memory = "16Mi"
+            }
+
+            limits = {
+              cpu    = "100m"
+              memory = "64Mi"
+            }
+          }
+
+          volume_mount {
+            name       = "home"
+            mount_path = "/home/coder"
+          }
+        }
+
         container {
           name  = "vessel"
           image = local.image
