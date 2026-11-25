@@ -62,62 +62,7 @@ pub fn runtime_manager_url(public_url: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// Resolve the tenant-specific hook destination used for transport and JWT audience.
-pub fn runtime_hook_url(tenant: uuid::Uuid) -> Result<String, String> {
-    runtime_hook_url_from_base(
-        &std::env::var("OPENFLOWS_RUNTIME_RELAY_BASE_URL").unwrap_or_default(),
-        tenant,
-    )
-}
-
-fn runtime_hook_url_from_base(base: &str, tenant: uuid::Uuid) -> Result<String, String> {
-    let base = base.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL is required for Coder hook relay".into());
-    }
-    let expanded = base.replace("{tenant}", &tenant.to_string());
-    let url = url::Url::parse(&expanded)
-        .map_err(|_| "OPENFLOWS_RUNTIME_RELAY_BASE_URL must be an absolute HTTP(S) URL")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("OPENFLOWS_RUNTIME_RELAY_BASE_URL must be HTTP(S) without credentials, query, or fragment".into());
-    }
-    Ok(format!("{expanded}/experimental/hooks/chat"))
-}
-
-#[cfg(test)]
-mod relay_tests {
-    use super::*;
-
-    #[test]
-    fn expands_tenant_and_normalizes_base() {
-        let tenant = uuid::Uuid::nil();
-        assert_eq!(
-            runtime_hook_url_from_base(" http://127.0.0.1:7081/tenants/{tenant}/ ", tenant)
-                .unwrap(),
-            format!("http://127.0.0.1:7081/tenants/{tenant}/experimental/hooks/chat")
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_relay_urls() {
-        for base in [
-            "",
-            "relative/path",
-            "ftp://relay",
-            "http://user:secret@relay",
-            "http://relay?x=1",
-            "http://relay#fragment",
-        ] {
-            assert!(runtime_hook_url_from_base(base, uuid::Uuid::nil()).is_err());
-        }
-    }
-}
+pub use crate::hook_url::runtime_hook_url;
 
 /// The deployment mode of the Manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

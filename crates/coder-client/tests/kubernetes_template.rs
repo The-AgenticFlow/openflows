@@ -380,6 +380,9 @@ fn nexus_keeps_the_relay_and_the_controller_bootstrap() {
         .expect("the Service block ends")
         .0;
     assert!(service.contains("port        = 3000"));
+    // The Manager relays Coder hooks here; keep it equal to HOOK_PORT in its isolation manifests.
+    assert!(service.contains(r#"name        = "hook""#));
+    assert!(service.contains("port        = 3001"));
     assert!(service.contains("selector = local.selector_labels"));
     // A template import has no tenant yet, and an empty name is an invalid Service.
     assert!(service.contains(r#"count = data.coder_parameter.tenant.value != "" ? 1 : 0"#));

@@ -54,6 +54,8 @@ pub const PLATFORM_PORTS_ENV: &str = "OPENFLOWS_K8S_PLATFORM_EGRESS_PORTS";
 pub const PLATFORM_CIDRS_ENV: &str = "OPENFLOWS_K8S_PLATFORM_EGRESS_CIDRS";
 /// `key=value` label of the Coder provisioner pods, which get their own policy.
 pub const PROVISIONER_SELECTOR_ENV: &str = "OPENFLOWS_K8S_PROVISIONER_SELECTOR";
+/// `key=value` label of the Manager's pods. They may reach each tenant's Nexus hook port.
+pub const MANAGER_SELECTOR_ENV: &str = "OPENFLOWS_K8S_MANAGER_SELECTOR";
 /// Comma-separated CIDRs of the Kubernetes API, which the provisioner must reach.
 pub const API_CIDRS_ENV: &str = "OPENFLOWS_K8S_API_EGRESS_CIDRS";
 /// `namespace/name` of the Coder provisioner's service account; it must not be able to read Secrets.
@@ -73,6 +75,8 @@ pub const PROBE_NAMESPACE_ENV: &str = "OPENFLOWS_K8S_PROBE_NAMESPACE";
 
 const DEFAULT_PLATFORM_NAMESPACE: &str = "openflows";
 const DEFAULT_PLATFORM_PORTS: [u16; 3] = [3002, 6379, 7080];
+/// Label the Manager chart puts on its pods.
+const DEFAULT_MANAGER_SELECTOR: (&str, &str) = ("app.kubernetes.io/name", "openflows-manager");
 const DEFAULT_POD_SECURITY_VERSION: &str = "v1.33";
 const DEFAULT_PROBE_IMAGE: &str = "docker.io/library/busybox:1.37.0";
 /// `(resource, environment variable, default)`.
@@ -102,6 +106,8 @@ pub struct IsolationSettings {
     pub platform_ports: Vec<u16>,
     pub platform_cidrs: Vec<String>,
     pub provisioner_selector: Option<(String, String)>,
+    /// Pods allowed to relay hooks to a tenant's Nexus.
+    pub manager_selector: (String, String),
     pub api_cidrs: Vec<String>,
     /// Namespace and name of the provisioner's service account.
     pub provisioner_account: Option<(String, String)>,
@@ -126,6 +132,10 @@ impl Default for IsolationSettings {
             platform_ports: DEFAULT_PLATFORM_PORTS.to_vec(),
             platform_cidrs: Vec::new(),
             provisioner_selector: None,
+            manager_selector: (
+                DEFAULT_MANAGER_SELECTOR.0.to_string(),
+                DEFAULT_MANAGER_SELECTOR.1.to_string(),
+            ),
             api_cidrs: Vec::new(),
             provisioner_account: None,
             delivery_account: None,
@@ -164,7 +174,11 @@ impl IsolationSettings {
             settings.api_cidrs = parse_cidrs(API_CIDRS_ENV, &cidrs)?;
         }
         if let Some(selector) = get(PROVISIONER_SELECTOR_ENV) {
-            settings.provisioner_selector = Some(parse_selector(&selector)?);
+            settings.provisioner_selector =
+                Some(parse_selector(PROVISIONER_SELECTOR_ENV, &selector)?);
+        }
+        if let Some(selector) = get(MANAGER_SELECTOR_ENV) {
+            settings.manager_selector = parse_selector(MANAGER_SELECTOR_ENV, &selector)?;
         }
         if let Some(account) = get(PROVISIONER_ACCOUNT_ENV) {
             settings.provisioner_account = Some(parse_account(PROVISIONER_ACCOUNT_ENV, &account)?);
@@ -317,7 +331,7 @@ fn parse_address(value: &str) -> Result<String, ManagerError> {
         })
 }
 
-fn parse_selector(value: &str) -> Result<(String, String), ManagerError> {
+fn parse_selector(var: &str, value: &str) -> Result<(String, String), ManagerError> {
     let allowed = |s: &str| {
         !s.is_empty()
             && s.chars()
@@ -326,7 +340,7 @@ fn parse_selector(value: &str) -> Result<(String, String), ManagerError> {
     match value.split_once('=') {
         Some((key, val)) if allowed(key) && allowed(val) => Ok((key.into(), val.into())),
         _ => Err(ManagerError::Config(format!(
-            "{PROVISIONER_SELECTOR_ENV} must look like app.kubernetes.io/name=coder-provisioner"
+            "{var} must look like app.kubernetes.io/name=coder-provisioner"
         ))),
     }
 }
@@ -622,6 +636,24 @@ mod tests {
         assert_eq!(settings.platform_namespace, "openflows");
         assert_eq!(settings.platform_ports, vec![3002, 6379, 7080]);
         assert!(settings.provisioner_selector.is_none());
+    }
+
+    #[test]
+    fn the_manager_selector_defaults_to_the_chart_label_and_can_be_overridden() {
+        let default = settings(&[]).expect("defaults");
+        assert_eq!(
+            default.manager_selector,
+            ("app.kubernetes.io/name".into(), "openflows-manager".into())
+        );
+
+        let custom = settings(&[(MANAGER_SELECTOR_ENV, "app=manager")]).expect("custom");
+        assert_eq!(custom.manager_selector, ("app".into(), "manager".into()));
+    }
+
+    #[test]
+    fn a_malformed_manager_selector_names_its_own_variable() {
+        let error = settings(&[(MANAGER_SELECTOR_ENV, "no-equals-sign")]).expect_err("rejected");
+        assert!(error.to_string().contains(MANAGER_SELECTOR_ENV));
     }
 
     #[test]

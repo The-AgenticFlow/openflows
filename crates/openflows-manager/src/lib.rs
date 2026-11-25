@@ -8,6 +8,7 @@ pub mod connections;
 pub mod db;
 pub mod dto;
 pub mod error;
+pub mod hook_url;
 pub mod id;
 pub mod idempotency;
 pub mod metrics;
