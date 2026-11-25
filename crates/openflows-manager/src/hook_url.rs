@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn a_misspelled_placeholder_is_rejected_instead_of_left_in_the_host() {
-        let error = hook_url_from_base("http://nexus.{namepace}.svc:3001", uuid::Uuid::nil(), NS)
+        let error = hook_url_from_base("http://nexus.{ns}.svc:3001", uuid::Uuid::nil(), NS)
             .expect_err("rejected");
         assert!(error.contains("unknown placeholder"));
     }
