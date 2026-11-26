@@ -116,9 +116,51 @@ else
     docker image inspect "$IMAGE" >/dev/null 2>&1 || die "${IMAGE} is not available locally; re-run without --no-pull."
 fi
 
-# Only one Console can own the port. Stop ours and any started by Compose, but keep them
-# so that they can be restarted if the new one does not come up.
+# Only one Console can own the port. Stop the one this script manages and any Compose Console
+# that holds the requested port, but keep them so that they can be restarted if the new one
+# does not come up. Consoles on other ports (or in other projects) are left alone.
 OLD=()
+REPLACED=0   # set once the new Console passed every check; until then an exit restores the old ones
+
+# host_port ID: the host port a Console container serves on.
+host_port() {
+    local id="$1" mode
+    mode="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$id" 2>/dev/null || true)"
+    if [ "$mode" = host ]; then
+        docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" 2>/dev/null \
+            | sed -n 's/^PORT=//p' | head -n1 | grep . || printf 3000
+    else
+        docker port "$id" 3000/tcp 2>/dev/null | head -n1 | sed 's/.*://'
+    fi
+}
+
+restore_old() { # restart the Consoles this run stopped; safe to call more than once
+    local id
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    for id in ${OLD[@]+"${OLD[@]}"}; do
+        if [ "$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null)" = "/${NAME}-old" ]; then
+            docker rename "${NAME}-old" "$NAME" >/dev/null 2>&1 || true
+        fi
+        docker start "$id" >/dev/null 2>&1 || true
+    done
+    [ "${#OLD[@]}" -eq 0 ] || note "The previous Console was restarted."
+    OLD=()
+}
+rollback_and_die() { # rollback_and_die MESSAGE [DETAIL]
+    restore_old
+    die "$@"
+}
+# Ctrl-C or a failure while replacing must not leave you without a Console.
+trap '[ "$REPLACED" = 1 ] || restore_old' EXIT
+trap 'exit 130' INT TERM
+
+# A previous run that was interrupted may have left its backup behind. Put it back first.
+leftover="$(docker ps -aq --filter "name=^/${NAME}-old\$" 2>/dev/null || true)"
+if [ -n "$leftover" ]; then
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker rename "${NAME}-old" "$NAME" >/dev/null
+fi
+
 ours="$(docker ps -aq --filter "name=^/${NAME}\$" 2>/dev/null || true)"
 if [ -n "$ours" ]; then
     docker stop "$ours" >/dev/null 2>&1 || true
@@ -128,21 +170,11 @@ fi
 for id in $(docker ps -q --filter label=com.docker.compose.service=console 2>/dev/null); do
     case "$(docker inspect --format '{{.Config.Image}}' "$id" 2>/dev/null)" in
         *openflows-console*)
-            note "Stopping the Compose Console ($(docker inspect --format '{{.Name}}' "$id" | tr -d /))."
+            [ "$(host_port "$id")" = "$PORT" ] || continue
+            note "Stopping the Compose Console on port ${PORT} ($(docker inspect --format '{{.Name}}' "$id" | tr -d /))."
             docker stop "$id" >/dev/null; OLD+=("$id") ;;
     esac
 done
-rollback_and_die() { # rollback_and_die MESSAGE [DETAIL]: remove the new Console and restart the old ones
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
-    for id in ${OLD[@]+"${OLD[@]}"}; do
-        if [ "$(docker inspect --format '{{.Name}}' "$id" 2>/dev/null)" = "/${NAME}-old" ]; then
-            docker rename "${NAME}-old" "$NAME" >/dev/null 2>&1 || true
-        fi
-        docker start "$id" >/dev/null 2>&1 || true
-    done
-    [ "${#OLD[@]}" -eq 0 ] || note "The previous Console was restarted."
-    die "$@"
-}
 
 if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
     rollback_and_die "Port ${PORT} is already in use." "Use another one: ./scripts/console.sh --port 3100"
@@ -181,19 +213,15 @@ Manager used: ${MANAGER_URL}"
 fi
 
 # The new Console works: the old ones are no longer needed.
+REPLACED=1
 for id in ${OLD[@]+"${OLD[@]}"}; do docker rm -f "$id" >/dev/null 2>&1 || true; done
 
+# Where the Manager sends the browser: the redirect's origin, and the callback GitHub will return to.
+# Plain sed, so that nothing beyond a POSIX shell is needed.
 location="$(printf '%s' "$headers" | tr -d '\r' | awk -F': ' 'tolower($1)=="location"{print $2}')"
-parsed="$(python3 - "$location" <<'PY' 2>/dev/null || true
-import sys, urllib.parse as u
-p = u.urlparse(sys.argv[1])
-q = u.parse_qs(p.query)
-print(p.scheme + "://" + p.netloc)
-print((q.get("redirect_uri") or [""])[0])
-PY
-)"
-dest_origin="$(printf '%s\n' "$parsed" | sed -n 1p)"
-callback="$(printf '%s\n' "$parsed" | sed -n 2p)"
+dest_origin="$(printf '%s' "$location" | sed -nE 's#^(https?://[^/?]+).*#\1#p')"
+callback="$(printf '%s' "$location" | sed -nE 's#.*[?&]redirect_uri=([^&]*).*#\1#p' \
+    | sed -E 's/%3[Aa]/:/g; s/%2[Ff]/\//g')"
 
 # The sign-in cookie belongs to the host the browser used, and GitHub returns to the callback host.
 # localhost and 127.0.0.1 are different hosts to a browser, so the address to open must match.
