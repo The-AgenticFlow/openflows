@@ -28,6 +28,39 @@ class ExternalAuth:
                 raise self.reject(404, 'No pending device')
             device['approved'] = True
             return 200, {'approved': True}
+        if method == 'POST' and parsed.path == '/login/oauth/access_token':
+            if body.get('code') or query.get('code'):
+                return 200, {'access_token': 'ci-operator-token', 'token_type': 'Bearer', 'scope': 'read:user'}
+            if body.get('grant_type') == 'refresh_token' or query.get('grant_type') == ['refresh_token']:
+                return 200, {
+                    'access_token': 'ci-operator-token',
+                    'refresh_token': 'ci-operator-refresh',
+                    'token_type': 'Bearer',
+                    'scope': 'repo',
+                    'expires_in': 28800,
+                    'refresh_token_expires_in': 86400,
+                }
+            code = body.get('device_code') or query.get('device_code', [''])[0]
+            device = self.devices.get(code)
+            if not device or device['expires'] <= time.monotonic():
+                return 400, {'error': 'expired_token'}
+            if not device['approved']:
+                return 400, {'error': 'authorization_pending'}
+            del self.devices[code]
+            return 200, {
+                'access_token': 'ci-operator-token',
+                'refresh_token': 'ci-operator-refresh',
+                'token_type': 'Bearer',
+                'scope': 'repo',
+                'expires_in': 28800,
+                'refresh_token_expires_in': 86400,
+            }
+        if method == 'POST' and parsed.path == '/login/device/code':
+            code, user_code = secrets.token_hex(16), secrets.token_hex(4)
+            self.devices[code] = {'user_code': user_code, 'approved': False,
+                'expires': time.monotonic() + 180}
+            return 200, {'device_code': code, 'user_code': user_code,
+                'verification_uri': 'http://oauth:8080/approve', 'expires_in': 180, 'interval': 1}
         if method != 'POST' or query.get('client_id') != ['ci-coder']:
             raise self.reject(404, 'Unsupported disposable OAuth request')
         if parsed.path == '/device/code':

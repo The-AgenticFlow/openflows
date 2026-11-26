@@ -80,7 +80,7 @@ def operator_status():
 
 
 def lifecycle(nexus):
-    command = 'env OPENFLOWS_TICKET=T-001 OPENFLOWS_ROLE=forge /opt/openflows-dev/openflows-harness status get'
+    command = 'env OPENFLOWS_TICKET=T-001 OPENFLOWS_ROLE=forge openflows-harness status get'
     state = json.loads(bootstrap.ssh(nexus, command))
     save('lifecycle.json', state)
     return state

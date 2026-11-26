@@ -6,7 +6,7 @@ The workspace runtime is released separately from the OpenFlows application. A d
 
 ## Why this change is needed
 
-Manager can select a `kubernetes` provisioner, but all five Coder role templates currently create Docker containers and volumes. They also assume Docker network names and host file mounts. Hosted configuration currently requires AWS Secrets Manager, while the template treats its secret reference as a filesystem path. Those combinations cannot start a hosted workspace. The local Docker path remains valuable and must continue to work.
+Manager can select a `kubernetes` provisioner, and all five Coder roles now have Kubernetes pod templates alongside their Docker variants. The Kubernetes templates mount per-workspace runtime Secrets rather than Docker host files. Hosted configuration currently requires AWS Secrets Manager, while non-AWS hosted secret storage remains planned. The local Docker path continues to serve development and evaluation.
 
 ## Four independent choices
 
@@ -163,6 +163,25 @@ The immutable role assets no longer depend on that volume. The Manager serves th
 Plans and handoffs use the existing `openflows-harness` workflow, which accesses Redis directly from workspace pods with tenant-scoped credentials and an immutable tenant namespace. This is existing behavior, not a new Manager API. Network policy must allow workspace-to-Redis connections; Redis ACLs and namespace scoping prevent a workspace from accessing another tenant's coordination data. Preserve existing in-workspace paths during migration where practical.
 
 Nexus keeps the golden clone in its own workspace in local mode and publishes it on the tenant volume for local workers. Hosted mode seeds nothing: each worker clones the requested revision with its own short-lived brokered credential into its own workspace storage. No tenant repository copy is stored outside the tenant's own workspaces, and RWX is an optional optimization for local installations, never a prerequisite.
+
+### Current implementation (Docker)
+
+Until the dedicated workspace-runtime repository exists, the runtime lives in `runtime/` of this repository, self-contained so it can move unchanged:
+
+| Part | Contract |
+| --- | --- |
+| Image | `ghcr.io/the-agenticflow/openflows-workspace:<version>`, `linux/amd64`, built by `docker-publish.yml` from `runtime/Dockerfile` with the programs of `ghcr.io/the-agenticflow/openflows` of the same version. Its digest is in the release notes under **Docker images**. |
+| Release record | `template-release.yml` writes the image repository, digest, architecture (`amd64`) and runtime release (`runtime/VERSION`) into each role's manifest entry. It fails when the repository differs from the templates' `workspace_image_repository` default (`scripts/check-template-image-repository.sh`). |
+| Bootstrap | `/opt/openflows/runtime/lib/bootstrap.sh`, sourced by every role template. A worker template sets its role's settings (`OF_ROLE`, `OF_REPO_URL`, `OF_GITHUB_ACCESS`, `OF_GITHUB_API_TOKEN`, `OF_GIT_IDENTITY`, `OF_ROLE_HOOKS`, `OF_CHECKOUT` and the assignment branch) and calls `of_bootstrap_worker`; Nexus calls `of_bootstrap_controller`. The step order lives there once: readiness (`of_signal_manager_ready`) only after the checkout and the role instructions exist, and the runtime session is dropped before the role's commands start. Templates keep the role's environment and commands. |
+| Runtime API | `OF_RUNTIME_API` (now `1`) names the `of_*` interface. Every template refuses to start on a runtime with another API. `runtime/VERSION` changes with every change to `runtime/lib`, `runtime/bin` or `runtime/Dockerfile` (`scripts/check-runtime-version.sh` in CI). |
+| Privilege | Only `of_prepare` (ownership of `/home/coder/workspace` and `~/.openflows`), reading the root-owned credential file and installing mounted development programs use `sudo`. Every other step, including clones, runs as `coder`, so a backend that grants ownership another way (an `fsGroup` or init container) needs no `sudo` afterwards. Hosted workspaces remove their sudo rule before reporting ready (`of_release_privileges`) and fail startup if `sudo` still works, so agents there never run as root. Local workspaces keep `sudo`. |
+| Local image | Templates have no default local workspace image. Setup pins `OPENFLOWS_WORKSPACE_IMAGE`, which `prod.sh` and the connected-local Manager pass as `TF_VAR_workspace_image`; a source install builds `openflows-workspace:dev`. Without one, the image reference's tag names the setting to fix. |
+| Credential file | `/run/openflows/runtime.json` (`OPENFLOWS_RUNTIME_CREDENTIAL_FILE`), read through a private copy. Tokens reach curl and python on stdin or through a file descriptor, never as process arguments. |
+| Background refresh | `/opt/openflows/runtime/bin/openflows-credential-refresh`, hosted only. In connected-local mode it keeps no git token on disk. |
+| Persistent paths | `/home/coder/workspace` (the checkout), `/home/coder/.local/state/openflows` (startup logs). |
+| Development override | Optional: `.dev-binaries` mounted at `/opt/openflows-dev` replaces the image's programs and runtime scripts. No release sets it. Startup logs the runtime version and directory it loaded. |
+
+Role assets still come from the tenant artifacts volume or the Manager bundle (#512, #516), and Manager selection still passes only the digest, with the repository taken from the template variable `workspace_image_repository` (#514).
 
 ## Networking and isolation
 

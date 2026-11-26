@@ -135,6 +135,62 @@ stage_release() {
     env_set OPENFLOWS_IMAGE_DIGEST ""
     ok "OpenFlows ${B}${version}${N} · checksums verified"
 }
+# The last release whose workspaces download or mount their programs instead of starting from the
+# workspace image. OPENFLOWS_LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE overrides it, for a candidate
+# whose programs report an older version or a maintenance release cut before the image existed.
+LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE="${OPENFLOWS_LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE:-1.8.2}"
+# has_workspace_image VERSION — true when the release publishes the workspace image its templates run.
+has_workspace_image() {
+    [ -n "$1" ] || return 1
+    [ "$(printf '%s\n' "$LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE" "$1" | sort -V | tail -1)" != "$LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE" ]
+}
+# pin_workspace_image — the image the workspaces start from: the version's published workspace
+# image, which holds the OpenFlows programs, pinned by digest in .env as OPENFLOWS_WORKSPACE_IMAGE.
+# An image already given as TF_VAR_workspace_image (a local build or a mirror) is used as it is.
+pin_workspace_image() {
+    local version repo pinned digest
+    [ -z "${TF_VAR_workspace_image:-}" ] || return 0
+    version="$(env_get OPENFLOWS_VERSION)"; repo="$(image_repo)-workspace"
+    if ! has_workspace_image "$version"; then
+        env_set OPENFLOWS_WORKSPACE_IMAGE ""   # older templates bring their own image
+        return 0
+    fi
+    pinned="$(env_get OPENFLOWS_WORKSPACE_IMAGE)"
+    case "$pinned" in "${repo}:${version}@sha256:"*) return 0 ;; esac
+    docker pull -q --platform linux/amd64 "${repo}:${version}" >"$LOG_FILE" 2>&1 \
+        || die "No published workspace image for OpenFlows ${version} (${repo}:${version})." \
+            "Pick a version that has one: https://github.com/The-AgenticFlow/openflows/pkgs/container/openflows-workspace"
+    digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${repo}:${version}" \
+        | sed -n "s|^${repo}@||p" | head -1)"
+    [ -n "$digest" ] || die "Could not read the digest of ${repo}:${version}."
+    env_set OPENFLOWS_WORKSPACE_IMAGE "${repo}:${version}@${digest}"
+}
+
+# resolve_workspace_image — save the workspace image in .env before the local Manager starts:
+# it reads OPENFLOWS_WORKSPACE_IMAGE once, at start, and publishes templates with it. A source
+# install names the image its bootstrap builds; a release pins its published image.
+resolve_workspace_image() {
+    if [ "$MODE" = source ]; then
+        env_set OPENFLOWS_WORKSPACE_IMAGE openflows-workspace:dev
+    else
+        pin_workspace_image
+    fi
+}
+
+# push_release_templates — push the templates of a --compose or --binary install. Workspaces run
+# the programs in the pinned workspace image; .dev-binaries holds the programs for this machine
+# and is mounted into workspaces only when TF_VAR_dev_binary_host_path asks for it. Releases
+# without the image keep their old wiring.
+push_release_templates() {
+    local template_env=()
+    pin_workspace_image   # a no-op once resolve_workspace_image has pinned it
+    if has_workspace_image "$(env_get OPENFLOWS_VERSION)"; then
+        template_env=("TF_VAR_workspace_image=${TF_VAR_workspace_image:-$(env_get OPENFLOWS_WORKSPACE_IMAGE)}"
+            "TF_VAR_dev_binary_host_path=${TF_VAR_dev_binary_host_path:-}")
+    fi
+    run_quiet "Pushing templates" env ${template_env[@]+"${template_env[@]}"} "${SCRIPT_DIR}/prod.sh" --skip-build bootstrap
+}
+
 image_ref() { # image_ref → the exact image the stack runs, e.g. ghcr.io/…/openflows:1.8.1@sha256:…
     printf '%s:%s@%s' "$(image_repo)" "$(env_get OPENFLOWS_VERSION)" "$(env_get OPENFLOWS_IMAGE_DIGEST)"
 }

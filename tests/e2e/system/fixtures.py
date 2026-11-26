@@ -242,7 +242,12 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', '0'))
             if length < 0 or length > 1024 * 1024:
                 raise Rejected(413, 'Request exceeds fixture limit')
-            body = json.loads(self.rfile.read(length)) if length else {}
+            raw_body = self.rfile.read(length) if length else b''
+            if raw_body and self.headers.get('Content-Type', '').startswith('application/x-www-form-urlencoded'):
+                from urllib.parse import parse_qs as _parse_qs
+                body = {k: v[0] for k, v in _parse_qs(raw_body.decode(), keep_blank_values=True).items()}
+            else:
+                body = json.loads(raw_body) if raw_body else {}
             with self.server.lock:
                 if self.server.service == 'model' and self.command == 'POST' and path == '/v1/chat/completions':
                     response = self.server.model.complete(body)

@@ -224,7 +224,8 @@ Coder needs these settings; each one was a failure seen in practice.
 | `OPENFLOWS_RUNTIME_REDIS_URL` | `redis://redis:6379` | Workspaces cannot reach a Redis published on host loopback. Attach the Redis container to the workspace network with the alias `redis` (`docker network connect --alias redis <network> <redis-container>`). |
 | `OPENFLOWS_PROVISIONER_NETWORK` / `OPENFLOWS_PROVISIONER_CODER_URL` | the Coder Compose network and `http://coder:7080` | Per-organization provisioner containers otherwise dial `host.docker.internal:7080`, which is refused when Coder publishes on `127.0.0.1` only. |
 | `TF_VAR_docker_network` | the same Coder Compose network | Workspaces must join the network the relay and Redis are on. |
-| `TF_VAR_dev_binary_host_path` | absolute path to `.dev-binaries` | Run `make dev-sync` first; workspaces mount these binaries. |
+| `TF_VAR_workspace_image` | a workspace image, e.g. `openflows-workspace:dev` from `runtime/build-image.sh` | Workspaces run the OpenFlows programs and startup steps in this image. |
+| `TF_VAR_dev_binary_host_path` | optional: absolute path to `.dev-binaries` | Only to run programs from `make dev-sync` instead of the image's; workspaces mount them read-only. |
 | `OPENFLOWS_RUNTIME_RELAY_BASE_URL` | `http://127.0.0.1:7081/tenants/{tenant}` | Run the relay (`runtime-relay` in `docker-compose.yml`) on the workspace network, published on `127.0.0.1:7081`. |
 
 Coder needs, in addition to its licence (multi-organization and external

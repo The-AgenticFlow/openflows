@@ -53,11 +53,12 @@ It will:
 2. Create `.env` and generate secrets.
 3. With `--binary` or `--compose`: pick the OpenFlows version, then verify its checksums or pin its image digest.
 4. Start Redis, Coder, and the local Manager in Docker.
-5. Open the local Manager console, install the **OpenFlows GitHub App** on the repository, authorize your GitHub account using its device code, then choose that repository.
-6. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
-7. Register the local Coder OAuth application, then add your **LLM** provider and model (asks for the API key).
-8. Push the workspace templates. With `--source` it builds the binaries first (about 10 minutes the first time); otherwise it uses the installed programs.
-9. Connect your repo. The local Manager renews your GitHub App user token when needed and supplies it to the workspaces.
+5. Sign you in to Coder with **your GitHub account** (you become the owner) and save an API token you create in the dashboard (one paste).
+6. Register the local Coder OAuth application. The Manager creates its own keys and Coder token here.
+7. Open the local Manager console, install the **OpenFlows GitHub App** on the repository, authorize your GitHub account using its device code, then choose that repository.
+8. Add your **LLM** provider and model (asks for the API key).
+9. Push the workspace templates. With `--source` it builds the binaries first (about 10 minutes the first time); otherwise it uses the installed programs.
+10. Connect your repo. The local Manager renews your GitHub App user token when needed and supplies it to the workspaces.
 
 Setup pauses and opens the Manager console at <http://localhost:3002>. There:
 

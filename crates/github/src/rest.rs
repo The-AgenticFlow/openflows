@@ -25,7 +25,7 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub struct GithubRestClient {
     client: reqwest::Client,
-    token: String,
+    pub(crate) token: crate::SharedToken,
     api_base: String,
 }
 
@@ -46,13 +46,13 @@ impl GithubRestClient {
                 .user_agent("AgentFlow-VESSEL/0.1")
                 .build()
                 .expect("Failed to build reqwest client"),
-            token: token.into(),
+            token: crate::SharedToken::new(token),
             api_base: api_base.into(),
         }
     }
 
     fn auth_header(&self) -> String {
-        format!("Bearer {}", self.token)
+        format!("Bearer {}", self.token.get())
     }
 
     fn build_get(&self, url: &str) -> reqwest::RequestBuilder {

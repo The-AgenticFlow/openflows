@@ -1,5 +1,8 @@
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
+# chrono is unmaintained (RUSTSEC-2026-0543) but deeply embedded via sqlx.
+# Migration to jiff/time tracked separately.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 allow = [

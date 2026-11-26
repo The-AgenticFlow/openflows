@@ -75,8 +75,8 @@ so a harness from either still installs. What it catches is a Manager whose
 assets differ from the harness's, which is the only case where mixing them
 changes what a worker reads.
 
-The consequence for operators: the `harness_version` the worker templates
-download has to name the release the Manager runs. Deploying one half ahead of
+The consequence for operators: the template release, whose workspace image holds
+the harness, has to be the release the Manager runs. Deploying one half ahead of
 the other makes workspace rebuilds fail loudly once the bundles differ, which is
 the intended behaviour and is recorded in the
 [production runbook](operator-production-runbook.md).

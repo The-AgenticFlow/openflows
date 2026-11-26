@@ -22,6 +22,16 @@ on:
         description: 'Publish only once its Docker images exist (turn off only to test on a fork)'
         type: boolean
         default: true
+      workspace_runtime_release:
+        description: 'Workspace-runtime release tag to pin (defaults to latest release)'
+        type: string
+        required: false
+        default: ''
+      allow_candidate_runtime:
+        description: 'Allow candidate workspace-runtime manifests when pinning template assets'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-assets-${{ inputs.version }}
@@ -212,6 +222,9 @@ jobs:
       contents: write
     with:
       version: ${{ inputs.version }}
+      wait_for_images: ${{ inputs.wait_for_images }}
+      workspace_runtime_release: ${{ inputs.workspace_runtime_release }}
+      allow_candidate_runtime: ${{ inputs.allow_candidate_runtime }}
 
   attach:
     name: Attach assets and publish
@@ -308,7 +321,7 @@ jobs:
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
               "https://ghcr.io/v2/${1}/manifests/${VERSION}")" = 200 ]
           }
-          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager" "${GITHUB_REPOSITORY,,}-workspace"; do
             until image_exists "${image}"; do
               if [ "${SECONDS}" -ge "${IMAGE_WAIT_SECONDS}" ]; then
                 echo "::error::ghcr.io/${image}:${VERSION} did not appear; ${TAG} stays a draft."
@@ -323,7 +336,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG_TREE="$(git rev-parse 'HEAD^{tree}')"
-          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager"; do
+          for image in "${GITHUB_REPOSITORY,,}" "${GITHUB_REPOSITORY,,}-manager" "${GITHUB_REPOSITORY,,}-workspace"; do
             bash verifier/scripts/verify-release.sh image "ghcr.io/${image}" "${VERSION}" "${TAG_TREE}"
           done
 

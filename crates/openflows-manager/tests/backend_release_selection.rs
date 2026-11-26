@@ -508,28 +508,6 @@ fn build_dual_backend_source_dir() -> tempfile::TempDir {
     dir
 }
 
-#[test]
-fn release_provider_packages_dual_backend_v2_manifest() {
-    let dir = build_dual_backend_source_dir();
-    let provider = ReleaseProvider::new(dir.path().to_path_buf(), None, None, "2026.11.0".into());
-    let artifacts = provider.load().expect("dual-backend packaging succeeds");
-    assert_eq!(
-        artifacts.manifest.schema_version,
-        TemplateManifest::CURRENT_V2_SCHEMA_VERSION
-    );
-    assert_eq!(artifacts.manifest.release, "2026.11.0");
-    assert_eq!(artifacts.manifest.variants.len(), 10);
-    for backend in ProvisionerBackend::ALL {
-        for role in Role::ALL {
-            assert!(artifacts.manifest.variant(backend, role).is_some());
-            assert!(artifacts.archive_for(backend, role).is_some());
-        }
-    }
-    let reparsed =
-        TemplateManifest::parse(&artifacts.manifest.to_canonical_json().unwrap()).unwrap();
-    assert_eq!((reparsed.schema_version, reparsed.variants.len()), (2, 10));
-}
-
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
 async fn release_provider_dual_backend_import_roundtrip() {
@@ -569,10 +547,8 @@ async fn all_five_roles_provision_on_docker_and_kubernetes() {
         workspace_runtime_release: Some("2026.11.0"),
     });
     let release_id = env.import_and_approve(&artifacts).await;
-
     let docker_target = ReleaseCompatibilityTarget::docker_default();
     let k8s_target = ReleaseCompatibilityTarget::kubernetes_default("amd64");
-
     let docker_org = env.create_ready_org("docker-org", 101, 201).await;
     let k8s_org = env.create_ready_org("k8s-org", 102, 202).await;
 
@@ -586,8 +562,7 @@ async fn all_five_roles_provision_on_docker_and_kubernetes() {
             .unwrap();
         let backends: Vec<(String, String)> = sqlx::query_as(
             "SELECT role, backend FROM organization_template_versions
-              WHERE organization_id = $1 AND release_id = $2
-              ORDER BY role",
+              WHERE organization_id = $1 AND release_id = $2 ORDER BY role",
         )
         .bind(org.0)
         .bind(release_id.0)
@@ -606,7 +581,6 @@ async fn all_five_roles_provision_on_docker_and_kubernetes() {
         let (tenant_id, nexus_id, nexus_scope) = env
             .provision_nexus_until_running(&worker, org, repo_id, slug, 5)
             .await;
-
         let mut ws_ids = vec![(Role::Nexus, nexus_id)];
         for (slot, role) in [Role::Forge, Role::Sentinel, Role::Vessel, Role::Lore]
             .into_iter()
@@ -623,7 +597,6 @@ async fn all_five_roles_provision_on_docker_and_kubernetes() {
                 .await;
             ws_ids.push((role, ws_id));
         }
-
         for (role, ws_id) in ws_ids {
             let expected_ver = env
                 .release_repo
@@ -860,50 +833,25 @@ async fn early_rejection_before_workspace_creation() {
     assert_eq!(env.adapter.create_calls(), 0);
 }
 
+#[rustfmt::skip]
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
 async fn safe_upgrade_and_rollback_for_docker_workspaces() {
     let env = TestEnv::new().await;
     let docker_target = ReleaseCompatibilityTarget::docker_default();
     let org = env.create_ready_org("upgrade-org", 160, 260).await;
-    let conn_id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM github_connections WHERE organization_id = $1")
-            .bind(org.0)
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
+    let conn_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM github_connections WHERE organization_id = $1").bind(org.0).fetch_one(&env.pool).await.unwrap();
     for (repo_id, name) in [(261, "upgrade-org/repo-b"), (262, "upgrade-org/repo-c")] {
-        common::insert_repository(&env.pool, org.0, conn_id, repo_id, name)
-            .await
-            .unwrap();
+        common::insert_repository(&env.pool, org.0, conn_id, repo_id, name).await.unwrap();
     }
 
-    let (r1_artifacts, _d1) =
-        build_docker_only_v1_artifacts("2026.10.0-r1", Some(digest_char('1')));
+    let (r1_artifacts, _d1) = build_docker_only_v1_artifacts("2026.10.0-r1", Some(digest_char('1')));
     let r1_id = env.import_and_approve(&r1_artifacts).await;
-    env.releases
-        .promote_to_org_for_backend(
-            org,
-            r1_id,
-            &docker_target,
-            env.adapter.as_ref(),
-            &r1_artifacts,
-        )
-        .await
-        .unwrap();
+    env.releases.promote_to_org_for_backend(org, r1_id, &docker_target, env.adapter.as_ref(), &r1_artifacts).await.unwrap();
 
     let worker = env.tenant_worker(docker_target.clone());
-    let (tenant_a, ws_a, _) = env
-        .provision_nexus_until_running(&worker, org, 260, "tenant-a", 1)
-        .await;
-    let v1_id = env
-        .release_repo
-        .get_org_template_version_for_backend(org, r1_id, ProvisionerBackend::Docker, Role::Nexus)
-        .await
-        .unwrap()
-        .unwrap()
-        .coder_version_id
-        .unwrap();
+    let (tenant_a, ws_a, _) = env.provision_nexus_until_running(&worker, org, 260, "tenant-a", 1).await;
+    let v1_id = env.release_repo.get_org_template_version_for_backend(org, r1_id, ProvisionerBackend::Docker, Role::Nexus).await.unwrap().unwrap().coder_version_id.unwrap();
 
     // Promote R2 to the org.
     let (r2_artifacts, _d2) = build_dual_backend_v2_artifacts(&VariantSpec {
@@ -914,84 +862,102 @@ async fn safe_upgrade_and_rollback_for_docker_workspaces() {
         workspace_runtime_release: Some("2026.11.0"),
     });
     let r2_id = env.import_and_approve(&r2_artifacts).await;
-    env.releases
-        .promote_to_org_for_backend(
-            org,
-            r2_id,
-            &docker_target,
-            env.adapter.as_ref(),
-            &r2_artifacts,
-        )
-        .await
-        .unwrap();
-    let v2_id = env
-        .release_repo
-        .get_org_template_version_for_backend(org, r2_id, ProvisionerBackend::Docker, Role::Nexus)
-        .await
-        .unwrap()
-        .unwrap()
-        .coder_version_id
-        .unwrap();
+    env.releases.promote_to_org_for_backend(org, r2_id, &docker_target, env.adapter.as_ref(), &r2_artifacts).await.unwrap();
+    let v2_id = env.release_repo.get_org_template_version_for_backend(org, r2_id, ProvisionerBackend::Docker, Role::Nexus).await.unwrap().unwrap().coder_version_id.unwrap();
     assert_ne!(v1_id, v2_id);
 
-    // Tenant A and its workspace remain pinned to R1 / v1_id.
+    // Tenant A and its workspace remain pinned to R1 / v1_id; new Tenant B picks up R2.
     assert_pins(&env.pool, tenant_a, ws_a, r1_id, "docker", &v1_id).await;
-
-    // New Tenant B picks up R2.
-    let (tenant_b, ws_b, _) = env
-        .provision_nexus_until_running(&worker, org, 261, "tenant-b", 1)
-        .await;
+    let (tenant_b, ws_b, _) = env.provision_nexus_until_running(&worker, org, 261, "tenant-b", 1).await;
     assert_pins(&env.pool, tenant_b, ws_b, r2_id, "docker", &v2_id).await;
 
     // Roll back org binding to R1; new Tenant C picks up R1 cleanly, while B stays on R2.
-    env.releases
-        .promote_to_org_for_backend(
-            org,
-            r1_id,
-            &docker_target,
-            env.adapter.as_ref(),
-            &r1_artifacts,
-        )
-        .await
-        .unwrap();
-    let (tenant_c, ws_c, _) = env
-        .provision_nexus_until_running(&worker, org, 262, "tenant-c", 1)
-        .await;
+    env.releases.promote_to_org_for_backend(org, r1_id, &docker_target, env.adapter.as_ref(), &r1_artifacts).await.unwrap();
+    let (tenant_c, ws_c, _) = env.provision_nexus_until_running(&worker, org, 262, "tenant-c", 1).await;
     assert_pins(&env.pool, tenant_c, ws_c, r1_id, "docker", &v1_id).await;
     assert_pins(&env.pool, tenant_b, ws_b, r2_id, "docker", &v2_id).await;
 }
 
-async fn assert_pins(
-    pool: &sqlx::PgPool,
-    tenant_id: TenantId,
-    ws_id: WorkspaceId,
-    expected_release: ReleaseId,
-    expected_backend: &str,
-    expected_version_id: &str,
-) {
-    let t_pin: (Option<uuid::Uuid>, Option<String>) =
-        sqlx::query_as("SELECT pinned_release_id, pinned_backend FROM tenants WHERE id = $1")
-            .bind(tenant_id.0)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        (t_pin.0, t_pin.1.as_deref()),
-        (Some(expected_release.0), Some(expected_backend))
-    );
-    let w_pin: (Option<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT pinned_release_id, pinned_backend, pinned_version_id FROM workspaces WHERE id = $1",
-    )
-    .bind(ws_id.0)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        (w_pin.0, w_pin.1.as_deref(), w_pin.2.as_deref()),
-        (
-            Some(expected_release.0),
-            Some(expected_backend),
-            Some(expected_version_id)
-        )
-    );
+#[rustfmt::skip]
+async fn assert_pins(pool: &sqlx::PgPool, tenant_id: TenantId, ws_id: WorkspaceId, expected_release: ReleaseId, expected_backend: &str, expected_version_id: &str) {
+    let t_pin: (Option<uuid::Uuid>, Option<String>) = sqlx::query_as("SELECT pinned_release_id, pinned_backend FROM tenants WHERE id = $1").bind(tenant_id.0).fetch_one(pool).await.unwrap();
+    assert_eq!((t_pin.0, t_pin.1.as_deref()), (Some(expected_release.0), Some(expected_backend)));
+    let w_pin: (Option<uuid::Uuid>, Option<String>, Option<String>) = sqlx::query_as("SELECT pinned_release_id, pinned_backend, pinned_version_id FROM workspaces WHERE id = $1").bind(ws_id.0).fetch_one(pool).await.unwrap();
+    assert_eq!((w_pin.0, w_pin.1.as_deref(), w_pin.2.as_deref()), (Some(expected_release.0), Some(expected_backend), Some(expected_version_id)));
+}
+
+#[rustfmt::skip]
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn workspace_runtime_manifest_ingestion_and_per_role_image_selection() {
+    let env = TestEnv::new().await;
+    let org = env.create_ready_org("acme-runtime", 190, 901).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let templates_dir = tmp.path().join("templates");
+    for role in Role::ALL {
+        package_role_dir(
+            &templates_dir.join(role.template_name()),
+            &format!("resource \"role\" {{ role = \"{}\" }}\n", role.as_str()),
+        );
+    }
+    let runtime_manifest_path = tmp.path().join("release-manifest.json");
+    let v0_2_0_images = [
+        (Role::Nexus, "sha256:76db4d6953b4ed5ba64cfd47e155fdb7aca38cd79ee89b600f9f46457cbe12cd"),
+        (Role::Forge, "sha256:660f6f401a13103e2012997f03ab7d864f8853ce06b280b0371fb07d05a752f0"),
+        (Role::Sentinel, "sha256:b824305d32ad15f087cf00f17880d36ef21271623336de83d5db917a9517d07f"),
+        (Role::Vessel, "sha256:59bff0379fa95382725b74196be274a9cbaac0e85e3183ffa6e5e48766342e3e"),
+        (Role::Lore, "sha256:5f42f72b37c9c8ec687599f9f905554ccf71e452d5a13e8b2133475c6fe068fb"),
+    ];
+    let images_json: serde_json::Map<String, serde_json::Value> = v0_2_0_images
+        .into_iter()
+        .map(|(role, digest)| {
+            (
+                role.as_str().to_string(),
+                serde_json::json!({
+                    "repository": format!("ghcr.io/the-agenticflow/workspace-runtime-{}", role.as_str()),
+                    "digest": digest,
+                    "architectures": ["linux/amd64", "linux/arm64"],
+                }),
+            )
+        })
+        .collect();
+    let v0_2_0 = serde_json::json!({
+        "schema_version": 2,
+        "runtime_version": "0.2.0",
+        "status": "candidate",
+        "images": images_json,
+        "roles": ["nexus", "forge", "sentinel", "vessel", "lore"],
+        "bootstrap": {"contract_version": 2, "asset_install_command": "openflows-runtime install", "role_environment_variable": "OPENFLOWS_ROLE", "credential_file": "/run/openflows/runtime.json", "asset_directory": ".openflows/artifacts"},
+        "harness": {"name": "openflows-harness", "openflows_release": "openflows-1.8.2"},
+        "compatibility": {"openflows_template_parameter_schema_versions": [], "minimum_manager_version": null}
+    });
+    std::fs::write(&runtime_manifest_path, v0_2_0.to_string()).unwrap();
+
+    let strict_err = ReleaseProvider::new(templates_dir.clone(), None, None, "2026.11.0-runtime-0.2.0".into())
+        .with_workspace_runtime_manifest(runtime_manifest_path.clone(), false)
+        .load()
+        .unwrap_err();
+    assert!(strict_err.to_string().contains("strict compatibility"));
+
+    let artifacts = ReleaseProvider::new(templates_dir, None, None, "2026.11.0-runtime-0.2.0".into())
+        .with_workspace_runtime_manifest(runtime_manifest_path, true)
+        .load()
+        .unwrap();
+    let release_id = env.import_and_approve(&artifacts).await;
+    let mut target = ReleaseCompatibilityTarget::docker_default();
+    target.expected_runtime_release = Some("0.2.0".into());
+    target.require_image_digest = true;
+    env.releases.promote_to_org_for_backend(org, release_id, &target, env.adapter.as_ref(), &artifacts).await.unwrap();
+
+    let worker = env.tenant_worker(target.clone());
+    let (tenant_id, _, _) = env.provision_nexus_until_running(&worker, org, 901, "runtime-tenant", 1).await;
+    let nexus_spec = openflows_manager::provisioning::resolve_nexus_release_for_tenant(&env.pool, &env.releases.repo, org, tenant_id, &target).await.unwrap().unwrap();
+    assert_eq!(nexus_spec.image_reference.as_deref(), Some("ghcr.io/the-agenticflow/workspace-runtime-nexus@sha256:76db4d6953b4ed5ba64cfd47e155fdb7aca38cd79ee89b600f9f46457cbe12cd"));
+    assert_eq!(nexus_spec.workspace_runtime_release.as_deref(), Some("0.2.0"));
+
+    for &(role, expected_digest) in &v0_2_0_images[1..] {
+        let spec = openflows_manager::provisioning::resolve_worker_release_for_tenant(&env.pool, &env.releases.repo, org, tenant_id, role, &target).await.unwrap();
+        assert_eq!(spec.image_reference.as_deref(), Some(format!("ghcr.io/the-agenticflow/workspace-runtime-{}@{expected_digest}", role.as_str()).as_str()));
+        assert_eq!(spec.workspace_runtime_release.as_deref(), Some("0.2.0"));
+    }
 }

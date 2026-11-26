@@ -2,7 +2,7 @@
 
 The hosted contract, including AWS Secrets Manager as the default and an explicit non-AWS path, is in [Portable workspace runtime](../../architecture/portable-workspace-runtime.md).
 
-> **Current blocker:** Hosted Kubernetes deployment is not yet validated. The role templates still create Docker containers, and hosted mode rejects the Docker backend. Follow the architecture contract and its implementation issues for the target design; do not use an arbitrary backend name to bypass the hosted-mode check. Remove this notice only after the hosted release gates pass.
+> **Production validation:** Kubernetes role templates now exist for all five agents. Before production use, complete the hosted release gates in staging, including workspace startup, tenant isolation, credential delivery, and recovery checks. This repository does not yet provide a turnkey production deployment command.
 
 Deploy **staging**, validate it, then deploy **production** with separate
 resources and credentials. The local Compose stack is not a production
@@ -58,11 +58,10 @@ unless the two identities are separate and the cluster enforces the network
 rules; [tenant isolation](tenant-isolation.md) lists the permissions and
 settings. Tenants of one organization share that
 namespace, so tenant separation relies on those rules, on RBAC and on each
-workspace mounting only the Secret it is given. The shipped templates
-bind-mount a host file, so they cannot use that Secret yet: the Manager refuses
-to start on the `kubernetes` backend unless `OPENFLOWS_K8S_RUNTIME_DELIVERY=1`
-is set, and that should only be set with a template that mounts the Secret's
-`runtime.json` key at `/run/openflows/runtime.json`. On the `docker`
+workspace mounting only the Secret it is given. The Kubernetes templates mount
+the Secret's `runtime.json` key at `/run/openflows/runtime.json`. Set
+`OPENFLOWS_K8S_RUNTIME_DELIVERY=1` when using these templates; the Manager
+refuses to start on the `kubernetes` backend without it. On the `docker`
 backend with a non-filesystem store, set an absolute
 `OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
 Manager refuses to start without it.
@@ -124,14 +123,43 @@ migration, not an environment-variable change.
 ### Upgrade order
 
 The workspace harness pins the artifact bundle to the one compiled into its own
-binary, so the harness and the Manager move together. What ties them is
-`harness_version` on the four worker templates: it decides which harness a
-workspace downloads, and it has to name the release the Manager runs. The
-default, `harness-edge`, is a tag rebuilt from `main` on every push, so a hosted
-deployment should set `harness_version` to the release tag instead.
+binary, so the harness and the Manager move together. Workspaces get the harness
+from the workspace image their template release pins
+(`ghcr.io/the-agenticflow/openflows-workspace`, by digest), so a template release
+and a Manager of the same version always agree.
 
 Deploying one half ahead of the other makes workspace rebuilds fail with a 404
 that names both digests, and they keep failing until the other half catches up.
 Upgrade both in one window. `openflows-harness artifacts fetch --any-release`
 installs whichever bundle the Manager serves, which is a deliberate mixed fleet
 for a migration window, not something to leave in a template.
+
+### Upgrading from 1.8.2 or earlier: the workspace image
+
+Releases up to 1.8.2 ran hosted workspaces from `codercom/enterprise-base`, and
+`OPENFLOWS_WORKSPACE_IMAGE_DIGEST` held a digest of that image. Later releases
+run them from `ghcr.io/the-agenticflow/openflows-workspace@<digest>`. An old
+digest does not exist in that repository: the Manager starts normally, and
+then every workspace build fails to pull its image. Before you start the
+upgraded Manager:
+
+1. Set `OPENFLOWS_WORKSPACE_IMAGE_DIGEST` in `.env.prod` to the
+   `openflows-workspace` digest listed under **Docker images** in the release
+   notes of the version you run.
+2. Run `scripts/check-workspace-image.sh`. It pulls
+   `openflows-workspace@<digest>` for `linux/amd64` and checks that it is an
+   OpenFlows workspace image. Start the Manager only when it prints `ok:`.
+
+The image is a minimal runtime (Ubuntu 24.04 with `git`, `curl`, `jq`,
+`python3`, `ssh`, `sudo` and the OpenFlows programs), not a development
+environment like `enterprise-base`. It has no compilers, `make`, `unzip`,
+`wget` or language toolchains.
+
+Hosted workspaces also give up `sudo` at the end of startup, before they report
+ready: the runtime removes the workspace user's sudo rule and checks that `sudo`
+no longer works, or startup fails. Agents in a hosted workspace therefore run
+without root. They cannot read the root-owned runtime secret, and they cannot
+`apt-get install` tools, which they could on `enterprise-base`. Tools a hosted
+repository needs for delegated verification must be installable without root
+(for example into the home directory or the checkout), or come with the image.
+Local workspaces keep `sudo`.

@@ -139,10 +139,9 @@ impl Deployment {
         {
             bail!("deployment URLs differ from saved setup state; restore the configured URLs or explicitly migrate this deployment");
         }
-        if let (Some(saved), Ok(configured)) = (
-            &self.oauth_id,
-            std::env::var("OPENFLOWS_CODER_OAUTH_CLIENT_ID"),
-        ) {
+        if let (Some(saved), Ok(configured)) =
+            (&self.oauth_id, setting("OPENFLOWS_CODER_OAUTH_CLIENT_ID"))
+        {
             if saved != &configured {
                 bail!("configured Coder OAuth application differs from saved setup state; explicitly migrate the client and secret together");
             }
@@ -607,7 +606,7 @@ pub async fn setup(initialize: bool, email: Option<&str>) -> Result<()> {
         id: uuid::Uuid::new_v4(),
         coder_url: coder.base.clone(),
         public_url,
-        oauth_id: std::env::var("OPENFLOWS_CODER_OAUTH_CLIENT_ID").ok(),
+        oauth_id: setting("OPENFLOWS_CODER_OAUTH_CLIENT_ID").ok(),
         managed_admin_email: None,
         operator_user_id: None,
         operator_token_issued_at: None,
@@ -961,7 +960,7 @@ async fn setup_aws(initialize: bool, email: Option<&str>) -> Result<()> {
             id: uuid::Uuid::new_v4(),
             coder_url: coder.base.clone(),
             public_url,
-            oauth_id: std::env::var("OPENFLOWS_CODER_OAUTH_CLIENT_ID").ok(),
+            oauth_id: setting("OPENFLOWS_CODER_OAUTH_CLIENT_ID").ok(),
             managed_admin_email: None,
             operator_user_id: None,
             operator_token_issued_at: None,

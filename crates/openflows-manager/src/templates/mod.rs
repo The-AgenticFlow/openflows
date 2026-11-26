@@ -8,12 +8,18 @@
 //! links, special files) are rejected. The old agent `registry.json` is never
 //! shipped or passed as a template parameter here.
 
+pub mod archive;
 pub mod backend;
 pub mod packaging;
 pub mod repository;
 pub mod service;
+pub mod workspace_runtime;
 
 pub use backend::{ProvisionerBackend, ReleaseCompatibilityTarget};
 pub use packaging::{build_deterministic_archive, Role, RoleManifestEntry, TemplateManifest};
 pub use repository::ReleaseRepository;
 pub use service::ReleaseService;
+pub use workspace_runtime::{
+    WorkspaceRuntimeCompatibilityOptions, WorkspaceRuntimeImage, WorkspaceRuntimeManifest,
+    WorkspaceRuntimeStatus,
+};
