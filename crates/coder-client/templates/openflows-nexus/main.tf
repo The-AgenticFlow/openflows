@@ -5,9 +5,6 @@ terraform {
   }
 }
 
-# TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
-# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
-# (Remove when switching to GitHub releases for the openflows binary.)
 variable "docker_network" {
   description = "Docker network shared by the control plane and tenant workspaces"
   type        = string
@@ -39,9 +36,9 @@ variable "connected_local_helper_host_path" {
 }
 
 variable "workspace_image" {
-  description = "Workspace image containing the tools used by the production bootstrap"
+  description = "STANDALONE TEMPLATE USE ONLY. A mutable release tag used when no workspace_image_digest parameter is set. Manager-provisioned workspaces never use it: Manager always passes workspace_image_repository plus a sha256 workspace_image_digest from the validated workspace-runtime release."
   type        = string
-  default     = "codercom/enterprise-base:ubuntu"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-nexus:v0.3.1"
 }
 
 variable "github_api_base" {
@@ -56,6 +53,9 @@ variable "github_git_base" {
   default     = "https://github.com"
 }
 
+# Optional development override: a host directory (normally .dev-binaries,
+# filled by `make dev-sync`) whose OpenFlows programs and runtime scripts replace
+# the image's. Releases never set it.
 variable "dev_binary_host_path" {
   description = "Absolute host path to the .dev-binaries directory"
   type        = string
@@ -198,6 +198,14 @@ data "coder_parameter" "runtime_secret_ref" {
   mutable     = false
 }
 
+data "coder_parameter" "workspace_image_repository" {
+  name        = "workspace_image_repository"
+  description = "Release-pinned container repository for the Nexus workspace image"
+  default     = "ghcr.io/the-agenticflow/workspace-runtime-nexus"
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "workspace_image_digest" {
   name        = "workspace_image_digest"
   description = "Release-pinned sha256 digest for the hosted workspace image"
@@ -215,199 +223,72 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    # Fix artifacts directory ownership. Local mode mounts the shared volume
-    # under this path as root; hosted mode mounts nothing here, so create the
-    # parent first and let the controller publish its tree into it.
-    sudo mkdir -p /home/coder/.openflows
-    sudo chown -R coder:coder /home/coder/.openflows
+    # Shared startup from the workspace runtime (runtime/lib/bootstrap.sh in the
+    # workspace image). A development copy mounted by `make dev-sync` replaces
+    # the image's. The template and the runtime must agree on the runtime API.
+    OF_RUNTIME_LIB=/opt/openflows/runtime/lib/bootstrap.sh
+    [ ! -f /opt/openflows-dev/runtime/lib/bootstrap.sh ] || OF_RUNTIME_LIB=/opt/openflows-dev/runtime/lib/bootstrap.sh
+    . "$OF_RUNTIME_LIB" || { echo "FATAL: cannot load the workspace runtime from $OF_RUNTIME_LIB" >&2; exit 1; }
+    [ "$${OF_RUNTIME_API:-}" = 1 ] || { echo "FATAL: $OF_RUNTIME_LIB provides workspace runtime API '$${OF_RUNTIME_API:-none}' but this template needs 1; use the workspace image of the templates' release" >&2; exit 1; }
+    OF_HOSTED="${data.coder_parameter.hosted.value}"
+    OF_CONNECTED_LOCAL="${var.connected_local}"
+    OF_RUNTIME_SECRET_REF="${data.coder_parameter.runtime_secret_ref.value}"
+    OF_REPO_URL="${data.coder_parameter.repo_url.value}"
 
-    # TEMPORARY: Use mounted dev binary for local testing
-    # (In production, download from GitHub releases instead)
-    if [ -f /opt/openflows-dev/openflows ]; then
-      # Guard against a non-ELF binary being mounted (e.g. a macOS Mach-O
-      # accidentally synced from a macOS dev host). Copying it over
-      # /usr/local/bin/openflows would brick the controller with cryptic
-      # `__PAGEZERO__: not found` errors when sh falls back to parsing the
-      # binary as a script after the kernel returns ENOEXEC.
-      if head -c 4 /opt/openflows-dev/openflows | grep -q $'\x7fELF'; then
-        echo "Using mounted dev binary..."
-        sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
-        sudo chmod +x /usr/local/bin/openflows
-
-        # Self-healing: if the workspace has a git checkout, warn when the
-        # mounted binary is older than the latest source commit.  This catches
-        # the case where someone forgot to run 'make dev-sync' before starting
-        # the workspace.
-        if [ -d /home/coder/workspace/.git ]; then
-          BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
-          LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
-          if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
-            echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
-            echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
-          fi
-        fi
-      else
-        echo "WARNING: Mounted dev binary is not a Linux ELF; keeping the image's built-in binary." >&2
-        echo "         Run 'make dev-sync' on the host to rebuild for $${LINUX_TARGET:-x86_64-unknown-linux-musl}." >&2
-      fi
-    else
-      echo "WARNING: Dev binary not found at /opt/openflows-dev/openflows"
-      echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
-    fi
-
-    # Hosted mode uses a mounted runtime secret. Local mode requests a
-    # short-lived GitHub App user token from the local Manager.
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
-      RUNTIME_CREDENTIAL_COPY=$(mktemp)
-      chmod 600 "$RUNTIME_CREDENTIAL_COPY"
-      if ! sudo cat "$OPENFLOWS_RUNTIME_CREDENTIAL_FILE" > "$RUNTIME_CREDENTIAL_COPY"; then
-        rm -f "$RUNTIME_CREDENTIAL_COPY"
-        echo "FATAL: runtime secret is not mounted" >&2
-        exit 1
-      fi
-      eval "$(python3 - "$RUNTIME_CREDENTIAL_COPY" <<'PY'
-import json, shlex, sys
-d=json.load(open(sys.argv[1]))
-for env,key in [('OF_MANAGER_URL','manager_url'),('OF_BOOTSTRAP','bootstrap_token'),('REDIS_URL','redis_url'),('OPENFLOWS_TENANT','redis_namespace'),('CODER_CHAT_HOOK_SECRET','hook_key'),('CODER_CHAT_HOOK_URL','hook_url')]:
-    print('export %s=%s' % (env, shlex.quote(str(d[key]))))
-PY
-)"
-      rm -f "$RUNTIME_CREDENTIAL_COPY"
-      SESSION=$(curl -fsS -H 'Content-Type: application/json' --data "$(python3 -c 'import json,os; print(json.dumps({"bootstrap":os.environ["OF_BOOTSTRAP"]}))')" "$${OF_MANAGER_URL}/api/v1/runtime/register") || {
-        echo "FATAL: Manager runtime registration failed. Stop and then start this tenant through OpenFlows to inject a fresh bootstrap; restarting directly in Coder reuses a single-use credential." >&2
-        exit 1
-      }
-      eval "$(python3 - "$SESSION" <<'PY'
-import json, shlex, sys
-d=json.loads(sys.argv[1])
-print('export OF_RUNTIME_ACCESS_TOKEN=%s' % shlex.quote(d['access_token']))
-print('export OF_RUNTIME_REFRESH_TOKEN=%s' % shlex.quote(d['refresh_token']))
-PY
-)"
+    # Nexus owns the tenant artifacts volume (local mode) and seeds the golden
+    # checkout workers copy. Hosted Nexus also receives the tenant's lifecycle
+    # hook key and URL from the runtime secret.
+    of_bootstrap_controller CODER_CHAT_HOOK_SECRET=hook_key CODER_CHAT_HOOK_URL=hook_url
+    if of_has_runtime_secret; then
       # The controller uses this Manager runtime session for hosted
-      # control-plane calls. It is intentionally distinct from Coder user
-      # credentials, which are never exported into the workspace.
+      # control-plane calls; Coder user credentials never reach the workspace.
       export OPENFLOWS_MANAGER_URL="$OF_MANAGER_URL"
-      GIT_RESPONSE=$(curl -fsS -H "Authorization: Bearer $${OF_RUNTIME_ACCESS_TOKEN}" -H 'Content-Type: application/json' --data '{"purpose":"git"}' "$${OF_MANAGER_URL}/api/v1/runtime/github-credentials") || {
-        echo "FATAL: Manager GitHub credential exchange failed after runtime registration." >&2
-        exit 1
-      }
-      GIT_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["token"])' "$GIT_RESPONSE")
-      # The controller reports readiness after opening its tenant store.
-      # A successful bootstrap alone does not mean the controller is running.
-    else
-      python3 /opt/openflows/connected-local-github.py setup || { echo "FATAL: connected-local GitHub authorization failed" >&2; exit 1; }
-      GIT_TOKEN=$(python3 /opt/openflows/connected-local-github.py token)
-    fi
-    if [ -n "$GIT_TOKEN" ]; then
-      git config --global credential.helper store
-      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
-      chmod 600 /home/coder/.git-credentials
-      echo "Configured git credentials for GitHub"
-    else
-      echo "FATAL: No GitHub token available from the local Manager" >&2
-      exit 1
     fi
 
-    if [ "${var.connected_local}" = "true" ]; then
-      git config --global --unset-all credential.helper 2>/dev/null || true
-      sudo git config --system --unset-all credential.helper 2>/dev/null || true
-      sudo git config --system credential.helper '!python3 /opt/openflows/connected-local-github.py credential'
-      rm -f /home/coder/.git-credentials
-      sudo rm -f /root/.git-credentials
-    fi
-
-    # git pull or clone (credentials from the local Manager in local mode)
-    if [ -d /home/coder/workspace/.git ]; then
-      cd /home/coder/workspace && git pull 2>/dev/null || true
-    elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
-      git clone ${data.coder_parameter.repo_url.value} /home/coder/workspace 2>/dev/null || true
-    fi
-
-    # Maintain a golden repo checkout on the shared artifacts volume so worker
-    # workspaces (forge/sentinel/vessel/lore) seed from an offline copy instead
-    # of a per-spawn network clone (see docs §3.2 "Repo acquisition: the golden
-    # mount clone"). Nexus owns the artifacts volume (writable here) and holds
-    # the git credentials / network egress, so the expensive fetch happens once.
-    # The golden tree is refreshed (fetch + reset) before any worker copies it.
-    #
-    # Local mode only. A hosted workspace clones from the remote with its own
-    # brokered credential, so there is no shared volume to seed and no copy for
-    # another workspace to read.
-    GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
-    if [ "${data.coder_parameter.hosted.value}" != "true" ] && [ -n "${data.coder_parameter.repo_url.value}" ]; then
-      if [ -d "$GOLDEN_REPO/.git" ]; then
-        cd "$GOLDEN_REPO" && git fetch --prune 2>/dev/null || true
-        git reset --hard "origin/HEAD" 2>/dev/null || git reset --hard 2>/dev/null || true
-        echo "Refreshed golden repo at $GOLDEN_REPO" >&2
-      else
-        mkdir -p "$(dirname "$GOLDEN_REPO")"
-        sudo chown -R coder:coder /home/coder/.openflows/artifacts
-        if git clone "${data.coder_parameter.repo_url.value}" "$GOLDEN_REPO" 2>/dev/null; then
-          echo "Seeded golden repo at $GOLDEN_REPO" >&2
-        else
-          echo "WARNING: could not seed golden repo at $GOLDEN_REPO — workers will not get an offline repo seed" >&2
-        fi
-      fi
-      sudo chown -R coder:coder "$GOLDEN_REPO" 2>/dev/null || true
-    fi
-
-    # Start the OpenFlows Controller
-    # Detect Coder URL: use internal 'coder' hostname when running inside workspace,
-    # otherwise use the passed-in external URL (for bootstrap/provisioning from host)
+    # Role settings. Use the internal 'coder' hostname when it resolves inside
+    # the workspace, otherwise the URL passed in for host-side provisioning.
     if curl -sf http://coder:7080/api/v2/buildinfo >/dev/null 2>&1; then
       export CODER_URL="http://coder:7080"
     else
       export CODER_URL="${data.coder_parameter.coder_url.value}"
     fi
     # Hosted mode never exports the platform Coder session token or the
-    # deployment-wide hook signing secret into the runtime; scoped runtime
-    # credentials come from the mounted secret-injection file. Local mode keeps
-    # the existing operator workflow unchanged.
-    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
+    # deployment-wide hook signing secret, and keeps the tenant-scoped Redis
+    # endpoint it loaded from the runtime secret: parameters are visible to
+    # Coder and are not the secret delivery channel.
+    if ! of_has_runtime_secret; then
       export CODER_SESSION_TOKEN="${data.coder_parameter.coder_session_token.value}"
       export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
       export OPENFLOWS_DOCS_GATE_SECRET="${data.coder_parameter.docs_gate_secret.value}"
       export OPENFLOWS_DOCS_GATE_SECRET_PREVIOUS="${data.coder_parameter.docs_gate_secret_previous.value}"
-    fi
-    # Hosted mode already loaded the tenant-scoped Redis endpoint from the
-    # mounted runtime secret above. Do not overwrite it with a Terraform
-    # parameter: parameters are visible to Coder and are not the secret
-    # delivery channel.
-    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
       export REDIS_URL="${data.coder_parameter.redis_url.value}"
       export OPENFLOWS_REDIS_USERNAME="${data.coder_parameter.redis_username.value}"
       export OPENFLOWS_REDIS_NAMESPACE="${data.coder_parameter.redis_namespace.value}"
+      export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
     fi
-    # Fleet size is authoritative only for hosted runtimes, where the Manager
-    # passes it as a workspace parameter. Local tenants supply their fleet
-    # through OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a
-    # parameter that defaults to 1 here would shrink that registry fleet.
-    if [ "${data.coder_parameter.hosted.value}" = "true" ]; then
+    # Fleet size is authoritative only when provisioned by the Manager (hosted or
+    # local Manager with runtime_secret_ref), where the Manager passes it as a
+    # workspace parameter. Legacy local tenants supply their fleet through
+    # OPENFLOWS_REGISTRY_JSON (tenant add --fleet N); exporting a parameter that
+    # defaults to 1 here would shrink that registry fleet.
+    if of_has_runtime_secret; then
       export OPENFLOWS_FLEET_SIZE="${data.coder_parameter.fleet_size.value}"
     fi
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
-    if [ "${data.coder_parameter.hosted.value}" != "true" ]; then
-      export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
-    fi
     if [ -n "${data.coder_parameter.coder_chat_hook_url.value}" ]; then
       export CODER_CHAT_HOOK_URL="${data.coder_parameter.coder_chat_hook_url.value}"
     fi
 
+    # Role command: the controller. It reports readiness to the Manager itself
+    # after opening its tenant store; a finished bootstrap does not mean it runs.
     cd /home/coder/workspace
-
-    # Only auto-start the controller if explicitly enabled
     if [ "${data.coder_parameter.start_controller.value}" = "true" ]; then
-      if command -v openflows >/dev/null 2>&1; then
-        echo "Starting OpenFlows Controller..."
-        nohup openflows run >/tmp/openflows-controller.log 2>&1 &
-        echo "Controller started. Check logs: tail -f /tmp/openflows-controller.log"
-      else
-        echo "ERROR: openflows binary not found. Controller not started."
-      fi
+      log "Starting OpenFlows Controller..."
+      nohup openflows run >/tmp/openflows-controller.log 2>&1 &
+      log "Controller started. Check logs: tail -f /tmp/openflows-controller.log"
     else
-      echo "Manual mode: controller not auto-started. Run 'openflows run' when ready."
+      log "Manual mode: controller not auto-started. Run 'openflows run' when ready."
     fi
   EOT
 }
@@ -416,21 +297,20 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Tenant artifacts volume, local mode only. Nexus seeds the golden repository
-# clone here and publishes the instruction bundle; local workers mount it
-# read-only. A hosted workspace installs the bundle from the Manager and clones
+# Tenant golden repository volume, local mode only. A hosted workspace clones
 # from the remote with its own brokered credential, so hosted mode creates no
 # shared volume and requires no read-write-many storage.
-resource "docker_volume" "artifacts" {
+resource "docker_volume" "golden" {
   count = data.coder_parameter.hosted.value != "true" ? 1 : 0
-  name  = "openflows-artifacts-${data.coder_parameter.tenant.value}"
+  name  = "openflows-golden-${data.coder_parameter.tenant.value}"
 }
 
 resource "docker_container" "workspace" {
   count = data.coder_workspace.me.start_count
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
-  image = data.coder_parameter.hosted.value == "true" ? "codercom/enterprise-base@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
-  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  image = data.coder_parameter.workspace_image_digest.value != "" ? "${data.coder_parameter.workspace_image_repository.value}@${data.coder_parameter.workspace_image_digest.value}" : var.workspace_image
+  # The workspace image is published for linux/amd64 only; Docker emulates
+  # it on Apple Silicon and other ARM64 hosts.
   platform = "linux/amd64"
 
   # Linux Docker has no built-in host.docker.internal. Map it to the host
@@ -446,18 +326,18 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel).
-  # Local mode only: a hosted Nexus keeps the tree in its own workspace and
-  # publishes nothing that another workspace has to mount.
+  # Tenant golden repository volume, local mode only. Nexus seeds it; local
+  # workers mount it read-only. Mounted at a path distinct from the role assets
+  # (`$HOME/.openflows/artifacts`, installed from the pinned image).
   dynamic "volumes" {
     for_each = data.coder_parameter.hosted.value != "true" ? [1] : []
     content {
-      container_path = "/home/coder/.openflows/artifacts"
-      volume_name    = docker_volume.artifacts[0].name
+      container_path = "/home/coder/.openflows/golden"
+      volume_name    = docker_volume.golden[0].name
     }
   }
 
-  # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
+  # Optional development override (see variable "dev_binary_host_path").
   dynamic "volumes" {
     for_each = var.dev_binary_host_path != "" ? [1] : []
     content {
@@ -468,7 +348,7 @@ resource "docker_container" "workspace" {
   }
 
   dynamic "volumes" {
-    for_each = data.coder_parameter.hosted.value == "true" && data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
+    for_each = data.coder_parameter.runtime_secret_ref.value != "" ? [1] : []
     content {
       container_path = "/run/openflows/runtime.json"
       host_path      = data.coder_parameter.runtime_secret_ref.value
@@ -507,6 +387,7 @@ resource "docker_container" "workspace" {
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
+    "OPENFLOWS_ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
     # reach it over the shared docker network (issue #143). Workspaces address
@@ -533,7 +414,9 @@ resource "docker_container" "workspace" {
     name = var.docker_network
     # Stable service name so forge/sentinel templates can default
     # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
-    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"]
+    # Manager-provisioned workers (hosted and local with runtime_secret_ref)
+    # address the tenant-scoped alias openflows-nexus-<tenant>:3000.
+    aliases = data.coder_parameter.hosted.value == "true" ? ["openflows-nexus-${data.coder_parameter.tenant.value}"] : (data.coder_parameter.runtime_secret_ref.value != "" ? ["openflows-nexus", "openflows-nexus-${data.coder_parameter.tenant.value}"] : ["openflows-nexus"])
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

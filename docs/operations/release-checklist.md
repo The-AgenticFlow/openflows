@@ -6,8 +6,8 @@ A published OpenFlows release cannot be changed: GitHub makes release files immu
 
 1. `develop` is merged into `main`. `release.yml` runs `release-plz`, which opens a `release-plz-*` PR with the next version and changelog.
 2. Merging that PR makes `release.yml` create the tag `openflows-X.Y.Z` and a **draft** GitHub Release, then dispatch `release-assets.yml` and `docker-publish.yml`.
-3. `release-assets.yml` builds the five archives, runs the checks below, attaches the files, waits for both images, checks them, and only then publishes the draft.
-4. `docker-publish.yml` pushes `ghcr.io/the-agenticflow/openflows:X.Y.Z` and records its digest under **Docker images** in the release notes (`scripts/record-image-digest.sh`).
+3. `release-assets.yml` builds the five archives, runs the checks below, attaches the files, waits for the three images, checks them, and only then publishes the draft. Its template bundles pin the workspace image of the same version in `manifest.json`.
+4. `docker-publish.yml` pushes `ghcr.io/the-agenticflow/openflows:X.Y.Z`, then the workspace image `ghcr.io/the-agenticflow/openflows-workspace:X.Y.Z` (`linux/amd64`, built from `runtime/` with the programs of the first image), and records both digests under **Docker images** in the release notes (`scripts/record-image-digest.sh`).
 
 ## Automatic gates
 
@@ -18,7 +18,8 @@ Every gate below must pass or the release stays a draft. A failed run can be ret
 | Archive on its own machine | `Verify (<target>)`, five runners | Checksum wrong, programs missing, wrong CPU, glibc newer than 2.17, `openflows --version` fails or prints another version, `openflows-doctor` or `openflows-harness` do not start |
 | Setup kit | `Attach assets and publish` | Checksum or `RELEASE_VERSION` wrong, a file `setup.sh` reads or runs is missing, a script it runs is not executable, a Compose file or `./deploy` path is missing, a script does not parse |
 | Uploaded files | `Attach assets and publish` | A file on the draft differs from the checked one |
-| Images | `Attach assets and publish` | `openflows` or `openflows-manager` is missing, lacks `linux/amd64`, or is labelled with another version |
+| Images | `Attach assets and publish` | `openflows`, `openflows-manager` or `openflows-workspace` is missing, lacks `linux/amd64`, or is labelled with another version |
+| Workspace image pin | `Template bundles` | The workspace image of the version does not appear, has no immutable digest, or is published to another repository than the templates' `workspace_image_repository` (`scripts/check-template-image-repository.sh`) |
 
 The checks are `scripts/verify-release.sh`; their tests are `tests/ci/verify-release-test.sh`.
 
@@ -29,18 +30,42 @@ Before merging `develop` into `main`:
 - [ ] `OpenFlows Merge Gate` is green on the `develop` commit being released.
 - [ ] No open PR is meant for this release.
 - [ ] Changes to the setup kit (`scripts/setup*.sh`, `scripts/prod.sh`, `docker-compose*.yml`, `deploy/local`) are matched by the kit list in `release-assets.yml`.
+- [ ] First release with the workspace image only: the `openflows-workspace` package on GHCR is public. A new package can start private, and then `template-release.yml` (which reads it without logging in) waits two hours and fails, and `setup.sh` cannot pull it. Publish the image once, for example with `docker-publish.yml` on a test version, and set it public under the package's settings.
 
 While the draft is open:
 
 - [ ] `release-assets.yml` for the version is green, including every `Verify` job.
 - [ ] The draft has the five archives, the setup kit, and a `.sha256` for each.
-- [ ] The release notes list both image digests under **Docker images**.
+- [ ] The release notes list the three image digests under **Docker images**.
+- [ ] `manifest.json` names `openflows-workspace`, its digest, architecture `amd64` and the runtime release in `runtime/VERSION`.
+- [ ] Upgrading from 1.8.2 or earlier: the release notes tell hosted operators to replace `OPENFLOWS_WORKSPACE_IMAGE_DIGEST` (it held a `codercom/enterprise-base` digest) and to run `scripts/check-workspace-image.sh` before starting the Manager (see the production runbook, "Upgrading from 1.8.2 or earlier").
 
 After publishing:
 
-- [ ] On a clean machine, `./scripts/setup.sh owner/repo --binary` installs the release and `openflows-doctor` passes.
+- [ ] On a clean machine, `--binary` installs the release and `openflows-doctor` passes (see [Test a release install](#test-a-release-install)).
 - [ ] `--compose` does the same with the published image.
 - [ ] If the Manager runs with `OPENFLOWS_MANAGER_METRICS=true`, error rates on `/api/v1/local/github-credential` stay at their usual level (see [Metrics](#metrics)).
+
+## Test a release install
+
+On a clean Linux x86_64 machine, once for `--binary` and once for `--compose`. Replace `1.8.2` with the version under test; versions below 1.8.2 are refused.
+
+You need Docker with Compose, the `coder` CLI, a test repository you can install the App on, and an LLM API key.
+
+```bash
+mkdir -p ~/of-test && cd ~/of-test
+gh release download openflows-1.8.2 --repo The-AgenticFlow/openflows --pattern '*-setup.tar.gz'
+tar xzf openflows-1.8.2-setup.tar.gz && cd openflows-1.8.2
+cp .env.example .env    # set OPENFLOWS_VERSION=1.8.2: the kit and this value must match
+./scripts/setup.sh your-user/your-test-repo --binary    # or --compose
+```
+
+Use the real repository name: setup checks it against the repositories you selected in the console.
+
+Setup asks for, in order: your Coder sign-in and an API token, the GitHub App install and device code in the console at <http://127.0.0.1:3002>, then the LLM provider and key. It ends with "All set".
+
+- [ ] Setup finishes and `./scripts/prod.sh doctor` passes.
+- [ ] Clean up: `docker compose down -v --remove-orphans` in the kit folder, then remove `~/.config/openflows`.
 
 ## Rollback
 

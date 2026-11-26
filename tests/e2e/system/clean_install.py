@@ -11,6 +11,11 @@ picks the mode:
   compose  setup's stage_image, from the kit, pulls the image and pins its digest; the
            kit's openflows-binaries Compose service copies the programs out of it
 
+In compose and binary mode, setup's pin_workspace_image also pins the candidate's
+workspace image (the runtime image holding the same programs), and the workspaces start
+from it with no development mount: what a fresh install from published artifacts does.
+Source mode mounts the built programs over the image's, as `--source` does.
+
 Each mode must then pass openflows-doctor, start a tenant and run a command in its
 workspace with the mode's own programs. clean-install-evidence.json records the platform,
 the candidate's version, checksums and digest, and what each check returned.
@@ -78,21 +83,30 @@ def stages(stage_list, log_name):
         raise RuntimeError(f'setup stages exited {result.returncode}; see {log_name}')
 
 
+def start_registry():
+    """Start the throwaway local registry once; returns its address."""
+    if 'registry' not in evidence:
+        name = f"{os.environ['OPENFLOWS_E2E_PROJECT']}-registry"
+        output('docker', 'run', '-d', '--name', name, '-p', '127.0.0.1::5000', REGISTRY_IMAGE)
+        port = output('docker', 'port', name, '5000').splitlines()[0].rsplit(':', 1)[1]
+        evidence['registry'] = f'localhost:{port}'
+    return evidence['registry']
+
+
 def publish_image(programs_dir):
     """Build an image holding the candidate's programs and push it to a local registry."""
-    project = os.environ['OPENFLOWS_E2E_PROJECT']
-    registry = f'{project}-registry'
-    output('docker', 'run', '-d', '--name', registry, '-p', '127.0.0.1::5000', REGISTRY_IMAGE)
-    port = output('docker', 'port', registry, '5000').splitlines()[0].rsplit(':', 1)[1]
-    repo = f'localhost:{port}/openflows'
+    repo = f'{start_registry()}/openflows'
     context = kit.SCRATCH / 'image'
     context.mkdir()
     for program in kit.PROGRAMS:
         (context / program).write_bytes((programs_dir / program).read_bytes())
+        # COPY keeps the mode, so this works with BuildKit and the legacy builder
+        # (COPY --chmod needs BuildKit).
+        (context / program).chmod(0o755)
     (context / 'Dockerfile').write_text(
         f'FROM {UBUNTU}\n'
         f'LABEL org.opencontainers.image.version="{VERSION}"\n'
-        f'COPY --chmod=0755 {" ".join(kit.PROGRAMS)} /usr/local/bin/\n')
+        f'COPY {" ".join(kit.PROGRAMS)} /usr/local/bin/\n')
     with (ARTIFACTS / 'candidate-image.log').open('w') as log:
         subprocess.run(['docker', 'build', '--platform', 'linux/amd64', '-t', f'{repo}:{VERSION}', str(context)],
             stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
@@ -103,6 +117,29 @@ def publish_image(programs_dir):
     return repo
 
 
+def publish_workspace_image():
+    """Push the candidate workspace image (the runtime image this run built from the
+    candidate programs) as the release's workspace image, and let setup pin it."""
+    registry = start_registry()
+    local = os.environ['TF_VAR_workspace_image']
+    published = f'{registry}/openflows-workspace:{VERSION}'
+    with (ARTIFACTS / 'candidate-workspace-image.log').open('w') as log:
+        for command in (['docker', 'tag', local, published], ['docker', 'push', published],
+                        ['docker', 'image', 'rm', published]):
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600)
+    os.environ['OPENFLOWS_IMAGE_REPO'] = f'{registry}/openflows'
+    # The candidate's programs report this checkout's version, which can predate the first
+    # release with a workspace image; the candidate is that release.
+    stages('LAST_RELEASE_WITHOUT_WORKSPACE_IMAGE=0.0.0; unset TF_VAR_workspace_image; pin_workspace_image',
+        'setup-workspace-image.log')
+    pinned = kit.env_value('OPENFLOWS_WORKSPACE_IMAGE')
+    assert pinned.startswith(f'{registry}/openflows-workspace:{VERSION}@sha256:'), \
+        f'setup did not pin the workspace image: {pinned!r}'
+    evidence['workspace_image'] = pinned
+    step(f'Setup pinned the workspace image {pinned}.')
+    return pinned
+
+
 def install():
     """Install the candidate in MODE; returns the folder the workspaces read programs from."""
     built = kit.SCRATCH / 'bin'
@@ -111,6 +148,7 @@ def install():
     if MODE == 'source':
         programs = built
         step(f'Source mode: using the programs built from this checkout ({kit.CHECKOUT}).')
+        os.environ['TF_VAR_dev_binary_host_path'] = str(programs)
     else:
         kit.make_kit()
         (kit.KIT / '.env').write_text(f'OPENFLOWS_SETUP_MODE={MODE}\n')
@@ -139,6 +177,10 @@ def install():
         evidence.update(image=f'{repo}:{VERSION}', digest=digest)
         step(f'Compose mode: setup pulled {repo}:{VERSION}, pinned {digest[:19]}..., and the kit\'s '
              f'openflows-binaries service installed the programs.')
+    if MODE != 'source':
+        os.environ['TF_VAR_workspace_image'] = publish_workspace_image()
+        # Nothing is mounted: the workspaces must run the programs of the pinned image.
+        os.environ['TF_VAR_dev_binary_host_path'] = ''
     installed = {p: kit.sha256(programs / p) for p in kit.PROGRAMS}
     expected = {p: kit.sha256(built / p) for p in kit.PROGRAMS}
     assert installed == expected, f'{MODE} installed other programs: {installed} != {expected}'
@@ -166,15 +208,19 @@ def run():
     save()
     programs = install()
     save()
-    os.environ['TF_VAR_dev_binary_host_path'] = str(programs)
     os.environ['PATH'] = f'{programs}:{os.environ["PATH"]}'
     ws, templates, _, ssh_name = pb.setup_tenant()
     step(f'Tenant started: {ws["name"]} cloned the repository and its controller is healthy.')
     doctor(programs)
-    command = pb.ssh(ssh_name, 'set -eu; openflows --version; sha256sum /usr/local/bin/openflows')
-    running = command.split()[-2]
+    command = pb.ssh(ssh_name, 'set -eu; openflows --version; sha256sum /usr/local/bin/openflows; '
+        'if [ -e /opt/openflows-dev ]; then echo dev-mount; else echo no-dev-mount; fi')
+    running = command.split()[-3]
     assert running == evidence['installed_checksums']['openflows'], \
         f'the workspace runs other programs: {running}'
+    mounted = command.split()[-1]
+    evidence['workspace_dev_mount'] = mounted
+    if MODE != 'source':
+        assert mounted == 'no-dev-mount', f'{MODE} workspaces must not need a development mount'
     evidence['workspace_command'] = command
     step(f'Workspace command ran with the {MODE} programs: "{command.splitlines()[0]}".')
     evidence['templates'] = sorted(t['name'] for t in templates)

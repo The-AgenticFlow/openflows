@@ -4,9 +4,11 @@
 // - REST: Direct API calls (used by Nexus for issue/PR sync and by VESSEL).
 
 pub mod rest;
+mod token;
 
 pub use rest::{
     effective_review_state, latest_review_per_user, CheckAnnotationDetail, CiFailureDetail,
     FailedCheck, GitHubIssueResponse, GithubRestClient, PrReview, PrReviewState, ReviewComment,
     ReviewCommentInput,
 };
+pub use token::SharedToken;

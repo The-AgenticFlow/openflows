@@ -150,6 +150,8 @@ jobs:
         run: python3 -m unittest discover -s tests/ci -p test_connected_local_helper.py -v
       - name: Run line-limit checker tests
         run: bash tests/ci/check-line-limits-test.sh
+      - name: Run runtime version and image repository checker tests
+        run: bash tests/ci/check-runtime-version-test.sh
 
   typos:
     name: Spelling
@@ -182,6 +184,11 @@ jobs:
             exit 0
           fi
           python3 scripts/check_line_limits.py
+      - name: Require a new runtime/VERSION for workspace runtime changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: bash scripts/check-runtime-version.sh
 
   redis-lifecycle:
     name: Redis lifecycle integration
@@ -343,6 +350,25 @@ jobs:
           path: target/ci-artifacts/connected-system/
           if-no-files-found: error
 
+  workspace-runtime-e2e:
+    name: Workspace runtime and Manager pinning E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Exercise Manager release pinning, workspace-runtime v0.2.0 containers, upgrade and rollback
+        run: bash tests/e2e/system/bootstrap.sh workspace-runtime
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workspace-runtime-e2e
+          path: target/ci-artifacts/workspace-runtime/
+          if-no-files-found: error
+
   merge-gate:
     name: OpenFlows Merge Gate
     if: always()
@@ -364,6 +390,7 @@ jobs:
       - system-fixtures
       - production-bootstrap
       - connected-system
+      - workspace-runtime-e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

@@ -374,9 +374,11 @@ impl CoderAdapter for RealCoderAdapter {
         org: &CoderOrganizationId,
         backend: &str,
     ) -> Result<(), ManagerError> {
+        let use_builtin =
+            std::env::var("OPENFLOWS_CODER_BUILTIN_PROVISIONER").as_deref() == Ok("1");
         // Docker reserves and persists one key and container per organization.
         // Other deployment backends retain operator-managed readiness.
-        let key_name = if backend == "docker" {
+        let key_name = if backend == "docker" && !use_builtin {
             match &self.docker_provisioner {
                 Some(provisioner) => provisioner.ensure(&self.client, org).await?,
                 None => format!("openflows-provisioner-{}", org.0),
@@ -394,7 +396,14 @@ impl CoderAdapter for RealCoderAdapter {
                 .list_provisioner_daemons(org)
                 .await
                 .map_err(ManagerError::from)?;
-            if daemons.iter().any(|d| daemon_is_online(d, &key_name)) {
+            let ready = if use_builtin {
+                daemons
+                    .iter()
+                    .any(|d| matches!(d.status.as_deref(), Some("idle" | "busy")))
+            } else {
+                daemons.iter().any(|d| daemon_is_online(d, &key_name))
+            };
+            if ready {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {

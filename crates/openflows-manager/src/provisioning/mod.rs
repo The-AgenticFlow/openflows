@@ -11,6 +11,7 @@
 
 pub mod docker;
 pub mod local_workspace_cleanup;
+pub mod parameters;
 pub mod release_provider;
 pub mod selection;
 pub mod source;

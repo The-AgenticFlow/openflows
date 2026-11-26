@@ -77,7 +77,6 @@ struct CiFixPrInfo {
 impl VesselNode {
     pub fn new(config: VesselConfig) -> Self {
         let client = github::GithubRestClient::new(&config.github_token);
-
         Self {
             lifecycle_store: std::sync::Mutex::new(None),
             poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
@@ -86,6 +85,11 @@ impl VesselNode {
             config,
             slots_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The token the node's GitHub clients share, so a hosted token can rotate in place.
+    pub fn github_token(&self) -> github::SharedToken {
+        self.client.token_handle()
     }
 
     pub fn from_env() -> Self {
@@ -136,10 +140,6 @@ impl VesselNode {
                 VesselConfig::from_env()
             }
         };
-        info!(
-            token_prefix = &config.github_token[..20.min(config.github_token.len())],
-            "VESSEL token loaded"
-        );
         Self::new(config)
     }
 

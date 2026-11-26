@@ -130,3 +130,7 @@ worktrees/
 .docker-cargo/
 .setup.log
 .local/
+
+# Terraform working directory in a template source (provider binaries, locks).
+**/.terraform/
+**/.terraform.lock.hcl

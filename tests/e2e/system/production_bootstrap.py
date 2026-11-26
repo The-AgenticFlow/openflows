@@ -144,14 +144,51 @@ def setup_tenant(model_name='bootstrap-canary', lore=False):
     assert next(a for a in fleet['team'] if a['id'] == 'lore')['enabled'] is lore
     assert parameters['start_controller'] == 'true'
     name = 'ci/' + workspace['name']
+    wait_nexus_ready(name)
+    print('Production Nexus workspace cloned the repository and started its controller.', flush=True)
+    return workspace, templates, organization, name
+
+
+def wait_nexus_ready(name):
     def ready():
         try:
             return ssh(name, "set -eu; curl -fsS http://localhost:3001/experimental/hooks/health; test -d .git; test \"$(cat answer.txt)\" = 41")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
     wait('production Nexus controller/bootstrap did not become ready', ready)
-    print('Production Nexus workspace cloned the repository and started its controller.', flush=True)
-    return workspace, templates, organization, name
+
+
+def restart_workspace(workspace, name):
+    """Stop and start a workspace through Coder, as an operator restart does.
+
+    Stopping removes the container; starting creates a new one from the image on the
+    same workspace volume, so startup runs again over the existing checkout."""
+    for transition, status in (('stop', 'stopped'), ('start', 'running')):
+        coder('/workspaces/' + workspace['id'] + '/builds', {'transition': transition})
+        def done():
+            build = coder('/workspaces/' + workspace['id'])['latest_build']
+            if build['job']['status'] in ('failed', 'canceled'):
+                raise RuntimeError(f'{transition} of {name} failed: {build}')
+            return (build['transition'] == transition and build['status'] == status
+                and build['job']['status'] == 'succeeded')
+        wait(f'{name} did not reach {status}', done, 300)
+
+
+def check_restart(workspace, name):
+    """A restarted Nexus runs the shared runtime from its image and comes back ready."""
+    restart_workspace(workspace, name)
+    wait_nexus_ready(name)
+    runtime_version = (Path(__file__).resolve().parents[3] / 'runtime' / 'VERSION').read_text().strip()
+    lines = ssh(name, 'set -eu; cat /opt/openflows/runtime/VERSION; '
+        'if [ -e /opt/openflows-dev ]; then echo dev-mount; else echo no-dev-mount; fi; '
+        'git config --get-all credential.helper | wc -l').split()
+    (ARTIFACTS / 'restart-evidence.json').write_text(json.dumps(
+        {'runtime_version': lines[0], 'dev_mount': lines[1], 'credential_helpers': lines[2]}, indent=2))
+    assert lines[0] == runtime_version, f'workspace runs runtime {lines[0]}, not {runtime_version}'
+    assert lines[1] == 'no-dev-mount', 'workspace programs must come from the image, not a development mount'
+    assert lines[2] == '1', f'restart left {lines[2]} git credential helpers configured'
+    print(f'Restarted Nexus came back ready on runtime {runtime_version} from its image, '
+          'with its startup applied once.', flush=True)
 
 
 def run():
@@ -172,6 +209,7 @@ def run():
         for agent in resource.get('agents') or []:
             logs = coder('/workspaceagents/' + agent['id'] + '/logs?after=0')
             (ARTIFACTS / ('agent-' + agent['id'] + '.json')).write_text(json.dumps(logs, indent=2))
+    check_restart(workspace, name)
     before = {t['name']: t['active_version_id'] for t in templates}
     def bootstrap(log_name):
         with (ARTIFACTS / log_name).open('w') as log:

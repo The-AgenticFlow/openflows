@@ -133,9 +133,15 @@ cp -v "$RELEASE_BIN" "$DEV_BINARIES_DIR/openflows"
 chmod +x "$DEV_BINARIES_DIR/openflows"
 cp -v "$HARNESS_BIN" "$DEV_BINARIES_DIR/openflows-harness"
 chmod +x "$DEV_BINARIES_DIR/openflows-harness"
+# The workspace runtime scripts: workspaces that mount .dev-binaries use these
+# instead of the copies in their image, so runtime edits apply on the next start.
+rm -rf "$DEV_BINARIES_DIR/runtime"
+mkdir -p "$DEV_BINARIES_DIR/runtime"
+cp -R "${PROJECT_ROOT}/runtime/lib" "${PROJECT_ROOT}/runtime/bin" "${PROJECT_ROOT}/runtime/VERSION" "$DEV_BINARIES_DIR/runtime/"
 echo "✓ Binaries synced"
 echo "  openflows:        $DEV_BINARIES_DIR/openflows"
 echo "  openflows-harness: $DEV_BINARIES_DIR/openflows-harness"
+echo "  runtime:          $DEV_BINARIES_DIR/runtime"
 echo ""
 
 # Step 3: Optional hot-deploy to running workspace

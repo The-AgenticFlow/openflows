@@ -249,6 +249,42 @@ expect_eq "binary: Manager image" "$(files_for binary)" \
 expect_eq "compose: images and Manager image" "$(files_for compose)" \
     "docker-compose.yml docker-compose.connected-local.yml docker-compose.manager-image.yml docker-compose.images.yml"
 
+echo "Workspace image"
+# pushed_with VERSION [SHELL_IMAGE] [SHELL_DEV_PATH] — push templates as a --binary or --compose
+# install does; prints the image pulled, the pin in .env, and the Terraform settings prod.sh got.
+pushed_with() {
+    (
+        ROOT="${WORK}/workspace-image"; ENV_FILE="${ROOT}/.env"; SCRIPT_DIR="${ROOT}/scripts"
+        LOG_FILE="${WORK}/workspace-image.log"; PULLED="${WORK}/workspace-image.pulled"
+        mkdir -p "$SCRIPT_DIR"; rm -f "$ENV_FILE" "$PULLED"; touch "$ENV_FILE"
+        printf '#!/bin/sh\necho "image=${TF_VAR_workspace_image-unset} dev=${TF_VAR_dev_binary_host_path-unset}" >"%s"\n' \
+            "${WORK}/workspace-image.prod" >"${SCRIPT_DIR}/prod.sh"
+        chmod +x "${SCRIPT_DIR}/prod.sh"
+        unset OPENFLOWS_IMAGE_REPO TF_VAR_workspace_image TF_VAR_dev_binary_host_path
+        [ -z "${2:-}" ] || export TF_VAR_workspace_image="$2"
+        [ -z "${3:-}" ] || export TF_VAR_dev_binary_host_path="$3"
+        env_set OPENFLOWS_VERSION "$1"
+        spin() { wait "$1"; }
+        docker() {
+            local image="${!#}"
+            case "$1 $*" in
+                pull*) printf '%s' "$image" >"$PULLED" ;;
+                *RepoDigests*) printf '%s@sha256:abc\n' "${image%:*}" ;;
+            esac
+        }
+        push_release_templates >/dev/null 2>&1
+        printf 'pulled=%s pin=%s %s' "$(cat "$PULLED" 2>/dev/null)" "$(env_get OPENFLOWS_WORKSPACE_IMAGE)" \
+            "$(cat "${WORK}/workspace-image.prod")"
+    )
+}
+WORKSPACE_IMAGE=ghcr.io/the-agenticflow/openflows-workspace
+expect_eq "a release with the image pins it and mounts nothing" "$(pushed_with 1.9.0)" \
+    "pulled=${WORKSPACE_IMAGE}:1.9.0 pin=${WORKSPACE_IMAGE}:1.9.0@sha256:abc image=${WORKSPACE_IMAGE}:1.9.0@sha256:abc dev="
+expect_eq "an image given in the shell is used as it is" "$(pushed_with 1.9.0 local/workspace:dev /src/.dev-binaries)" \
+    "pulled= pin= image=local/workspace:dev dev=/src/.dev-binaries"
+expect_eq "a release without the image keeps its old wiring" "$(pushed_with 1.8.2)" \
+    "pulled= pin= image=unset dev=unset"
+
 echo "prod.sh runs the installed programs"
 prod_bin() {   # prod_bin MODE HAS_HOST
     (
@@ -268,6 +304,25 @@ prod_bin() {   # prod_bin MODE HAS_HOST
 expect_eq "binary, same machine" "$(prod_bin binary no)" workspace
 expect_eq "binary, macOS or ARM64" "$(prod_bin binary yes)" host
 expect_eq "compose, macOS or ARM64" "$(prod_bin compose yes)" host
+
+echo "prod.sh tenant pushes templates as setup did"
+# tenant_env PINNED_IMAGE — the Terraform settings `prod.sh tenant` hands the programs, whose
+# bootstrap pushes the templates again; .dev-binaries exists, as in every release install.
+tenant_env() {
+    (
+        P="${WORK}/tenant-$RANDOM"; mkdir -p "${P}/scripts" "${P}/.dev-binaries"
+        cp "${ROOT}/scripts/prod.sh" "${P}/scripts/"
+        printf 'OPENFLOWS_SETUP_MODE=binary\nOPENFLOWS_WORKSPACE_IMAGE=%s\n' "$1" >"${P}/.env"
+        printf '#!/bin/sh\necho "image=${TF_VAR_workspace_image-unset} dev=${TF_VAR_dev_binary_host_path-unset}"\n' \
+            >"${P}/.dev-binaries/openflows"
+        chmod +x "${P}/.dev-binaries/openflows"
+        env -u OPENFLOWS_BIN -u TF_VAR_workspace_image -u TF_VAR_dev_binary_host_path \
+            bash "${P}/scripts/prod.sh" tenant o/r --name t --fleet 1 2>&1 | grep '^image='
+    )
+}
+expect_eq "a release with the image keeps it and mounts nothing" "$(tenant_env "${WORKSPACE_IMAGE}:1.9.0@sha256:abc")" \
+    "image=${WORKSPACE_IMAGE}:1.9.0@sha256:abc dev="
+expect_eq "a release without the image keeps its old wiring" "$(tenant_env "")" "image=unset dev=unset"
 
 echo
 if [ "$failures" -gt 0 ]; then
