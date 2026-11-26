@@ -20,7 +20,7 @@ rebuild) the Manager applies these objects. Repeating it is safe.
 | NetworkPolicy `openflows-allow-platform` | Egress for tenant-labelled pods to the platform namespace and any platform CIDRs, on the platform ports. A pod without the tenant label gets none of it |
 | NetworkPolicy `openflows-allow-public-egress` | Egress to the internet except private, link-local and carrier-grade NAT ranges |
 | NetworkPolicy `openflows-tenant-<tenant id>` | Ingress and egress between pods of that tenant only |
-| NetworkPolicy `openflows-allow-manager-hooks` | Ingress for the tenant's Nexus pods from the Manager's pods in the platform namespace, on port 3001 only. It carries Coder lifecycle hooks to the tenant's Nexus |
+| NetworkPolicy `openflows-allow-manager-hooks` | Ingress for the organization's Nexus pods from the Manager's pods in the platform namespace, on port 3001 only. It carries Coder lifecycle hooks to each tenant's Nexus |
 | NetworkPolicy `openflows-provisioner` | Only when `OPENFLOWS_K8S_PROVISIONER_SELECTOR` is set |
 
 Deleting a tenant removes its `openflows-tenant-*` policy. The organization

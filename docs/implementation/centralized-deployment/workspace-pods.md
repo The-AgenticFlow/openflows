@@ -120,12 +120,19 @@ the tenant's Nexus. On Kubernetes that relay target is the Nexus Service, so set
 http://openflows-nexus-{tenant}.{namespace}.svc.cluster.local:3001
 ```
 
-`{tenant}` expands to the tenant id and `{namespace}` to the tenant's organization namespace
-(`OPENFLOWS_K8S_NAMESPACE_PREFIX` plus the organization id). The Manager writes the same URL into
-the tenant's credential bundle, where the controller checks it as the hook token's audience, so
-changing the setting, or the namespace prefix it expands, takes effect for a tenant only after it is stopped and started. The
-Manager's pods reach port 3001 through the `openflows-allow-manager-hooks` policy described in
-[tenant isolation](tenant-isolation.md); `OPENFLOWS_K8S_MANAGER_SELECTOR` names those pods and must match their labels, or the policy admits nothing and every hook times out. If the platform namespace denies egress by default, allow the Manager to reach port 3001 in the organization namespaces.
+`{tenant}` expands to the tenant id and `{namespace}` to the tenant's
+organization namespace (`OPENFLOWS_K8S_NAMESPACE_PREFIX` plus the organization
+id). The Manager writes the same URL into the tenant's credential bundle, where
+the controller checks it as the hook token's audience, so a change to the
+setting or to the namespace prefix reaches a tenant only after it is stopped and
+started.
+
+The Manager's pods reach port 3001 through the `openflows-allow-manager-hooks`
+policy described in [tenant isolation](tenant-isolation.md).
+`OPENFLOWS_K8S_MANAGER_SELECTOR` names those pods and must match their labels: a
+selector that matches nothing admits nothing, and every hook then times out. If
+the platform namespace denies egress by default, allow the Manager to reach port
+3001 in the organization namespaces.
 
 ## Bringing a tenant up on a new cluster
 
@@ -190,5 +197,6 @@ because a start fails without it.
 | A new tenant still runs the old templates | Promotion does not upgrade existing pins | [Recreate the tenant](#recreating-a-tenant) |
 | `/api/v1/runtime/chats` returns 503 `CODER_CHAT_UNAVAILABLE`, and the Manager log says `No chat model is available in this organization` | The tenant's Coder organization has no model | Step 4 |
 | A start fails with `cannot resolve hook key` | The Manager's secrets directory was lost | [Recreate the tenant](#recreating-a-tenant); see step 5 |
+| A chat fails with `502 Chat lifecycle hook dispatch failed (http_error)`, and the Manager log shows `tenant hook relay failed` or `tenant hook relay timed out` | The relay base does not name the Nexus Service, or `OPENFLOWS_K8S_MANAGER_SELECTOR` does not match the Manager's pod labels, so the policy admits nothing | [Hook delivery](#hook-delivery) |
 | `FATAL: Manager runtime registration failed` after restarting a workspace in Coder | The bootstrap credential is single use ([`bootstrap.sh`](../../../runtime/lib/bootstrap.sh)) | Stop, then start the tenant through OpenFlows |
 | The `prepare-workspace` init container fails with `is not writable and holds files` | A populated workspace directory the user cannot write | Keep the files, fix the ownership, restart |
