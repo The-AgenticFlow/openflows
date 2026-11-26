@@ -59,6 +59,16 @@ Then open an issue in the connected repository. OpenFlows will pick it up and wo
 
 For installation modes, platform requirements, and the complete walkthrough, see the [quick start guide](quick_start.md). For upgrades and troubleshooting, see the [setup reference](docs/setup-reference.md).
 
+### The web Console
+
+`setup.sh` leaves you with the Manager's built-in console at <http://localhost:3002>, which is all the steps above need. The separate OpenFlows Console (organisations, tenants and agent activity) runs next to a running Manager. From this checkout:
+
+```bash
+./scripts/console.sh
+```
+
+It finds your Manager, starts the Console at <http://localhost:3000> and reports anything that would stop you signing in. Signing in through the Console uses GitHub OAuth. The Manager from `setup.sh` signs you in without it, so on that install the script tells you to keep using <http://localhost:3002>. To run the whole control plane in Docker with the Console (your own GitHub App, Manager and Console), follow the [operator runbook](docs/implementation/centralized-deployment/operator-local-runbook.md) and start it with `./scripts/up.sh`.
+
 ## Deployment
 
 OpenFlows is designed to run on infrastructure you control. The deployment path depends on the workspace backend and the isolation you need:

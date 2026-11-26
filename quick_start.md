@@ -167,6 +167,16 @@ Open an issue in your repo. OpenFlows picks it up, writes code, reviews it and o
 - Health check: `./scripts/prod.sh doctor`
 - Add another repo: `./scripts/prod.sh tenant owner/repo --name team --fleet 1`
 
+## The web Console (optional)
+
+Setup gives you the Manager's built-in console at <http://localhost:3002>. To also run the OpenFlows Console, start it against the running Manager:
+
+```bash
+./scripts/console.sh
+```
+
+It finds the Manager, starts the Console at <http://localhost:3000> and prints the exact address to open. It also tells you when sign-in through the Console cannot work. That is the case for the Manager `setup.sh` installs, which signs you in without GitHub OAuth. There, keep using <http://localhost:3002>. For a full control plane in Docker with the Console, see the [operator runbook](docs/implementation/centralized-deployment/operator-local-runbook.md) (`./scripts/up.sh`). Stop the Console with `./scripts/console.sh --stop`.
+
 ## Something went wrong?
 
 Re-run `./scripts/setup.sh owner/repo` after fixing the problem it printed. Messages specific to `--binary` and `--compose` are explained in [troubleshooting](docs/setup-reference.md#troubleshooting). Your Coder token lasts 90 days; re-running the script refreshes it. For manual steps, hooks, roles, configuration and troubleshooting, see [docs/setup-reference.md](docs/setup-reference.md).
