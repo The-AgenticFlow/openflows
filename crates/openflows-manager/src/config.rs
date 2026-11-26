@@ -62,6 +62,7 @@ pub fn runtime_manager_url(public_url: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Kept at this path for existing callers; [`crate::hook_url`] owns the derivation.
 pub use crate::hook_url::runtime_hook_url;
 
 /// The deployment mode of the Manager.

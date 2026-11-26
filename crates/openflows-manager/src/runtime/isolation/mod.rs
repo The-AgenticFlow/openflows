@@ -174,11 +174,16 @@ impl IsolationSettings {
             settings.api_cidrs = parse_cidrs(API_CIDRS_ENV, &cidrs)?;
         }
         if let Some(selector) = get(PROVISIONER_SELECTOR_ENV) {
-            settings.provisioner_selector =
-                Some(parse_selector(PROVISIONER_SELECTOR_ENV, &selector)?);
+            settings.provisioner_selector = Some(parse_selector(
+                PROVISIONER_SELECTOR_ENV,
+                "app.kubernetes.io/name=coder-provisioner",
+                &selector,
+            )?);
         }
         if let Some(selector) = get(MANAGER_SELECTOR_ENV) {
-            settings.manager_selector = parse_selector(MANAGER_SELECTOR_ENV, &selector)?;
+            let (key, value) = DEFAULT_MANAGER_SELECTOR;
+            settings.manager_selector =
+                parse_selector(MANAGER_SELECTOR_ENV, &format!("{key}={value}"), &selector)?;
         }
         if let Some(account) = get(PROVISIONER_ACCOUNT_ENV) {
             settings.provisioner_account = Some(parse_account(PROVISIONER_ACCOUNT_ENV, &account)?);
@@ -331,7 +336,7 @@ fn parse_address(value: &str) -> Result<String, ManagerError> {
         })
 }
 
-fn parse_selector(var: &str, value: &str) -> Result<(String, String), ManagerError> {
+fn parse_selector(var: &str, example: &str, value: &str) -> Result<(String, String), ManagerError> {
     let allowed = |s: &str| {
         !s.is_empty()
             && s.chars()
@@ -340,7 +345,7 @@ fn parse_selector(var: &str, value: &str) -> Result<(String, String), ManagerErr
     match value.split_once('=') {
         Some((key, val)) if allowed(key) && allowed(val) => Ok((key.into(), val.into())),
         _ => Err(ManagerError::Config(format!(
-            "{var} must look like app.kubernetes.io/name=coder-provisioner"
+            "{var} must look like {example}"
         ))),
     }
 }
@@ -651,9 +656,18 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_manager_selector_names_its_own_variable() {
-        let error = settings(&[(MANAGER_SELECTOR_ENV, "no-equals-sign")]).expect_err("rejected");
-        assert!(error.to_string().contains(MANAGER_SELECTOR_ENV));
+    fn a_malformed_manager_selector_names_its_own_variable_and_example() {
+        let error = settings(&[(MANAGER_SELECTOR_ENV, "no-equals-sign")])
+            .expect_err("rejected")
+            .to_string();
+
+        assert!(error.contains(MANAGER_SELECTOR_ENV), "{error}");
+        // The example has to name the Manager's own default, not the provisioner's.
+        assert!(
+            error.contains("app.kubernetes.io/name=openflows-manager"),
+            "{error}"
+        );
+        assert!(!error.contains("coder-provisioner"), "{error}");
     }
 
     #[test]
