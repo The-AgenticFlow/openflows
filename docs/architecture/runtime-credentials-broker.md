@@ -81,7 +81,8 @@ with `401`.
    workspace `running`, connection `active`, repository `accessible`. Any
    failure returns a sanitized `403` and no upstream call.
 2. Resolves the server-controlled permission profile from the workspace role
-   and the requested `purpose` (`git` or `api`). Unknown roles fail closed.
+   and the requested `purpose` (`git`, `api` or `merge`). Unknown roles, and any role that
+   is not allowed the purpose, fail closed.
 3. Captures the connection and workspace generations **before** the external
    exchange.
 4. Signs a fresh App JWT and exchanges it for an installation token restricted
@@ -109,7 +110,7 @@ Authorization: Bearer <workspace-runtime-credential>
 Content-Type: application/json
 Cache-Control: no-store        (response)
 
-{"purpose": "git"}             // or {"purpose": "api"}
+{"purpose": "git"}             // or "api", or "merge" (nexus only)
 ```
 
 Response (placeholders; never log the token):
@@ -135,11 +136,34 @@ supplied by a caller. `metadata` is implicit.
 
 | Role | `git` | `api` |
 |---|---|---|
-| nexus | contents: read | contents: read, issues: write, pull_requests: write |
-| forge | contents: write | contents: write, pull_requests: write |
+| nexus | contents: read | contents: read, issues: write, pull_requests: write, checks: read, statuses: read, actions: read |
+| forge | contents: write, workflows: write | contents: write, pull_requests: write |
 | sentinel | contents: read | contents: read, pull_requests: write, checks: read |
 | vessel | contents: write | contents: write, pull_requests: write, checks: read, statuses: read, actions: read |
 | lore | contents: write | contents: write, pull_requests: write |
+
+Only Forge's `git` profile carries `workflows: write`. GitHub requires the
+"Workflows" permission to access or edit files under `.github/workflows`, which
+"Contents" alone does not cover ([GitHub docs](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)).
+No other role or purpose receives it
+([`permissions.rs`](../../crates/openflows-manager/src/runtime/permissions.rs)).
+
+### Vessel in the controller
+
+In a hosted tenant the Vessel merge manager runs inside the Nexus controller.
+Its GitHub client holds a token from the `merge` purpose, which the Manager
+issues only to the `nexus` role. The profile is the `nexus` `api` grants with
+`contents` raised to `write`: `contents`, `issues` and `pull_requests` write,
+and `checks`, `statuses` and `actions` read. Every other role that asks for
+`merge` fails closed, and the `nexus` `git` and `api` profiles are unchanged,
+so the controller's own calls keep `contents: read`.
+
+The controller fetches the token through its own runtime session at startup and
+every eight minutes after, and updates the client in place
+([`runtime_control.rs`](../../crates/agent-nexus/src/runtime_control.rs)). The
+refresher shares the runtime client's session instead of keeping a second one,
+so it consumes no extra refresh token. When a refresh fails, the previous token
+stays in use and the next attempt follows in 30 seconds.
 
 ## Concurrency and revocation
 
