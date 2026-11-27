@@ -3,6 +3,26 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.9.1] - 2026-11-27
+
+### Features
+
+- Setup: Add console.sh to start the Console against any running Manager (e9ce419) (@arielpetit)
+
+### Bug fixes
+
+- Build: Build the Manager image with Rust 1.95.0 (036f02d) (@arielpetit)
+- Deps: Update kube to 5.2.0 and url to 2.5.9 for RUSTSEC-2026-0600 and -0592 (a2039bb) (@arielpetit)
+- Setup: Make console.sh recover from interrupted runs and stay in its lane (602553a) (@arielpetit)
+- Setup: Keep a working Console on failure and match the sign-in host in console.sh (24ff787) (@arielpetit)
+
+
+### Contributors
+
+- @arielpetit
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.9.0...openflows-1.9.1
+
 ## [1.9.0] - 2026-11-20
 
 ### Features
@@ -49,12 +69,6 @@ All notable changes to this project will be documented in this file.
 ### Chores
 
 - Hosted: Tighten the CI-read profile test and broker doc wording (873f4bc) (@onelrian)
-
-
-### Contributors
-
-- @Christiantyemele
-- @onelrian
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.8.3...openflows-1.9.0
 
