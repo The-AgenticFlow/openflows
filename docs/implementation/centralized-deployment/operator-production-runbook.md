@@ -66,6 +66,13 @@ backend with a non-filesystem store, set an absolute
 `OPENFLOWS_RUNTIME_DELIVERY_DIR` for the per-workspace bundle files; the
 Manager refuses to start without it.
 
+On the `kubernetes` backend, set `OPENFLOWS_RUNTIME_RELAY_BASE_URL` to
+`http://openflows-nexus-{tenant}.{namespace}.svc.cluster.local:3001` so Coder
+hooks reach each tenant's Nexus, and set `OPENFLOWS_K8S_MANAGER_SELECTOR` to the
+labels your Manager pods carry, so the organization namespaces admit it on the
+hook port. [Hook delivery](workspace-pods.md#hook-delivery) explains the
+placeholders and what a selector that matches nothing looks like.
+
 Hosted workspaces need no shared storage. The role templates mount the tenant
 `openflows-artifacts-<tenant>` volume only when the workspace is not hosted, so
 a hosted deployment creates none and requires no read-write-many volume; each

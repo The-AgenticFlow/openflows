@@ -305,9 +305,9 @@ resource "kubernetes_persistent_volume_claim_v1" "workspace" {
   }
 }
 
-# Stable per-tenant address for the A2A relay. The workers receive
-# `openflows-nexus-<tenant>:3000` from the Manager, so the name must match even
-# while the Nexus pod is restarting; the selector simply has no endpoints then.
+# Stable per-tenant address for the A2A relay (3000) and the Coder hook server (3001). The
+# workers receive `openflows-nexus-<tenant>:3000` from the Manager and the Manager relays hooks
+# to port 3001, so the name must match even while the pod restarts; it just has no endpoints then.
 resource "kubernetes_service_v1" "relay" {
   # A template import plans with no tenant, and "openflows-nexus-" is not a valid name.
   count = data.coder_parameter.tenant.value != "" ? 1 : 0
@@ -325,6 +325,13 @@ resource "kubernetes_service_v1" "relay" {
       name        = "a2a-relay"
       port        = 3000
       target_port = 3000
+      protocol    = "TCP"
+    }
+
+    port {
+      name        = "hook"
+      port        = 3001
+      target_port = 3001
       protocol    = "TCP"
     }
   }

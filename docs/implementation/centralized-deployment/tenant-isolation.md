@@ -20,6 +20,7 @@ rebuild) the Manager applies these objects. Repeating it is safe.
 | NetworkPolicy `openflows-allow-platform` | Egress for tenant-labelled pods to the platform namespace and any platform CIDRs, on the platform ports. A pod without the tenant label gets none of it |
 | NetworkPolicy `openflows-allow-public-egress` | Egress to the internet except private, link-local and carrier-grade NAT ranges |
 | NetworkPolicy `openflows-tenant-<tenant id>` | Ingress and egress between pods of that tenant only |
+| NetworkPolicy `openflows-allow-manager-hooks` | Ingress for the organization's Nexus pods from the Manager's pods in the platform namespace, on port 3001 only. It carries Coder lifecycle hooks to each tenant's Nexus |
 | NetworkPolicy `openflows-provisioner` | Only when `OPENFLOWS_K8S_PROVISIONER_SELECTOR` is set |
 
 Deleting a tenant removes its `openflows-tenant-*` policy. The organization
@@ -46,6 +47,7 @@ namespace stays.
 | `OPENFLOWS_K8S_PLATFORM_EGRESS_CIDRS` | none | Platform services outside the cluster, such as a managed Redis |
 | `OPENFLOWS_K8S_DELIVERY_KUBECONFIG` | none | Kubeconfig of the Secret delivery identity, apart from the namespace identity. Required in hosted mode; see below |
 | `OPENFLOWS_K8S_DELIVERY_SERVICE_ACCOUNT` | none | `namespace/name` of that identity's service account. Required in hosted mode: each organization namespace grants it Secret write access |
+| `OPENFLOWS_K8S_MANAGER_SELECTOR` | `app.kubernetes.io/name=openflows-manager` | `key=value` label of the Manager's pods in the platform namespace; only they may reach a tenant's hook port, so it must match the labels your deployment gives the Manager |
 | `OPENFLOWS_K8S_PROVISIONER_SELECTOR` | none | `key=value` label of the Coder provisioner pods |
 | `OPENFLOWS_K8S_API_EGRESS_CIDRS` | none | Kubernetes API address, for the provisioner policy |
 | `OPENFLOWS_K8S_PROVISIONER_SERVICE_ACCOUNT` | none | `namespace/name` of the provisioner's service account; see below |

@@ -20,7 +20,7 @@ Per role, the Terraform creates:
 | `kubernetes_deployment_v1` | One replica, `count = coder_workspace.me.start_count`, so the pod follows the workspace's start and stop. `wait_for_rollout = false`: the agent reports readiness to the Manager, not to a container probe |
 | `kubernetes_persistent_volume_claim_v1` | `ReadWriteOnce`, created with the workspace and **not** tied to `start_count`, so a stop does not discard the home |
 | `init_container` `prepare-workspace` | Runs first as uid 1000 and creates `/home/coder/workspace`; see [The workspace directory](#the-workspace-directory) |
-| `kubernetes_service_v1` (Nexus only) | `openflows-nexus-<tenant>` on port 3000, the address the Manager passes to workers as `a2a_relay_addr` |
+| `kubernetes_service_v1` (Nexus only) | `openflows-nexus-<tenant>` on port 3000, the address the Manager passes to workers as `a2a_relay_addr`, and on port 3001, where the Manager relays Coder lifecycle hooks (see [Hook delivery](#hook-delivery)) |
 
 Startup is unchanged: the pod sources the same `runtime/lib/bootstrap.sh` from
 the pinned image, checks `OF_RUNTIME_API`, and calls `of_bootstrap_controller`
@@ -110,6 +110,30 @@ terraform fmt -check
 (start count, digest pinning, Secret mount, Service name, labels, pod security)
 without needing a cluster. `.terraform/` is excluded from the packaged archives.
 
+## Hook delivery
+
+Coder posts a lifecycle hook to the Manager for every worker chat, and the Manager relays it to
+the tenant's Nexus. On Kubernetes that relay target is the Nexus Service, so set
+`OPENFLOWS_RUNTIME_RELAY_BASE_URL` to
+
+```
+http://openflows-nexus-{tenant}.{namespace}.svc.cluster.local:3001
+```
+
+`{tenant}` expands to the tenant id and `{namespace}` to the tenant's
+organization namespace (`OPENFLOWS_K8S_NAMESPACE_PREFIX` plus the organization
+id). The Manager writes the same URL into the tenant's credential bundle, where
+the controller checks it as the hook token's audience, so a change to the
+setting or to the namespace prefix reaches a tenant only after it is stopped and
+started.
+
+The Manager's pods reach port 3001 through the `openflows-allow-manager-hooks`
+policy described in [tenant isolation](tenant-isolation.md).
+`OPENFLOWS_K8S_MANAGER_SELECTOR` names those pods and must match their labels: a
+selector that matches nothing admits nothing, and every hook then times out. If
+the platform namespace denies egress by default, allow the Manager to reach port
+3001 in the organization namespaces.
+
 ## Bringing a tenant up on a new cluster
 
 Do these once per cluster, in order.
@@ -173,5 +197,6 @@ because a start fails without it.
 | A new tenant still runs the old templates | Promotion does not upgrade existing pins | [Recreate the tenant](#recreating-a-tenant) |
 | `/api/v1/runtime/chats` returns 503 `CODER_CHAT_UNAVAILABLE`, and the Manager log says `No chat model is available in this organization` | The tenant's Coder organization has no model | Step 4 |
 | A start fails with `cannot resolve hook key` | The Manager's secrets directory was lost | [Recreate the tenant](#recreating-a-tenant); see step 5 |
+| A chat fails with `502 Chat lifecycle hook dispatch failed (http_error)`, and the Manager log shows `tenant hook relay failed` or `tenant hook relay timed out` | The relay base does not name the Nexus Service, or `OPENFLOWS_K8S_MANAGER_SELECTOR` does not match the Manager's pod labels, so the policy admits nothing | [Hook delivery](#hook-delivery) |
 | `FATAL: Manager runtime registration failed` after restarting a workspace in Coder | The bootstrap credential is single use ([`bootstrap.sh`](../../../runtime/lib/bootstrap.sh)) | Stop, then start the tenant through OpenFlows |
 | The `prepare-workspace` init container fails with `is not writable and holds files` | A populated workspace directory the user cannot write | Keep the files, fix the ownership, restart |

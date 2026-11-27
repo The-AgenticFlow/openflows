@@ -633,7 +633,7 @@ impl ManagerServices {
         let Some(ref_name) = &config.coder_operator_token_ref else {
             return Ok(self);
         };
-        crate::config::runtime_hook_url(uuid::Uuid::nil()).map_err(ManagerError::Config)?;
+        crate::hook_url::validate().map_err(ManagerError::Config)?;
         let token_bytes = provider.get(ref_name).await.map_err(|e| {
             ManagerError::Config(format!("failed to resolve Coder operator token: {e}"))
         })?;

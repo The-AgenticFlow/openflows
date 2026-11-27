@@ -1228,9 +1228,7 @@ pub async fn doctor() -> Result<()> {
     );
     report(
         "runtime hook routing",
-        crate::config::runtime_hook_url(uuid::Uuid::nil())
-            .map(|_| ())
-            .map_err(anyhow::Error::msg),
+        crate::hook_url::validate().map_err(anyhow::Error::msg),
     );
     // Resolve the secret directory as a reported check so a missing directory
     // does not abort the remaining independent diagnostics (PostgreSQL, Redis,

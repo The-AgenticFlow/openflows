@@ -36,6 +36,12 @@ pub const NON_PUBLIC_CIDRS: [&str; 5] = [
 pub const DEFAULT_DENY: &str = "openflows-default-deny";
 pub const ALLOW_DNS: &str = "openflows-allow-dns";
 pub const ALLOW_PLATFORM: &str = "openflows-allow-platform";
+pub const ALLOW_HOOKS: &str = "openflows-allow-manager-hooks";
+/// Port of the controller's hook server. The Nexus Service in the pod templates exposes the same one.
+pub const HOOK_PORT: u16 = 3001;
+/// Label the Nexus pod template sets. Only Nexus runs a hook server, so only it is selected.
+const NEXUS_LABEL_KEY: &str = "app.kubernetes.io/name";
+const NEXUS_LABEL_VALUE: &str = "openflows-nexus";
 pub const ALLOW_PUBLIC: &str = "openflows-allow-public-egress";
 pub const PROVISIONER_POLICY: &str = "openflows-provisioner";
 pub const QUOTA_NAME: &str = "openflows-quota";
@@ -303,6 +309,16 @@ fn platform_peers(settings: &IsolationSettings) -> Vec<Value> {
     peers
 }
 
+/// Ingress peer for the Manager's pods, which relay Coder lifecycle hooks to a tenant's Nexus.
+fn manager_peer(settings: &IsolationSettings) -> Value {
+    let (key, value) = &settings.manager_selector;
+    json!({
+        "namespaceSelector": { "matchLabels": {
+            "kubernetes.io/metadata.name": settings.platform_namespace } },
+        "podSelector": { "matchLabels": { key: value } },
+    })
+}
+
 /// Policies every organization namespace gets, whichever tenants it holds.
 pub fn base_policies(
     settings: &IsolationSettings,
@@ -312,6 +328,10 @@ pub fn base_policies(
     // Only pods that carry the tenant label may reach the platform services.
     let tenant_pods =
         json!({ "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }] });
+    let nexus_pods = json!({
+        "matchLabels": { NEXUS_LABEL_KEY: NEXUS_LABEL_VALUE },
+        "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }],
+    });
     let mut policies = vec![
         policy(
             DEFAULT_DENY,
@@ -332,6 +352,14 @@ pub fn base_policies(
             json!({ "podSelector": tenant_pods, "policyTypes": ["Egress"], "egress": [{
                 "to": platform_peers(settings),
                 "ports": tcp_ports(&settings.platform_ports),
+            }]}),
+        )?,
+        policy(
+            ALLOW_HOOKS,
+            namespace,
+            json!({ "podSelector": nexus_pods, "policyTypes": ["Ingress"], "ingress": [{
+                "from": [manager_peer(settings)],
+                "ports": tcp_ports(&[HOOK_PORT]),
             }]}),
         )?,
         policy(
@@ -466,6 +494,62 @@ mod tests {
         );
         assert_eq!(selector_of(ALLOW_DNS), json!({}));
         assert_eq!(selector_of(ALLOW_PUBLIC), json!({}));
+    }
+
+    #[test]
+    fn the_manager_may_reach_only_the_hook_port_of_tenant_nexus_pods() {
+        let policies = base_policies(&IsolationSettings::default(), "ns").expect("policies");
+        let policy = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(ALLOW_HOOKS))
+            .expect("hook policy");
+        let spec = spec(policy);
+
+        assert_eq!(
+            spec["podSelector"],
+            json!({
+                "matchLabels": { "app.kubernetes.io/name": "openflows-nexus" },
+                "matchExpressions": [{ "key": TENANT_LABEL, "operator": "Exists" }],
+            })
+        );
+        assert_eq!(spec["policyTypes"], json!(["Ingress"]));
+        assert_eq!(
+            spec["ingress"][0]["ports"],
+            json!([{ "protocol": "TCP", "port": HOOK_PORT }])
+        );
+        assert_eq!(
+            spec["ingress"][0]["from"],
+            json!([{
+                "namespaceSelector": { "matchLabels": {
+                    "kubernetes.io/metadata.name": "openflows" } },
+                "podSelector": { "matchLabels": { "app.kubernetes.io/name": "openflows-manager" } },
+            }])
+        );
+        assert!(spec.get("egress").is_none());
+    }
+
+    #[test]
+    fn the_hook_peer_follows_the_platform_namespace_and_manager_selector() {
+        let settings = IsolationSettings {
+            platform_namespace: "platform".into(),
+            manager_selector: ("app".into(), "manager".into()),
+            ..IsolationSettings::default()
+        };
+        let policies = base_policies(&settings, "ns").expect("policies");
+        let policy = policies
+            .iter()
+            .find(|p| p.metadata.name.as_deref() == Some(ALLOW_HOOKS))
+            .expect("hook policy");
+        let from = spec(policy)["ingress"][0]["from"][0].clone();
+
+        assert_eq!(
+            from["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+            "platform"
+        );
+        assert_eq!(
+            from["podSelector"]["matchLabels"],
+            json!({ "app": "manager" })
+        );
     }
 
     #[test]

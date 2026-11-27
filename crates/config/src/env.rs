@@ -92,6 +92,7 @@ pub struct CoderHooksConfig {
 
     /// Bind address for the OpenFlows hook consumer endpoint. The default is
     /// Docker-reachable because the bundled Coder service posts from a container.
+    /// The Kubernetes Nexus Service and the Manager's hook policy use port 3001; change them together.
     #[envconfig(from = "OPENFLOWS_HOOK_ADDR", default = "0.0.0.0:3001")]
     pub hook_addr: String,
 

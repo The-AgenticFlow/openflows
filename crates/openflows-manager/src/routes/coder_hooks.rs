@@ -114,7 +114,7 @@ pub async fn receive(
     } else {
         targets.into_iter().next()
     };
-    let (_organization_id, tenant_id, hook_secret_ref) =
+    let (organization_id, tenant_id, hook_secret_ref) =
         target.ok_or_else(|| ManagerError::not_found("hook workspace"))?;
 
     let tenant_secret = zeroize::Zeroizing::new(
@@ -126,7 +126,8 @@ pub async fn receive(
                 ManagerError::api("SERVICE_UNAVAILABLE", "tenant hook channel unavailable")
             })?,
     );
-    let relay_url = crate::config::runtime_hook_url(tenant_id).map_err(ManagerError::Config)?;
+    let relay_url = crate::config::runtime_hook_url(organization_id, tenant_id)
+        .map_err(ManagerError::Config)?;
     let relay_claims = HookClaims {
         iss: "openflows-manager".into(),
         aud: relay_url.clone(),

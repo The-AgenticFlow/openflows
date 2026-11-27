@@ -564,8 +564,8 @@ impl TenantRuntimeRepository {
         redis_url
             .set_password(Some(redis_password.as_str()))
             .map_err(|_| ManagerError::Config("invalid Redis password".into()))?;
-        let hook_url =
-            crate::config::runtime_hook_url(tenant_id.into()).map_err(ManagerError::Config)?;
+        let hook_url = crate::config::runtime_hook_url(org_id.0, tenant_id.into())
+            .map_err(ManagerError::Config)?;
         let mut bundle = serde_json::json!({
             "schema_version": 1,
             "workspace_id": workspace_id,
