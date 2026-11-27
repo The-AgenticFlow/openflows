@@ -107,7 +107,7 @@ It never prints the token value.
 3. Copy the example and set these three values in `.env.prod`:
 
    ```bash
-   cp .env.prod.example .env.prod
+   cp docs/examples/manager-local.env.example .env.prod
    ```
 
    ```dotenv
