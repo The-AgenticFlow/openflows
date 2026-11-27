@@ -133,7 +133,8 @@ the provisioner credential directory, points `OPENFLOWS_HOOK_URL` and
 `.env.openflows.bak`), starts the stack, waits until the Manager and Console
 answer, and prints their URLs. Add `--pull` to fetch a newer Console image. It is
 safe to re-run, and it stops without changing anything if the install was saved
-for a host Manager (see below). The equivalent plain command is
+for a host Manager (see below). To add only the Console to a Manager that is already
+running, however it was started, use `./scripts/console.sh`. The equivalent plain command is
 `docker compose --env-file .env.openflows -f deployment.compose.yml up -d`.
 
 The Manager image is built from this checkout the first time (a few minutes).
